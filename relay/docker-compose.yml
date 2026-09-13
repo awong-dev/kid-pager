@@ -1,0 +1,21 @@
+# For local development only — do not use in production
+
+version: "3.8"
+
+services:
+    ports:
+    volumes:
+    networks:
+      - pager-net
+
+  relay:
+    build: .
+    depends_on:
+    ports:
+      - "8000:8000"
+    networks:
+      - pager-net
+
+networks:
+  pager-net:
+    driver: bridge
