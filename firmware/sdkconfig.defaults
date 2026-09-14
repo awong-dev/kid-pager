@@ -1,0 +1,1 @@
+# vendored library's own compilation (WalterModem.cpp references those members unguarded).
