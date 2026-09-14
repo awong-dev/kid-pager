@@ -1,0 +1,47 @@
+name: CI
+
+# Relay unit tests against the emulators, then the end-to-end suite on the relay and home stacks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+
+        with:
+          python-version: "3.12"
+
+      - name: Install relay dependencies
+        run: pip install -e "./relay[dev]"
+
+      - name: Start Firestore/Auth emulators for unit tests
+        working-directory: relay
+        run: docker compose up -d firebase
+
+      # The compose healthcheck probes only 8080; the Auth emulator (9099) can start later.
+      - name: Wait for emulators to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/ >/dev/null 2>&1 && curl -sf http://localhost:9099/ >/dev/null 2>&1; then
+              echo "Firestore + Auth emulators are up"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8080/ >/dev/null || { echo "Firestore emulator never became reachable"; exit 1; }
+          curl -sf http://localhost:9099/ >/dev/null || { echo "Auth emulator never became reachable"; exit 1; }
+
+      - name: Run relay unit tests
+        working-directory: relay
+        run: pytest -v
+
+      - name: Stop the unit-test-only emulators (e2e_v2.py brings up its own full stack)
+        working-directory: relay
+        run: docker compose down -v
+
+      - name: Run end-to-end test against the real docker-compose stack
+        run: python3 tools/e2e_v2.py

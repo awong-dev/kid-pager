@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars and fill in real values. terraform.tfvars is git-ignored.
+# Secret Manager values are added with `gcloud secrets versions add`, never through Terraform.
+
+project_id  = "my-pager-project"
+region      = "us-central1"
+github_org  = "my-github-org"
+github_repo = "pager"
+
+
+# EMQX Cloud Serverless REST API base URL, from its console.
+broker_api_url = "https://<your-deployment>.emqxsl.com:8443/api/v5"
+
+# Optional overrides (defaults shown):
+# firestore_location     = "nam5"
+# custom_domain          = ""
+# enable_phone_auth      = true
+# enable_email_link_auth = true
+# time_zone              = "America/Los_Angeles"
+# use_broker_gce         = false  
+# broker_domain          = ""      # required if use_broker_gce = true
+# letsencrypt_email      = ""      # required if use_broker_gce = true

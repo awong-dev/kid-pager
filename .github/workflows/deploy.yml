@@ -1,0 +1,119 @@
+name: Deploy
+
+# Build the relay image, `terraform apply` (WIF), then `firebase deploy`. Every job is skipped
+# until the GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_DEPLOY_SERVICE_ACCOUNT secrets are set.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+  TF_VERSION: "1.14.9"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        # Secrets go through env: so their values are data, not shell syntax.
+        env:
+          WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          DEPLOY_SA: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$WIF_PROVIDER" ] && [ -n "$DEPLOY_SA" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP_WORKLOAD_IDENTITY_PROVIDER and/or GCP_DEPLOY_SERVICE_ACCOUNT repo secrets are not set -- deploy is a no-op until infra/README.md's WIF runbook step is done by hand. This is expected, not an error."
+          fi
+
+  build-and-push:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+
+      - id: auth
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - id: image
+        run: |
+          IMAGE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/pager/relay:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build relay image
+        working-directory: relay
+        run: docker build -t "${{ steps.image.outputs.image }}" .
+
+      - name: Push relay image
+        run: docker push "${{ steps.image.outputs.image }}"
+
+  terraform-apply:
+    needs: [gate, build-and-push]
+    if: needs.gate.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: infra/envs/prod
+        run: terraform init -input=false
+
+      - name: terraform apply
+        working-directory: infra/envs/prod
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var "project_id=${{ env.GCP_PROJECT_ID }}" \
+            -var "region=${{ env.GCP_REGION }}" \
+            -var "relay_image=${{ needs.build-and-push.outputs.image }}" \
+            -var "github_org=${{ github.repository_owner }}" \
+            -var "github_repo=${{ github.event.repository.name }}" \
+
+  firebase-deploy:
+    needs: [gate, terraform-apply]
+    if: needs.gate.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+        with:
+
+      # NEXT_PUBLIC_FIREBASE_* are inlined at build time; unset, the build ships demo config
+      - name: Build web app
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: firebase deploy (hosting + firestore rules/indexes)
+        run: |
+          npx firebase-tools@13 deploy \
+            --only hosting,firestore \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --non-interactive

@@ -1,0 +1,34 @@
+{
+  "hosting": {
+    "public": "web/out",
+    "cleanUrls": true,
+    "trailingSlash": false,
+    "rewrites": [
+      {
+        "source": "/api/**",
+        "run": {
+          "serviceId": "pager-relay",
+        }
+      },
+      {
+        "source": "/webhooks/**",
+        "run": {
+          "serviceId": "pager-relay",
+        }
+      },
+      {
+        "source": "/chat/**",
+        "destination": "/chat/_.html"
+      }
+    ],
+    "headers": [
+      {
+        "source": "/firebase-messaging-sw.js",
+      }
+    ]
+  },
+  "firestore": {
+    "rules": "relay/firestore.rules",
+    "indexes": "relay/firestore.indexes.json"
+  }
+}

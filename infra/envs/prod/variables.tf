@@ -1,0 +1,105 @@
+variable "project_id" {
+  description = "GCP project id (already created by hand, Blaze billing enabled -- infra/README.md step 0)."
+  type        = string
+}
+
+variable "region" {
+  type    = string
+  default = "us-central1"
+}
+
+variable "firestore_location" {
+  type    = string
+  default = "nam5"
+}
+
+variable "web_app_display_name" {
+  type    = string
+  default = "pager-web"
+}
+
+variable "hosting_site_id" {
+  type    = string
+  default = ""
+}
+
+variable "custom_domain" {
+  description = "docs/SERVER_PLAN.md §11 D6. Empty = none (the *.web.app URL is used everywhere)."
+  type        = string
+  default     = ""
+}
+
+variable "enable_phone_auth" {
+  type    = bool
+  default = true
+}
+
+variable "enable_email_link_auth" {
+  type    = bool
+  default = true
+}
+
+variable "relay_service_name" {
+  type    = string
+  default = "pager-relay"
+}
+
+variable "relay_image" {
+  type        = string
+}
+
+variable "broker_api_url" {
+  description = "docs/SERVER_PLAN.md §9.4: EMQX Cloud Serverless REST API base URL for this deployment (from the EMQX Cloud console, infra/README.md), or the broker-gce module's own REST endpoint if use_broker_gce=true."
+  type        = string
+}
+
+variable "tick_schedule" {
+  type    = string
+  default = "*/5 * * * *"
+}
+
+variable "sweep_schedule" {
+  type    = string
+}
+
+variable "time_zone" {
+  type        = string
+  default     = "America/Los_Angeles"
+}
+
+variable "github_org" {
+  type = string
+}
+
+variable "github_repo" {
+  type    = string
+  default = "pager"
+}
+
+variable "use_broker_gce" {
+  type    = bool
+  default = false
+}
+
+variable "broker_domain" {
+  description = "Required only when use_broker_gce=true."
+  type        = string
+  default     = ""
+}
+
+variable "letsencrypt_email" {
+  description = "Required only when use_broker_gce=true."
+  type        = string
+  default     = ""
+}
+
+variable "broker_admin_cidr_ranges" {
+  description = "CIDR ranges allowed to reach the broker-gce EMQX dashboard. Empty = dashboard not exposed. Only relevant when use_broker_gce=true."
+  type        = list(string)
+  default     = []
+}
+
+variable "labels" {
+  type    = map(string)
+  default = { app = "pager", managed-by = "terraform" }
+}

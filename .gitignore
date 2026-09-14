@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
+
+# Firebase Emulator Suite
+firestore-debug.log
+ui-debug.log
+firebase-debug.log
+pubsub-debug.log
+database-debug.log
+firestore-export-metadata.json
+
+# Environment files
+.env
+
+# ESP-IDF
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+.claude/scheduled_tasks.lock
+
+build-v2.log
