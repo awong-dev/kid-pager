@@ -74,6 +74,12 @@ def _topic_suffix(topic: str) -> str | None:
     return parts[2]
 
 
+def _is_boot_ack_topic(topic: str) -> bool:
+    """`pager/boot/{bid}/up` (PROTOCOL.md §2): longer than the topics `_topic_suffix` matches."""
+    parts = topic.split("/")
+    return len(parts) == 4 and parts[0] == "pager" and parts[1] == "boot" and parts[3] == "up"
+
+
 @router.post("/webhooks/mqtt")
 async def mqtt_webhook(request: Request) -> Response:
     broker: BrokerClient = request.app.state.broker

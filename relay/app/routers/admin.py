@@ -7,12 +7,18 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from firebase_admin import auth as fb_auth
 
+from app.broker import BrokerClient
+from app.db.firestore import get_db
+from app.ingest import Ingest
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import contacts as contacts_store
+from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import rate_limits as rate_limits_store
 from app.store import settings as settings_store
@@ -34,6 +40,26 @@ def _admin_write_rate_limit() -> tuple[int, int]:
         os.environ.get("RATE_LIMIT_ADMIN_WRITE_WINDOW_S", str(DEFAULT_ADMIN_WRITE_WINDOW_S))
     )
     return limit, window_s
+
+
+def get_broker(request: Request) -> BrokerClient:
+    """The app's broker client."""
+    return request.app.state.broker
+
+
+def get_ingest(request: Request) -> Ingest:
+    """The app's `Ingest`, so a rotated `hmacKey` invalidates the cache that verifies envelopes."""
+    return request.app.state.ingest
+
+
+    """`app.state.emqx_admin` if set (tests inject one), else a fresh `make_broker_admin`."""
+    existing = getattr(request.app.state, "emqx_admin", None)
+    if existing is not None:
+        return existing
+
+
+def get_app_settings(request: Request) -> Settings:
+    return request.app.state.settings
 
 
 def require_admin_write_rate_limit(
@@ -142,14 +168,50 @@ class CreateDeviceRequest(BaseModel):
     defaultToAlias: str | None = None
 
 
+class DeviceSetupCodeResponse(BaseModel):
+    """Response for device create and rotate-credentials; plaintext secrets leave only in the bundle."""
+
     device: Device
+    setupCode: str
+    expiresAt: datetime
+    brokerPush: Literal["pushed", "manual"]
+    manualAcl: list[str] | None = None
 
 
+HMAC_KEY_BYTES = 32
+
+
+
+
+def _manual_acl_lines(device_id: str) -> list[str]:
+    """Display-only mirror of the broker ACL, shown when the real push did not happen."""
+    return [
+        f"publish pager/{device_id}/up",
+        f"publish pager/{device_id}/status",
+        f"publish pager/{device_id}/loc",
+        f"subscribe pager/{device_id}/down",
+    ]
+
+
+def _broker_push_outcome(
+    device_id: str, result: EmqxResult
+) -> tuple[Literal["pushed", "manual"], list[str] | None]:
+    if result == "ok":
+        return "pushed", None
+    return "manual", _manual_acl_lines(device_id)
+
+
+    req: CreateDeviceRequest,
+) -> DeviceSetupCodeResponse:
     owner_uid = _resolve_uid(req.ownerAlias)
     default_to_uid = _resolve_uid(req.defaultToAlias) if req.defaultToAlias else None
 
+    # generate the MQTT password and HMAC key; the plaintext exists only here
     password = secrets.token_urlsafe(MQTT_PASSWORD_BYTES)
     password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    hmac_key = secrets.token_bytes(HMAC_KEY_BYTES)
+
+    devices_store.create_device(
         owner_uid=owner_uid,
         label=req.label,
         mqtt_password_hash=password_hash,
@@ -160,7 +222,19 @@ class CreateDeviceRequest(BaseModel):
     )
     # pick up incoming `locate` edges that predate this device
     allow_store.recompute_locatable_by_for_owner(owner_uid)
+
+    # push the broker credential and ACL before handing out a setup code
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(minutes=devsetup.EXPIRY_MINUTES)
+
     assert device is not None
+    return DeviceSetupCodeResponse(
+        device=device,
+        setupCode=setup_code,
+        expiresAt=expires_at,
+        brokerPush=broker_push,
+        manualAcl=manual_acl,
+    )
 
 
 @router.get("/devices")
@@ -170,11 +244,70 @@ class CreateDeviceRequest(BaseModel):
     return {"ok": True}
 
 
+    device_id: str,
+) -> DeviceSetupCodeResponse:
     device = devices_store.get_device(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="no such device")
+
     password = secrets.token_urlsafe(MQTT_PASSWORD_BYTES)
     password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    hmac_key = secrets.token_bytes(HMAC_KEY_BYTES)
+
+    # delete the old broker credential outright before `deviceSecrets.rotate` replaces key/hash
+    emqx.delete_user(device.mqttUsername)
+    device_secrets_store.rotate(device_id, hmac_key, password_hash)
+    # the alarm and its window concern the old key
+    devices_store.clear_auth_alarm(device_id)
+    # drop the cached secret so envelopes are not verified against the deleted `hmacKey`
+    ingest.invalidate_secret_cache(device_id)
+    devices_store.set_provision_state(device_id, "issued")
+
+    emqx_result = emqx.ensure_device(device.mqttUsername, password, device_id)
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(minutes=devsetup.EXPIRY_MINUTES)
+
+    updated = devices_store.get_device(device_id)
+    assert updated is not None
+    broker_push, manual_acl = _broker_push_outcome(device_id, emqx_result)
+    return DeviceSetupCodeResponse(
+        device=updated,
+        setupCode=setup_code,
+        expiresAt=expires_at,
+        brokerPush=broker_push,
+        manualAcl=manual_acl,
+    )
+
+
+@router.post(
+)
+    device_id: str,
+    """Revoke the device and delete its broker credential."""
+    device = devices_store.get_device(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    emqx.delete_user(device.mqttUsername)
+    return devices_store.revoke_device(device_id)
+
+
+class LockCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    clear: bool | None = None
+    # stored device-side as a `u8` (0-255 minutes; 0 = never)
+    auto: int | None = Field(default=None, ge=0, le=255)
+
+
+class PushCfgRequest(BaseModel):
+    lock: LockCfg
+
+
+@router.post("/devices/{device_id}/cfg", dependencies=[Depends(require_admin_write_rate_limit)])
+def push_cfg(
+    device_id: str,
+    req: PushCfgRequest,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+) -> dict[str, bool]:
 
 
 class PutSettingsRequest(BaseModel):

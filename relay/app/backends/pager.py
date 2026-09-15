@@ -1,8 +1,10 @@
 """`pager` backend: the MQTT gateway over the broker's REST publish API.
+The wire `id` is the message id, so republishes dedup on the device (docs/PROTOCOL.md §5.3)."""
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -16,6 +18,17 @@ from app.store.users import User
 logger = logging.getLogger("relay.backends.pager")
 
 SYSTEM_ALIAS = "system"
+
+
+    """The down envelope's fields (docs/PROTOCOL.md §3.1/§3.2); `sndr` only on a group page."""
+    obj: dict[str, Any] = {"v": 1, "id": msg_id, "ts": ts}
+    if kind != "msg":
+        obj["kind"] = kind
+    obj["from"] = from_
+    if kind != "loc_req":
+        obj["body"] = body
+    obj["ack"] = None
+    return obj
 
 
 class PagerConfig(BaseModel):
@@ -38,10 +51,13 @@ class PagerBackend:
             return DeliverResult(ok=False, state="failed", error="pager backend missing deviceId")
 
         down_kind = "loc_req" if msg.kind == "loc_req" else "msg"
+        obj = _build_down_obj(
             msg_id=msg.id,
             ts=msg.ts,
             kind=down_kind,
+            body=msg.body,
         )
+        ok = self._broker.publish_down(device_id, obj)
         if ok:
             return DeliverResult(ok=True, state="sent", external_id=device_id)
         return DeliverResult(ok=False, state="queued", error="broker publish failed")

@@ -10,6 +10,8 @@ import time
 from typing import Any, Literal
 
 
+from app import wirecbor
+
 logger = logging.getLogger("relay.wire")
 
 
@@ -58,6 +60,11 @@ def resolve_ts(ts: int) -> int:
     return ts if ts != 0 else int(time.time())
 
 
+def _check_n_range(value: int | None) -> int | None:
+        raise ValueError("n out of range")
+    return value
+
+
 class UpEnvelope(BaseModel):
     """A payload on `pager/{device_id}/up`: an ack (§3.2) or a device up-message."""
 
@@ -70,6 +77,11 @@ class UpEnvelope(BaseModel):
     to: str | None = None
     body: str | None = None
     ack: str | None = None
+    # §3.2: only the default kind (an ack or a content message, `kind` omitted) is handled here;
+    # any other kind takes the unknown-kind path (§3.4).
+    kind: str | None = None
+    # §14.2: present on every signed envelope; absent when `authMode` is "password".
+    n: int | None = None
 
     @field_validator("id")
     @classmethod
@@ -84,6 +96,11 @@ class UpEnvelope(BaseModel):
         validate_ts(value)
         return value
 
+    @field_validator("n")
+    @classmethod
+    def _check_n(cls, value: int | None) -> int | None:
+        return _check_n_range(value)
+
     @field_validator("to")
     @classmethod
     def _check_to(cls, value: str | None) -> str | None:
@@ -94,6 +111,9 @@ class UpEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def _check_shape(self) -> UpEnvelope:
+        if self.kind is not None:
+            # §3.4: an unrecognised kind is not rendered or acked, only counted and dropped.
+            raise ValueError(f"unknown kind on /up: {self.kind!r}")
         if self.ack is not None:
             if self.ack not in ACK_VALUES:
                 raise ValueError("invalid ack value")
@@ -133,11 +153,18 @@ class StatusEnvelope(BaseModel):
     # §4.5/§5.1: display only; stored as reported, never written back.
     loc_period_s: int | None = None
     loc_min_s: int | None = None
+    # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
+    n: int | None = None
 
     @classmethod
     def _check_loc_timing(cls, value: int | None) -> int | None:
         if value is not None and not (0 <= value <= 86400):
         return value
+
+    @field_validator("n")
+    @classmethod
+    def _check_n(cls, value: int | None) -> int | None:
+        return _check_n_range(value)
 
     @field_validator("session")
     @classmethod
@@ -244,6 +271,48 @@ def parse_envelope_bytes(raw: bytes) -> dict[str, Any] | None:
     return data
 
 
+EnvelopeEncoding = Literal["json", "cbor"]
+
+
+def is_oversize(raw: bytes) -> bool:
+    """§3.3/§14.4 step 1: the 640-byte check, done *before* anything about
+    the payload (encoding, signature, shape) is inspected."""
+    return len(raw) > MAX_ENVELOPE_BYTES
+
+
+def decode_envelope_bytes(raw: bytes) -> tuple[dict[str, Any], EnvelopeEncoding] | None:
+    """§14.4 step 4: CBOR (first-byte dispatch) or JSON decode; `(dict, encoding)` or None."""
+    if is_oversize(raw):
+        return None
+    if wirecbor.is_cbor(raw):
+        try:
+            data = wirecbor.decode(raw)
+        except Exception:  # noqa: BLE001 -- cbor2 raises several distinct exception types
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data, "cbor"
+    try:
+        text = raw.decode("utf-8")
+        data = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data, "json"
+
+
+# §14.6: the one unsigned inbound envelope an hmac device may send, the broker LWT: exactly
+# {v, state:"offline", session}, matching §5.2's wire example.
+_LWT_ALLOWED_KEYS = {"v", "state", "session"}
+
+
+def is_unsigned_lwt_shape(data: dict[str, Any]) -> bool:
+    if not set(data.keys()) <= _LWT_ALLOWED_KEYS:
+        return False
+    return data.get("state") == "offline" and isinstance(data.get("session"), str)
+
+
 def log_malformed(topic: str, raw: bytes, reason: str) -> None:
     """§3.4: relay logs the topic and first 64 bytes, then drops."""
     logger.warning("malformed payload on %s (%s): %r", topic, reason, raw[:64])
@@ -304,6 +373,13 @@ class LocEnvelope(BaseModel):
     req: str | None
     cached: bool = False
     err: Literal["no_fix", "disabled"] | None = None
+    # §14.2: present on every signed envelope.
+    n: int | None = None
+
+    @field_validator("n")
+    @classmethod
+    def _check_n(cls, value: int | None) -> int | None:
+        return _check_n_range(value)
 
     @field_validator("id")
     @classmethod

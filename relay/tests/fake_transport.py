@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,9 @@ class FakeBrokerClient:
         self.published.append(PublishedMessage(topic, payload, qos, retain))
         return True
 
+    def publish_down(self, device_id: str, obj: dict[str, Any]) -> bool:
+        return BrokerClient.publish_down(self, device_id, obj)  # type: ignore[arg-type]
+
     def healthcheck(self) -> bool:
         return self.healthy
 
@@ -54,6 +58,13 @@ class FakeBrokerClient:
 
 def webhook_event(topic: str, payload: bytes, qos: int = 1) -> dict:
     """The JSON the EMQX HTTP action POSTs: `payload_b64` is exact, `payload` is EMQX's lossy
+    rendering (invalid UTF-8 becomes U+FFFD)."""
+    return {
+        "topic": topic,
+        "payload": payload.decode("utf-8", "replace"),
+        "payload_b64": base64.b64encode(payload).decode("ascii"),
+        "qos": qos,
+    }
 
 
 def webhook_body(topic: str, payload: bytes, qos: int = 1) -> bytes:

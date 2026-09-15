@@ -25,6 +25,12 @@ class Settings:
     google_cloud_project: str | None
     firestore_emulator_host: str | None
     firebase_auth_emulator_host: str | None
+    # Production MQTT/TLS host for bootstrap bundles; `app/ca_resolve.py` connects to :8883
+    # to resolve the CA when BROKER_CA_PEM is unset.
+    broker_host: str = "localhost"
+    # The broker CA PEM; wins over auto-resolve. Empty: `app/ca_resolve.py` looks it up;
+    # if that fails, bundles carry no `ca`.
+    broker_ca_pem: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -36,4 +42,5 @@ class Settings:
             google_cloud_project=os.environ.get("GOOGLE_CLOUD_PROJECT") or None,
             firestore_emulator_host=os.environ.get("FIRESTORE_EMULATOR_HOST") or None,
             firebase_auth_emulator_host=os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or None,
+            broker_host=os.environ.get("BROKER_HOST", "localhost"),
         )

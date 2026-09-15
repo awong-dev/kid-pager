@@ -36,6 +36,7 @@ def _make_pager_device(device_id: str, owner_uid: str, *, default_to_uid: str | 
         mqtt_username=device_id,
         mqtt_password_hash="x",
         default_to_uid=default_to_uid,
+        auth_mode="password",
     )
     return backends_store.create_backend(
         owner_uid, kind="pager", config={"deviceId": device_id}, enabled=True

@@ -12,6 +12,8 @@ services:
     volumes:
       # Pre-seeds an api_key:api_secret pair matching BROKER_API_KEY/BROKER_API_SECRET in .env.
       - ./emqx/bootstrap_api_keys.txt:/opt/emqx/data/bootstrap_api_keys.txt:ro
+      # Built-in database authentication + authorization, deny-by-default (see emqx.conf).
+      - ./emqx/emqx.conf:/opt/emqx/etc/emqx.conf:ro
     environment:
       EMQX_API_KEY__BOOTSTRAP_FILE: /opt/emqx/data/bootstrap_api_keys.txt
     healthcheck:

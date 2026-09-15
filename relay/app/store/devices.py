@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
+from typing import Literal
 
 
 from app.db.firestore import get_db
+
+# More than 20 failures in 10 minutes on one device raises `status.authAlarm`.
+AUTH_ALARM_THRESHOLD = 20
+AUTH_ALARM_WINDOW_S = 600
 
 
 class DeviceStatus(BaseModel):
@@ -22,6 +28,9 @@ class DeviceStatus(BaseModel):
     locPeriodS: int | None = None
     locMinS: int | None = None
     updatedAt: datetime | None = None
+    # Set once `sigFailures` crosses AUTH_ALARM_THRESHOLD within AUTH_ALARM_WINDOW_S; cleared on
+    # key rotation.
+    authAlarm: bool | None = None
 
 
 class Device(BaseModel):
@@ -35,6 +44,14 @@ class Device(BaseModel):
     revokedAt: datetime | None = None
     locatableBy: list[str] = []
     status: DeviceStatus = DeviceStatus()
+    # "password" is the unsigned legacy device; "hmac" signs every `/up`, `/status` and `/loc`
+    # envelope with its `deviceSecrets` key.
+    authMode: Literal["password", "hmac"] = "hmac"
+    # Encoding of the device's last accepted envelope, which `/down` answers in; `None` until then.
+    wire: Literal["json", "cbor"] | None = None
+    # "issued" once a setup code exists for this device (create and rotate); "provisioned" on
+    # its first signed `/status`. `None` on devices created before the field existed.
+    provisionState: Literal["issued", "provisioned"] | None = None
 
 
 def _devices():
@@ -49,7 +66,9 @@ def create_device(
     mqtt_username: str,
     mqtt_password_hash: str,
     default_to_uid: str | None = None,
+    auth_mode: Literal["password", "hmac"] = "hmac",
 ) -> Device:
+    """`mqtt_password_hash` is accepted but not stored; the hash lives in `deviceSecrets/{d}`."""
     ref = _devices().document(device_id)
     ref.set(
         {
@@ -60,6 +79,9 @@ def create_device(
             "revokedAt": None,
             "locatableBy": [],
             "status": {},
+            "authMode": auth_mode,
+            "wire": None,
+            "provisionState": "issued",
         }
     )
     fetched = get_device(device_id)
@@ -101,6 +123,42 @@ def set_locatable_by(device_id: str, uids: list[str]) -> None:
     _devices().document(device_id).update({"locatableBy": uids})
 
 
+def set_provision_state(device_id: str, state: Literal["issued", "provisioned"]) -> None:
+    """Written "issued" on create and rotate; "provisioned" on the first signed `/status`."""
+    _devices().document(device_id).set({"provisionState": state}, merge=True)
+
+
+def set_wire(device_id: str, wire: Literal["json", "cbor"]) -> None:
+    """Set from each accepted inbound envelope's encoding so `/down` answers in kind."""
+    _devices().document(device_id).set({"wire": wire}, merge=True)
+
+
+def record_sig_failure(device_id: str, now: float | None = None) -> int:
+    """Returns the failures in the trailing `AUTH_ALARM_WINDOW_S`, this one included."""
+    now = now if now is not None else time.time()
+    ref = _devices().document(device_id)
+    snap = ref.get()
+    data = (snap.to_dict() or {}) if snap.exists else {}
+    cutoff = now - AUTH_ALARM_WINDOW_S
+    times = [
+        t for t in data.get("authFailureTimes", []) if isinstance(t, (int, float)) and t > cutoff
+    ]
+    times.append(now)
+    # Capped so a sustained attack cannot grow the list; only the last threshold's worth matters.
+    times = times[-AUTH_ALARM_THRESHOLD:]
+    ref.set({"authFailureTimes": times}, merge=True)
+    return len(times)
+
+
+def set_auth_alarm(device_id: str, value: bool) -> None:
+    _devices().document(device_id).set({"status": {"authAlarm": value}}, merge=True)
+
+
+def clear_auth_alarm(device_id: str) -> None:
+    """Clears the auth alarm; called on key rotation."""
+    _devices().document(device_id).set(
+        {"authFailureTimes": [], "status": {"authAlarm": False}}, merge=True
+    )
 
 
     """Overwrites `status` with `fields` + `updatedAt`; `clear` names are deleted."""

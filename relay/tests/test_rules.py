@@ -12,6 +12,7 @@ from firebase_admin import auth as fb_auth
 
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.store import users as users_store
@@ -349,5 +350,72 @@ def test_gchat_link_codes_is_default_deny(two_pairs):
 
     resp_write = _write("gchatLinkCodes/999111", owner_token, {"uid": "u3"})
     assert resp_write.status_code == 403
+
+
+def test_device_secrets_is_default_deny(two_pairs):
+    """`deviceSecrets/{d}` (HMAC key, MQTT password hash) is unreadable by the device's owner and by
+    an admin client."""
+    devices_store.create_device(
+        device_id="pgr-secret-rules-1",
+        owner_uid="u1",
+        label="d",
+        mqtt_username="pgr-secret-rules-1",
+        mqtt_password_hash="x",
+    )
+    device_secrets_store.create(
+        "pgr-secret-rules-1", hmac_key=b"k" * 32, mqtt_password_hash="hash"
+    )
+
+    owner_token = mint_id_token("u1")
+    resp = _get("deviceSecrets/pgr-secret-rules-1", owner_token)
+    assert resp.status_code == 403
+
+    fb_auth.create_user(uid="admin1", email="admin1@example.com")
+    users_store.create_user(uid="admin1", alias="admin1", display_name="Admin", role="admin")
+    fb_auth.set_custom_user_claims("admin1", {"admin": True})
+    admin_token = mint_id_token("admin1")
+    resp_admin = _get("deviceSecrets/pgr-secret-rules-1", admin_token)
+    assert resp_admin.status_code == 403
+
+    resp_unauth = _get("deviceSecrets/pgr-secret-rules-1", None)
+    assert resp_unauth.status_code == 403
+
+    resp_write = _write(
+        "deviceSecrets/pgr-secret-rules-1", owner_token, {"mqttPasswordHash": "hacked"}
+    )
+    assert resp_write.status_code == 403
+
+
+    """`contactRequests/{deviceId}_{reqId}` is readable by the device owner and a family admin of
+    from app.store import contacts as contacts_store
+
+    devices_store.create_device(
+        device_id="pgr-rules-contacts-1",
+        owner_uid="u1",
+        label="d",
+        mqtt_username="pgr-rules-contacts-1",
+        mqtt_password_hash="x",
+    )
+    )
+    doc_key = contacts_store.key("pgr-rules-contacts-1", "u_rules1")
+
+    owner_token = mint_id_token("u1")
+    resp_owner = _get(f"contactRequests/{doc_key}", owner_token)
+    assert resp_owner.status_code == 200
+
+    other_token = mint_id_token("u3")
+    resp_other = _get(f"contactRequests/{doc_key}", other_token)
+    assert resp_other.status_code == 403
+
+    fb_auth.create_user(uid="admin-contacts-1", email="admin-contacts-1@example.com")
+    users_store.create_user(
+        uid="admin-contacts-1", alias="admincontacts1", display_name="Admin", role="admin"
+    )
+    admin_token = mint_id_token("admin-contacts-1")
+    resp_admin = _get(f"contactRequests/{doc_key}", admin_token)
+    assert resp_admin.status_code == 200
+
+    resp_unauth = _get(f"contactRequests/{doc_key}", None)
+    assert resp_unauth.status_code == 403
 
 

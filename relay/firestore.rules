@@ -35,6 +35,12 @@ service cloud.firestore {
       );
     }
 
+    // `contactRequests`: readable by super, the device owner or a family admin of the family.
+    match /contactRequests/{r} {
+      allow read: if request.auth != null && (
+      );
+    }
+
     match /settings/{s} {
     }
 

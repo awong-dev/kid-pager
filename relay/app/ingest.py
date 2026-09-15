@@ -5,10 +5,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.broker import BrokerClient
 from app.routing import Routing
+from app.store import contacts as contacts_store
+from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.wire import (
@@ -23,6 +29,67 @@ logger = logging.getLogger("relay.ingest")
 # PROTOCOL.md §4.2 case 3: the one exception to "never auto-reply on MQTT".
 UNKNOWN_RECIPIENT_BODY = "unknown recipient"
 
+# docs/PROTOCOL.md §3.2/§3.1: `name` is 1-16 code points, <=48 UTF-8 bytes.
+_CONTACT_NAME_MAX_CODEPOINTS = 16
+_CONTACT_NAME_MAX_UTF8_BYTES = 48
+_PHONE_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+class ContactReqEnvelope(BaseModel):
+    """A payload received on `pager/{device_id}/up` with `kind:"contact_req"` (docs/PROTOCOL.md §3.2).
+
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    v: int = 1
+    id: str
+    ts: int
+    name: str
+    ph: str | None = None
+    n: int | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        if not wire.ID_RE.match(value):
+            raise ValueError("invalid id format")
+        return value
+
+    @field_validator("ts")
+    @classmethod
+    def _check_ts(cls, value: int) -> int:
+        wire.validate_ts(value)
+        return value
+
+    @field_validator("n")
+    @classmethod
+    def _check_n(cls, value: int | None) -> int | None:
+            raise ValueError("n out of range")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not value:
+            raise ValueError("contact_req name must not be empty")
+        if wire.CONTROL_CHAR_RE.search(value):
+            raise ValueError("contact_req name contains control characters")
+        if len(value) > _CONTACT_NAME_MAX_CODEPOINTS:
+            raise ValueError("contact_req name exceeds 16 code points")
+        if len(value.encode("utf-8")) > _CONTACT_NAME_MAX_UTF8_BYTES:
+            raise ValueError("contact_req name exceeds 48 UTF-8 bytes")
+        return value
+
+    @field_validator("ph")
+    @classmethod
+    def _check_ph(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return value
+
+
+
 
 def _device_id_from_topic(topic: str, expected_suffix: str) -> str | None:
     parts = topic.split("/")
@@ -31,12 +98,101 @@ def _device_id_from_topic(topic: str, expected_suffix: str) -> str | None:
     return parts[1]
 
 
+def _bid_from_boot_up_topic(topic: str) -> str | None:
+    """`pager/boot/{bid}/up` (docs/PROTOCOL.md §2): one segment longer than `_device_id_from_topic` parses."""
+    parts = topic.split("/")
+    if len(parts) != 4 or parts[0] != "pager" or parts[1] != "boot" or parts[3] != "up":
+        return None
+    return parts[2]
+
+
 class Ingest:
     """Owns the relay's reaction to device traffic; the webhook router calls it once per event.
+
+    `_secret_cache` holds only the static `deviceSecrets/{d}` key material; the replay-window
+    counters are read fresh from the store on every call."""
 
     def __init__(self, broker: BrokerClient, routing: Routing | None = None) -> None:
         self._broker = broker
         self._routing = routing if routing is not None else Routing(broker)
+        self._secret_cache: dict[str, device_secrets_store.DeviceSecret] = {}
+
+    def invalidate_secret_cache(self, device_id: str) -> None:
+        """Drop the cached secret so a rotated `hmacKey` is picked up on the next envelope."""
+        self._secret_cache.pop(device_id, None)
+
+    def _get_secret(self, device_id: str) -> device_secrets_store.DeviceSecret | None:
+        cached = self._secret_cache.get(device_id)
+        if cached is not None:
+            return cached
+        secret = device_secrets_store.get(device_id)
+        if secret is not None:
+            self._secret_cache[device_id] = secret
+        return secret
+
+
+    def _verify_and_decode(
+        self,
+        device: devices_store.Device | None,
+        device_id: str,
+        topic: str,
+        payload: bytes,
+        *,
+        lwt_exception: bool = False,
+    ) -> tuple[dict[str, Any], wire.EnvelopeEncoding] | None:
+        """Verify before parse (docs/PROTOCOL.md §14.4), for `/up`, `/status` and `/loc`: size check,
+        HMAC verify when `authMode == "hmac"` (bad signatures are logged, counted and dropped), decode
+        (CBOR or JSON), replay-window check on `n`.
+
+        Returns `None` if the caller should drop the envelope (already logged); otherwise the decoded
+        envelope and its wire encoding. `lwt_exception=True` (`handle_status` only) accepts an
+        unsigned `{v, state:"offline", session}`, the broker-generated LWT (§14.6).
+        """
+        if wire.is_oversize(payload):
+            wire.log_malformed(topic, payload, "oversize")
+            return None
+
+        if device is None or device.authMode != "hmac":
+            decoded = wire.decode_envelope_bytes(payload)
+            if decoded is None:
+                wire.log_malformed(topic, payload, "non-utf8/non-JSON/non-CBOR-object")
+                return None
+            data, encoding = decoded
+            if device is not None:
+                devices_store.set_wire(device_id, encoding)
+            return data, encoding
+
+        secret = self._get_secret(device_id)
+        ok, unsigned = (
+            devauth.verify(secret.hmacKey, topic, payload) if secret is not None else (False, b"")
+        )
+        if not ok:
+            if lwt_exception:
+                decoded = wire.decode_envelope_bytes(payload)
+                if decoded is not None and wire.is_unsigned_lwt_shape(decoded[0]):
+                    # docs/PROTOCOL.md §14.6: accepted despite the missing signature; the
+                    # `devices/{d}.wire` field and the replay window are not touched (no `n`).
+                    return decoded
+            logger.warning(
+                "SECURITY bad-sig device=%s topic=%s first64=%r", device_id, topic, payload[:64]
+            )
+            if secret is not None:
+            return None
+
+        decoded = wire.decode_envelope_bytes(unsigned)
+        if decoded is None:
+            wire.log_malformed(topic, payload, "signed payload did not decode")
+            return None
+        data, encoding = decoded
+        n = data.get("n")
+        if not isinstance(n, int):
+            wire.log_malformed(topic, payload, "hmac envelope missing/invalid n")
+            return None
+        if not device_secrets_store.accept_up_n(device_id, n):
+            logger.warning("SECURITY replay device=%s topic=%s n=%s", device_id, topic, n)
+            return None
+        devices_store.set_wire(device_id, encoding)
+        return data, encoding
 
 
     def handle_up(self, topic: str, payload: bytes) -> None:
@@ -44,23 +200,77 @@ class Ingest:
         if device_id is None:
             logger.warning("up webhook for unrecognised topic %s dropped", topic)
             return
+        device = devices_store.get_device(device_id)
+        result = self._verify_and_decode(device, device_id, topic, payload)
+        if result is None:
             return
+        data, _encoding = result
+
+        # `kind:"contact_req"` is dispatched on the raw dict before `UpEnvelope.model_validate`,
+        # which rejects any non-null `kind` (docs/PROTOCOL.md §3.4).
+        if data.get("kind") == "contact_req":
+            self._handle_contact_req(device_id, device, data, topic, payload)
+            return
+
         try:
             env = UpEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+            wire.log_malformed(topic, payload, str(exc))
             return
 
         if env.is_ack:
             self._handle_ack(device_id, env)
         else:
+            self._handle_up_message(device_id, device, env)
+
+    def _handle_contact_req(
+        self,
+        device_id: str,
+        device: devices_store.Device | None,
+        data: dict[str, Any],
+        topic: str,
+        payload: bytes,
+    ) -> None:
+        path never reaches `_handle_up_message`."""
+        if device is None:
+            logger.warning(
+                "contact_req %s from unregistered device %s dropped",
+                data.get("id"),
+                device_id,
+            )
+            return
+        if device.revokedAt is not None:
+            logger.warning(
+                "SECURITY contact_req %s from revoked device %s dropped",
+                data.get("id"),
+                device_id,
+            )
+            return
+
+        try:
+            env = ContactReqEnvelope.model_validate(data)
+        except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+            wire.log_malformed(topic, payload, str(exc))
+            return
+
+                device_id=device_id,
+                req_id=env.id,
+                name=env.name,
+            )
+            return
+
+
 
     def _handle_ack(self, device_id: str, env: UpEnvelope) -> None:
         assert env.ack is not None and env.ack in ("shown", "read")
         ack_ts = resolve_ts(env.ts)
 
         # A down message's wire `id` is its `messages/{id}` doc id, except a `book`/`cfg` id, which
+        # addresses a device and is checked here after the ordinary lookup misses.
         msg = messages_store.get_message(env.id)
         if msg is None:
+            if env.ack == "shown" and devcfg.ack(device_id, env.id):
+                return
             # docs/PROTOCOL.md §4.1 rule 3: unknown id -> log + drop, never create a row.
             logger.info("ack for unknown message id=%s from device=%s dropped", env.id, device_id)
             return
@@ -87,6 +297,9 @@ class Ingest:
         if result == "noop":
             logger.debug("idempotent ack '%s' for message %s backend %s", ack, msg.id, bid)
 
+    def _handle_up_message(
+        self, device_id: str, device: devices_store.Device | None, env: UpEnvelope
+    ) -> None:
         if device is None:
             # Not a registered device: nowhere to route it, dropped like an unknown recipient.
             logger.warning("up message %s from unregistered device %s dropped", env.id, device_id)
@@ -125,10 +338,19 @@ class Ingest:
         if device_id is None:
             logger.warning("status webhook for unrecognised topic %s dropped", topic)
             return
+        device = devices_store.get_device(device_id)
+        if device is None:
+            # Not a registered device: nowhere to store status.
+            logger.info("status for unregistered device %s dropped", device_id)
             return
+        result = self._verify_and_decode(device, device_id, topic, payload, lwt_exception=True)
+        if result is None:
+            return
+        data, _encoding = result
         try:
             env = StatusEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+            wire.log_malformed(topic, payload, str(exc))
             return
 
         previous_status = device.status
@@ -150,18 +372,32 @@ class Ingest:
             # docs/PROTOCOL.md §5.3: bare offline (retained or LWT) -> mark offline only.
             return
 
+        # The first signed `/status` marks the device `provisioned`; only `hmac` devices sign.
+        if device.authMode == "hmac" and device.provisionState != "provisioned":
+            devices_store.set_provision_state(device_id, "provisioned")
+
+        # Republish before the bv-triggered push so a fresh book is published once. A changed `link`
+        # (silent modem session resume, <= 10 s subscription gap) also triggers it.
         offline_to_online = previous_status.state == "offline"
         if session_changed or offline_to_online:
             self._republish_unacked(device_id)
 
+        reported_bv = data.get("bv")
+            logger.info(
+                reported_bv,
+                device_id,
+            )
+
     def _republish_unacked(self, device_id: str) -> None:
         """The online-edge re-publish (docs/PROTOCOL.md §5.3): pending messages from `pendingDeviceIds`
+        (oldest first, capped at 10, excluding `kind:"loc_req"`), plus the newest unacked `book`/`cfg`,
         one each, which do not count against the cap."""
         for msg in messages_store.list_pending_for_device(device_id):
             if msg.kind == "loc_req":
                 continue
             logger.info("re-publishing unacked message %s to device %s", msg.id, device_id)
             self._routing.redeliver_pager(msg, device_id)
+        devcfg.republish_pending(device_id, self._broker)
 
 
     def handle_loc(self, topic: str, payload: bytes) -> None:
@@ -171,9 +407,35 @@ class Ingest:
         if device_id is None:
             logger.warning("loc webhook for unrecognised topic %s dropped", topic)
             return
+        device = devices_store.get_device(device_id)
+        result = self._verify_and_decode(device, device_id, topic, payload)
+        if result is None:
             return
+        data, _encoding = result
         try:
             env = LocEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+            wire.log_malformed(topic, payload, str(exc))
             return
         location.ingest_loc(device_id, env)
+
+
+    def handle_boot_ack(self, topic: str, payload: bytes) -> None:
+        """The device's bootstrap ack, `{"v":1,"ok":1}` in CBOR (`app/wirecbor.KEYMAP` `v`=0, `ok`=29).
+        The bootstrap credential (`boot-{bid}`, ACL'd to publish only `pager/boot/{bid}/up`) is the
+        authentication, so there is no signature step. Anything but exactly `{v:1, ok:1}` is dropped
+        and logged (docs/PROTOCOL.md §3.4); `devsetup.complete` runs only on a recognised ack."""
+        bid = _bid_from_boot_up_topic(topic)
+        if bid is None:
+            logger.warning("boot-ack webhook for unrecognised topic %s dropped", topic)
+            return
+        decoded = wire.decode_envelope_bytes(payload)
+        if decoded is None:
+            wire.log_malformed(topic, payload, "boot ack non-utf8/non-JSON/non-CBOR-object")
+            return
+        data, _encoding = decoded
+        if data.get("v") != 1 or data.get("ok") != 1:
+            wire.log_malformed(topic, payload, "boot ack is not {v:1, ok:1}")
+            return
+        logger.info("boot ack received for bid=%s -- completing bootstrap", bid)
+        devsetup.complete(bid, broker=self._broker)

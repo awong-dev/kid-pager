@@ -117,9 +117,27 @@ access on its own, independent of anything the relay's Python code does
 (the relay itself always uses admin credentials, which bypass rules
 entirely).
 
+### End-to-end test scenarios
+
 End-to-end integration tests (brings up the real Docker Compose stack —
+`tools/pager_client.py`'s combined device+server client):
+
 ```bash
+relay/.venv/bin/python tools/e2e_v2.py bootstrap text_roundtrip              # named scenarios
+relay/.venv/bin/python tools/e2e_v2.py --wire cbor                           # repeat in CBOR encoding
 ```
+
+Scenarios available (see `tools/e2e_v2.py`'s module docstring for details):
+- **bootstrap**: device provisioning via setup code (docs/DEVICE_PLAN.md §3.2)
+- **text_roundtrip**: text messages and acks round-trip end to end
+- **allowlist**: approving contacts and routing per allow-list
+- **republish**: messages re-deliver on reconnect
+- **location_periodic**: periodic location publishing with TTL sync
+- **location_on_demand**: on-demand location requests with coalescing
+- **retention**: per-device retention policy with sweep
+- **bytes**: data budget accounting and SIM constraints
+- **setup_code**: real admin-create → code → bootstrap → provisioned flow
+- **address_book**: device requests contact approval, book/cfg ingest and ack
 
 - **Google Chat**: Chat apps can only be installed by accounts on **Google Workspace**, not
   consumer Gmail; with consumer Gmail this backend cannot be used (Email is not implemented).

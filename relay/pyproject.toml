@@ -18,6 +18,10 @@ dependencies = [
     "google-auth",
     # `app/tasks.py` CloudTasksQueue (TASKS_MODE=cloud_tasks).
     "google-cloud-tasks",
+    # Integer-keyed CBOR wire encoding (docs/PROTOCOL.md §10, `app/wirecbor.py`).
+    "cbor2",
+    # Bootstrap-bundle crypto in `app/devsetup.py`: HKDF-SHA256 and AES-256-GCM.
+    "cryptography",
 ]
 
 [project.optional-dependencies]
