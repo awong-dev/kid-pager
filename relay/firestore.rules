@@ -1,0 +1,45 @@
+// bypasses these rules); relay/tests/test_rules.py drives this file through the emulator.
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function registered() {
+      return exists(/databases/$(db)/documents/users/$(request.auth.uid));
+    }
+
+    }
+
+    match /users/{uid} {
+
+      match /backends/{b} {
+      }
+    }
+
+    // A `list` is authorised by a pre-check on the query's filters, so it must filter on `uids`
+    match /messages/{id} {
+    }
+
+    match /conversations/{k} {
+    }
+
+    match /devices/{d} {
+      allow read: if request.auth != null && (
+      );
+
+      match /locations/{l} {
+      }
+    }
+
+    match /allow/{e} {
+      allow read: if request.auth != null && (
+      );
+    }
+
+    match /settings/{s} {
+    }
+
+    match /{document=**} {
+      allow write: if false;
+    }
+  }
+}

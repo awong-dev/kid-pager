@@ -9,7 +9,15 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
+    "httpx",
     "pydantic",
+    # Firestore and Firebase Auth (bundles google-cloud-firestore); emulator-aware via
+    # FIRESTORE_EMULATOR_HOST / FIREBASE_AUTH_EMULATOR_HOST.
+    "firebase-admin",
+    # Google JWT verification and ADC for the Chat API (`app/backends/gchat.py`).
+    "google-auth",
+    # `app/tasks.py` CloudTasksQueue (TASKS_MODE=cloud_tasks).
+    "google-cloud-tasks",
 ]
 
 [project.optional-dependencies]
