@@ -1,0 +1,7 @@
+# Needs CONFIG_ESPTOOLPY_FLASHSIZE_16MB: this layout does not fit the 2 MB default.
+#
+# Name,     Type, SubType,  Offset,   Size,      Flags
+nvs,        data, nvs,      ,         0x6000,
+otadata,    data, ota,      ,         0x2000,
+ota_0,      app,  ota_0,    ,         0x200000,
+ota_1,      app,  ota_1,    ,         0x200000,

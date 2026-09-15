@@ -1,1 +1,11 @@
+# The walter-modem socket/HTTP/CoAP/BlueCherry options stay enabled: disabling any of them breaks the
 # vendored library's own compilation (WalterModem.cpp references those members unguarded).
+
+# Custom partition table (partitions.csv); the Walter module has 16 MB flash.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# setup_derive() needs mbedtls_hkdf(); off by default in ESP-IDF 5.2.
+CONFIG_MBEDTLS_HKDF_C=y

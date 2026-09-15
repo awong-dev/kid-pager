@@ -30,6 +30,21 @@ typedef struct {
 /* Cold-boot modem bring-up through attach and mqttConfig; repeatable after net_recover_modem(). */
 bool net_init(void);
 
+/* Configures TLS profile 3 with validation off for the bootstrap hop; profile 2 is untouched. */
+bool net_tls_profile_bootstrap(void);
+
+/* Bootstrap path: never runs in the same power cycle as net_init(). */
+
+/* Begin, handlers, PDP context with `apn` (NULL/empty = carrier default), one attach attempt. */
+bool net_bootstrap_attach(const char *apn);
+
+/* mqttConfig + mqttConnect on the bootstrap profile; subscribes to `down_topic`. */
+bool net_bootstrap_connect(const char *client_id, const char *password, const char *host,
+                           uint16_t port, const char *down_topic);
+
+/* Writes `ca_pem` to modem cert slot 12 (PAGER_TLS_CA_SLOT). Power: one modem NVRAM write. */
+bool net_write_ca(const char *ca_pem);
+
 /* Issues mqttConnect(); never on a timer (PROTOCOL.md §6.1). Power: one TLS handshake, ~5 kB. */
 bool net_session_up(void);
 
@@ -38,7 +53,10 @@ void net_session_down(void);
 /* Publishes `buf` (mutable); len > 1280 is refused (PROTOCOL.md §3.3). */
 bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos);
 
+/* Binary publish; `mid` (nullable) gets the message id. True means accepted, not PUBACKed. */
+
 /* Callback per inbound MQTT message, on the modem event task (keep it short); `body` has no NUL.
+ * Oversize cap is topic-aware (PROTOCOL.md §2): `pager/boot/...` 4 kB, otherwise 1280 bytes. */
 void net_set_msg_cb(void (*cb)(const char *topic, const char *body, uint16_t len));
 
 /* Light-sleeps up to `ms` (ext1 wake from the LIS3DH); false if a key is queued. Power: ~1 mA. */
@@ -54,6 +72,9 @@ bool net_get_clock(int64_t *epoch_s);
 
 /* Battery millivolts via AT+SQNVMON? (PROTOCOL.md §12 item 6); false on failure. */
 bool net_get_battery_mv(int *batt_mv);
+
+/* Signal strength in dBm via AT+CSQ; false on failure or "not known" (CSQ 99). */
+bool net_get_rssi(int *dbm);
 
 /* Read-only MQTT state snapshot; does not clear disconnect_edge. */
 void net_get_mqtt_status(net_mqtt_status_t *out);

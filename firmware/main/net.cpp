@@ -3,6 +3,7 @@
 
 #include "net.h"
 #include "pins.h"
+#include "ident.h"
 
 #include "WalterModem.h"
 
@@ -35,12 +36,19 @@ static constexpr const char *PAGER_EDRX_PTW = "0001";
 static constexpr uint8_t PAGER_TLS_CA_SLOT = 12;
 static constexpr int PAGER_TLS_PROFILE_ID = 2;
 
+
 // The bootstrap session lasts a few seconds, so a short keepalive suffices.
+static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
+
 // State: plain static storage, retained across light sleep. Not mutex-protected: the only writer
 // besides the caller's task is the MQTT event handler, and all shared fields are single words.
 
 static char s_granted_edrx[16] = { 0 };
 
+// Hash of the CA last written to modem slot PAGER_TLS_CA_SLOT, so repeated net_init() calls in one
+// power session skip the NVRAM write when ident's ca_hash is unchanged.
+static bool s_ca_written = false;
+static uint8_t s_ca_written_hash[IDENT_CA_HASH_LEN];
 
 static int64_t s_clock_epoch = 0;    // 0 = no network time yet (§3.5)
 static int64_t s_clock_epoch_us = 0; // esp_timer_get_time() at the moment s_clock_epoch was read
@@ -84,6 +92,8 @@ static void pager_network_event_handler(WMNetworkEventType event, const WMNetwor
         return false;
     }
 
+    // ident's apn is "" for the carrier default; definePDPContext() wants NULL for that.
+    if (!WalterModem::definePDPContext(PAGER_PDP_CTX_ID, apn)) {
         ESP_LOGI(TAG, "definePDPContext() failed");
         return false;
     }
@@ -138,13 +148,109 @@ static void pager_network_event_handler(WMNetworkEventType event, const WMNetwor
     }
 
     // TLS (PROTOCOL.md §6.1): the CA slot is always named, rewritten only when ident's ca_hash changed.
+        }
     }
 
+    snprintf(s_down_topic, sizeof(s_down_topic), "pager/%s/down", ident_get_dev_id());
 
+    if (!WalterModem::mqttConfig(ident_get_dev_id(), ident_get_dev_id(), ident_get_mqtt_pw(),
         ESP_LOGI(TAG, "mqttConfig() failed");
         return false;
     }
 
+    return true;
+}
+
+extern "C" bool net_tls_profile_bootstrap(void)
+{
+    // No CA is trusted (single-use key from the setup code). Power effect: one AT command, no RRC.
+    if (!WalterModem::tlsConfigProfile(PAGER_TLS_BOOTSTRAP_PROFILE_ID,
+                                       WALTER_MODEM_TLS_VALIDATION_NONE,
+        return false;
+    }
+    ESP_LOGI(TAG, "bootstrap TLS profile %d configured (VALIDATION_NONE)",
+             PAGER_TLS_BOOTSTRAP_PROFILE_ID);
+    return true;
+}
+
+extern "C" bool net_bootstrap_attach(const char *apn)
+{
+    // Power effect: as net_init()'s attach phase; no eDRX/PSM/voltage monitor (the session is short).
+    if (!WalterModem::begin(PAGER_MODEM_UART)) {
+        ESP_LOGI(TAG, "WalterModem::begin() failed (bootstrap)");
+        return false;
+    }
+
+    WalterModem::setMQTTEventHandler(pager_mqtt_event_handler, nullptr);
+    WalterModem::setNetworkEventHandler(pager_network_event_handler, nullptr);
+
+    if (!WalterModem::setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
+        ESP_LOGI(TAG, "setOpState(NO_RF) failed (bootstrap)");
+        return false;
+    }
+
+    // The setup code's APN or the carrier default (NULL for empty, as net_init()).
+    if (!WalterModem::definePDPContext(PAGER_PDP_CTX_ID, use_apn)) {
+        ESP_LOGI(TAG, "definePDPContext() failed (bootstrap)");
+        return false;
+    }
+
+    if (!WalterModem::setOpState(WALTER_MODEM_OPSTATE_FULL)) {
+        ESP_LOGI(TAG, "setOpState(FULL) failed (bootstrap)");
+        return false;
+    }
+
+    if (!WalterModem::setNetworkSelectionMode(WALTER_MODEM_NETWORK_SEL_MODE_AUTOMATIC)) {
+        ESP_LOGI(TAG, "setNetworkSelectionMode() failed (bootstrap)");
+        return false;
+    }
+
+    // Same single-attempt cap as net_init(); the caller turns a false return into a "no network" message.
+    bool attached = false;
+    for (int waited_s = 0; waited_s < PAGER_ATTACH_POLL_CAP_S; waited_s++) {
+        WalterModemNetworkRegState st = WalterModem::getNetworkRegState();
+        if (st == WALTER_MODEM_NETWORK_REG_REGISTERED_HOME ||
+            st == WALTER_MODEM_NETWORK_REG_REGISTERED_ROAMING) {
+            attached = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    if (!attached) {
+        ESP_LOGI(TAG, "network attach timed out after %ds (bootstrap)", PAGER_ATTACH_POLL_CAP_S);
+        return false;
+    }
+    ESP_LOGI(TAG, "network attached (bootstrap)");
+    return true;
+}
+
+extern "C" bool net_bootstrap_connect(const char *client_id, const char *password, const char *host,
+                                      uint16_t port, const char *down_topic)
+{
+    // Points the shared down-topic buffer at the bootstrap topic so the CONNECTED handler subscribes
+    // to it; safe because bootstrap and production never share a power cycle.
+    snprintf(s_down_topic, sizeof(s_down_topic), "%s", down_topic);
+
+    if (!WalterModem::mqttConfig(client_id, client_id, password,
+        ESP_LOGI(TAG, "mqttConfig() failed (bootstrap)");
+        return false;
+    }
+
+    // Power effect: one TLS handshake (~5 kB) plus the RRC time it takes.
+    s_disconnect_edge = false;
+    if (!WalterModem::mqttConnect(host, port, PAGER_BOOT_MQTT_KEEPALIVE_S)) {
+        ESP_LOGI(TAG, "mqttConnect() call could not be queued (bootstrap)");
+        return false;
+    }
+    ESP_LOGI(TAG, "bootstrap MQTT connect issued to %s:%u as %s", host, (unsigned) port, client_id);
+    return true;
+}
+
+extern "C" bool net_write_ca(const char *ca_pem)
+{
+    // Unconditional: runs at most once per device lifetime, so no ca_hash short-circuit.
+        return false;
+    }
     return true;
 }
 
@@ -157,6 +263,9 @@ extern "C" void net_session_down(void)
 }
 
 extern "C" bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
+{
+}
+
 {
 }
 
@@ -228,6 +337,25 @@ extern "C" bool net_get_battery_mv(int *batt_mv)
     return true;
 }
 
+extern "C" bool net_get_rssi(int *dbm)
+{
+    // Power effect: one AT round trip, no RRC. getRSSI() is AT+CSQ in dBm (-113 + raw*2); raw 99
+    // ("not known") converts to +85, outside [-113, -51], and is treated as no reading.
+    WalterModemRsp rsp = {};
+        return false;
+    }
+    if (rsp.type != WALTER_MODEM_RSP_DATA_TYPE_RSSI) {
+        return false;
+    }
+    if (rsp.data.rssi < -113 || rsp.data.rssi > -51) {
+        return false;
+    }
+    if (dbm) {
+        *dbm = rsp.data.rssi;
+    }
+    return true;
+}
+
 extern "C" void net_get_mqtt_status(net_mqtt_status_t *out)
 {
 }
@@ -250,4 +378,5 @@ extern "C" uint32_t net_take_oversize_delta(void)
 
 extern "C" const char *net_get_device_id(void)
 {
+    return ident_get_dev_id();
 }
