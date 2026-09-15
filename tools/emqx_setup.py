@@ -6,10 +6,14 @@ Uses only the standard library (`urllib`). Safe to re-run against the EMQX REST 
 
 Not provisioned here: the relay's REST-publish credential (`BROKER_API_KEY`/`BROKER_API_SECRET`),
 which is seeded via `relay/emqx/bootstrap_api_keys.txt` and `EMQX_API_KEY__BOOTSTRAP_FILE`. The
+`relay-1` MQTT credential created here gives the relay the mirror-image ACL of PROTOCOL.md §2 for
+manual MQTT sessions. Per-device credentials and ACLs are pushed by `relay/app/emqx_admin.py`.
 
 Usage (after `docker compose up -d` in `relay/`):
     python3 tools/emqx_setup.py
     python3 tools/emqx_setup.py --emqx-url http://localhost:18083 \\
+        --relay-url http://relay:8000 --webhook-key dev-webhook-key \\
+        --relay-mqtt-password dev-relay-mqtt-password
 
 Safe to re-run: every resource is created if missing, updated in place if
 already present (never errors on "already exists").
@@ -28,6 +32,12 @@ from typing import Any
 CONNECTOR_NAME = "relay_webhook"
 ACTION_NAME = "relay_webhook_action"
 RULE_ID = "pager_to_relay"
+# `pager/boot/+/up` carries the bootstrap ack (`{v:1,ok:1}`, CBOR keys 0/29).
+TOPICS = ["pager/+/up", "pager/+/status", "pager/+/loc", "pager/boot/+/up"]
+
+# docs/PROTOCOL.md §2: the `relay` credential gets the mirror image of a device ACL.
+# `-1` matches the MQTT client id reserved for the relay (§1).
+RELAY_MQTT_USERNAME = "relay-1"
 
 
 def _request(
@@ -146,6 +156,12 @@ def upsert_action(base_url: str, token: str, webhook_key: str) -> None:
 
 def upsert_rule(base_url: str, token: str) -> None:
     topics_sql = ", ".join(f'"{t}"' for t in TOPICS)
+    # `payload_b64` carries CBOR bytes intact (PROTOCOL.md §3.1): EMQX's JSON encoder replaces
+    # every byte of a non-UTF-8 `payload` with U+FFFD. `payload` stays for plain-JSON envelopes.
+    sql = (
+        "SELECT topic, payload, base64_encode(payload) as payload_b64, qos, clientid "
+        f"FROM {topics_sql}"
+    )
     get_status, _ = _request("GET", f"{base_url}/api/v5/rules/{RULE_ID}", token)
     if get_status == 200:
         status, data = _request(
@@ -165,6 +181,49 @@ def upsert_rule(base_url: str, token: str) -> None:
         raise SystemExit(f"failed to upsert EMQX rule: {status} {data}")
 
 
+def upsert_relay_user(base_url: str, token: str, username: str, password: str) -> None:
+    """Creates or updates the `built_in_database` authentication user for the relay credential."""
+    get_status, _ = _request(
+        "GET",
+        f"{base_url}/api/v5/authentication/password_based:built_in_database/users/{username}",
+        token,
+    )
+    if get_status == 200:
+        status, data = _request(
+            "PUT",
+            f"{base_url}/api/v5/authentication/password_based:built_in_database/users/{username}",
+            token,
+            {"password": password, "is_superuser": False},
+        )
+    else:
+        status, data = _request(
+            "POST",
+            f"{base_url}/api/v5/authentication/password_based:built_in_database/users",
+            token,
+            {"user_id": username, "password": password, "is_superuser": False},
+        )
+    if status not in (200, 201):
+        raise SystemExit(f"failed to upsert EMQX relay credential: {status} {data}")
+
+
+def upsert_relay_acl(base_url: str, token: str, username: str) -> None:
+    """Mirror image of a device's ACL (PROTOCOL.md §2); `PUT` replaces the whole rule list."""
+    rules = [
+        {"topic": "pager/+/up", "permission": "allow", "action": "subscribe"},
+        {"topic": "pager/+/status", "permission": "allow", "action": "subscribe"},
+        {"topic": "pager/+/loc", "permission": "allow", "action": "subscribe"},
+        {"topic": "pager/+/down", "permission": "allow", "action": "publish"},
+    ]
+    status, data = _request(
+        "PUT",
+        f"{base_url}/api/v5/authorization/sources/built_in_database/rules/users/{username}",
+        token,
+        {"username": username, "rules": rules},
+    )
+    if status not in (200, 204):
+        raise SystemExit(f"failed to upsert EMQX relay ACL: {status} {data}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -180,6 +239,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--webhook-key", default="dev-webhook-key")
     parser.add_argument("--admin-user", default="admin")
     parser.add_argument("--admin-password", default="public")
+    parser.add_argument(
+        "--relay-mqtt-password",
+        default="dev-relay-mqtt-password",
+        help=(
+            f"password for the {RELAY_MQTT_USERNAME!r} built_in_database MQTT "
+            "credential (docs/PROTOCOL.md §2's 'relay credential', mirror-image "
+            "ACL -- see this script's module docstring for who, if anyone, uses it)"
+        ),
+    )
     return parser
 
 
@@ -191,10 +259,13 @@ def main() -> None:
     upsert_connector(args.emqx_url, token, args.relay_url)
     upsert_action(args.emqx_url, token, args.webhook_key)
     upsert_rule(args.emqx_url, token)
+    upsert_relay_user(args.emqx_url, token, RELAY_MQTT_USERNAME, args.relay_mqtt_password)
+    upsert_relay_acl(args.emqx_url, token, RELAY_MQTT_USERNAME)
     print(
         f"EMQX rule engine configured: {', '.join(TOPICS)} -> "
         f"{args.relay_url}/webhooks/mqtt"
     )
+    print(f"EMQX '{RELAY_MQTT_USERNAME}' credential + mirror-image ACL provisioned")
 
 
 if __name__ == "__main__":

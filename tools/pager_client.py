@@ -16,6 +16,12 @@ Two ways to drive it:
 
 Server-side flags: `--api --auth-url --as <alias>` (`--as` runs `login <alias>` first).
 
+`--bootstrap "<code>"` performs the setup-code bootstrap fetch instead of using
+`--device-id`/`--host`/`--username`/`--password`/`--hmac-key`: parse the code, derive
+`bid`/`bpw`/`bkey`, connect as `boot-{bid}`/`bpw` without server-cert validation, fetch and
+decrypt the retained bundle, publish the ack, disconnect, then build the `DeviceClient` from the
+bundle's `id`/`pw`/`k`/`host`/`port`.
+
 Commands:
 
   Device: connect, disconnect, crash, inbox, msg, ack, autoack, status, bytes,
@@ -23,23 +29,37 @@ Commands:
   Server: login, contacts, chat, say, watch, tick, sweep, locate <alias>,
           locations <alias> [n],
 
+`DeviceClient.book`/`.lock` hold the simulated device's applied state (docs/PROTOCOL.md §3.2:
+`book`/`cfg` are not thread entries and are acked `shown` once applied).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import cmd
 import json
 import os
+import queue
 import re
 import shlex
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
 
 import httpx
 import paho.mqtt.client as mqtt
+
+# The simulated device signs with the relay's own `app/devauth.py` and `app/wirecbor.py`.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RELAY_DIR = REPO_ROOT / "relay"
+if str(RELAY_DIR) not in sys.path:
+    sys.path.insert(0, str(RELAY_DIR))
+
+from app import devauth, devsetup, wirecbor
 
 DEFAULT_MQTT_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
 DEFAULT_MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
@@ -105,14 +125,38 @@ class InboxEntry:
     received_at: float = field(default_factory=time.time)
 
 
+# docs/PROTOCOL.md §14.2: n = (epoch << 20) | lo -- 20 bits of `lo` per
+# epoch, 12 bits of epoch left over in the 32-bit counter.
+_UP_LO_BITS = 20
+_UP_LO_MASK = (1 << _UP_LO_BITS) - 1
+
+# Device-side `/down` window; narrower than the relay's 64-wide `upBits`, same arithmetic.
+_DOWN_WINDOW = 32
+_DOWN_WINDOW_MASK = (1 << _DOWN_WINDOW) - 1
+
+
 class DeviceClient:
     """A simulated pager device with the wire shapes of docs/PROTOCOL.md; `hmac_key` plays an
+    `authMode: "hmac"` device (§14), `wire` selects the envelope encoding."""
 
+    def __init__(
+        self,
+        device_id: str,
+        host: str,
+        port: int,
+        username: str | None,
+        password: str | None,
+        *,
+        hmac_key: bytes | None = None,
+        wire: Literal["json", "cbor"] = "json",
+    ):
         self.device_id = device_id
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.hmac_key = hmac_key
+        self.wire = wire
         self.session_id = new_id("s_")
         self.connected = False
         self.inbox: list[InboxEntry] = []
@@ -121,6 +165,17 @@ class DeviceClient:
         self._client: mqtt.Client | None = None
         self._loc_period_s = 0
         self._loc_min_s = 120
+        # §14.2 `/up`, `/status`, `/loc` counter `n = (epoch << 20) | lo`; `crash()` bumps epoch.
+        self._up_epoch = 0
+        self._up_lo = 0
+        # §14.2 `/down` replay window: highest accepted `n` plus a bitmap of the window below it.
+        self._down_n = 0
+        self._down_bits = 0
+        # Last applied address book (`bv`/`d`/`c`/`p` as on the wire); `None` before the first.
+        self.book: dict[str, Any] | None = None
+        # `cfg` `lock` map applied cumulatively; `lock_cleared_count` counts applied `clear`s.
+        self.lock_auto_min: int | None = None
+        self.lock_cleared_count: int = 0
         # §13.3 location state: `_lat`/`_lon` current position, `_last_fix` last successful fix,
         # `_last_attempt_ts` last attempt (successful or not; rule 1's window runs from it).
         self._lat = 37.7749
@@ -161,6 +216,9 @@ class DeviceClient:
         )
         if self.username:
             client.username_pw_set(self.username, self.password)
+        # §14.6: the broker-generated LWT carries no signature or `n`, so it bypasses `_publish`.
+        lwt_obj = {"v": 1, "state": "offline", "session": self.session_id}
+        lwt_payload = self._encode(lwt_obj)
         client.will_set(self.status_topic, lwt_payload, qos=1, retain=True)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
@@ -192,6 +250,9 @@ class DeviceClient:
         """New cold-boot session id and reconnect (§1); bumps the `n` epoch (§14.2); see §5.3."""
         self.disconnect()
         self.session_id = new_id("s_")
+        if self.hmac_key:
+            self._up_epoch += 1
+            self._up_lo = 0
         self.connect()
 
     def _on_connect(self, client, userdata, connect_flags, reason_code, properties) -> None:
@@ -199,8 +260,70 @@ class DeviceClient:
         client.subscribe(self.down_topic, qos=1)
         self.publish_status()
 
+
+    def _encode(self, obj: dict[str, Any]) -> bytes:
+        """Encodes `obj` unsigned; used only for the LWT (§14.6)."""
+        if self.wire == "cbor":
+            return wirecbor.encode(obj)
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    def _decode(self, payload: bytes) -> dict[str, Any] | None:
+        """Inverse of `_encode` (first-byte dispatch, §3); `None` if it does not parse."""
+        try:
+            if wirecbor.is_cbor(payload):
+                return wirecbor.decode(payload)
+            return json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError):
+            return None
+
+    def _next_up_n(self) -> int:
+        """`n = (epoch << 20) | lo` (§14.2), pre-incremented: `upN=0` means nothing accepted yet."""
+        self._up_lo += 1
+        if self._up_lo > _UP_LO_MASK:
+            self._up_lo = 1
+            self._up_epoch += 1
+        return (self._up_epoch << _UP_LO_BITS) | self._up_lo
+
+    def _accept_down_n(self, n: int) -> bool:
+        """Device-side `/down` replay window (§14.2), `_DOWN_WINDOW` wide."""
+        if n > self._down_n:
+            shift = n - self._down_n
+            if shift >= _DOWN_WINDOW:
+                self._down_bits = 0
+            else:
+                self._down_bits = ((self._down_bits << shift) | (1 << (shift - 1))) & _DOWN_WINDOW_MASK
+            self._down_n = n
+            return True
+        gap = self._down_n - n
+        if 0 < gap <= _DOWN_WINDOW:
+            bit = 1 << (gap - 1)
+            if self._down_bits & bit:
+                return False
+            self._down_bits |= bit
+            return True
+        return False
+
     def _on_message(self, client, userdata, msg) -> None:
         self.bytes.add_received(msg.topic, len(msg.payload))
+        payload = msg.payload
+        if self.hmac_key:
+            ok, unsigned = devauth.verify(self.hmac_key, msg.topic, payload)
+            if not ok:
+                print(f"<- SECURITY dropped bad-sig/unsigned payload on {msg.topic}: {payload[:64]!r}")
+                return
+            data = self._decode(unsigned)
+            if data is None:
+                print(f"<- dropped unparsable (post-verify) payload on {msg.topic}: {unsigned[:64]!r}")
+                return
+            n = data.get("n")
+            if not isinstance(n, int) or not self._accept_down_n(n):
+                print(f"<- SECURITY dropped replayed/out-of-window /down n={n!r} on {msg.topic}")
+                return
+        else:
+            data = self._decode(payload)
+            if data is None:
+                print(f"<- received unparsable payload on {msg.topic}: {payload[:64]!r}")
+                return
         self.inbox.append(InboxEntry(topic=msg.topic, data=data))
         kind = data.get("kind", "msg")
         print(f"<- [{kind}] {data}")
@@ -208,6 +331,13 @@ class DeviceClient:
             # PROTOCOL.md §3.2: MUST NOT ack, MUST NOT render -- answered on
             # /loc instead, subject to §13.3's device-side rate limit.
             self._handle_loc_req(data.get("id"))
+            return
+        if kind == "book":
+            # §3.2 `kind:"book"`: not a thread entry; applied, then acked `shown` unconditionally.
+            self._handle_book(data)
+            return
+        if kind == "cfg":
+            self._handle_cfg(data)
             return
         msg_id = data.get("id")
         if not msg_id:
@@ -219,7 +349,16 @@ class DeviceClient:
             self.publish_ack(msg_id, "shown")
 
     def _publish(self, topic: str, obj: dict[str, Any], qos: int, retain: bool = False) -> None:
+        """§14.3: an `authMode: hmac` device signs every publish with a fresh `n` and `sig`."""
         assert self._client is not None, "not connected"
+        if self.hmac_key:
+            signed_obj = {**obj, "n": self._next_up_n()}
+            if self.wire == "cbor":
+                payload = devauth.sign_cbor(self.hmac_key, topic, signed_obj)
+            else:
+                payload = devauth.sign_json(self.hmac_key, topic, signed_obj)
+        else:
+            payload = self._encode(obj)
         self.bytes.add_published(topic, len(payload))
         self._client.publish(topic, payload, qos=qos, retain=retain)
 
@@ -240,6 +379,52 @@ class DeviceClient:
         self._publish(self.up_topic, obj, qos=1)
         print(f"-> sent u-message {msg_id}{' to ' + to if to else ''}: {body!r}")
         return msg_id
+
+
+    def publish_contact_req(self, name: str, ph: str | None = None) -> str:
+        """`/up kind:"contact_req"` (§3.2, §4.2): `ph` is an E.164 number (leading `+`) or an alias,
+        passed through unvalidated."""
+        req_id = new_id("u_")
+        obj: dict[str, Any] = {
+            "v": 1,
+            "id": req_id,
+            "ts": now_ts(),
+            "kind": "contact_req",
+            "name": name,
+            "ack": None,
+        }
+        if ph:
+            obj["ph"] = ph
+        self._publish(self.up_topic, obj, qos=1)
+        print(f"-> contact_req {req_id}: name={name!r} ph={ph!r}")
+        return req_id
+
+    def _handle_book(self, data: dict[str, Any]) -> None:
+        """`kind:"book"` (§3.2): assigns `self.book` synchronously, then acks `shown`."""
+        self.book = {
+            "bv": data.get("bv", 0),
+            "d": data.get("d"),
+            "c": data.get("c", []),
+            "p": data.get("p", []),
+        }
+        msg_id = data.get("id")
+        print(
+            f"-> book applied: bv={self.book['bv']} d={self.book['d']!r} "
+            f"contacts={[c.get('a') for c in self.book['c']]} "
+            f"pending={[p.get('n') for p in self.book['p']]}"
+        )
+        if msg_id:
+            self.publish_ack(msg_id, "shown")
+
+    def _handle_cfg(self, data: dict[str, Any]) -> None:
+        """`kind:"cfg"` (§3.2): applies `cfg.lock`, `cfg.ca` and `cfg.sms`, then acks `shown`.
+        if lock.get("clear"):
+            self.lock_cleared_count += 1
+        if lock.get("auto") is not None:
+            self.lock_auto_min = lock["auto"]
+        msg_id = data.get("id")
+        if msg_id:
+            self.publish_ack(msg_id, "shown")
 
 
     def _take_fix(self) -> dict[str, Any] | None:
@@ -355,6 +540,96 @@ class DeviceClient:
             threading.Thread(target=_answer, args=(delay_s,), daemon=True).start()
         else:
             _answer(0.0)
+
+
+# Seconds to wait for the broker CONNACK and for the retained bundle.
+BOOTSTRAP_TIMEOUT_S = 10.0
+
+
+def bootstrap_device(
+    code: str,
+    *,
+    port: int | None = None,
+    wire: Literal["json", "cbor"] = "json",
+    timeout: float = BOOTSTRAP_TIMEOUT_S,
+) -> DeviceClient:
+    """Fetches and decrypts the retained setup bundle as `boot-{bid}`, acks it, and returns an
+    unconnected `DeviceClient`; `port` overrides the bundle's port, `timeout` bounds each wait."""
+    print(f"[bootstrap] network: parsing code {code!r}...")
+    token_bytes, host, code_port, apn = devsetup.parse(code)
+    conn_port = port if port is not None else code_port
+    bid, bpw, bkey = devsetup.derive(token_bytes)
+    print(
+        f"[bootstrap] network: derived bid={bid} host={host} port={conn_port} "
+        f"(code said {code_port}) apn={apn!r}"
+    )
+
+    down_topic = devsetup.boot_topic_down(bid)
+    up_topic = f"pager/boot/{bid}/up"
+    username = devsetup.boot_username(bid)
+
+    # PROTOCOL.md §6.1 bootstrap TLS row: no server-cert validation on this hop; plain MQTT here.
+    received: queue.Queue[bytes] = queue.Queue()
+    connected = threading.Event()
+
+    def _on_connect(client, userdata, connect_flags, reason_code, properties) -> None:
+        client.subscribe(down_topic, qos=1)
+        connected.set()
+
+    def _on_message(client, userdata, msg) -> None:
+        received.put(msg.payload)
+
+    boot_client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=username,
+        clean_session=True,
+        protocol=mqtt.MQTTv311,
+    )
+    boot_client.username_pw_set(username, bpw)
+    boot_client.on_connect = _on_connect
+    boot_client.on_message = _on_message
+    boot_client.connect(host, conn_port, keepalive=30)
+    boot_client.loop_start()
+    try:
+        if not connected.wait(timeout):
+            raise RuntimeError(
+                f"bootstrap connect to {host}:{conn_port} as {username!r} timed out after "
+                f"{timeout}s (cannot reach broker)"
+            )
+        print(f"[bootstrap] broker: connected as {username}, subscribed {down_topic}")
+
+        try:
+            payload = received.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(
+                f"timed out after {timeout}s waiting for the retained bundle on {down_topic} "
+                "(no setup code waiting -- expired or already used?)"
+            ) from None
+
+        plain = devsetup.decrypt_bundle(bkey, payload)
+        print(
+            f"[bootstrap] bundle: decrypted {len(payload)} bytes -> id={plain['id']!r} "
+            f"label={plain.get('label')!r} host={plain['host']}:{plain['port']}"
+        )
+
+        info = boot_client.publish(up_topic, wirecbor.encode({"v": 1, "ok": 1}), qos=1)
+        info.wait_for_publish(timeout=timeout)
+    finally:
+        boot_client.loop_stop()
+        boot_client.disconnect()
+    print(f"[bootstrap] done: acked on {up_topic}, disconnected {username}")
+
+    device = DeviceClient(
+        plain["id"],
+        plain["host"],
+        conn_port,
+        plain["id"],
+        plain["pw"],
+        hmac_key=plain["k"],
+        wire=wire,
+    )
+    print(f"[bootstrap] continuing as {device.device_id} with the bundle's real credentials")
+    return device
 
 
 class ServerClient:
@@ -533,6 +808,36 @@ class ServerClient:
         resp = self.api_put("/api/admin/settings", payload)
         if resp.status_code >= 400:
             raise RuntimeError(f"admin settings retention failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+
+    ) -> list[dict[str, Any]]:
+        resp.raise_for_status()
+
+        self,
+        *,
+        alias: str | None = None,
+    ) -> dict[str, Any]:
+        if alias is not None:
+            body["alias"] = alias
+        if resp.status_code >= 400:
+        return resp.json()
+
+        if resp.status_code >= 400:
+        return resp.json()
+
+    def admin_push_cfg(
+        self, device_id: str, *, auto: int | None = None, clear: bool | None = None
+    ) -> dict[str, Any]:
+        """`POST /api/admin/devices/{id}/cfg`: remote lock (`cfg.lock.auto`/`cfg.lock.clear`)."""
+        lock: dict[str, Any] = {}
+        if auto is not None:
+            lock["auto"] = auto
+        if clear is not None:
+            lock["clear"] = clear
+        resp = self.api_post(f"/api/admin/devices/{device_id}/cfg", {"lock": lock})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"admin push_cfg failed: {resp.status_code} {resp.text}")
         return resp.json()
 
 
@@ -809,6 +1114,25 @@ class PagerShell(cmd.Cmd):
                 return
             self.device.loc_now(lat, lon, acc)
 
+    def do_contactreq(self, arg: str) -> None:
+        parts = shlex.split(arg)
+        if not parts:
+            print("usage: contactreq <name> [phone-or-alias]")
+            return
+        name = parts[0]
+        ph = parts[1] if len(parts) > 1 else None
+        self.device.publish_contact_req(name, ph)
+
+    def do_book(self, arg: str) -> None:
+        """Shows the last-applied address book (`None` before one has arrived), PROTOCOL.md §3.2."""
+        self._out(self.device.book)
+
+    def do_lock(self, arg: str) -> None:
+        """Shows the applied `cfg.lock` state (PROTOCOL.md §3.2 `kind:"cfg"`)."""
+        self._out(
+            {"auto_min": self.device.lock_auto_min, "cleared_count": self.device.lock_cleared_count}
+        )
+
 
     def do_login(self, arg: str) -> None:
         alias = arg.strip()
@@ -902,6 +1226,8 @@ class PagerShell(cmd.Cmd):
     def do_admin(self, arg: str) -> None:
         parts = shlex.split(arg)
         if not parts:
+            print(
+            )
             return
         sub, rest = parts[0], parts[1:]
         if sub == "user-add":
@@ -914,6 +1240,10 @@ class PagerShell(cmd.Cmd):
             self._admin_deny(rest)
         elif sub == "settings":
             self._admin_settings(rest)
+        elif sub == "approve":
+            self._admin_approve(rest)
+        elif sub == "cfg":
+            self._admin_cfg(rest)
         else:
             print(f"unknown admin subcommand: {sub}")
 
@@ -983,6 +1313,36 @@ class PagerShell(cmd.Cmd):
             return
         self._out(result)
 
+            return
+
+    def _admin_approve(self, args: list[str]) -> None:
+        parser = argparse.ArgumentParser(prog="admin approve", add_help=False)
+        parser.add_argument("alias", nargs="?")
+        try:
+            ns = parser.parse_args(args)
+        except SystemExit:
+            return
+        self._out(
+            )
+        )
+
+            return
+
+    def _admin_cfg(self, args: list[str]) -> None:
+        parser = argparse.ArgumentParser(prog="admin cfg", add_help=False)
+        parser.add_argument("device_id")
+        parser.add_argument("--auto", type=int)
+        parser.add_argument("--clear", action="store_true")
+        try:
+            ns = parser.parse_args(args)
+        except SystemExit:
+            return
+        self._out(
+            self.server.admin_push_cfg(
+                ns.device_id, auto=ns.auto, clear=ns.clear if ns.clear else None
+            )
+        )
+
 
     def do_exit(self, arg: str) -> bool:
         return True
@@ -999,6 +1359,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_MQTT_PORT)
     parser.add_argument("--username", default=os.environ.get("MQTT_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
+    parser.add_argument(
+        "--hmac-key",
+        default=os.environ.get("PAGER_HMAC_KEY", ""),
+        help="base64 device HMAC key (docs/PROTOCOL.md §14) -- every publish is signed "
+        "with it and every /down is verified and dropped on failure. Omit or pass '' to "
+        "play an unsigned authMode:password device (the default).",
+    )
+    parser.add_argument(
+        "--wire",
+        choices=["json", "cbor"],
+        default=os.environ.get("PAGER_WIRE", "json"),
+        help="wire encoding for this device's publishes (default: json)",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        metavar="CODE",
+        help="setup-code bootstrap fetch: derives and fetches this "
+        "device's real credentials from the broker first, then continues as that device -- "
+        "overrides --device-id/--username/--password/--hmac-key (the bundle supplies all four); "
+        "--host stays the code's own host, but --port (still 1883 by default) overrides both the "
+        "bootstrap hop and the continuation, since this tool never speaks TLS",
+    )
     parser.add_argument("--api", default=DEFAULT_API_URL, help="relay API base URL")
     parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Auth emulator base URL")
     parser.add_argument("--as", dest="as_alias", help="log in as this alias before running")
@@ -1012,6 +1394,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
+    if args.bootstrap:
+        device = bootstrap_device(args.bootstrap, port=args.port, wire=args.wire)
+    else:
+        hmac_key = base64.b64decode(args.hmac_key) if args.hmac_key else None
+        device = DeviceClient(
+            args.device_id,
+            args.host,
+            args.port,
+            args.username,
+            args.password,
+            hmac_key=hmac_key,
+            wire=args.wire,
+        )
     server = ServerClient(args.api, args.auth_url)
     shell = PagerShell(device, server, as_json=args.json)
 

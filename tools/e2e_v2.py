@@ -61,6 +61,46 @@ import pager_client
 
 _env_backup: str | None = None
 
+# Wire encoding every `make_device()` plays; set once in `main()` from `--wire`.
+WIRE_MODE: str = "json"
+
+# `make_device` caches one `DeviceClient` per device id: §14.2's `n` is per-device state, so a
+# second client for the same device would restart at `n=0` and be dropped as a replay.
+# `disconnect()`/`connect()` models a warm reconnect; only `crash()` (§1) models a cold boot.
+_DEVICE_CLIENTS: dict[str, pager_client.DeviceClient] = {}
+
+
+def create_device_with_secret(
+    admin: pager_client.ServerClient,
+    device_id: str,
+    owner_alias: str,
+    *,
+    default_to_alias: str | None = None,
+) -> dict:
+    """Creates a device via `POST /api/admin/devices` and runs the real bootstrap fetch
+    (`pager_client.bootstrap_device`); caches the signed `DeviceClient` in `_DEVICE_CLIENTS`."""
+    device = pager_client.bootstrap_device(info["setupCode"], port=MQTT_PORT, wire=WIRE_MODE)
+    return info
+
+
+def make_device(device_id: str) -> pager_client.DeviceClient:
+    """Returns the cached `DeviceClient` for `device_id` (see `_DEVICE_CLIENTS`); an unprovisioned
+    id gets an unsigned device speaking this run's `--wire` encoding."""
+    existing = _DEVICE_CLIENTS.get(device_id)
+    if existing is not None:
+        return existing
+    device = pager_client.DeviceClient(
+        device_id,
+        MQTT_HOST,
+        MQTT_PORT,
+        None,
+        None,
+        hmac_key=None,
+        wire=WIRE_MODE,
+    )
+    _DEVICE_CLIENTS[device_id] = device
+    return device
+
 
 def compose(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     print(f"$ {' '.join(cmd)}")
@@ -266,6 +306,8 @@ def scenario_bootstrap() -> None:
     admin.admin_user_add("student", "Student", email="student@example.com", phone=None)
     admin.admin_set_allow("parent", "student", message=True, locate=True, one_way=False)
 
+    device_info = create_device_with_secret(admin, "pgr-e2e-1", "student", default_to_alias="parent")
+    assert device_info["setupCode"]
 
 
 def scenario_text_roundtrip() -> None:
@@ -276,6 +318,7 @@ def scenario_text_roundtrip() -> None:
     parent = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     parent.login("parent")
 
+    device = make_device("pgr-e2e-1")
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="device to connect")
 
@@ -326,6 +369,7 @@ def scenario_text_roundtrip() -> None:
 def scenario_allowlist() -> None:
     """student `msg @stranger` (unregistered alias) is dropped with a `system` reply; admin denies
     parent<->student -> send returns 403; an unregistered signed-in UID gets 403 and cannot read."""
+    device = make_device("pgr-e2e-1")
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="device to connect")
     device.inbox.clear()
@@ -396,6 +440,7 @@ def scenario_republish() -> None:
     oracle = Oracle()
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
+    create_device_with_secret(admin, "pgr-e2e-2", "student", default_to_alias="parent")
 
     parent = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     parent.login("parent")
@@ -409,6 +454,7 @@ def scenario_republish() -> None:
 
     wait_until(_is_queued_or_sent, timeout=10, description="pager delivery to be created")
 
+    device = make_device("pgr-e2e-2")
     device.connect()
     wait_until(
         lambda: any(e.data.get("id") == msg_id for e in device.inbox),
@@ -462,8 +508,10 @@ def scenario_location_periodic() -> None:
     )
     # Device before allow-edge: `create_device` starts `locatableBy` at `[]`, and only a later
     # allow-list write recomputes it, so the opposite order would leave it empty.
+    create_device_with_secret(admin, "pgr-e2e-locp", "locperiodic", default_to_alias="parent")
     admin.admin_set_allow("parent", "locperiodic", message=True, locate=True, one_way=True)
 
+    device = make_device("pgr-e2e-locp")
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="loc-periodic device to connect")
 
@@ -511,7 +559,9 @@ def scenario_location_on_demand() -> None:
     # --- a real fix, then a <60s cached re-ask ---
     # Device before allow-edge in every sub-case (see scenario_location_periodic).
     admin.admin_user_add("locdemo1", "LocDemo1", email="locdemo1@example.com", phone=None)
+    create_device_with_secret(admin, "pgr-e2e-locd1", "locdemo1", default_to_alias="parent")
     admin.admin_set_allow("parent", "locdemo1", message=True, locate=True, one_way=True)
+    device1 = make_device("pgr-e2e-locd1")
     device1.connect()
     wait_until(lambda: device1.connected, timeout=10, description="locdemo1 device to connect")
 
@@ -542,8 +592,10 @@ def scenario_location_on_demand() -> None:
     admin.admin_user_add(
         "locrequester2", "LocRequester2", email="locrequester2@example.com", phone=None
     )
+    create_device_with_secret(admin, "pgr-e2e-locd2", "locdemo2", default_to_alias="parent")
     admin.admin_set_allow("parent", "locdemo2", message=True, locate=True, one_way=True)
     admin.admin_set_allow("locrequester2", "locdemo2", message=True, locate=True, one_way=True)
+    device2 = make_device("pgr-e2e-locd2")
     # A real device takes seconds to attempt a fix (§13.3 rule 2 bounds it at 60 s); a few
     # seconds of delay make the coalescing window deterministic.
     device2.loc_answer_delay_s = 3.0
@@ -575,7 +627,9 @@ def scenario_location_on_demand() -> None:
 
     # --- loc fail on -> no_fix, still resolves the request ---
     admin.admin_user_add("locdemo3", "LocDemo3", email="locdemo3@example.com", phone=None)
+    create_device_with_secret(admin, "pgr-e2e-locd3", "locdemo3", default_to_alias="parent")
     admin.admin_set_allow("parent", "locdemo3", message=True, locate=True, one_way=True)
+    device3 = make_device("pgr-e2e-locd3")
     device3.connect()
     wait_until(lambda: device3.connected, timeout=10, description="locdemo3 device to connect")
     device3.loc_set_fail(True)
@@ -597,6 +651,7 @@ def scenario_location_on_demand() -> None:
 
     # --- derived expiry: shortened LOC_REQ_TTL_S + tick() ---
     admin.admin_user_add("locdemo4", "LocDemo4", email="locdemo4@example.com", phone=None)
+    create_device_with_secret(admin, "pgr-e2e-locd4", "locdemo4", default_to_alias="parent")
     admin.admin_set_allow("parent", "locdemo4", message=True, locate=True, one_way=True)
 
     # Never connected: §5.3 excludes loc_req from the online-edge republish, so this request
@@ -627,6 +682,7 @@ def scenario_retention() -> None:
 
     # --- locations: retention.locations=1d, messages untouched ---
     admin.admin_user_add("retloc", "RetLoc", email="retloc@example.com", phone=None)
+    create_device_with_secret(admin, "pgr-e2e-retloc", "retloc")
     admin.admin_set_retention(messages="4w", locations="1d")
 
     fresh_msg_id = parent.say("student", "retention: still here after a locations-only sweep")["id"]
@@ -669,10 +725,12 @@ def scenario_bytes() -> None:
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
     admin.admin_user_add("bytesuser", "BytesUser", email="bytesuser@example.com", phone=None)
+    create_device_with_secret(admin, "pgr-e2e-bytes", "bytesuser", default_to_alias="parent")
     # Two-way, so the device's up-message lands in the thread rather than tripping the
     # unknown-recipient path; this scenario wants representative traffic sizes.
     admin.admin_set_allow("parent", "bytesuser", message=True, locate=True, one_way=False)
 
+    device = make_device("pgr-e2e-bytes")
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="bytes device to connect")
 
@@ -707,6 +765,172 @@ def scenario_bytes() -> None:
     )
 
 
+def _pending_book_or_cfg_acked(device_id: str, field: str) -> bool:
+    """Whitebox check that `devcfg.ack()` recorded the device's latest `book`/`cfg` `shown` ack
+    (`devices/{d}.pendingBook`/`pendingCfg`); no client-facing read exists (§3.2)."""
+        return False
+    return isinstance(pending, dict) and pending.get("acked") is True
+
+
+def _relay_settings():
+    """A `Settings` this host process can use against the compose stack's published ports
+    stack's EMQX API is on 127.0.0.1:18083; its Mosquitto is reached over TLS on 8883 as `relay`."""
+    from app.config import Settings
+
+    return Settings(
+        broker_api_url=f"{EMQX_API_URL}/api/v5",
+        broker_api_key=BROKER_API_KEY,
+        broker_api_secret=BROKER_API_SECRET,
+        webhook_key=WEBHOOK_KEY,
+        dev_mode=True,
+        google_cloud_project=FIREBASE_PROJECT_ID,
+    )
+
+
+    method). Mosquitto: the dynsec `getClient` command."""
+    resp = httpx.get(
+        f"{EMQX_API_URL}/api/v5/authentication/password_based:built_in_database/users/{username}",
+        auth=(BROKER_API_KEY, BROKER_API_SECRET),
+        timeout=5.0,
+    )
+    return resp.status_code == 200
+
+
+    """EMQX 5 retainer HTTP API (`GET /api/v5/mqtt/retainer/message/{topic}`: 200 or 404). Used
+    because the cleanup revokes the bootstrap credential. Mosquitto: subscribe as `relay` and see
+    import urllib.parse
+
+    encoded = urllib.parse.quote(topic, safe="")
+    resp = httpx.get(
+        f"{EMQX_API_URL}/api/v5/mqtt/retainer/message/{encoded}",
+        auth=(BROKER_API_KEY, BROKER_API_SECRET),
+        timeout=5.0,
+    )
+    return resp.status_code == 200
+
+
+def scenario_setup_code() -> None:
+    """Admin creates a device, a simulated device performs the real bootstrap fetch,
+    `provisionState` becomes `"provisioned"` on the first signed `/status`, and `boot-{bid}` is gone
+    from EMQX. A second code is expired by patching `setupCodes/{bid}.expiresAt` and calling
+    `devsetup.expire()`, which leaves no credential or retained bundle; a fresh `bootstrap_device()`
+    then fails. `BROKER_MANAGES_AUTH=0` (a shared `boot` user) is not exercised."""
+    bootstrap_admin()
+    from datetime import UTC, datetime, timedelta
+
+    from app import devsetup
+
+    admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
+    admin.login("admin")
+    admin.admin_user_add("scowner", "SCOwner", email="scowner@example.com", phone=None)
+
+    # --- happy path: create -> code -> real bootstrap -> provisioned -> boot user gone ---
+    result = admin.admin_device_add("pgr-e2e-setup", "scowner")
+    assert result["brokerPush"] == "pushed", result  # BROKER_MANAGES_AUTH=1 (default) in this stack
+    code = result["setupCode"]
+
+    token_bytes, _host, _port, _apn = devsetup.parse(code)
+    bid, _bpw, _bkey = devsetup.derive(token_bytes)
+    boot_username = devsetup.boot_username(bid)
+
+    device = pager_client.bootstrap_device(code, port=MQTT_PORT, wire=WIRE_MODE)
+
+    device.connect()
+    wait_until(lambda: device.connected, timeout=10, description="bootstrapped device to connect signed")
+    device.publish_status(batt_mv=3800, mode="active", rssi=-70)
+
+    def _provisioned() -> bool:
+
+    wait_until(
+        _provisioned,
+        timeout=10,
+        description="provisionState to flip to 'provisioned' on the first signed /status",
+    )
+    print("setup_code: provisionState == 'provisioned' after the device's first signed /status")
+
+    print(f"setup_code: boot user {boot_username} and setupCodes/{bid} are both gone -- the boot user is gone")
+    device.disconnect()
+
+    # --- expired code: patch expiresAt, call devsetup.expire() directly, confirm no retained bundle ---
+    result2 = admin.admin_device_add("pgr-e2e-setup-exp", "scowner")
+    code2 = result2["setupCode"]
+    token_bytes2, _h2, _p2, _a2 = devsetup.parse(code2)
+    bid2, _bpw2, _bkey2 = devsetup.derive(token_bytes2)
+    boot_username2 = devsetup.boot_username(bid2)
+    down_topic2 = devsetup.boot_topic_down(bid2)
+
+
+    assert expired_count == 1, expired_count
+    print(
+        "setup_code: devsetup.expire() (standalone) "
+        f"cleaned up {expired_count} expired code"
+    )
+
+    print("setup_code: expired code left no retained message on pager/boot/{bid}/down and no live bootstrap credential")
+
+    try:
+        pager_client.bootstrap_device(code2, port=MQTT_PORT, wire=WIRE_MODE, timeout=5.0)
+        raise AssertionError("bootstrap_device() must fail against an expired code")
+    except RuntimeError as exc:
+        print(f"setup_code: a real bootstrap attempt against the expired code fails, as a real device would: {exc}")
+
+
+def scenario_address_book() -> None:
+    """Device `contact_req` for `+15550001111 Grandma` -> admin approves (creates the family SMS
+    not in `c[]` and reaches the pager only as `cfg.sms`; a device `up` to its alias gets
+    `unknown recipient` and no thread; admin pushes `cfg` `lock.auto=2` and the device acks."""
+    bootstrap_admin()
+    oracle = Oracle()
+
+    admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
+    admin.login("admin")
+    create_device_with_secret(admin, "pgr-e2e-book", "abstudent")
+
+    device = make_device("pgr-e2e-book")
+    device.connect()
+    wait_until(lambda: device.connected, timeout=10, description="address_book device to connect")
+
+    req_id = device.publish_contact_req("Grandma", "+15550001111")
+
+        return next(
+        )
+
+    wait_until(
+        timeout=10,
+    )
+
+    wait_until(
+        timeout=10,
+    )
+    assert device.book is not None
+    print(
+    )
+
+    wait_until(
+        timeout=10,
+        description="device's book 'shown' ack to land at the relay",
+    )
+    print("address_book: device's book ack ('shown') landed at the relay")
+
+    wait_until(
+        timeout=10,
+    )
+
+    wait_until(
+        lambda: device.lock_auto_min == 2,
+        timeout=10,
+        description="device to receive and apply cfg lock.auto=2",
+    )
+    print("address_book: device applied cfg lock.auto=2")
+
+    wait_until(
+        timeout=10,
+        description="device's cfg 'shown' ack to land at the relay",
+    )
+    print("address_book: device's cfg ack ('shown') landed at the relay")
+    device.disconnect()
+
+
 SCENARIOS: dict[str, Callable[[], None]] = {
     "bootstrap": scenario_bootstrap,
     "text_roundtrip": scenario_text_roundtrip,
@@ -716,6 +940,8 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "location_on_demand": scenario_location_on_demand,
     "retention": scenario_retention,
     "bytes": scenario_bytes,
+    "address_book": scenario_address_book,
+    "setup_code": scenario_setup_code,
 }
 
 
@@ -726,11 +952,21 @@ def main(argv: list[str] | None = None) -> int:
         "scenarios", nargs="*", default=list(SCENARIOS), help="scenario names to run, in order"
     )
     parser.add_argument("--no-build", action="store_true", help="skip `docker compose build`")
+    parser.add_argument(
+        "--wire",
+        choices=["json", "cbor"],
+        default="json",
+        help="wire encoding every simulated device in this run speaks "
+        "-- run the whole suite once per value to cover both (default: json)",
+    )
     args = parser.parse_args(argv)
 
     unknown = [s for s in args.scenarios if s not in SCENARIOS]
     if unknown:
         raise SystemExit(f"unknown scenario(s): {unknown}; choices: {list(SCENARIOS)}")
+
+    global WIRE_MODE
+    WIRE_MODE = args.wire
 
     start_stack(build=not args.no_build)
     passed: list[str] = []
