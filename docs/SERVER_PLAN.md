@@ -114,7 +114,13 @@ queries stay simple), **denormalised arrays for rules** (`uids`, `locatableBy`) 
 ```
 aliases/{alias}                {uid}                                  uniqueness = doc id, created in a txn
 users/{uid}/backends/{bid}     {kind: 'pager'|'webapp'|'sms'|'gchat'|…, config, enabled, verifiedAt}
+                                authMode: 'hmac'|'password', provisionState: 'issued'|'provisioned',
+                                wire: 'json'|'cbor'|null, bookVersion: int,
 devices/{deviceId}/locations/{autoId}
+deviceSecrets/{deviceId}       {hmacKey, mqttPasswordHash, upN, upBits, downN, sigFailures, createdAt, rotatedAt} [server-only]
+setupCodes/{bid}               {deviceId, expiresAt}                  [server-only]
+contactRequests/{deviceId}_{reqId}
+                                status: 'pending'|'approved'|'rejected', reason, createdAt, decidedAt, decidedBy}
 messages/{id}                  {id: 'm_…', seq, convKey, uids: [a, b], senderUid, recipientUid,
                                 kind: 'text'|'loc_req'|'loc', body|null, loc|null, wireId|null,
                                 originBackendKind, originBackendId|null, ts, createdAt,
@@ -678,8 +684,21 @@ makes unnecessary.
 
 ### 9.4 Broker
 **Default: EMQX Cloud Serverless**, outside Terraform (no provider), configured once by hand and
+documented in `infra/README.md`: three rules (`SELECT topic, payload, base64_encode(payload) as
+payload_b64, qos, clientid FROM "pager/+/up"` etc.) → one HTTP action to
+`https://<hosting-domain>/webhooks/mqtt` with the `X-Relay-Webhook-Key` header; an API key for
+the relay's REST publishes; per-device authentication and the three ACL rules from
+`PROTOCOL.md` §2. Device sees TLS on 8883 exactly as before and pins the broker's CA. `PROTOCOL.md` §12 item 2 (free-tier session limits) is
 re-asked against EMQX's numbers: 1M session-minutes/month is ≈ 23 devices always connected, and
 QoS 1 / retained / LWT / persistent sessions are all supported.
+
+**`base64_encode(payload)` in that rule is not optional, and neither is `payload_encoding:
+"base64"` on the relay's REST publishes.** The HTTP action's `${.}` body is JSON and EMQX
+replaces every non-UTF-8 byte of `payload` with U+FFFD, so a rule that selects only `payload`
+destroys every CBOR envelope (`PROTOCOL.md` §3.1), every HMAC signature (§14) and the encrypted
+bootstrap blob (`DEVICE_PLAN.md` §3.3) before the relay ever sees them; `payload_b64` is the
+field `broker.py`'s `parse_webhook` reads. `tools/emqx_setup.py` provisions exactly this rule
+locally — a hand-configured production broker must match it.
 
 What must be true, and checkable only by opening the free account (§10 D2): rule engine with an
 HTTP action on the Serverless tier; REST publish API on the Serverless tier; webhook retry
