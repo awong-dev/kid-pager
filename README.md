@@ -14,6 +14,9 @@ pager that is asleep is delivered. Pagers can use an ordinary data SIM or a Sora
 carried through Soracom Beam (`docs/SORACOM_DESIGN.md`).
 
 
+**Start with [`docs/OVERVIEW.md`](docs/OVERVIEW.md)**, then
+[`docs/GOTCHAS.md`](docs/GOTCHAS.md). [`docs/README.md`](docs/README.md) indexes the rest.
+
 ## Repository layout
 
 | `hardware/` | Carrier board and enclosure design files. |
@@ -43,3 +46,4 @@ Scenarios: `bootstrap`, `text_roundtrip`, `allowlist`, `republish`, `location_pe
 `tools/e2e_v2.py`.
 
 Unit tests and manual checklists are documented in `relay/README.md`, `web/README.md` and
+`firmware/README.md`.

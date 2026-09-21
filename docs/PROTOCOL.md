@@ -5,6 +5,9 @@
 this file *first*, then the code — including anything `docs/SERVER_PLAN.md` implies, whose wire
 changes are all recorded here.
 
+**Scope:** a text and location relay, **plus** (§3.6/§7.3) an
+audited device-direct SMS path to a parent-managed allow-list. Geofences and schedule-based mode
+switching are still out of scope; §11 records where the contract leaves room for them.
 
 **Compatibility.** Payloads carry an explicit schema version (`v`, §3.1) and every field added
 since the first release is optional, so a device that ignores all of them stays conformant and a
@@ -122,9 +125,13 @@ Base envelope:
 | `from` | string | yes on content messages, **absent** on acks | `^[a-z0-9][a-z0-9_-]{0,15}$` **or** the literal `system`, ≤16 chars | Author's **alias**. *(a deployment has named users rather than one parent and one student, so `from` carries the sender's alias rather than a two-value enum. `parent` and `student` are ordinary aliases, so an older two-value payload is still valid. **Firmware impact: none** — `msg.c` accepts any 1–16 byte string and renders it verbatim.)* |
 | `ack` | string \| null | yes; `null` on content messages | `shown` \| `read` | Ack state being reported. |
 | `to` | string | no; `/up` content messages only | same regex as `from` | Recipient alias chosen by the device. Absent → the relay uses the device's configured default recipient, or broadcasts to every user the owner may message. *(the device can address one of several users; optional, so a device that never sets it works unchanged.)* |
+| `n` | uint | no; signed envelopes only | 0…2⁵³-1 *(widened from a 32-bit counter; see rationale)* | Per-device, per-direction replay counter (§2.4, §2.5, §14.2). Strictly increasing per publisher. |
 | `sig` | bstr(8) in CBOR / base64url(8) in JSON | no; signed envelopes only | — | HMAC-SHA256 tag, truncated to 64 bits, MUST be the last pair (§2.4). |
 | `d` | string | `book` only | same regex as `from` | Default recipient alias (`DEVICE_PLAN.md` §4.3). |
 | `more` | bool | `book` only | — | Reserved for chunking if the cap moves (`DEVICE_PLAN.md` §4.3). |
+| `peer` | string | `sms_log` only | E.164 | The other party's phone number (§3.6). |
+| `dir` | string | `sms_log` only | `out` \| `in` | Direction of the SMS this entry audits (§3.6). |
+| `sms_ts` | int | `sms_log` only | ≥ 0, epoch s | When the SMS itself was sent/received, which may differ from the envelope's own `ts` if the pager was offline and queued the audit entry (§3.6). |
 
 Additional rules:
 - `body` MUST NOT contain Unicode control characters `U+0000`–`U+001F` or `U+007F`. Relay strips
@@ -159,6 +166,7 @@ Additional rules:
 | Ack (device → relay) | `/up` | `{"v":1,"id":"m_7f3a","ts":…,"ack":"shown"}` — **51 bytes**; no `from`, no `body` | — |
 | Up message (device reply) | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","body":"ok coming","ack":null}` — **84 bytes** | Thread entry, routed to default recipient. |
 | Up message, addressed | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","to":"mom","body":"ok coming","ack":null}` — **95 bytes** | Thread entry, routed to named recipient. |
+| SMS log (device → relay) | `/up` | `{"v":1,"id":"s_1a2b3c4d","ts":…,"kind":"sms_log","peer":"+12065550100","dir":"out","st":"sent","body":"On my way","sms_ts":…,"n":…,"sig":"…"}` — **170 bytes** signed JSON, **88 bytes** signed CBOR | Not a thread entry, not routed to anyone; audits the pager's own direct SMS send/receive (§3.6). QoS 1, deduped on `id` like any other up message. |
 | Location | `/loc` | §13 | — |
 
 A receiver distinguishes an ack from a content message by `ack !== null`. A payload with both a
@@ -208,6 +216,8 @@ carrying the approved contacts and pending requests for this device:
 
 **`kind:"cfg"` (relay → device).** A configuration message is a down message with `kind:"cfg"`,
 `ack:null`, carrying device settings that only the relay can modify (passcode lock, auto-lock
+timing, CA trust, the SMS contact allow-list, etc.). Fields: `cfg` is an object that currently
+`{n, p}` objects, the device's *whole* SMS contact allow-list, replaced wholesale on every push;
 - **Not a thread entry:** the device MUST NOT render it in the message thread, and MUST NOT
   `shown`- or `read`-ack it in the normal sense. Instead, the device acks with `shown` **once the
   config has been applied**.
@@ -234,11 +244,14 @@ sums each field's independent maximum, and several of those maxima are mutually 
 "to":"<=16>", 24
   ----
 
+"sig":"<11 base64url chars>", 20   (the tag is 8 bytes, §3.1, which is 11 base64url characters)
   ----
 ```
 
 **JSON, signed (with `n` and `sig`):**
 ```
+"n":9007199254740991, 19  (n's max grew from 2^32-1 (10 digits) to 2^53-1 (16 digits), +6 B)
+"sig":"<11 base64url>", 20
   ----
   
   ----
@@ -284,6 +297,58 @@ The device sets `ts` from the LTE network clock obtained at attach (NITZ / modem
 substitutes its own receive time. *(avoids adding an SNTP/`esp_netif` code path
 purely for timestamps; the relay is already authoritative for thread ordering.)*
 Thread order in the parent UI is the relay's insertion order (SQLite rowid), **not** `ts`.
+
+### 3.6 `kind:"sms_log"` (device-direct SMS)
+
+The pager may send and receive SMS **directly
+through its own modem**, to a phone-number allow-list the device's owner (or an admin) manages in
+the web app — a delivery path that works without the relay, for exactly the case the relay itself
+cannot cover (the relay and the broker are both down, or the parent's own phone has no data). The pager has **no UI of its own** to add, edit or remove an allow-list entry — only the parent, in
+the web app, can.
+
+- **The allow-list itself is not a wire message.** It travels as `/down cfg.sms` (§3.2's `cfg` kind,
+  §10's `cfg.sms[]` sub-map): an array of `{n, p}` (name, E.164 phone), the *whole* list every time,
+  newest-wins exactly like `cfg.lock`/`cfg.ca`, acked `shown` once the device has written it to NVS.
+  Max 8 entries. The relay's own name-length cap for this list (24 UTF-8 bytes, tighter than
+  `book`/`contact_req`'s 48-byte name cap) exists purely so 8 maximal entries always fit under the
+  envelope limit in *both* wire encodings (§3.3); a future revision that widens the name cap back to 48 bytes would
+  first have to either shrink the entry cap or move to CBOR-only delivery for this one kind. *(the relay derives the list: the member's approved contacts plus, when their outbound policy allows any number, every family contact; names are unique per family because the pager matches by name.)* *(An owner who holds an `smsNumber` gets their SMS contacts in `c[]` instead; see §3.2.)*
+- **Sending.** A message to an SMS contact goes out through the modem's own `smsSend()`, never
+  through `/down`/`/up` at all — the relay is not in this path.
+- **Receiving.** An inbound SMS from a listed number is inserted into the on-device thread and
+  alerts like any other message; from an unlisted number, it is **never shown** to the student —
+  only logged.
+- **The audit trail, non-negotiable:** every SMS in either direction — sent, failed, received, or
+  blocked — produces exactly one signed `/up` envelope, `kind:"sms_log"`, id `s_` + 8 hex, QoS 1,
+  deduped on `id` exactly like any other up message (redelivery-safe). Fields, beyond the base
+  envelope's `id`/`ts`/`n`/`sig`:
+
+  | Field | Type | Range | Meaning |
+  |---|---|---|---|
+  | `peer` | string | `^\+[1-9]\d{6,14}$` (E.164) | The other party's phone number. |
+  | `dir` | string | `out` \| `in` | Direction of the SMS this entry audits. |
+  | `st` | string | `sent` \| `failed` \| `recv` \| `blocked` | Outcome: `sent`/`failed` for `dir:"out"`; `recv`/`blocked` for `dir:"in"` (`blocked` = sender not on the allow-list, never shown). |
+  | `body` | string | ≤160 Unicode code points; **empty allowed** | The SMS text. Unlike an ordinary content message's `body` (§3.1), an empty `body` is legal here — some real handsets/gateways deliver a body-less SMS, and this is an audit record of what happened, not a thing a human reads on the pager's screen. |
+  | `sms_ts` | int | ≥ 0, epoch s | When the SMS itself was sent/received — differs from the envelope's own `ts` whenever the pager was offline and queued the entry. |
+
+  Example (JSON, signed, ~170 bytes; ~88 bytes as signed CBOR):
+  ```json
+  {"v":1,"id":"s_1a2b3c4d","ts":1757700000,"kind":"sms_log","peer":"+12065550100","dir":"out","st":"sent","body":"On my way","sms_ts":1757700000,"n":12,"sig":"…"}
+  ```
+- **Not a thread entry, not routed to anyone.** The relay stores it under
+  `devices/{deviceId}/smsLog/{logId}` (`logId` = this envelope's own `id`) and nothing else — no
+  `messages/{id}` row, no delivery/backend fan-out, no push notification. It is read back only
+  through `GET /api/devices/{id}/sms-log` (owner or admin), never through a Firestore listener.
+- **Offline durability.** If the pager is offline when an SMS is sent or received, the audit entry
+  is queued in NVS (at least 16 entries) and published once the session is back; **sent/received
+  first, logged second** — the whole point of this path is that it works without the relay, so a
+  slow or failed audit publish must never block or roll back the SMS itself. If the queue fills, the
+  oldest entry is dropped and the drop is counted in `/status`'s `sms_lost` (§5.1) rather than
+  silently lost with no trace at all.
+- **Retention.** `smsLog` entries are swept by the retention job (`relay/app/jobs.py`).
+- **Compatibility.** A device that predates §3.6 sends no `sms_log` and applies no
+  `cfg.sms`, and is unaffected — every field here is on a kind (`sms_log`) and a sub-map (`cfg.sms`)
+  such a device never emits or parses.
 
 ---
 
@@ -389,6 +454,10 @@ broker-generated LWT.
 | `ts` | int | yes when `online` | epoch s, or 0 | Same rule as §3.5 |
 | `fw` | string | no | ≤16 chars | Firmware version |
 | `bv` | int | no | 0…2³²-1 | Book version (`DEVICE_PLAN.md` §4.3). Reported so the relay can detect a factory reset or a lost book message and re-publish. |
+| `loc_min_s` | int | no | 0…86400 | The device's own minimum gap between on-demand fixes (§13.3); default 120. Firmware with the growing backoff of §13.3 reports **600**: the floor it keeps since its last attempt even after a backoff reset. |
+| `ca_fp` | string | no | 16 lowercase hex chars | First 16 hex characters of the SHA-256 of the pinned CA PEM (the same digest carried in the bootstrap bundle's `ca_sha`/a `cfg.ca.sha` push, `V02_DESIGN.md` §4.4). Absent when `tls` is `unpinned` or absent. |
+| `loc_backoff_s` | int | no | 0…86400 | *(§13.3)* Seconds until the device's own growing location-attempt backoff next allows a fresh fix attempt; `0` = an attempt is allowed now. See §13.3's amendment for how this relates to `loc_min_s`. |
+| `sms_lost` | int | no | ≥ 0 | *(§3.6 — device-direct SMS)* Count of `sms_log` audit entries dropped from the device's NVS queue for lack of space; normally 0. |
 
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
@@ -454,6 +523,8 @@ Status is **never** published on a plain paging wake or on receipt of a down mes
 | MQTT version | **3.1.1** | The library exposes no version, no `sessionExpiry`, and no MQTT 5 property API anywhere. `mqttConnect()` emits `AT+SQNSMQTTCONNECT=0,<host>,<port>,<keepAlive>` (`src/proto/WalterMQTT.cpp:83-95`). 3.1.1 it is. |
 | Clean session | **false** — **NOT SETTABLE from the library** | Required in spirit by the "one persistent session" constraint: with `cleanSession=false` and a stable client id the broker queues QoS 1 `/down` while the TCP link is briefly down. **Finding:** neither `mqttConfig()` nor `mqttConnect()` exposes a clean-session flag, so the value is whatever the Sequans MQTT client defaults to. Not verified, and load-bearing for §4.1 rule 6 and §5.3. Weak evidence against us: `mqttConnect()` *deliberately clears the entire local subscription table* before connecting (`src/proto/WalterMQTT.cpp:87-89`), and the vendor's own `examples/mqtts` re-subscribes from inside the CONNECTED event handler — which is what a library assuming a **clean** session on every connect would look like. Experiment: connect, reset the ESP32 only, and have the relay publish while the device is down — if the queued message arrives on reconnect, the session is persistent. ~20 min on hardware. |
 | LWT | **NOT SETTABLE from the library** | `mqttConfig()` emits `AT+SQNSMQTTCFG=0,"<clientId>"[,"<user>","<pass>"][,<tlsProfileId>]` and stops there (`src/proto/WalterMQTT.cpp:53-75`) — no will topic, message, QoS or retain argument, and grepping the whole of `src/` for `will`/`lastwill` returns nothing. §5.2's LWT contract therefore has no implementation path through the typed API. Fallback: `WalterModem::sendCmd()` (public) can queue a raw `AT+SQNSMQTTCFG=...` carrying the will parameters *before* `mqttConnect()`. Not verified against the Sequans AT manual. If that fails, the relay must fall back to inferring offline from keepalive expiry and §5.2's LWT becomes advisory. Tracked in §12. |
+| TLS (production) | TLS 1.2; server certificate validated **only if the bootstrap bundle carried a CA** (`DEVICE_PLAN.md` §3.3, default: none, validation off); username/password per device; profile 2. **The profile MUST name certificate slot 12 even with validation off** — with no slot named the modem's MQTT engine silently sends plaintext MQTT to the TLS port (verified on hardware, `DEVICE_PLAN.md` §3.3). | Provisioning is the vendor's `examples/mqtts` flow: `tlsWriteCredential(false, 12, ca_pem)` → `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_CA, WALTER_MODEM_TLS_VERSION_12, 12)` → `mqttConfig(client_id, user, pass, 2)`. Both functions are public (`src/WalterModem.h:4147` and `:4404`). **Slot discipline: certificate slots 0–10 and private-key index 1 are reserved for Sequans/BlueCherry — use ≥ 11, and TLS profile ≥ 2 (profile 1 is BlueCherry's).** |
+| TLS (bootstrap) | no server-cert validation; profile 2 (the library caps profile ids at 0–2, and bootstrap and production never share a power cycle) | For the one-time setup fetch (§3.2): `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_NONE, WALTER_MODEM_TLS_VERSION_12, 12)`. **Verified on hardware:** the slot argument is required — `no_cert` makes the MQTT engine send plaintext (see the production row). The bundle is authenticated and encrypted under a token-derived key, so server authentication on this hop adds only DoS resistance. |
 | Reconnect policy | **Only** on detected session loss. Never on a timer. Backoff 5 s, 15 s, 60 s, 300 s, then 300 s steady. | Each reconnect costs a full TLS handshake ≈ 5 kB (§7) — reconnects are the largest single term in the data budget. |
 
 *(scoping note, no behaviour change.)* Every row above describes the **device's**
@@ -586,6 +657,16 @@ exposes TLS session resumption: it does not.** There is no session-ticket or ses
 in v1.5.0's public TLS API, so a reconnect is a full ~5 kB handshake every time. This does not
 threaten the data constraint but it is the dominant energy cost.
 
+**SMS budget: device-direct SMS is in scope (see §3.6).** The pager's own modem may send
+and receive SMS directly, to a **parent-managed allow-list of phone numbers**, as a delivery path
+that does not depend on the relay at all. Every real SMS the modem sends or receives against this
+SIM's 100-message/month allowance is one message off that budget — a school day with a handful of
+direct texts to a parent's own phone is nowhere near it, but this line exists precisely so nobody
+has to guess: **every SMS sent or received by the modem MUST also produce one signed `sms_log`
+audit envelope** (§3.6), non-negotiable, so the relay has a complete record of what left/reached
+the SIM even though it never carried the message itself. Not verified whether the production SIM
+carries SMS at all. If it does not, the feature fails safe (every send attempt logs `st:"failed"`, §3.6) rather than silently
+pretending to work.
 ### 7.4 Measurement — validating the model
 
 §7.3 is a theoretical count of JSON bytes plus assumed TLS/TCP framing overhead. There is one
@@ -1011,19 +1092,51 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 31 | `k` | bstr(32) | bootstrap bundle (device HMAC key) |
 | 32 | `host` | tstr | bootstrap bundle (broker hostname) |
 | 33 | `port` | int | bootstrap bundle (broker port) |
+| 34 | `ca` | tstr | bootstrap bundle (CA PEM) — **legacy.** A relay MUST still decode this key if it appears (an old retained bundle, or a bundle from before a device's firmware/relay pair upgraded), but a current relay MUST NOT emit it: `ca_url`+`ca_sha` (40/41 below) replace it (`V02_DESIGN.md` §4.4). |
 | 35 | `flags` | int | bootstrap bundle (device flags) |
 | 36 | `label` | tstr | bootstrap bundle (device label) |
 | 37 | `apn` | tstr | bootstrap bundle (carrier APN, optional) |
 | 38 | `cfg` | map | `/down` `cfg` (device settings) |
+| 39 | `tls` | tstr | `/status` (CA trust state — §5.1) |
+| 40 | `ca_url` | tstr | bootstrap bundle (CA pointer URL — `V02_DESIGN.md` §4.4) |
+| 41 | `ca_sha` | bstr(32) | bootstrap bundle (CA pointer SHA-256 — `V02_DESIGN.md` §4.4) |
+| 42 | `ca_fp` | tstr(16) | `/status` (CA fingerprint — §5.1) |
+| 43 | `loc_backoff_s` | int | `/status` (location backoff — §5.1, §13.3) |
+| 44 | `peer` | tstr | `/up` `sms_log` (§3.6 — the other party's E.164 phone number) |
+| 45 | `dir` | tstr | `/up` `sms_log` (§3.6 — `out`/`in`) |
+| 47 | `sms_ts` | int | `/up` `sms_log` (§3.6 — when the SMS itself was sent/received) |
+| 48 | `sms_lost` | int | `/status` (§3.6 — device SMS audit-drop counter) |
+| 49 | `cell` | map | `/loc` envelope, optional (§13.2 — cell-tower location fallback) |
 
 **Sub-map keys:**
 
 `loc` object (inside `/loc` envelope): `lat=0, lon=1, acc=2, fix_ts=3, src=4`.
 
+`cell` object (inside `/loc` envelope, key 49 above, §13.2 — cell-tower location fallback):
+`mcc=0` (tstr, 3 digits), `mnc=1` (tstr, 2 or 3 digits), `tac=2` (uint, 0…65535), `ci=3` (uint,
+0…268435455), `rsrp=4` (int, dBm, optional). Unknown sub-keys are ignored, per §3.1's usual
+forward-compatibility rule.
+
 
 `p[]` pending request object (inside `/down` `book`): `n=0` (name), `s=1` (status pend/no).
 
+`cfg` object (inside `/down` `cfg`, key 38 above): `lock=0` (map, existing — see below), `ca=1`
+(map, `V02_DESIGN.md` §4.4: `{url=0 tstr, sha=1 bstr(32)}`; `sha` absent on an un-pin push, `url=""`),
+
 `lock` map (inside `/down` `cfg.lock`): `clear=0` (bool), `auto=1` (int minutes).
+
+`ca` map (inside `/down` `cfg.ca`, `V02_DESIGN.md` §4.4): `url=0` (tstr; `""` means un-pin), `sha=1`
+(bstr(32), the CA PEM's SHA-256 — same digest as the bootstrap bundle's `ca_sha`; absent when
+`url` is `""`).
+
+`cfg.sms[]` item (§3.6): `n=0` (tstr, contact display name, ≤16 code points and ≤24 UTF-8
+bytes — tighter than `book`/`contact_req`'s 48-byte name cap; see §3.6 for why), `p=1` (tstr,
+E.164 phone number). Note this is its own small namespace, distinct from `c[]`'s `{a, n, t}` above,
+even though both happen to use `n` for a display name.
+
+**JSON note (§3, §14.3):** the CBOR sub-map keys above are integers; in JSON the same *names* are
+used (`{"lock":{...}}`, `{"ca":{"url":...,"sha":...}}`), and, exactly like `sig`, a `bstr`-typed
+field (`ca_sha`/`cfg.ca.sha`) is base64url text without padding in JSON, raw bytes in CBOR.
 
 ---
 
@@ -1215,7 +1328,40 @@ a broker rule forwards it to the relay's authenticated HTTPS endpoint (§2).
 | `loc.src` | `gnss` \| `cell` | no (default `gnss`) | How the position was obtained |
 | `req` | string \| null | **yes** | The `id` of the `loc_req` (§3.2) this answers; `null` = an unsolicited periodic fix |
 | `cached` | bool | no (default `false`) | True when the device's rate limit (§13.3) answered from the last fix instead of powering GNSS |
+| `cell` | object, optional | no | The device's serving cell (§13.2's own sub-table below). Absent = today's behaviour exactly. |
 
+**`cell` (cell-tower location fallback).** GNSS and LTE cannot run at once on this modem, and a
+school pager is indoors most of the day, so a GNSS attempt usually ends in `no_fix`. The pager
+always knows its serving cell; it cannot turn that into coordinates, but the relay can (a
+pluggable third-party lookup, `relay/app/cellgeo.py`). The device sends `cell` whenever it answers
+without a GNSS fix (`loc:null, err:"no_fix", cell:{...}`); it MAY also send it alongside a real
+GNSS fix, in which case the GNSS fix wins and the cell is only recorded (on
+`devices/{d}.status.lastCell`, for diagnosis). **`loc.src:"cell"` fixes are produced by the relay,
+never by the pager** — the pager's own `loc.src` is always `gnss` or absent; a `cell` sub-map on
+the wire is raw cell identity, not a position.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `cell.mcc` | string, 3 digits | **yes** | Mobile Country Code. A string (not an int) so a leading zero survives. |
+| `cell.mnc` | string, 2 or 3 digits | **yes** | Mobile Network Code. Same leading-zero reason as `mcc`. |
+| `cell.tac` | uint, 0…65535 | **yes** | Tracking Area Code. |
+| `cell.ci` | uint, 0…268435455 (2²⁸-1) | **yes** | E-UTRAN Cell Identity (28 bits). |
+| `cell.rsrp` | int, dBm, -156…-30 | no | Reference Signal Received Power, if known. |
+
+A malformed `cell` (an out-of-range value, a missing required sub-field, a non-object) is treated
+as **absent**, not as a reason to drop the whole `/loc` envelope — the pager's actual fix/no_fix
+answer is still good and must still be processed. Unknown `cell` sub-keys are ignored, per §3.1's
+usual forward-compatibility rule. Relay-side: a resolved cell position is stored exactly like a
+fix (`src:"cell"`, the provider's own accuracy radius, `fixTs` = the envelope's `ts` or the relay's
+receive time if `ts` is 0) and fulfils the `loc_req` it answers, same as a real fix would; an
+unresolved cell behaves exactly like a plain `no_fix` answer, except the raw cell identity and
+timestamp are still recorded on `devices/{d}.status.lastCell` so the web app can show "last known
+cell" even with no position. See `docs/SERVER_PLAN.md` §5.6/§3 for the relay-side cache and data
+model, and `relay/app/cellgeo.py` for the pluggable provider (`google` / `opencellid` /
+`none` — the default, which makes no third-party call at all).
+
+The example is ~160 bytes; the worst case is ≤ ~200 bytes without `cell`, and ≤ ~260 bytes with a
+either way. A `/loc` payload that violates any rule above is malformed
 and is handled per §3.4 — logged and dropped, never crashing the ingest path.
 
 Relay-side: dedup on `id` exactly as §4.2 dedups an up message, in the same transaction that
@@ -1231,6 +1377,15 @@ device and the server disagree about is a limit that produces phantom `expired` 
 1. A `loc_req` arriving **less than `loc_min_s`** (default **120 s**) after the last fix *attempt*
   is answered **immediately** from the last fix, with `cached:true`, **without powering GNSS**.
   The window runs from the last *attempt*, not the last success, so a device in a basement cannot
+  be made to retry continuously by a user pressing a button. **Growing backoff alternative (`V02_DESIGN.md`
+  §5):** a device may replace this fixed `loc_min_s` window with a **growing backoff** instead —
+  5 minutes after the first failed attempt, doubling on every further failure, capped at 12 hours,
+  and reset to zero by a successful fix. This is *stricter* than the fixed `loc_min_s` window (it
+  only ever waits as long or longer), so it remains conformant with the rule above; a device
+  choosing it reports the seconds until its next allowed attempt in `/status`'s `loc_backoff_s`
+  (§5.1) so the relay and web app do not show a phantom "expired" while the device is deliberately
+  quiet. `loc_min_s` keeps its old meaning (the floor a fixed-window device enforces, or the
+  backoff-scheme device's minimum step) either way.
 2. Otherwise the device attempts a fix, **bounded by 60 s**, and then answers: the fix if it got
   one, otherwise `loc:null, err:"no_fix"`. The device always answers a `loc_req` it accepted;
   silence is reserved for firmware that does not implement `kind` at all (§3.2).
@@ -1238,6 +1393,7 @@ device and the server disagree about is a limit that produces phantom `expired` 
   start another one; it is answered by the same result, as a separate `/loc` publish with its own
   `req`.
 4. `loc_min_s` and the periodic interval `loc_period_s` are reported in `/status` (§5.1) for
+  display. They are the **device's** choices — see §12 item 8 for why. `loc_backoff_s` (§5.1) is reported the same way, for a device using item 1's growing-backoff amendment.
 
 **The relay mirrors this limit; it does not merely trust it.**
 
@@ -1252,6 +1408,10 @@ device and the server disagree about is a limit that produces phantom `expired` 
   battery: **who may make one is a server-side allow-list decision** — the same mechanism §4.2
   applies to messages, carrying a separate "may locate" right — enforced in the relay *and* in the
   store's own access rules, and never on the device. The device answers whatever it is asked;
+8. `cell` rides on the same rate-limited answer — it costs the pager nothing extra to attach (the
+  serving cell is already known from the modem's registration state, no separate radio activity),
+  so it does not get its own rate limit or its own `loc_req`/`/locate` path; it is only ever a
+  sub-field of an ordinary `/loc` answer (§13.2).
 
 ### 13.4 Request lifecycle
 
@@ -1299,18 +1459,51 @@ signature and the replay window before parsing and storing the message.
 
 ### 14.2 Per-device, per-direction counter (`n`)
 
+`n = (epoch << 20) | lo`. **`epoch` is 32 bits (`V02_DESIGN.md` §3), `lo` is 20 bits, so `n` is a 52-bit unsigned integer** (exact in JSON and in a Firestore int64;
+§3.1's range is `0…2⁵³-1`, one bit of headroom above the tightest packing). It is strictly
+increasing per publisher and is verified with a sliding window to absorb the jump when the epoch
+increments. CBOR encodes `n` at minimal length, so nothing on the wire grows until the epoch passes
+4095 — the same point at which the old 12-bit epoch would have wrapped and died. *(Why: TLS covers
+only pager↔broker, and only when the server is authenticated, which `V02_DESIGN.md` §4 makes optional with a
+deliberate fallback to no validation on a trust break — so TLS cannot be the sole replay defence;
+the counter is what stops a third-party broker, or an on-path attacker during that fallback,
+replaying an old signed `/down`. A 12-bit epoch would be exhausted after 4096 cold boots, a realistic lifetime for a device with a flaky battery; a 32-bit epoch is effectively unbounded.)*
 
 **Device side, `/up`, `/status`, `/loc`:**
 - `lo` (low 20 bits) lives in RTC memory (§9.3 `auth.up_lo`) and increments per publish (free).
+- `epoch` (32 bits) lives in NVS and increments only on cold boot or when `lo`
+  wraps. `n` itself is `uint64_t` end to end on the up path (signing, CBOR writer); only the NVS
+  `epoch` field and the wire encoding are width-dependent. 20 bits of `lo` = 1 M envelopes per epoch.
+  The relay's window (below) absorbs the jump at each cold boot regardless of epoch width.
+- **Migration:** a device upgrading from the 12-bit epoch reads its old NVS value once (a
+  distinct, narrower key), then keeps the epoch going forward in a new, wider key — the two never
+  share storage, so a half-migrated value can never be misread as either width.
 
 **Device side, `/down`:**
 - Device maintains `down_n` (highest accepted `n`) and a 64-bit bitmap of the 64 values below it in
+  RTC (§9.3). This path may stay `uint32_t` internally (the relay's own `downN` counts by one from
+  zero and has no epoch/lo split to begin with — see below), but MUST *parse* a `uint64_t` `n`
+  without rejecting it, since the relay signs with the same widened field. A `/down` failing
+  signature or window verification is treated as malformed (§3.4): count the error, log it, do
+  **not** render, **do not ack**. The relay then sees the message stay `sent`.
 
 **Relay side, per device (in `deviceSecrets/{d}`):**
 - `upN` (highest accepted `n` for device-originated messages), `upBits` (64-bit bitmap of values
+  below it). Both are plain integers with no epoch/lo split of their own — the split is a
+  device-side NVS/RTC storage detail (how a device budgets its own limited non-volatile bits), not
+  a wire or server-side concept; the relay only ever compares whole `n` values. Firestore stores
+  `upN` as an int64, which holds every value up to `2⁵³-1` exactly, same as JSON.
 - Accept an inbound `n` if `n > upN` (shift the window) or `upN − 64 < n ≤ upN` and its bit is clear;
+  otherwise drop as a replay and log a security event. This arithmetic does not depend on the width of `n`: a larger `n` changes only which absolute values appear, never the comparison.
 - The update is part of the same Firestore transaction that deduplicates by message `id`, so this adds
   no round trip.
+- `downN` (§14.5, the relay's own per-device `/down` counter) is unaffected by any of the above: it
+  counts by one from zero and is nowhere near either bound in practice, so it stays a plain
+  incrementing integer with no epoch/lo split — the wide form is for the *device's* counter, which has to survive thousands of cold boots, not the relay's.
+
+**Not implemented:** a signed resync handshake for the case where a device's NVS (and therefore its
+whole identity, not just this counter) is lost outright — with a 32-bit epoch this is needed only if NVS itself is gone, at which point re-provisioning is required anyway (`DEVICE_PLAN.md`
+§2.5).
 
 ### 14.3 Signature (`sig`)
 

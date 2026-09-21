@@ -215,6 +215,35 @@ would produce false rejections; 64 is the IPsec/DTLS convention and costs 8 byte
 a Firestore transaction on that one document; the same transaction is where the existing `wireIds`
 dedup already lives, so this adds no round trip.
 
+**Device side, `n` for `/up`, `/status`, `/loc`.** A counter split as `n = (epoch << 20) | lo`.
+`lo` lives in RTC memory and increments per publish (free). `epoch` lives in NVS and increments
+**only** on a cold boot (RTC CRC invalid) or when `lo` wraps, i.e. an NVS write a handful of times
+over the device's life. **v0.2 (`V02_DESIGN.md` §3): `epoch` widens from 12 to 32 bits — `n` is now
+a 52-bit unsigned integer, `uint64_t` end to end on the up path (signing, CBOR writer).** 20 bits of
+`lo` stays 1 M envelopes per epoch; 32 bits of epoch is 4 billion cold boots, in practice unbounded
+for this project. The relay's window absorbs the jump at each cold boot exactly as before — the
+width change affects only how large a jump the relay's `n > upN` comparison has to accept, never the
+comparison itself. RTC cost is unchanged (`lo` is still 20 bits in a 4-byte RTC field); the NVS
+`epoch` field grows from `uint16_t` to `uint32_t`. **Migration:** on first boot after an upgrade, the
+device reads its old 12-bit-epoch NVS key (`n_epoch`, `uint16_t`) once, then keeps the epoch going
+forward in a new key (`n_epoch32`, `uint32_t`) — the two are never the same storage slot, so a
+partially-migrated device can never misread one width as the other.
+
+*(see rationale: the epoch is 32 bits because a narrower one guarantees exhaustion. At 12 bits a
+pager whose battery dies a few times a day would run out within a year or two, and the failure is
+a live device that silently can no longer authenticate. The alternative considered is a resync
+handshake, in which the relay tells the device the last counter it saw. It is safe only as a
+signed, challenged exchange: the device sends a signed hello with a random value and the relay
+echoes it together with its `upN`. An unchallenged "your last n was X" can be replayed to wind the
+counter back. The handshake costs a round trip per cold boot and makes the pager wait for the
+relay before it can send; the epoch costs one flash write and nothing on the air. With a 32-bit
+epoch the handshake would matter only if flash were lost, and then the identity is gone too, so it
+is not built. Deriving `n` from the clock is ruled out: the clock comes from the network and the
+modem has been seen reporting the year 2070; one such value would lock the device out for good.)*
+
+**The epoch MUST rise on every cold boot** (`modes_boot()`), not only when `lo` wraps: `lo` is in
+RTC memory and restarts at 0, and the relay accepts only `n` above the highest it has seen.
+
 **Device side, `n` for `/down`.** Mirror of the relay's window: `down_n` + 32-bit bitmap in RTC
 (8 bytes). Re-publishes on an online edge (`PROTOCOL.md` §5.3) reuse the message `id` but get a fresh
 `n` from the relay, so dedup (§4.1 rule 7) still suppresses the re-render and the counter still
@@ -406,6 +435,25 @@ ever exposes ciphertext.
 
 ### 3.3 The broker CA
 
+**The CA is optional.** A bundle with no CA pointer leaves the pager running with certificate
+validation off; one with a pointer pins that CA. Production pins the broker's root
+(`broker_ca_pem_file` in `infra/envs/prod`). What pinning buys is confidentiality against an
+active attacker on the LTE→broker path, and protection of the MQTT password; envelopes are
+HMAC-authenticated either way (`PROTOCOL.md` §2.4). What it costs is that a broker which changes
+its root would strand every pager, so a pinned pager whose validation fails falls back to an
+unvalidated connection, says so, and can be given a new CA from the web app (`V02_DESIGN.md` §4).
+"DNS guarantees the server" is not a justification for skipping validation: the modem does no
+DNSSEC.
+
+**Every TLS profile used for MQTT MUST name a CA slot, even with validation off.** Without one the
+modem's MQTT client sends plaintext (`GOTCHAS.md`). The firmware keeps a placeholder certificate
+in the slot when nothing is pinned.
+
+**The CA is delivered as a pointer**, a URL and a SHA-256, never inline: a single MQTT message
+larger than about 1.5 kB cannot be received, and common roots are larger than that.
+
+The rest of this section gives the rationale for pinning.
+
 **Why a CA is involved at all.** The bootstrap hop uses none: the token authenticates the bundle.
 The CA is cargo for the *production* session, which pins one today (`net.cpp`'s hardcoded DigiCert
 root, `PROTOCOL.md` §6.1) and must keep doing so once every household's broker chains to a
@@ -429,18 +477,54 @@ bundle carries:
 | Self-hosted on GCE (`infra/modules/broker-gce`) | Let's Encrypt via certbot at first boot; falls back to plain 1883 only, logged, if DNS is not ready | ISRG Root X1, which `infra/` already names |
 | EMQX open source, untouched defaults | a self-signed demo certificate under `etc/certs/`, signed by a bundled test CA | that test CA — the "custom PEM" case; fine for the local compose stack, never for a deployment |
 
+Because the CA is delivered (see below) to the device, it needs **no built-in root store and no CA
+choice in the typed code**. The relay has to know the PEM it wants pinned: `BROKER_CA_PEM` in config
 (the Terraform in `infra/` knows which broker it deployed and sets it), otherwise resolved once at
 startup by a TLS handshake to the broker and matching the served chain's issuer against the
 `certifi` bundle, with the result shown on *Admin → Settings* so a wrong guess is visible before a
 device is issued. A self-signed or private CA is just a different PEM in the same field; nothing on
 the device changes.
 
+**v0.2 (`V02_DESIGN.md` §4.4): the CA no longer travels inline in the
+bundle.** The measured sizes above were always going to be a problem for a broker behind a root
+other than DigiCert's — ISRG Root X1 (Let's Encrypt) is 1939 bytes PEM and GTS Root R1 is 1911,
+both larger than the vendor library's 1540-byte receive buffer even before the rest of the bundle's
+fields are added, so a bundle carrying either inline cannot be received at all. The bootstrap
+bundle now carries a **pointer** instead — `ca_url` + `ca_sha` (§7's boot keys 40/41: a URL and the
+CA PEM's SHA-256) — and the device fetches the CA itself, over its own bootstrap-hop TLS socket
+(profile 3, validation off, exactly like the bundle fetch itself: trust comes from the hash, which
+arrived inside the already-encrypted bundle, not from the fetch), verifying the SHA-256 before
+trusting anything. Both fields absent means unpinned, same meaning as an empty inline `ca` before.
+Firmware **still accepts the old inline `ca` field** (key 34) if it ever sees one — a retained
+bundle from before an upgrade, or a relay that has not yet been upgraded — preferring the pointer
+when both are somehow present, so nothing already deployed breaks; a v0.2 relay itself never emits
+the inline form again. Once fetched (whether at bootstrap or via the `cfg.ca` push of §4.4 below),
+the CA PEM and its hash are stored in NVS exactly as before this change (`ca`/`ca_hash` in the
+`ident` namespace, §3.4) — the pointer only changes how the bytes arrive on the wire, not what the
+device keeps.
+
 The CA is written to modem NVRAM only when its hash differs from the stored `ca_hash`, instead of
 on every `net_init()`, as `net.cpp` does today. Today that call runs on every recovery.
+
+**Pushing a new CA without a new setup code (v0.2, `V02_DESIGN.md` §4.4).** The same pointer shape
+travels in an ordinary signed `/down` `cfg` message once the device is already provisioned:
+`cfg.ca = {url, sha}`, `url = ""` to un-pin. Two-phase apply, so a bad push cannot make things
+worse: write the new CA to a scratch slot, reconnect validated; commit (`ident_store`, slot 12,
+state `pinned`, ack `shown`) only if that connect succeeds, otherwise discard it, keep the previous
+CA and state, and do not ack (the relay re-publishes on the next online edge, per the newest-
+unacked-`cfg` rule §5.8 already gives `cfg.lock` — a pending CA push and a pending lock push are
+independent and do not clobber each other). Admin-triggered from the web app
+(`POST /api/admin/devices/{id}/ca`), and this is also how a device stuck in the `broken` trust state
+(`V02_DESIGN.md` §4.1-3.2 and §4.1-4.2 — `unpinned`/`pinned`/`broken`, entered when
+a validated connect fails and the device falls back to running unvalidated so pages keep arriving)
+gets repaired without anyone touching it.
 
 ### 3.4 What the device keeps
 
 NVS namespace `ident`, one key per bundle field (`dev_id`, `mqtt_pw`, `kdev` blob 32, `host`,
+`port`, `ca` ≤ 4 kB — fetched via the v0.2 `ca_url`/`ca_sha` pointer or, for a bundle predating it,
+still read inline, §3.3 — `apn`, `flags`, `label`), plus `ca_hash`, `n_epoch` (u16, legacy — read
+once for migration then superseded by `n_epoch32`, u32, §2.5 counter epoch,
 starts at 0) and `claimed` (u8, set on the first verified `book`, §4.3 — display only). Partition
 table: `partitions.csv` with `nvs` (24 kB — the address book of §4 shares it under its own
 namespace, and `msgq` of §5.6), `assets` (font and IME data, §5.2), `otadata`/`ota_0` reserved for
@@ -569,6 +653,45 @@ request — UTF-8 throughout),
 rewritten only when a `book` arrives, a request is made, or a nickname changes. RAM copy for
 rendering.
 
+### 4.4 Device-direct SMS (v0.2)
+
+Full design in `V02_DESIGN.md` §6; this is the pointer and the device-side
+summary. A second, independent contact list — **SMS contacts** — sits alongside the address book
+above, for a delivery path that does not go through the relay at all: the pager's own modem sending
+and receiving SMS directly, to a parent-managed allow-list.
+
+Device-direct SMS is in the firmware (`firmware/main/sms.c`). The composer sends to an SMS contact
+through `sms_queue_send()`, `cfg.sms` delivers the list, and inbound texts are read on `+CMTI`. Whether
+it runs depends on the SIM and the carrier preset: the preset's `sms_mo` flag (`firmware/main/carrier.c`)
+allows it on the US Mobile preset and refuses it on the Soracom preset. The relay-side route through the
+bridge phone is separate from this list.
+
+- **List management is server-only, same posture as the address book**, but with no device-side
+  request flow at all — there is no on-device equivalent of `contactreq` for this list. The pager
+  never adds, edits or removes an SMS contact itself; only the owner or an admin, in the web app.
+- **Delivery**: `/down cfg.sms` (`PROTOCOL.md` §3.6/§10, the `cfg` kind's `sms` sub-map), the *whole*
+  list every time (max 8 `{name, phone}` entries), newest-wins and acked `shown` on apply — the same
+  shape `cfg.lock`/`cfg.ca` already use, stored in its own NVS slot (not the `book` blob above, since
+  it has nothing to do with the message thread's recipient set).
+- **Composer/picker integration**: SMS contacts appear in the recipient picker and as `@name` in the
+  composer, tagged `sms` so they're visually distinct from a `book` contact. A message to one is
+  sent with `smsSend()` — GSM 7-bit when the whole message is in the basic alphabet (≤160
+  characters), UCS-2 otherwise (≤70 characters, and the composer enforces the tighter limit before
+  the character count can silently overflow into truncation); no concatenated SMS. The thread entry
+  shows `sent`/`FAILED` exactly like any other reply.
+- **Receiving** (`+CMTI` → read → delete from the SIM): a sender on the list is inserted into the
+  thread and alerts like any message; a sender not on the list is **never shown**.
+- **Audit is mandatory, not optional**, in both directions including blocked receives — see
+  `PROTOCOL.md` §3.6 for the exact `sms_log` envelope. This is the feature's real safety property:
+  even though the SMS itself never touches the relay, the relay still ends up with a complete
+  record of who the pager texted and who texted it, for the same reason the address book's
+  allow-list exists — a parent needs visibility into who can reach the kid outside the relay's own
+  channel, not just the ability to grant it.
+- **`UNVERIFIED`**: whether SMS works at all on the production SIM (data-only plans are a real
+  possibility of "no"), the modem's `+CMTI` timing under eDRX, and UCS-2 text-mode support on this
+  firmware — `smstest` (the debug console command, `V02_DESIGN.md` §2 item 7) exists to settle all
+  three on real hardware before this feature is relied on.
+
 ---
 
 ## 5. On-device UI
@@ -664,6 +787,11 @@ stays" free.
 `replace`. Every render draws the status bar, the screen's body, and a footer of key hints, into
 the framebuffer, then calls the existing diff-based partial refresh — only rows that changed are
 sent, so a status-bar-only change costs one 10-row window. The 20-partial/1-full cadence stays, but
+the full refresh is **not taken for messages arriving into an already-open Chat**: it is deferred to
+the moment the UI-awake window lapses. The one exception is a message that **changes the screen**, e.g. greeting → Chat: a
+partial refresh there leaves the old screen ghosted under the message, so `ui_incoming()` takes a
+full refresh for that first message only. The Chat screen has no key-hint footer; rows have 2 px
+of leading instead.
 
 while the device is meant to be asleep; message rows carry absolute `HH:MM` instead, which never
 change)*.
