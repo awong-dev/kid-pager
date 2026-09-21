@@ -28,6 +28,11 @@ service cloud.firestore {
 
       match /locations/{l} {
       }
+
+      match /smsLog/{l} {
+        allow read: if request.auth != null && (
+        );
+      }
     }
 
     match /allow/{e} {

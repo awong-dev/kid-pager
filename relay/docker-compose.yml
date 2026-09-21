@@ -31,6 +31,11 @@ services:
         condition: service_healthy
       firebase:
         condition: service_healthy
+    # required: false -- some Docker Compose versions resolve every service's env_file even for
+    # `down`, which fails when relay/.env is absent.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Emulator-aware settings pointing at the `firebase` service; they override .env values.
       FIRESTORE_EMULATOR_HOST: firebase:8080

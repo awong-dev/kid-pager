@@ -58,8 +58,10 @@ def create_app(
         return response
 
     app.include_router(webhooks.router)
+    app.include_router(ca.router)
     app.include_router(admin.router)
     app.include_router(dev.router)
+    app.include_router(devices.router)
     app.include_router(conversations.router)
     app.include_router(me.router)
     app.include_router(internal.router)

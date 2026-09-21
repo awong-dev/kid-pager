@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import socket
 import ssl
@@ -14,6 +15,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from app.config import Settings
+from app.store import cas as cas_store
 
 logger = logging.getLogger("relay.ca_resolve")
 
@@ -180,6 +182,24 @@ def _split_pem_certificates(data: bytes) -> list[bytes]:
         elif in_block:
             current.append(line)
     return blocks
+
+
+class PublicBaseUrlRequired(RuntimeError):
+    """A CA is configured but `PUBLIC_BASE_URL` is not: an unpinned bundle is refused."""
+
+
+def ca_pointer(pem: str, settings: Settings) -> tuple[str, bytes]:
+    """`pem` -> `(url, sha256_digest)`; remembers `pem` in `cas/{sha256hex}` for `GET /ca/...`."""
+    if not settings.public_base_url:
+        raise PublicBaseUrlRequired(
+            "a broker CA is configured but PUBLIC_BASE_URL is not set -- refusing to issue "
+            "an unpinned bundle/push silently"
+        )
+    sha = hashlib.sha256(pem.encode("utf-8")).digest()
+    sha_hex = sha.hex()
+    cas_store.remember(sha_hex, pem)
+    url = f"{settings.public_base_url.rstrip('/')}/ca/{sha_hex}.pem"
+    return url, sha
 
 
 def _to_pem(cert: x509.Certificate) -> str:

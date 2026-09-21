@@ -44,6 +44,9 @@ def sign_json(key: bytes, topic: str, obj: dict[str, Any]) -> bytes:
     """§14.3 JSON rule: MAC the minified JSON without `sig` (`P`), append `,"sig":"<tag>"}`."""
     if "sig" in obj:
         raise ValueError("obj must not already contain sig")
+    p = json.dumps(wirecbor.to_json_safe(obj), separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
     if not p.endswith(b"}"):
         raise ValueError("obj did not serialise to a JSON object")
     b64 = base64.urlsafe_b64encode(tag(key, topic, p)).rstrip(b"=").decode("ascii")

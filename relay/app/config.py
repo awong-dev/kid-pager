@@ -31,6 +31,9 @@ class Settings:
     # The broker CA PEM; wins over auto-resolve. Empty: `app/ca_resolve.py` looks it up;
     # if that fails, bundles carry no `ca`.
     broker_ca_pem: str | None = None
+    # The relay's public base URL, for `GET /ca/{sha256hex}.pem` pointers. Empty with a CA
+    # configured makes `app/devsetup.py` and the CA-push route refuse.
+    public_base_url: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -38,9 +41,15 @@ class Settings:
             broker_api_url=os.environ.get(
                 "BROKER_API_URL", "http://localhost:18083/api/v5"
             ),
+            # .strip(): Secret Manager returns exactly the stored bytes, possibly with a
+            # trailing newline, which an HTTP header cannot carry.
+            broker_api_key=(os.environ.get("BROKER_API_KEY") or "").strip() or None,
+            broker_api_secret=(os.environ.get("BROKER_API_SECRET") or "").strip() or None,
+            webhook_key=os.environ.get("WEBHOOK_KEY", "").strip(),
             dev_mode=os.environ.get("DEV_MODE", "") == "1",
             google_cloud_project=os.environ.get("GOOGLE_CLOUD_PROJECT") or None,
             firestore_emulator_host=os.environ.get("FIRESTORE_EMULATOR_HOST") or None,
             firebase_auth_emulator_host=os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or None,
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
+            public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
         )

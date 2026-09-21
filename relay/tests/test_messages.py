@@ -1,4 +1,5 @@
 """Direct tests of `app.store.messages` against the Firestore emulator, including the
+`create_message` wireId dedup invariant."""
 
 from __future__ import annotations
 

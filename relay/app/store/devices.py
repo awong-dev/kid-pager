@@ -3,16 +3,41 @@
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.db.firestore import get_db
+from app.wire import CellInfo
+
+# `phone` is a real E.164 number, never an alias reference (same shape as `app/wire.py`'s
+_SMS_PHONE_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+SMS_CONTACT_NAME_MAX_CODEPOINTS = 16
+# Names are capped at 24 UTF-8 bytes so 8 maximal `cfg.sms` entries fit the 640-byte signed
+# envelope limit (570 bytes JSON, 421 CBOR; docs/PROTOCOL.md §3.3).
+SMS_CONTACT_NAME_MAX_UTF8_BYTES = 24
+MAX_SMS_CONTACTS = 8
 
 # More than 20 failures in 10 minutes on one device raises `status.authAlarm`.
 AUTH_ALARM_THRESHOLD = 20
 AUTH_ALARM_WINDOW_S = 600
+
+
+class LastCell(BaseModel):
+    """The pager's last reported serving cell, resolved or not (docs/PROTOCOL.md §13.2)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mcc: str
+    mnc: str
+    tac: int
+    ci: int
+    rsrp: int | None = None
+    ts: int | None = None
 
 
 class DeviceStatus(BaseModel):
@@ -27,10 +52,49 @@ class DeviceStatus(BaseModel):
     fw: str | None = None
     locPeriodS: int | None = None
     locMinS: int | None = None
+    # Trust state and the pinned CA's short fingerprint.
+    caFp: str | None = None
+    # The device's own reported location backoff.
+    locBackoffS: int | None = None
+    # Device SMS audit-queue drop counter.
+    smsLost: int | None = None
     updatedAt: datetime | None = None
     # Set once `sigFailures` crosses AUTH_ALARM_THRESHOLD within AUTH_ALARM_WINDOW_S; cleared on
     # key rotation.
     authAlarm: bool | None = None
+    lastCell: LastCell | None = None
+
+
+class SmsContact(BaseModel):
+    """One `smsContacts` entry: `name` 1-16 code points, no control characters; `phone` E.164."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    phone: str
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not (1 <= len(value) <= SMS_CONTACT_NAME_MAX_CODEPOINTS):
+            raise ValueError(
+                f"sms contact name {value!r} must be 1-{SMS_CONTACT_NAME_MAX_CODEPOINTS} "
+                "characters"
+            )
+        if _CONTROL_CHAR_RE.search(value):
+            raise ValueError(f"sms contact name {value!r} contains control characters")
+        if len(value.encode("utf-8")) > SMS_CONTACT_NAME_MAX_UTF8_BYTES:
+            raise ValueError(
+                f"sms contact name {value!r} exceeds {SMS_CONTACT_NAME_MAX_UTF8_BYTES} UTF-8 bytes"
+            )
+        return value
+
+    @field_validator("phone")
+    @classmethod
+    def _check_phone(cls, value: str) -> str:
+        if not _SMS_PHONE_RE.match(value):
+            raise ValueError(f"sms contact phone {value!r} is not a valid E.164 number")
+        return value
 
 
 class Device(BaseModel):
@@ -44,6 +108,12 @@ class Device(BaseModel):
     revokedAt: datetime | None = None
     locatableBy: list[str] = []
     status: DeviceStatus = DeviceStatus()
+    # The SMS contact allow-list, the relay's source of truth, pushed as `/down cfg.sms` on every
+    # change; `pendingCfgSms` tracks what the device has acked.
+    smsContacts: list[SmsContact] = []
+    # Carrier APN baked into this device's setup codes and bundles
+    # (app/apn_presets.py). None = carrier default.
+    apn: str | None = None
     # "password" is the unsigned legacy device; "hmac" signs every `/up`, `/status` and `/loc`
     # envelope with its `deviceSecrets` key.
     authMode: Literal["password", "hmac"] = "hmac"
@@ -67,6 +137,7 @@ def create_device(
     mqtt_password_hash: str,
     default_to_uid: str | None = None,
     auth_mode: Literal["password", "hmac"] = "hmac",
+    apn: str | None = None,
 ) -> Device:
     """`mqtt_password_hash` is accepted but not stored; the hash lives in `deviceSecrets/{d}`."""
     ref = _devices().document(device_id)
@@ -74,6 +145,7 @@ def create_device(
         {
             "ownerUid": owner_uid,
             "label": label,
+            "apn": apn,
             "mqttUsername": mqtt_username,
             "defaultToUid": default_to_uid,
             "revokedAt": None,
@@ -123,6 +195,18 @@ def set_locatable_by(device_id: str, uids: list[str]) -> None:
     _devices().document(device_id).update({"locatableBy": uids})
 
 
+def set_sms_contacts(device_id: str, contacts: list[SmsContact]) -> None:
+    """Stores the whole SMS contact list, replacing the old one; the API has validated it."""
+    _devices().document(device_id).set(
+        {"smsContacts": [c.model_dump() for c in contacts]}, merge=True
+    )
+
+
+def set_apn(device_id: str, apn: str | None) -> None:
+    """The caller has validated `apn`; it takes effect at the next setup code, nothing is pushed."""
+    _devices().document(device_id).set({"apn": apn}, merge=True)
+
+
 def set_provision_state(device_id: str, state: Literal["issued", "provisioned"]) -> None:
     """Written "issued" on create and rotate; "provisioned" on the first signed `/status`."""
     _devices().document(device_id).set({"provisionState": state}, merge=True)
@@ -158,6 +242,22 @@ def clear_auth_alarm(device_id: str) -> None:
     """Clears the auth alarm; called on key rotation."""
     _devices().document(device_id).set(
         {"authFailureTimes": [], "status": {"authAlarm": False}}, merge=True
+    )
+
+
+        {
+            "status": {
+                "lastCell": {
+                    "mcc": cell.mcc,
+                    "mnc": cell.mnc,
+                    "tac": cell.tac,
+                    "ci": cell.ci,
+                    "rsrp": cell.rsrp,
+                    "ts": ts,
+                }
+            }
+        },
+        merge=True,
     )
 
 

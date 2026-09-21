@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+import cbor2
 import pytest
 
+from app import devauth, wire, wirecbor
 
 VECTORS_PATH = Path(__file__).resolve().parents[2] / "tools" / "authvectors.json"
 VECTORS: list[dict[str, Any]] = json.loads(VECTORS_PATH.read_text())
@@ -184,3 +186,72 @@ def test_is_cbor_detects_first_byte():
     assert wirecbor.is_cbor(bytes([0xBF]))
     assert not wirecbor.is_cbor(b"{}")
     assert not wirecbor.is_cbor(b"")
+# docs/PROTOCOL.md §0, §3.1: an unknown CBOR integer key is dropped, not a decode failure.
+
+
+def test_decode_drops_a_single_unknown_integer_key_not_the_whole_envelope():
+    # Key 99 is not in wirecbor.KEYMAP; it sits alongside two keys the relay knows.
+    raw = cbor2.dumps({0: 1, 21: "online", 99: "from-the-future"})
+    decoded = wirecbor.decode(raw)
+    assert decoded == {"v": 1, "state": "online"}
+
+
+def test_decode_envelope_bytes_accepts_cbor_with_an_unknown_key():
+    raw = cbor2.dumps({0: 1, 21: "online", 25: "s_aabbccdd", 99: "from-the-future"})
+    result = wire.decode_envelope_bytes(raw)
+    assert result is not None
+    data, encoding = result
+    assert encoding == "cbor"
+    assert data == {"v": 1, "state": "online", "session": "s_aabbccdd"}
+
+
+def test_to_json_safe_base64url_encodes_bytes_recursively():
+    obj = {"cfg": {"ca": {"url": "https://x/y.pem", "sha": b"\x00\x01\xfe\xff"}}}
+    safe = wirecbor.to_json_safe(obj)
+    assert safe["cfg"]["ca"]["url"] == "https://x/y.pem"
+    assert safe["cfg"]["ca"]["sha"] == "AAH-_w"  # base64url, no padding
+    json.dumps(safe)
+
+
+def test_to_json_safe_leaves_non_bytes_values_unchanged():
+    obj = {"a": 1, "b": [1, "x", None, {"c": True}]}
+    assert wirecbor.to_json_safe(obj) == obj
+# docs/PROTOCOL.md §13.2, §10: the `/loc` `cell` sub-map, key 49 (mcc=0 mnc=1 tac=2 ci=3 rsrp=4).
+
+
+def test_wirecbor_cell_round_trips():
+    obj = {"cell": {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95}}
+    encoded = wirecbor.encode(obj)
+    assert wirecbor.decode(encoded) == obj
+
+
+def test_wirecbor_cell_encodes_at_key_49_with_expected_submap():
+    encoded = wirecbor.encode({"cell": {"mcc": "310", "mnc": "41", "tac": 1, "ci": 2}})
+    assert encoded == cbor2.dumps({49: {0: "310", 1: "41", 2: 1, 3: 2}})
+
+
+def test_wirecbor_cell_unknown_subkey_is_dropped_not_raised():
+    """§13.2: unknown `cell` sub-keys (99 here) are ignored and must not fail the decode."""
+    raw = cbor2.dumps({49: {0: "310", 1: "410", 2: 12345, 3: 87654321, 99: "future"}})
+    decoded = wirecbor.decode(raw)
+    assert decoded == {"cell": {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321}}
+
+
+def test_loc_envelope_with_cell_example_cbor_hex():
+    """An example `/loc` answering `no_fix` with a `cell`: the exact CBOR bytes."""
+    obj = {
+        "v": 1,
+        "id": "l_3c9a11f0",
+        "ts": 1757700000,
+        "loc": None,
+        "req": "m_7f3a2b10",
+        "err": "no_fix",
+        "cell": {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95},
+    }
+    encoded = wirecbor.encode(obj)
+    assert wirecbor.decode(encoded) == obj
+    # Pinned so a change to key ordering or encoding is a deliberate diff.
+    assert (
+        encoded.hex()
+        == "a70001016a6c5f3363396131316630021a68c45fa008f6096a6d5f37663361326231300b666e6f5f6669781831a50063333130016334313002193039031a05397fb104385e"
+    )

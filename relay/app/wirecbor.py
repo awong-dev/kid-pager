@@ -1,11 +1,14 @@
 """CBOR wire envelope (docs/PROTOCOL.md §10): integer-keyed maps on the wire, text keys in JSON.
+Only keys are renamed, one level down for nested shapes; `KEYMAP` is the flat namespace."""
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import cbor2
 
+# docs/PROTOCOL.md §10: one flat integer namespace; new fields take the next free integer.
 KEYMAP: dict[str, int] = {
     "v": 0,
     "id": 1,
@@ -46,6 +49,19 @@ KEYMAP: dict[str, int] = {
     "label": 36,
     "apn": 37,
     "cfg": 38,
+    "tls": 39,
+    "ca_url": 40,
+    "ca_sha": 41,
+    "ca_fp": 42,
+    "loc_backoff_s": 43,
+    # `/up kind:"sms_log"` fields; `body`/`id`/`ts`/`kind`/`n`/`sig` reuse keys above.
+    "peer": 44,
+    "dir": 45,
+    "st": 46,
+    "sms_ts": 47,
+    "sms_lost": 48,
+    # `/loc` optional `cell` sub-map (docs/PROTOCOL.md §13.2).
+    "cell": 49,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
@@ -54,17 +70,30 @@ LOC_KEYMAP: dict[str, int] = {"lat": 0, "lon": 1, "acc": 2, "fix_ts": 3, "src": 
 CONTACT_KEYMAP: dict[str, int] = {"a": 0, "n": 1, "t": 2}
 REQUEST_KEYMAP: dict[str, int] = {"n": 0, "s": 1}
 LOCK_KEYMAP: dict[str, int] = {"clear": 0, "auto": 1}
+# `cfg.ca = {url, sha}`.
+CA_KEYMAP: dict[str, int] = {"url": 0, "sha": 1}
+# `cfg.sms = [{n, p}, ...]`, one entry per SMS contact; its own namespace, unrelated to
+# `CONTACT_KEYMAP` though both use `n`.
+SMS_CONTACT_KEYMAP: dict[str, int] = {"n": 0, "p": 1}
+# PROTOCOL.md §10's `cfg` sub-map: `lock=0`, `ca=1`, `sms=2`; 3 (`wifi`) is retired, do not reuse.
+# docs/PROTOCOL.md §13.2: `cell = {mcc, mnc, tac, ci, rsrp}`.
+CELL_KEYMAP: dict[str, int] = {"mcc": 0, "mnc": 1, "tac": 2, "ci": 3, "rsrp": 4}
 
 _REVERSE_LOC = {v: k for k, v in LOC_KEYMAP.items()}
 _REVERSE_CONTACT = {v: k for k, v in CONTACT_KEYMAP.items()}
 _REVERSE_REQUEST = {v: k for k, v in REQUEST_KEYMAP.items()}
 _REVERSE_LOCK = {v: k for k, v in LOCK_KEYMAP.items()}
+_REVERSE_CA = {v: k for k, v in CA_KEYMAP.items()}
+_REVERSE_SMS_CONTACT = {v: k for k, v in SMS_CONTACT_KEYMAP.items()}
 _REVERSE_CFG = {v: k for k, v in CFG_KEYMAP.items()}
+_REVERSE_CELL = {v: k for k, v in CELL_KEYMAP.items()}
 
 
 def _value_to_int_keys(name: str, value: Any) -> Any:
     if name == "loc" and isinstance(value, dict):
         return {LOC_KEYMAP[k]: v for k, v in value.items()}
+    if name == "cell" and isinstance(value, dict):
+        return {CELL_KEYMAP[k]: v for k, v in value.items()}
     if name == "c" and isinstance(value, list):
         return [{CONTACT_KEYMAP[k]: v for k, v in item.items()} for item in value]
     if name == "p" and isinstance(value, list):
@@ -74,6 +103,15 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
         for k, v in value.items():
             if k == "lock" and isinstance(v, dict):
                 out[CFG_KEYMAP["lock"]] = {LOCK_KEYMAP[lk]: lv for lk, lv in v.items()}
+            elif k == "ca" and isinstance(v, dict):
+                # `cfg.ca = {url, sha}`; `sha` is absent on an un-pin push (`url=""`, §4.4).
+                out[CFG_KEYMAP["ca"]] = {CA_KEYMAP[ck]: cv for ck, cv in v.items()}
+            elif k == "sms" and isinstance(v, list):
+                # `cfg.sms = [{n, p}, ...]`: the whole list, republished each time; empty means no
+                # contacts.
+                out[CFG_KEYMAP["sms"]] = [
+                    {SMS_CONTACT_KEYMAP[sk]: sv for sk, sv in item.items()} for item in v
+                ]
             else:
                 # §3.2: unknown members of cfg are ignored: a future member passes through under
                 # its JSON name.
@@ -85,6 +123,9 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
 def _value_to_names(name: str, value: Any) -> Any:
     if name == "loc" and isinstance(value, dict):
         return {_REVERSE_LOC[k]: v for k, v in value.items()}
+    if name == "cell" and isinstance(value, dict):
+        # §13.2: unknown sub-keys are ignored: dropped, not raised, like unknown top-level keys.
+        return {_REVERSE_CELL[k]: v for k, v in value.items() if k in _REVERSE_CELL}
     if name == "c" and isinstance(value, list):
         return [{_REVERSE_CONTACT[k]: v for k, v in item.items()} for item in value]
     if name == "p" and isinstance(value, list):
@@ -94,6 +135,12 @@ def _value_to_names(name: str, value: Any) -> Any:
         for k, v in value.items():
             if k == CFG_KEYMAP["lock"] and isinstance(v, dict):
                 out["lock"] = {_REVERSE_LOCK[lk]: lv for lk, lv in v.items()}
+            elif k == CFG_KEYMAP["ca"] and isinstance(v, dict):
+                out["ca"] = {_REVERSE_CA[ck]: cv for ck, cv in v.items()}
+            elif k == CFG_KEYMAP["sms"] and isinstance(v, list):
+                out["sms"] = [
+                    {_REVERSE_SMS_CONTACT[sk]: sv for sk, sv in item.items()} for item in v
+                ]
             else:
                 out[_REVERSE_CFG.get(k, k)] = v
         return out
@@ -109,8 +156,22 @@ def translate_to_names(raw: dict[int, Any]) -> dict[str, Any]:
     """Inverse of `translate_to_int`; unknown integer keys are dropped, not raised (§3.1)."""
     result: dict[str, Any] = {}
     for k, v in raw.items():
+        name = REVERSE_KEYMAP.get(k)
+        if name is None:
+            continue
         result[name] = _value_to_names(name, v)
     return result
+
+
+def to_json_safe(obj: Any) -> Any:
+    """Replaces every `bytes` value with unpadded base64url text, as JSON cannot carry bytes."""
+    if isinstance(obj, bytes):
+        return base64.urlsafe_b64encode(obj).rstrip(b"=").decode("ascii")
+    if isinstance(obj, dict):
+        return {k: to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_json_safe(v) for v in obj]
+    return obj
 
 
 def map_header(count: int) -> bytes:

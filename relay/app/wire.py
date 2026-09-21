@@ -60,7 +60,13 @@ def resolve_ts(ts: int) -> int:
     return ts if ts != 0 else int(time.time())
 
 
+#: `n` is a 52-bit counter; `2**53` is the exact bound (docs/PROTOCOL.md §3.1, §14.2).
+N_MAX_EXCLUSIVE = 2**53
+
+
 def _check_n_range(value: int | None) -> int | None:
+    """§14.2: `n` is a replay counter on every signed envelope (`/up`, `/status`, `/loc`)."""
+    if value is not None and not (0 <= value < N_MAX_EXCLUSIVE):
         raise ValueError("n out of range")
     return value
 
@@ -153,12 +159,33 @@ class StatusEnvelope(BaseModel):
     # §4.5/§5.1: display only; stored as reported, never written back.
     loc_period_s: int | None = None
     loc_min_s: int | None = None
+    # CA trust state (optional): trust state and the first 16 hex chars of the pinned CA's SHA-256.
+    ca_fp: str | None = None
+    # Seconds until the device's own backoff next allows an attempt, 0 = now (optional); the bound
+    # is generous so a backoff retune is not rejected.
+    loc_backoff_s: int | None = None
+    # Count of sms_log audit entries dropped for lack of NVS queue space, normally 0 (optional).
+    sms_lost: int | None = None
     # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
     n: int | None = None
 
     @classmethod
     def _check_loc_timing(cls, value: int | None) -> int | None:
         if value is not None and not (0 <= value <= 86400):
+        return value
+
+    @field_validator("ca_fp")
+    @classmethod
+    def _check_ca_fp(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[0-9a-f]{16}", value):
+            raise ValueError("ca_fp must be 16 lowercase hex chars")
+        return value
+
+    @field_validator("sms_lost")
+    @classmethod
+    def _check_sms_lost(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("sms_lost must be >= 0")
         return value
 
     @field_validator("n")
@@ -288,6 +315,7 @@ def decode_envelope_bytes(raw: bytes) -> tuple[dict[str, Any], EnvelopeEncoding]
         try:
             data = wirecbor.decode(raw)
         except Exception:  # noqa: BLE001 -- cbor2 raises several distinct exception types
+            # An unknown integer key is dropped by wirecbor.translate_to_names (§3.1), not raised.
             return None
         if not isinstance(data, dict):
             return None
@@ -361,6 +389,42 @@ class LocFix(BaseModel):
         return value
 
 
+# Cell sub-keys mcc=0, mnc=1, tac=2, ci=3, rsrp=4 (app/wirecbor.py's CELL_KEYMAP); `mcc`/`mnc` are
+# strings so a leading zero ("05") survives.
+_MCC_RE = re.compile(r"^\d{3}$")
+_MNC_RE = re.compile(r"^\d{2,3}$")
+CELL_TAC_MAX = 65535
+CELL_CI_MAX = 268_435_455  # 2**28 - 1: E-UTRAN cell identity is 28 bits.
+CELL_RSRP_MIN = -156
+CELL_RSRP_MAX = -30
+
+
+class CellInfo(BaseModel):
+    """`cell` sub-map on a `/loc` (§13.2): the serving cell, sent with `no_fix` or a fix."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mcc: str
+    mnc: str
+    tac: int = Field(ge=0, le=CELL_TAC_MAX)
+    ci: int = Field(ge=0, le=CELL_CI_MAX)
+    rsrp: int | None = Field(default=None, ge=CELL_RSRP_MIN, le=CELL_RSRP_MAX)
+
+    @field_validator("mcc")
+    @classmethod
+    def _check_mcc(cls, value: str) -> str:
+        if not _MCC_RE.match(value):
+            raise ValueError("cell.mcc must be exactly 3 digits")
+        return value
+
+    @field_validator("mnc")
+    @classmethod
+    def _check_mnc(cls, value: str) -> str:
+        if not _MNC_RE.match(value):
+            raise ValueError("cell.mnc must be 2 or 3 digits")
+        return value
+
+
 class LocEnvelope(BaseModel):
     """A payload on `pager/{device_id}/loc` (§13.2); `loc` and `req` are required keys, nullable."""
 
@@ -373,8 +437,26 @@ class LocEnvelope(BaseModel):
     req: str | None
     cached: bool = False
     err: Literal["no_fix", "disabled"] | None = None
+    # Optional serving cell; a malformed one is dropped by `_drop_malformed_cell`, not rejected.
+    cell: CellInfo | None = None
     # §14.2: present on every signed envelope.
     n: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_malformed_cell(cls, data: Any) -> Any:
+        """§13.2: a malformed `cell` is treated as absent; the fix/no_fix answer is still used."""
+        if not isinstance(data, dict) or "cell" not in data:
+            return data
+        cell = data["cell"]
+        if cell is None:
+            return data
+        try:
+            CellInfo.model_validate(cell)
+        except Exception:  # noqa: BLE001 -- any validation error means "treat as absent"
+            data = dict(data)
+            data.pop("cell", None)
+        return data
 
     @field_validator("n")
     @classmethod
@@ -409,3 +491,68 @@ class LocEnvelope(BaseModel):
         if self.loc is not None and self.err is not None:
             raise ValueError("loc and err are mutually exclusive")
         return self
+
+
+# `peer` is always a real E.164 number, never an alias reference; same shape as `app/ingest.py`'s
+_SMS_PEER_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+SMS_LOG_DIR_VALUES = ("out", "in")
+SMS_LOG_ST_VALUES = ("sent", "failed", "recv", "blocked")
+# The SMS text may be empty (up to 160 chars), so it does not use `validate_body`.
+SMS_LOG_BODY_MAX_CODEPOINTS = 160
+
+
+class SmsLogEnvelope(BaseModel):
+    """An `/up` `kind:"sms_log"` payload: the pager's direct SMS, audited and never routed."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    v: int = 1
+    id: str
+    ts: int
+    peer: str
+    dir: Literal["out", "in"]
+    st: Literal["sent", "failed", "recv", "blocked"]
+    body: str = ""
+    sms_ts: int
+    # §14.2: present on every signed envelope; optional so password-mode devices are not rejected
+    # by shape.
+    n: int | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        if not ID_RE.match(value):
+            raise ValueError("invalid id format")
+        return value
+
+    @field_validator("ts")
+    @classmethod
+    def _check_ts(cls, value: int) -> int:
+        validate_ts(value)
+        return value
+
+    @field_validator("peer")
+    @classmethod
+    def _check_peer(cls, value: str) -> str:
+        if not _SMS_PEER_RE.match(value):
+            raise ValueError("sms_log peer is not a valid E.164 phone number")
+        return value
+
+    @field_validator("body")
+    @classmethod
+    def _check_body(cls, value: str) -> str:
+        if len(value) > SMS_LOG_BODY_MAX_CODEPOINTS:
+            raise ValueError("sms_log body exceeds 160 Unicode code points")
+        return value
+
+    @field_validator("sms_ts")
+    @classmethod
+    def _check_sms_ts(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("sms_ts must be >= 0")
+        return value
+
+    @field_validator("n")
+    @classmethod
+    def _check_n(cls, value: int | None) -> int | None:
+        return _check_n_range(value)

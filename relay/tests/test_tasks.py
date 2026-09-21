@@ -25,6 +25,18 @@ def test_build_task_queue_unknown_mode_raises():
         tasks.build_task_queue("carrier-pigeon")
 
 
+def test_build_task_queue_cloud_tasks_mode_constructs_cloud_tasks_queue(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The no-client branch builds a real tasks_v2.CloudTasksClient(), whose constructor calls
+    # google.auth.default() and raises without GCP credentials; patch the class.
+    from google.cloud import tasks_v2
+
+    class _FakeClient:
+        pass
+
+    monkeypatch.setattr(tasks_v2, "CloudTasksClient", _FakeClient)
+
     queue = tasks.build_task_queue("cloud_tasks")
     assert isinstance(queue, tasks.CloudTasksQueue)
 

@@ -86,6 +86,10 @@ class BrokerClient:
         elif wire_encoding == "cbor":
             payload = wirecbor.encode(obj)
         else:
+            # An unsigned `cfg.ca` push still needs its raw-bytes `sha` as base64url text.
+            payload = json.dumps(
+                wirecbor.to_json_safe(obj), separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
         return self.publish(topic, payload, qos=1, retain=False)
 
     def healthcheck(self) -> bool:

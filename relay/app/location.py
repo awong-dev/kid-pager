@@ -18,6 +18,7 @@ from google.cloud.firestore import (
     Transaction,
 )
 
+from app import cellgeo
 from app.db.firestore import get_db, run_transaction
 from app.ids import new_id
 from app.routing import Routing
@@ -28,6 +29,7 @@ from app.store import messages as messages_store
 from app.store.backends import Backend as BackendRow
 from app.store.locations import LocationFix
 from app.store.messages import Message
+from app.wire import CellInfo, LocEnvelope, LocFix, resolve_ts
 
 logger = logging.getLogger("relay.location")
 
@@ -57,12 +59,34 @@ def _loc_wire_ids():
     return get_db().collection("locWireIds")
 
 
+def _fix_doc(env: LocEnvelope, loc: LocFix) -> dict:
     return {
         "ts": env.ts,
+        "fixTs": loc.fix_ts,
+        "lat": loc.lat,
+        "lon": loc.lon,
+        "accM": loc.acc,
+        "src": loc.src,
         "cached": env.cached,
         "reqId": env.req,
         "createdAt": SERVER_TIMESTAMP,
     }
+
+
+def _resolve_cell_fallback(cell: CellInfo, fix_ts: int) -> LocFix | None:
+    """Asks `app/cellgeo.py` to turn a `cell` into a position, called only when there is no GNSS fix
+    (docs/PROTOCOL.md §13.2). `fix_ts` is the envelope's `ts`, or the receive time when 0. Returns
+    `None` when resolution fails; nothing here may turn into a 500 on `POST /webhooks/mqtt`."""
+    try:
+        resolved = cellgeo.resolve(cell)
+    except Exception as exc:  # noqa: BLE001 -- must never break /webhooks/mqtt ingest
+        resolved = None
+    if resolved is None:
+        return None
+    try:
+        return LocFix(lat=resolved.lat, lon=resolved.lon, acc=resolved.acc_m, fix_ts=fix_ts, src="cell")
+    except Exception as exc:  # noqa: BLE001 -- a malformed provider response must not break ingest
+        return None
 
 
 def ingest_loc(device_id: str, env: LocEnvelope) -> None:
@@ -70,14 +94,28 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
     transaction (docs/PROTOCOL.md §13.2). Split across two, a failure after the first commit would
     make the redelivered QoS-1 message dedup away and leave the `loc_req` stuck `sent`.
 
+    `_resolve_cell_fallback` (an HTTP call, so before the transaction) may produce a `src:"cell"` fix
+    treated like a real one; a GNSS fix wins. `req_ref`/`loc_field` are built only when
+    `env.req is not None`.
+
     # The device lookup is not part of the transaction: an unknown device is dropped either way.
     # Needed when there is a `req` (for `owner_uid`) or a `cell` (for `set_last_cell`).
     owner_uid: str | None = None
+    if env.req is not None or env.cell is not None:
         device = devices_store.get_device(device_id)
         if device is None:
+            if env.req is not None:
+                logger.warning("/loc req=%s for unknown device=%s dropped", env.req, device_id)
         else:
             owner_uid = device.ownerUid
 
+    effective_loc = env.loc
+    if env.cell is not None and owner_uid is not None:
+        cell_fix_ts = resolve_ts(env.ts)
+        if effective_loc is None:
+
+    fix_ref = locations_store.new_location_ref(device_id) if effective_loc is not None else None
+    fix_data = _fix_doc(env, effective_loc) if effective_loc is not None else None
     ttl = loc_req_ttl_s()
 
     def _txn(transaction: Transaction) -> None:
@@ -166,13 +204,25 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
         return
 
 
+def _loc_message_field(env: LocEnvelope, loc: LocFix | None) -> dict:
     """The `loc` field of the `kind='loc'` message posted to each requester: the fix's shape, or
+    `{"err": ...}` when no position was available."""
+    if loc is not None:
         return {
+            "lat": loc.lat,
+            "lon": loc.lon,
+            "accM": loc.acc,
+            "fixTs": loc.fix_ts,
+            "src": loc.src,
             "cached": env.cached,
         }
     return {"err": env.err}
 
 
+def _loc_preview(loc_field: dict) -> str:
+    """`loc_field` is `_loc_message_field`'s output; a usable position (cell-resolved included) has no
+    `err` key."""
+    return "location" if "err" not in loc_field else f"location unavailable ({loc_field['err']})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +300,7 @@ def _fulfil_loc_req_in_txn(
         conv_data = {
             "uids": uids_sorted,
             "lastMessageAt": SERVER_TIMESTAMP,
+            "lastPreview": _loc_preview(loc_field),
             "unread": unread,
         }
         if conv_snap.exists:

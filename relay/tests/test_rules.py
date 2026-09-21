@@ -12,6 +12,8 @@ from firebase_admin import auth as fb_auth
 
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import cas as cas_store
+from app.store import cells as cells_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
@@ -386,6 +388,56 @@ def test_device_secrets_is_default_deny(two_pairs):
     assert resp_write.status_code == 403
 
 
+def test_cas_is_default_deny(two_pairs):
+    """`cas/{sha256hex}` has no client read path (the public read is `GET /ca/{sha256hex}.pem`):
+    unreadable by a registered user and by an admin."""
+    sha_hex = "ab" * 32
+    cas_store.remember(sha_hex, "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+
+    owner_token = mint_id_token("u1")
+    resp = _get(f"cas/{sha_hex}", owner_token)
+    assert resp.status_code == 403
+
+    fb_auth.create_user(uid="admin-cas", email="admin-cas@example.com")
+    users_store.create_user(uid="admin-cas", alias="admincas", display_name="Admin", role="admin")
+    fb_auth.set_custom_user_claims("admin-cas", {"admin": True})
+    admin_token = mint_id_token("admin-cas")
+    resp_admin = _get(f"cas/{sha_hex}", admin_token)
+    assert resp_admin.status_code == 403
+
+    resp_unauth = _get(f"cas/{sha_hex}", None)
+    assert resp_unauth.status_code == 403
+
+    resp_write = _write(f"cas/{sha_hex}", owner_token, {"pem": "hacked"})
+    assert resp_write.status_code == 403
+
+
+def test_cells_is_default_deny(two_pairs):
+    """`cells/{mcc}-{mnc}-{tac}-{ci}` (the cell geolocation cache, PROTOCOL.md §13.2) has no match
+    block: unreadable by a registered user and by an admin."""
+    cells_store.remember_resolved(
+        "310", "410", 12345, 87654321, lat=1.0, lon=2.0, acc_m=1000, provider="google"
+    )
+    key = cells_store.cache_key("310", "410", 12345, 87654321)
+
+    owner_token = mint_id_token("u1")
+    resp = _get(f"cells/{key}", owner_token)
+    assert resp.status_code == 403
+
+    fb_auth.create_user(uid="admin-cells", email="admin-cells@example.com")
+    users_store.create_user(uid="admin-cells", alias="admincells", display_name="Admin", role="admin")
+    fb_auth.set_custom_user_claims("admin-cells", {"admin": True})
+    admin_token = mint_id_token("admin-cells")
+    resp_admin = _get(f"cells/{key}", admin_token)
+    assert resp_admin.status_code == 403
+
+    resp_unauth = _get(f"cells/{key}", None)
+    assert resp_unauth.status_code == 403
+
+    resp_write = _write(f"cells/{key}", owner_token, {"lat": 999.0})
+    assert resp_write.status_code == 403
+
+
     """`contactRequests/{deviceId}_{reqId}` is readable by the device owner and a family admin of
     from app.store import contacts as contacts_store
 
@@ -419,3 +471,71 @@ def test_device_secrets_is_default_deny(two_pairs):
     assert resp_unauth.status_code == 403
 
 
+    """`devices/{id}/smsLog/{logId}` is readable by the owner and the device's family admin only; a
+    from app.store import sms as sms_store
+
+    devices_store.create_device(
+        device_id="pgr-rules-sms-1",
+        owner_uid="u2",
+        label="d",
+        mqtt_username="pgr-rules-sms-1",
+        mqtt_password_hash="x",
+    )
+    devices_store.set_locatable_by("pgr-rules-sms-1", ["u1"])
+    sms_store.create_log(
+        "pgr-rules-sms-1",
+        "s_rules1",
+        ts=1000,
+        sms_ts=1000,
+        dir_="out",
+        peer="+15550001111",
+        st="sent",
+        body="hi",
+    )
+
+    owner_token = mint_id_token("u2")
+    resp_owner = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", owner_token)
+    assert resp_owner.status_code == 200
+
+    # A `locate`-permission uid is neither owner nor admin: denied, though it can read the device's
+    # `locations`.
+    locate_token = mint_id_token("u1")
+    resp_locate = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", locate_token)
+    assert resp_locate.status_code == 403
+
+    other_token = mint_id_token("u3")
+    resp_other = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", other_token)
+    assert resp_other.status_code == 403
+
+    resp_unauth = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", None)
+    assert resp_unauth.status_code == 403
+
+    fb_auth.create_user(uid="admin-sms-1", email="admin-sms-1@example.com")
+    users_store.create_user(uid="admin-sms-1", alias="adminsms1", display_name="Admin", role="admin")
+    admin_token = mint_id_token("admin-sms-1")
+    resp_admin = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", admin_token)
+    assert resp_admin.status_code == 200
+
+    resp_write = _write(
+        "devices/pgr-rules-sms-1/smsLog/s_rules1", owner_token, {"body": "hacked"}
+    )
+    assert resp_write.status_code == 403
+
+
+def test_sms_contacts_field_not_client_writable(two_pairs):
+    """`devices/{id}.smsContacts` is a field of the readable device document; every client write is
+    denied by the blanket `allow write: if false`."""
+    devices_store.create_device(
+        device_id="pgr-rules-sms-2",
+        owner_uid="u2",
+        label="d",
+        mqtt_username="pgr-rules-sms-2",
+        mqtt_password_hash="x",
+    )
+    owner_token = mint_id_token("u2")
+    resp_write = _write(
+        "devices/pgr-rules-sms-2",
+        owner_token,
+        {"smsContacts": "hacked"},
+    )
+    assert resp_write.status_code == 403

@@ -17,8 +17,10 @@ from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
+from app.store import sms as sms_store
 from app.wire import (
     LocEnvelope,
+    SmsLogEnvelope,
     StatusEnvelope,
     UpEnvelope,
     resolve_ts,
@@ -65,6 +67,7 @@ class ContactReqEnvelope(BaseModel):
     @field_validator("n")
     @classmethod
     def _check_n(cls, value: int | None) -> int | None:
+        if value is not None and not (0 <= value < wire.N_MAX_EXCLUSIVE):
             raise ValueError("n out of range")
         return value
 
@@ -212,6 +215,11 @@ class Ingest:
             self._handle_contact_req(device_id, device, data, topic, payload)
             return
 
+        # `kind:"sms_log"` is dispatched the same way, before `UpEnvelope.model_validate`.
+        if data.get("kind") == "sms_log":
+            self._handle_sms_log(device_id, device, data, topic, payload)
+            return
+
         try:
             env = UpEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
@@ -260,6 +268,55 @@ class Ingest:
             return
 
 
+
+    def _handle_sms_log(
+        self,
+        device_id: str,
+        device: devices_store.Device | None,
+        data: dict[str, Any],
+        topic: str,
+        payload: bytes,
+    ) -> None:
+        """Store one `devices/{deviceId}/smsLog/{logId}` row (`app/store/sms.py`); not routed to
+        anyone. Same drop rules as `_handle_contact_req` for an unregistered/revoked device."""
+        if device is None:
+            logger.warning(
+                "sms_log %s from unregistered device %s dropped", data.get("id"), device_id
+            )
+            return
+        if device.revokedAt is not None:
+            logger.warning(
+                "SECURITY sms_log %s from revoked device %s dropped", data.get("id"), device_id
+            )
+            return
+
+        try:
+            env = SmsLogEnvelope.model_validate(data)
+        except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+            wire.log_malformed(topic, payload, str(exc))
+            return
+
+        created = sms_store.create_log(
+            device_id,
+            env.id,
+            ts=resolve_ts(env.ts),
+            sms_ts=env.sms_ts,
+            dir_=env.dir,
+            peer=env.peer,
+            st=env.st,
+            body=env.body,
+        )
+        # Logged whether this call created the row or found it already there (broker redelivery);
+        # `sms_store.create_log` dedups silently.
+        logger.info(
+            "sms_log %s device=%s dir=%s peer=%s st=%s%s",
+            env.id,
+            device_id,
+            env.dir,
+            env.st,
+            "" if created else " (duplicate, already stored)",
+        )
+        if env.st == "blocked":
 
     def _handle_ack(self, device_id: str, env: UpEnvelope) -> None:
         assert env.ack is not None and env.ack in ("shown", "read")
@@ -366,7 +423,15 @@ class Ingest:
             fw=env.fw,
             locPeriodS=env.loc_period_s,
             locMinS=env.loc_min_s,
+            tls=env.tls,
+            caFp=env.ca_fp,
+            locBackoffS=env.loc_backoff_s,
+            smsLost=env.sms_lost,
         )
+
+        # On a transition into `broken`, log a security event.
+        if env.tls == "broken" and previous_status.tls != "broken":
+            logger.error("SECURITY tls-broken device=%s", device_id)
 
         if env.state != "online":
             # docs/PROTOCOL.md §5.3: bare offline (retained or LWT) -> mark offline only.

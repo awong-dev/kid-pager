@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.wire import (
+    CellInfo,
     DownEnvelope,
     LocEnvelope,
     StatusEnvelope,
@@ -105,6 +106,94 @@ def test_status_invalid_session_format_is_malformed():
     with pytest.raises(ValidationError):
         StatusEnvelope.model_validate({"v": 1, "state": "offline", "session": "not-a-session"})
 # PROTOCOL.md §14.2: `n = (epoch << 20) | lo` with a 32-bit epoch, so `n` can exceed 2**32.
+
+
+def _online_status(**overrides: object) -> dict:
+    base = {
+        "v": 1,
+        "state": "online",
+        "mode": "sleep",
+        "batt_mv": 3280,
+        "rssi": -85,
+        "session": "s_aabbccdd",
+        "ts": 1_700_000_000,
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.parametrize("n", [0, 2**32 - 1, 2**32, 2**32 + 1, 2**53 - 1])
+def test_n_up_to_2_53_minus_1_is_accepted_on_every_signed_kind(n):
+    assert UpEnvelope.model_validate(
+        {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "n": n}
+    ).n == n
+    assert StatusEnvelope.model_validate(_online_status(n=n)).n == n
+    assert (
+        LocEnvelope.model_validate(
+            {
+                "v": 1,
+                "id": "l_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "loc": None,
+                "req": None,
+                "err": "no_fix",
+                "n": n,
+            }
+        ).n
+        == n
+    )
+
+
+@pytest.mark.parametrize("n", [2**53, 2**53 + 1, -1])
+def test_n_at_or_above_2_53_or_negative_is_rejected(n):
+    with pytest.raises(ValidationError):
+        UpEnvelope.model_validate(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "n": n}
+        )
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(n=n))
+# Unknown or new optional /status fields must never cause rejection; these are accepted.
+
+
+def test_status_accepts_tls_ca_fp_loc_backoff_s_sms_lost():
+    env = StatusEnvelope.model_validate(
+        _online_status(tls="broken", ca_fp="0123456789abcdef", loc_backoff_s=320, sms_lost=2)
+    )
+    assert env.tls == "broken"
+    assert env.ca_fp == "0123456789abcdef"
+    assert env.loc_backoff_s == 320
+    assert env.sms_lost == 2
+
+
+def test_status_tls_ca_fp_loc_backoff_s_sms_lost_are_optional():
+    env = StatusEnvelope.model_validate(_online_status())
+    assert env.tls is None
+    assert env.ca_fp is None
+    assert env.loc_backoff_s is None
+    assert env.sms_lost is None
+
+
+def test_status_rejects_bad_tls_value():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(tls="not-a-state"))
+
+
+def test_status_rejects_malformed_ca_fp():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(ca_fp="too-short"))
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(ca_fp="0123456789ABCDEF"))  # must be lowercase
+
+
+def test_status_rejects_negative_sms_lost():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(sms_lost=-1))
+# /status `loc_move_s`: the GNSS-while-moving interval.
+def test_status_still_ignores_a_genuinely_unknown_field():
+    env = StatusEnvelope.model_validate(_online_status(some_future_field="whatever"))
+    assert env.state == "online"
+
+
 def test_parse_envelope_bytes_rejects_oversize():
     assert parse_envelope_bytes(huge) is None
 
@@ -516,3 +605,101 @@ def test_loc_envelope_example_from_protocol_round_trips():
     assert env.req == "m_7f3a2b10"
     assert env.loc is not None
     assert env.loc.src == "gnss"
+
+
+def _cell(**overrides) -> dict:
+    obj = {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95}
+    obj.update(overrides)
+    return obj
+
+
+def test_cell_info_valid_full():
+    info = CellInfo.model_validate(_cell())
+    assert info.mcc == "310"
+    assert info.mnc == "410"
+    assert info.tac == 12345
+    assert info.ci == 87654321
+    assert info.rsrp == -95
+
+
+def test_cell_info_valid_without_rsrp():
+    info = CellInfo.model_validate(_cell(rsrp=None))
+    assert info.rsrp is None
+
+
+def test_cell_info_valid_two_digit_mnc_leading_zero_preserved():
+    info = CellInfo.model_validate(_cell(mnc="05"))
+    assert info.mnc == "05"
+
+
+def test_loc_envelope_no_fix_with_valid_cell():
+    """§13.2: "the pager sends `cell` whenever it answers without a GNSS
+    fix": `loc: null, err: "no_fix", cell: {...}`."""
+    obj = {
+        "v": 1,
+        "id": "l_3c9a11f0",
+        "ts": 1_700_000_000,
+        "loc": None,
+        "req": "m_7f3a2b10",
+        "err": "no_fix",
+        "cell": _cell(),
+    }
+    env = LocEnvelope.model_validate(obj)
+    assert env.loc is None
+    assert env.err == "no_fix"
+    assert env.cell is not None
+    assert env.cell.mcc == "310"
+    assert env.cell.ci == 87654321
+
+
+def test_loc_envelope_cell_absent_is_backward_compatible():
+    env = LocEnvelope.model_validate(_base_loc())
+    assert env.cell is None
+
+
+def test_loc_envelope_gnss_fix_wins_cell_is_only_recorded():
+    """PROTOCOL.md §13.2: a real `loc` and a `cell` validate together; no winner is picked."""
+    obj = _base_loc()
+    obj["cell"] = _cell()
+    env = LocEnvelope.model_validate(obj)
+    assert env.loc is not None
+    assert env.cell is not None
+
+
+@pytest.mark.parametrize(
+    "bad_cell",
+    [
+        {"mcc": "31", "mnc": "410", "tac": 1, "ci": 1},  # mcc not 3 digits
+        {"mcc": "310", "mnc": "4100", "tac": 1, "ci": 1},  # mnc too long
+        {"mcc": "31x", "mnc": "410", "tac": 1, "ci": 1},  # mcc non-digit
+        {"mcc": "310", "mnc": "410", "tac": -1, "ci": 1},  # tac out of range
+        {"mcc": "310", "mnc": "410", "tac": 65536, "ci": 1},  # tac out of range
+        {"mcc": "310", "mnc": "410", "tac": 1, "ci": -1},  # ci out of range
+        {"mcc": "310", "mnc": "410", "tac": 1, "ci": 268_435_456},  # ci out of range (2**28)
+        {"mcc": "310", "mnc": "410", "tac": 1, "ci": 1, "rsrp": -29},  # rsrp out of range
+        {"mcc": "310", "mnc": "410", "tac": 1, "ci": 1, "rsrp": -157},  # rsrp out of range
+        {"mcc": "310", "mnc": "410"},  # missing required tac/ci
+        "not-a-map",
+    ],
+)
+def test_loc_envelope_malformed_cell_is_treated_as_absent(bad_cell):
+    """PROTOCOL.md §13.2: a malformed cell is treated as absent; the rest of the envelope parses."""
+    obj = {
+        "v": 1,
+        "id": "l_3c9a11f0",
+        "ts": 1_700_000_000,
+        "loc": None,
+        "req": None,
+        "err": "no_fix",
+        "cell": bad_cell,
+    }
+    env = LocEnvelope.model_validate(obj)
+    assert env.cell is None
+    assert env.err == "no_fix"
+
+
+def test_loc_envelope_cell_null_is_absent():
+    obj = _base_loc()
+    obj["cell"] = None
+    env = LocEnvelope.model_validate(obj)
+    assert env.cell is None

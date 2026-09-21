@@ -17,8 +17,14 @@
       "queryScope": "COLLECTION",
       "fields": [
       ]
+    }
+  ],
+  "fieldOverrides": [
     {
       "collectionGroup": "locations",
+      "fieldPath": "createdAt",
+      "indexes": [
       ]
     }
+  ]
 }

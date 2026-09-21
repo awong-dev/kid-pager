@@ -11,7 +11,9 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from app import ca_resolve, wirecbor
 from app.broker import BrokerClient
 from app.config import Settings
 from app.store import setup_codes as setup_codes_store
@@ -172,12 +174,29 @@ class BootstrapDevice(BaseModel):
     k: bytes
     host: str
     port: int = DEFAULT_PORT
+    ca_url: str | None = None
+    ca_sha: bytes | None = None
     flags: int = 0
     label: str
     apn: str | None = None
 
+    @field_validator("ca_sha")
+    @classmethod
+    def _check_ca_sha_len(cls, value: bytes | None) -> bytes | None:
+        if value is not None and len(value) != 32:
+            raise ValueError("ca_sha must be a 32-byte SHA-256 digest")
+        return value
+
+    @model_validator(mode="after")
+    def _check_ca_pair(self) -> BootstrapDevice:
+        if (self.ca_url is None) != (self.ca_sha is None):
+            raise ValueError("ca_url and ca_sha must be both present or both absent")
+        return self
+
 
 def bundle(device: BootstrapDevice, bkey: bytes) -> bytes:
+    """CBOR-encode `device` (`docs/PROTOCOL.md` §10 boot keys), AES-256-GCM encrypt under `bkey`;
+    returns `nonce ‖ ciphertext ‖ tag`."""
     plain_obj: dict[str, Any] = {
         "v": 1,
         "id": device.id,
@@ -188,6 +207,9 @@ def bundle(device: BootstrapDevice, bkey: bytes) -> bytes:
         "flags": device.flags,
         "label": device.label,
     }
+    if device.ca_url is not None:
+        plain_obj["ca_url"] = device.ca_url
+        plain_obj["ca_sha"] = device.ca_sha
     if device.apn is not None:
         plain_obj["apn"] = device.apn
     plaintext = wirecbor.encode(plain_obj)
@@ -209,6 +231,7 @@ def issue(
     mqtt_password: str,
     hmac_key: bytes,
     host: str,
+    ca_pem: str | None,
     label: str,
     port: int = DEFAULT_PORT,
     flags: int = 0,
@@ -219,6 +242,9 @@ def issue(
 ) -> str:
     """Pushes the bootstrap credential, publishes the encrypted bundle retained to
     `pager/boot/{bid}/down`, records `setupCodes/{bid}` (never the token), returns the setup code.
+
+    `ca_pem` is pinned via a pointer (`ca_resolve.ca_pointer`); a missing `public_base_url` raises
+    `PublicBaseUrlRequired` rather than sending an unpinned bundle."""
     settings = settings if settings is not None else Settings.from_env()
     broker = broker if broker is not None else BrokerClient(settings)
 
@@ -227,12 +253,19 @@ def issue(
 
     emqx.ensure_boot_user(bid, bpw)
 
+    ca_url: str | None = None
+    ca_sha: bytes | None = None
+    if ca_pem:
+        ca_url, ca_sha = ca_resolve.ca_pointer(ca_pem, settings)
+
     device = BootstrapDevice(
         id=device_id,
         pw=mqtt_password,
         k=hmac_key,
         host=host,
         port=port,
+        ca_url=ca_url,
+        ca_sha=ca_sha,
         flags=flags,
         label=label,
         apn=apn,

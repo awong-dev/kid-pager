@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,15 +15,21 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from app import ca_resolve, devsetup, wirecbor
 from app.config import Settings
+from app.store import cas as cas_store
 from app.store import setup_codes as setup_codes_store
 from tests.fake_transport import FakeBrokerClient
 
 VECTORS_PATH = Path(__file__).resolve().parents[2] / "tools" / "setup_code_vectors.json"
 VECTORS: list[dict[str, Any]] = json.loads(VECTORS_PATH.read_text())
 VECTOR = VECTORS[0]
+# Second vector: pointer bundle (`ca_url`/`ca_sha`). The firmware host test reads only the first
+# occurrence of each field name, so this entry uses different CA field names.
+POINTER_VECTOR = next(v for v in VECTORS if v["label"] == "boot_bundle_ca_pointer")
 
 
+def _settings(*, public_base_url: str | None = None) -> Settings:
     return Settings(
         broker_api_url="http://emqx.test/api/v5",
         broker_api_key="k",
@@ -32,6 +39,7 @@ VECTOR = VECTORS[0]
         google_cloud_project=None,
         firestore_emulator_host=None,
         firebase_auth_emulator_host=None,
+        public_base_url=public_base_url,
     )
 
 
@@ -179,6 +187,8 @@ def test_bundle_round_trips_with_a_fresh_random_nonce():
         pw="pw",
         k=b"k" * 32,
         host="broker.example.com",
+        ca_url="https://relay.example.com/ca/" + "ab" * 32 + ".pem",
+        ca_sha=b"a" * 32,
         flags=0,
         label="Kid 2",
         apn="internet",
@@ -196,10 +206,50 @@ def test_bundle_round_trips_with_a_fresh_random_nonce():
             "k": b"k" * 32,
             "host": "broker.example.com",
             "port": devsetup.DEFAULT_PORT,
+            "ca_url": device.ca_url,
+            "ca_sha": device.ca_sha,
             "flags": 0,
             "label": "Kid 2",
             "apn": "internet",
         }
+
+
+def test_bundle_omits_ca_fields_entirely_when_unpinned():
+    device = devsetup.BootstrapDevice(
+        id="pgr-0003", pw="pw", k=b"k" * 32, host="broker.example.com", flags=0, label="Kid 3"
+    )
+    bkey = b"b" * 32
+    decoded = devsetup.decrypt_bundle(bkey, devsetup.bundle(device, bkey))
+    assert "ca_url" not in decoded
+    assert "ca_sha" not in decoded
+    assert "ca" not in decoded
+
+
+def test_bootstrap_device_rejects_ca_url_without_ca_sha():
+    with pytest.raises(ValueError, match="ca_url and ca_sha"):
+        devsetup.BootstrapDevice(
+            id="pgr-0004",
+            pw="pw",
+            k=b"k" * 32,
+            host="broker.example.com",
+            ca_url="https://relay.example.com/ca/" + "ab" * 32 + ".pem",
+            flags=0,
+            label="Kid 4",
+        )
+
+
+def test_bootstrap_device_rejects_a_short_ca_sha():
+    with pytest.raises(ValueError, match="32-byte"):
+        devsetup.BootstrapDevice(
+            id="pgr-0005",
+            pw="pw",
+            k=b"k" * 32,
+            host="broker.example.com",
+            ca_url="https://relay.example.com/ca/" + "ab" * 32 + ".pem",
+            ca_sha=b"too-short",
+            flags=0,
+            label="Kid 5",
+        )
 
 
 def test_decrypt_bundle_wrong_key_raises_invalid_tag():
@@ -211,16 +261,32 @@ def test_decrypt_bundle_wrong_key_raises_invalid_tag():
 
 
 def test_bundle_uses_wirecbor_keymap_for_every_field():
+    for name in (
+        "v",
+        "id",
+        "pw",
+        "k",
+        "host",
+        "port",
+        "ca_url",
+        "ca_sha",
+        "flags",
+        "label",
+        "apn",
+    ):
         assert name in wirecbor.KEYMAP
 
 
 def _issue(device_id: str, broker: FakeBrokerClient, emqx: _FakeEmqx, **kwargs: Any) -> str:
+    settings = kwargs.pop("settings", _settings())
     return devsetup.issue(
         device_id,
         mqtt_password=kwargs.pop("mqtt_password", "real-mqtt-password"),
         hmac_key=kwargs.pop("hmac_key", b"h" * 32),
         host=kwargs.pop("host", "broker.example.com"),
+        ca_pem=kwargs.pop("ca_pem", None),
         label=kwargs.pop("label", "Kid 1"),
+        settings=settings,
         broker=broker,  # type: ignore[arg-type]
         emqx=emqx,  # type: ignore[arg-type]
         **kwargs,
@@ -273,6 +339,67 @@ def test_issue_bundle_decrypts_to_the_supplied_secrets():
     assert decoded["host"] == host
     assert decoded["port"] == port
     assert decoded["label"] == "Kid 2"
+    assert "ca_url" not in decoded and "ca_sha" not in decoded
+
+
+def test_issue_with_ca_pem_uses_a_pointer_not_inline():
+    broker = FakeBrokerClient()
+    emqx = _FakeEmqx()
+    pem = "-----BEGIN CERTIFICATE-----\nMIIB...FAKE...TEST...CA==\n-----END CERTIFICATE-----\n"
+    settings = _settings(public_base_url="https://relay.example.com")
+    code = _issue(
+        "pgr-issue-ca-1", broker, emqx, ca_pem=pem, settings=settings
+    )
+    raw, *_ = devsetup.parse(code)
+    bid, _bpw, bkey = devsetup.derive(raw)
+    decoded = devsetup.decrypt_bundle(bkey, broker.published[0].payload)
+
+    assert "ca" not in decoded
+    expected_sha = hashlib.sha256(pem.encode("utf-8")).digest()
+    assert decoded["ca_sha"] == expected_sha
+    assert decoded["ca_url"] == f"https://relay.example.com/ca/{expected_sha.hex()}.pem"
+    assert cas_store.get_pem(expected_sha.hex()) == pem
+    assert bid
+
+
+def test_issue_with_ca_pem_but_no_public_base_url_raises():
+    broker = FakeBrokerClient()
+    emqx = _FakeEmqx()
+    with pytest.raises(ca_resolve.PublicBaseUrlRequired):
+        _issue(
+            "pgr-issue-ca-2",
+            broker,
+            emqx,
+            ca_pem="-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+            settings=_settings(public_base_url=None),
+        )
+    assert broker.published == []
+
+
+def test_pointer_vector_decrypts_to_ca_url_and_ca_sha_not_inline_ca():
+    bkey = base64.b64decode(POINTER_VECTOR["bkey_b64"])
+    blob = base64.b64decode(POINTER_VECTOR["bundle_ct_b64"])
+    nonce, ct = blob[:12], blob[12:]
+    assert nonce == base64.b64decode(POINTER_VECTOR["bundle_nonce_b64"])
+    plaintext = AESGCM(bkey).decrypt(nonce, ct, None)
+    raw = cbor2.loads(plaintext)
+
+    obj = POINTER_VECTOR["bundle_plain_obj"]
+    assert raw[1] == obj["id"]
+    assert raw[30] == obj["pw"]
+    assert raw[31] == base64.b64decode(obj["k_b64"])
+    assert raw[32] == obj["host"]
+    assert raw[33] == obj["port"]
+    assert raw[40] == obj["ca_url"]
+    assert raw[41] == base64.b64decode(obj["ca_sha_b64"])  # raw bytes
+    assert 34 not in raw
+    assert raw[35] == obj["flags"]
+    assert raw[36] == obj["label"]
+
+    decoded = devsetup.decrypt_bundle(bkey, blob)
+    assert decoded["ca_url"] == obj["ca_url"]
+    assert decoded["ca_sha"] == base64.b64decode(obj["ca_sha_b64"])
+    assert "ca" not in decoded
 
 
 def test_complete_clears_bundle_revokes_boot_user_and_deletes_setup_code():

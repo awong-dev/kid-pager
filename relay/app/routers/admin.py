@@ -166,6 +166,12 @@ class CreateDeviceRequest(BaseModel):
     ownerAlias: str
     label: str
     defaultToAlias: str | None = None
+    # Carrier APN; omitted/empty = carrier default.
+    apn: str | None = None
+
+
+class SetApnRequest(BaseModel):
+    apn: str | None = None
 
 
 class DeviceSetupCodeResponse(BaseModel):
@@ -181,6 +187,19 @@ class DeviceSetupCodeResponse(BaseModel):
 HMAC_KEY_BYTES = 32
 
 
+def _bootstrap_host_and_ca(settings: Settings) -> tuple[str, str | None]:
+    """The broker host for the bootstrap bundle and the CA PEM to pin (settings win)."""
+    ca = settings.broker_ca_pem or ca_resolve.get_broker_ca_pem()
+    return settings.broker_host, ca
+
+
+# Bit 0 of the bundle `flags` is `req_sig`; it must track `authMode`, else an `hmac` device
+# publishes unsigned and `ingest.py` drops every envelope as `bad-sig`.
+_FLAG_REQ_SIG = 1
+
+
+def _bootstrap_flags(auth_mode: str) -> int:
+    return _FLAG_REQ_SIG if auth_mode == "hmac" else 0
 
 
 def _manual_acl_lines(device_id: str) -> list[str]:
@@ -205,6 +224,10 @@ def _broker_push_outcome(
 ) -> DeviceSetupCodeResponse:
     owner_uid = _resolve_uid(req.ownerAlias)
     default_to_uid = _resolve_uid(req.defaultToAlias) if req.defaultToAlias else None
+    try:
+        apn = apn_presets.validate_apn(req.apn)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     # generate the MQTT password and HMAC key; the plaintext exists only here
     password = secrets.token_urlsafe(MQTT_PASSWORD_BYTES)
@@ -216,6 +239,7 @@ def _broker_push_outcome(
         label=req.label,
         mqtt_password_hash=password_hash,
         default_to_uid=default_to_uid,
+        apn=apn,
     )
     # the pager is a delivery backend of its owner; without this it is undeliverable
     backends_store.create_backend(
@@ -224,7 +248,24 @@ def _broker_push_outcome(
     allow_store.recompute_locatable_by_for_owner(owner_uid)
 
     # push the broker credential and ACL before handing out a setup code
+    host, ca = _bootstrap_host_and_ca(settings)
     now = datetime.now(UTC)
+    try:
+        setup_code = devsetup.issue(
+            mqtt_password=password,
+            hmac_key=hmac_key,
+            host=host,
+            ca_pem=ca,
+            flags=_bootstrap_flags("hmac"),
+            label=req.label,
+            apn=apn,
+            settings=settings,
+            broker=broker,
+            emqx=emqx,
+            now=now,
+        )
+    except ca_resolve.PublicBaseUrlRequired as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     expires_at = now + timedelta(minutes=devsetup.EXPIRY_MINUTES)
 
     assert device is not None
@@ -264,7 +305,25 @@ def _broker_push_outcome(
     devices_store.set_provision_state(device_id, "issued")
 
     emqx_result = emqx.ensure_device(device.mqttUsername, password, device_id)
+    host, ca = _bootstrap_host_and_ca(settings)
     now = datetime.now(UTC)
+    try:
+        setup_code = devsetup.issue(
+            device_id,
+            mqtt_password=password,
+            hmac_key=hmac_key,
+            host=host,
+            ca_pem=ca,
+            flags=_bootstrap_flags(device.authMode),
+            label=device.label,
+            apn=device.apn,
+            settings=settings,
+            broker=broker,
+            emqx=emqx,
+            now=now,
+        )
+    except ca_resolve.PublicBaseUrlRequired as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     expires_at = now + timedelta(minutes=devsetup.EXPIRY_MINUTES)
 
     updated = devices_store.get_device(device_id)
@@ -308,6 +367,44 @@ def push_cfg(
     req: PushCfgRequest,
     broker: Annotated[BrokerClient, Depends(get_broker)],
 ) -> dict[str, bool]:
+
+
+class PushCaRequest(BaseModel):
+    action: Literal["push", "unpin"]
+
+
+@router.get("/apn-presets")
+def list_apn_presets() -> list[apn_presets.ApnPreset]:
+    """Carrier APN choices for the device forms."""
+
+
+    if devices_store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    try:
+        apn = apn_presets.validate_apn(req.apn)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    devices_store.set_apn(device_id, apn)
+    return {"apn": apn}
+
+
+) -> dict[str, bool]:
+    """`push` sends the relay's CA as a `/down cfg.ca` pointer; `unpin` sends `cfg.ca = {url: ""}`."""
+    if devices_store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    if req.action == "unpin":
+        ok = devcfg.unpin_ca(device_id, broker)
+        return {"ok": ok}
+    ca_pem = settings.broker_ca_pem or ca_resolve.get_broker_ca_pem()
+    if not ca_pem:
+        raise HTTPException(
+            status_code=400, detail="no CA is configured on this relay to push"
+        )
+    try:
+        ok = devcfg.push_ca(device_id, pem=ca_pem, broker=broker, settings=settings)
+    except ca_resolve.PublicBaseUrlRequired as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": ok}
 
 
 class PutSettingsRequest(BaseModel):
