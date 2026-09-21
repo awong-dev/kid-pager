@@ -14,6 +14,10 @@ Two ways to drive it:
   - one-shot subcommand (scripting): relay/.venv/bin/python tools/pager_client.py msg "hi"
 `--json` on either prints machine-readable output instead of prose.
 
+Device-side flags: `--device-id --host --port --username --password`, and
+`--cell <mcc,mnc,tac,ci[,rsrp]>` (docs/PROTOCOL.md §13.2): the device's serving cell, which also
+starts it with `loc fail on` so it answers a `loc_req` with `no_fix` + `cell` (same shorthand as
+the REPL's `loc cell`).
 Server-side flags: `--api --auth-url --as <alias>` (`--as` runs `login <alias>` first).
 
 `--bootstrap "<code>"` performs the setup-code bootstrap fetch instead of using
@@ -26,8 +30,19 @@ Commands:
 
   Device: connect, disconnect, crash, inbox, msg, ack, autoack, status, bytes,
           loc <lat> <lon> [acc] | loc auto <period_s> [--walk] |
+          loc min <s> | loc fail on|off | loc backoff <s> |
+          contactreq <name> [phone-or-alias],
+          sms out <phone> <text...> | sms in <phone> <text...>
   Server: login, contacts, chat, say, watch, tick, sweep, locate <alias>,
           locations <alias> [n],
+          backend add <kind> <json-config>,
+          smscontacts get <device_id> | smscontacts set <device_id> <name> <phone> [<name> <phone>...] |
+          smslog <device_id> [limit]
+
+`sms out`/`sms in` publish a signed `kind:"sms_log"` `/up` envelope: `out` always logs
+`st:"sent"`; `in` checks the sender against the device's applied `cfg.sms` contact list and logs
+`recv` for a listed number, `blocked` for an unlisted one. `smscontacts`/`smslog` drive the
+device-owner `GET`/`PUT /api/devices/{id}/sms-contacts` and `GET /api/devices/{id}/sms-log` API.
 
 `DeviceClient.book`/`.lock` hold the simulated device's applied state (docs/PROTOCOL.md §3.2:
 `book`/`cfg` are not thread entries and are acked `shown` once applied).
@@ -87,6 +102,21 @@ def parse_retention_shorthand(value: str) -> dict[str, Any]:
     n = int(m.group(1))
     unit = "weeks" if m.group(2) == "w" else "days"
     return {"n": n, "unit": unit}
+
+
+def parse_cell_arg(value: str) -> dict[str, Any]:
+    """`mcc,mnc,tac,ci[,rsrp]` -> the §13.2 `cell` map; mcc/mnc stay strings (leading zeros)."""
+    parts = value.split(",")
+    if len(parts) not in (4, 5):
+        raise ValueError(f"--cell/loc cell must be mcc,mnc,tac,ci[,rsrp], got {value!r}")
+    mcc, mnc, tac_s, ci_s = (p.strip() for p in parts[:4])
+    try:
+        cell: dict[str, Any] = {"mcc": mcc, "mnc": mnc, "tac": int(tac_s), "ci": int(ci_s)}
+        if len(parts) == 5:
+            cell["rsrp"] = int(parts[4].strip())
+    except ValueError as exc:
+        raise ValueError(f"--cell/loc cell: tac/ci/rsrp must be integers ({value!r})") from exc
+    return cell
 
 
 def _fs_value(field: dict[str, Any] | None) -> Any:
@@ -149,6 +179,7 @@ class DeviceClient:
         *,
         hmac_key: bytes | None = None,
         wire: Literal["json", "cbor"] = "json",
+        cell: dict[str, Any] | None = None,
     ):
         self.device_id = device_id
         self.host = host
@@ -176,11 +207,23 @@ class DeviceClient:
         # `cfg` `lock` map applied cumulatively; `lock_cleared_count` counts applied `clear`s.
         self.lock_auto_min: int | None = None
         self.lock_cleared_count: int = 0
+        # Applied `cfg.ca` state, reported in `/status`. A push is applied by trusting the given
+        # `sha` (no HTTP fetch); `ca_fp` is its first 16 hex chars.
+        self.tls: str = "unpinned"
+        self.ca_fp: str | None = None
+        # Applied `cfg.sms` list `[{"name", "phone"}]`; `sms in` checks the sender against it.
+        self.sms_contacts: list[dict[str, str]] = []
+        # Reported in `/status`; a test-only knob (`loc backoff <s>`), not a real backoff.
+        self.loc_backoff_s: int = 0
         # §13.3 location state: `_lat`/`_lon` current position, `_last_fix` last successful fix,
         # `_last_attempt_ts` last attempt (successful or not; rule 1's window runs from it).
         self._lat = 37.7749
         self._lon = -122.4194
         self._loc_acc: int | None = None
+        # §13.2 serving cell `{mcc, mnc, tac, ci, rsrp?}`, attached to no-fix `/loc` answers.
+        # Starting with a cell also starts with `loc fail on`.
+        self._cell: dict[str, Any] | None = cell
+        self._loc_fail = cell is not None
         self._last_fix: dict[str, Any] | None = None
         self._last_attempt_ts: float | None = None
         # Rule 3 (one fix attempt in flight): serialises concurrent MQTT-thread callbacks.
@@ -364,6 +407,23 @@ class DeviceClient:
 
     def publish_status(
     ) -> None:
+        obj: dict[str, Any] = {
+            "v": 1,
+            "state": "online",
+            "mode": mode,
+            "batt_mv": batt_mv,
+            "rssi": rssi,
+            "session": self.session_id,
+            "ts": now_ts(),
+            "fw": fw,
+            "loc_period_s": self._loc_period_s,
+            "loc_min_s": self._loc_min_s,
+            "tls": self.tls,
+            "loc_backoff_s": self.loc_backoff_s,
+        }
+        if self.ca_fp is not None:
+            obj["ca_fp"] = self.ca_fp
+        self._publish(self.status_topic, obj, qos=1, retain=True)
 
     def publish_ack(self, msg_id: str, ack: str) -> None:
         self._publish(self.up_topic, {"v": 1, "id": msg_id, "ts": now_ts(), "ack": ack}, qos=1)
@@ -418,13 +478,80 @@ class DeviceClient:
 
     def _handle_cfg(self, data: dict[str, Any]) -> None:
         """`kind:"cfg"` (§3.2): applies `cfg.lock`, `cfg.ca` and `cfg.sms`, then acks `shown`.
+        `cfg.ca` is applied without a real fetch; `lock.clear` is only counted."""
+        cfg = data.get("cfg") or {}
+        lock = cfg.get("lock") or {}
         if lock.get("clear"):
             self.lock_cleared_count += 1
         if lock.get("auto") is not None:
             self.lock_auto_min = lock["auto"]
+        if "ca" in cfg:
+            self._apply_ca(cfg["ca"] or {})
+        if "sms" in cfg:
+            self._apply_sms_contacts(cfg["sms"] or [])
         msg_id = data.get("id")
+        print(
+            f"-> cfg applied: lock={lock!r} (auto_min now {self.lock_auto_min}) "
+            f"tls={self.tls} ca_fp={self.ca_fp} sms_contacts={self.sms_contacts}"
+        )
         if msg_id:
             self.publish_ack(msg_id, "shown")
+
+    def _apply_sms_contacts(self, contacts: list[dict[str, Any]]) -> None:
+        """`cfg.sms = [{n, p}, ...]` (§10): replaces the whole list, stored under `name`/`phone`."""
+        self.sms_contacts = [
+            {"name": c.get("n", ""), "phone": c.get("p", "")} for c in contacts
+        ]
+
+
+    def publish_sms_log(self, *, peer: str, direction: Literal["out", "in"], st: str, body: str) -> str:
+        """`/up kind:"sms_log"`: the pager's own modem SMS, audited back; not a thread entry."""
+        log_id = new_id("s_")
+        # No `ack` key: `sms_log` is `{id, ts, peer, dir, st, body, sms_ts}` plus `n`/`sig`.
+        obj: dict[str, Any] = {
+            "v": 1,
+            "id": log_id,
+            "ts": now_ts(),
+            "kind": "sms_log",
+            "peer": peer,
+            "dir": direction,
+            "st": st,
+            "body": body,
+            "sms_ts": now_ts(),
+        }
+        self._publish(self.up_topic, obj, qos=1)
+        print(f"-> sms_log {log_id}: dir={direction} peer={peer} st={st} body={body!r}")
+        return log_id
+
+    def sms_send(self, peer: str, body: str) -> str:
+        """`sms out <phone> <text>`: always succeeds, so `st` is `sent`."""
+        return self.publish_sms_log(peer=peer, direction="out", st="sent", body=body)
+
+    def sms_receive(self, peer: str, body: str) -> str:
+        """`sms in <phone> <text>`: `st` is `recv` for a listed sender, `blocked` otherwise."""
+        listed = any(c["phone"] == peer for c in self.sms_contacts)
+        st = "recv" if listed else "blocked"
+        return self.publish_sms_log(peer=peer, direction="in", st=st, body=body)
+
+    def _apply_ca(self, ca: dict[str, Any]) -> None:
+        url = ca.get("url")
+        if not url:
+            # `url = ''` un-pins.
+            self.tls = "unpinned"
+            self.ca_fp = None
+            return
+        sha = ca.get("sha")
+        sha_hex: str | None
+        if isinstance(sha, bytes):
+            sha_hex = sha.hex()
+        elif isinstance(sha, str):
+            # JSON wire: base64url, no padding.
+            padded = sha + "=" * (-len(sha) % 4)
+            sha_hex = base64.urlsafe_b64decode(padded).hex()
+        else:
+            sha_hex = None
+        self.tls = "pinned"
+        self.ca_fp = sha_hex[:16] if sha_hex else None
 
 
     def _take_fix(self) -> dict[str, Any] | None:
@@ -445,6 +572,9 @@ class DeviceClient:
             obj["cached"] = True
         if err:
             obj["err"] = err
+        # §13.2: `cell` is attached whenever an answer has no fix and a cell is configured.
+        if loc is None and self._cell is not None:
+            obj["cell"] = self._cell
         # PROTOCOL.md §2: QoS 1 when `req` is non-null, QoS 0 for an unsolicited periodic fix.
         qos = 1 if req is not None else 0
         self._publish(self.loc_topic, obj, qos=qos)
@@ -503,6 +633,13 @@ class DeviceClient:
     def loc_set_fail(self, on: bool) -> None:
         """`loc fail on|off`: every attempt answers `err:"no_fix"` while on (§13.2)."""
         self._loc_fail = on
+
+    def loc_set_cell(self, cell: dict[str, Any] | None) -> None:
+        """`loc cell <mcc,mnc,tac,ci[,rsrp]>|off` (and `--cell`): the cell attached to no-fix
+        answers (§13.2). Setting one turns `loc fail on`; `off` does not turn it back off."""
+        self._cell = cell
+        if cell is not None:
+            self._loc_fail = True
 
     def _handle_loc_req(self, req_id: str | None) -> None:
         """PROTOCOL.md §13.3 rules 1-3: answers a `loc_req` on `/loc` under the rate limit."""
@@ -840,6 +977,48 @@ class ServerClient:
             raise RuntimeError(f"admin push_cfg failed: {resp.status_code} {resp.text}")
         return resp.json()
 
+    def admin_push_ca(self, device_id: str, action: Literal["push", "unpin"]) -> dict[str, Any]:
+        """`POST /api/admin/devices/{id}/ca`: CA-pointer push or un-pin."""
+        resp = self.api_post(f"/api/admin/devices/{device_id}/ca", {"action": action})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"admin push_ca failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+
+    def my_devices(self) -> list[dict[str, Any]]:
+        """`GET /api/devices`: the logged-in user's own devices (id, label, status)."""
+        resp = self.api_get("/api/devices")
+        resp.raise_for_status()
+        return resp.json()
+
+    def sms_contacts_get(self, device_id: str) -> dict[str, Any]:
+        """`GET /api/devices/{id}/sms-contacts` -- owner or admin only."""
+        resp = self.api_get(f"/api/devices/{device_id}/sms-contacts")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"sms_contacts_get failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def sms_contacts_put(
+        self, device_id: str, contacts: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        """`PUT /api/devices/{id}/sms-contacts`: `contacts` is the whole list."""
+        resp = self.api_put(f"/api/devices/{device_id}/sms-contacts", {"contacts": contacts})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"sms_contacts_put failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def sms_log_get(
+        self, device_id: str, *, limit: int = 100, before: int | None = None
+    ) -> dict[str, Any]:
+        """`GET /api/devices/{id}/sms-log?limit=&before=`: the audit log, newest first."""
+        path = f"/api/devices/{device_id}/sms-log?limit={limit}"
+        if before is not None:
+            path += f"&before={before}"
+        resp = self.api_get(path)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"sms_log_get failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
 
     def firestore_get(self, path: str) -> httpx.Response:
         return self._http.get(f"{self.firestore_base}/{path}", headers=self._headers())
@@ -1080,7 +1259,33 @@ class PagerShell(cmd.Cmd):
         if not parts:
             print(
                 "usage: loc <lat> <lon> [acc] | loc auto <period_s> [--walk] | "
+                "loc min <s> | loc fail on|off | loc backoff <s> | "
             )
+            return
+        if parts[0] == "cell":
+            # Same shorthand as --cell.
+            if len(parts) != 2:
+                print("usage: loc cell <mcc,mnc,tac,ci[,rsrp]>|off")
+                return
+            if parts[1] == "off":
+                self.device.loc_set_cell(None)
+                print("loc cell = off")
+                return
+            try:
+                cell = parse_cell_arg(parts[1])
+            except ValueError as exc:
+                print(f"usage: loc cell <mcc,mnc,tac,ci[,rsrp]>|off ({exc})")
+                return
+            self.device.loc_set_cell(cell)
+            print(f"loc cell = {cell}")
+            return
+        if parts[0] == "backoff":
+            # Test-only knob for `/status`'s `loc_backoff_s`.
+            if len(parts) != 2:
+                print("usage: loc backoff <s>")
+                return
+            self.device.loc_backoff_s = int(parts[1])
+            print(f"loc backoff_s = {parts[1]}")
             return
         if parts[0] == "auto":
             parser = argparse.ArgumentParser(prog="loc auto", add_help=False)
@@ -1122,6 +1327,18 @@ class PagerShell(cmd.Cmd):
         name = parts[0]
         ph = parts[1] if len(parts) > 1 else None
         self.device.publish_contact_req(name, ph)
+
+    def do_sms(self, arg: str) -> None:
+        """`sms out|in <phone> <text...>`: publishes a signed `kind:"sms_log"` `/up` envelope."""
+        parts = shlex.split(arg)
+        if len(parts) < 3 or parts[0] not in ("out", "in"):
+            print("usage: sms out|in <phone> <text...>")
+            return
+        direction, phone, text = parts[0], parts[1], " ".join(parts[2:])
+        if direction == "out":
+            self.device.sms_send(phone, text)
+        else:
+            self.device.sms_receive(phone, text)
 
     def do_book(self, arg: str) -> None:
         """Shows the last-applied address book (`None` before one has arrived), PROTOCOL.md §3.2."""
@@ -1244,6 +1461,8 @@ class PagerShell(cmd.Cmd):
             self._admin_approve(rest)
         elif sub == "cfg":
             self._admin_cfg(rest)
+        elif sub == "ca":
+            self._admin_ca(rest)
         else:
             print(f"unknown admin subcommand: {sub}")
 
@@ -1343,6 +1562,50 @@ class PagerShell(cmd.Cmd):
             )
         )
 
+    def _admin_ca(self, args: list[str]) -> None:
+        parser = argparse.ArgumentParser(prog="admin ca", add_help=False)
+        parser.add_argument("action", choices=["push", "unpin"])
+        parser.add_argument("device_id")
+        try:
+            ns = parser.parse_args(args)
+        except SystemExit:
+            return
+        self._out(self.server.admin_push_ca(ns.device_id, ns.action))
+
+
+    def do_devices(self, arg: str) -> None:
+        """`GET /api/devices` -- the logged-in user's own devices."""
+        self._out(self.server.my_devices())
+
+    def do_smscontacts(self, arg: str) -> None:
+        """`smscontacts get <device_id>` / `smscontacts set <device_id> <name> <phone> [...]`."""
+        parts = shlex.split(arg)
+        if len(parts) >= 2 and parts[0] == "get":
+            self._out(self.server.sms_contacts_get(parts[1]))
+            return
+        if len(parts) >= 2 and parts[0] == "set":
+            device_id = parts[1]
+            rest = parts[2:]
+            if len(rest) % 2 != 0:
+                print("usage: smscontacts set <device_id> <name> <phone> [<name> <phone> ...]")
+                return
+            contacts = [
+                {"name": rest[i], "phone": rest[i + 1]} for i in range(0, len(rest), 2)
+            ]
+            self._out(self.server.sms_contacts_put(device_id, contacts))
+            return
+        print("usage: smscontacts get|set <device_id> ...")
+
+    def do_smslog(self, arg: str) -> None:
+        """`smslog <device_id> [limit]` -- `GET /api/devices/{id}/sms-log`."""
+        parts = shlex.split(arg)
+        if not parts:
+            print("usage: smslog <device_id> [limit]")
+            return
+        device_id = parts[0]
+        limit = int(parts[1]) if len(parts) > 1 else 100
+        self._out(self.server.sms_log_get(device_id, limit=limit))
+
 
     def do_exit(self, arg: str) -> bool:
         return True
@@ -1381,6 +1644,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--host stays the code's own host, but --port (still 1883 by default) overrides both the "
         "bootstrap hop and the continuation, since this tool never speaks TLS",
     )
+    parser.add_argument(
+        "--cell",
+        metavar="MCC,MNC,TAC,CI[,RSRP]",
+        help="PROTOCOL.md §13.2 cell-tower location fallback: this device's serving "
+        "cell, attached to every /loc answer that has no fix -- e.g. --cell 310,410,12345,87654321,-95 "
+        "makes this simulated pager answer a loc_req with no_fix + cell instead of plain no_fix "
+        "(same effect as 'loc fail on' plus this option, or simply before any real fix has been set)",
+    )
     parser.add_argument("--api", default=DEFAULT_API_URL, help="relay API base URL")
     parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Auth emulator base URL")
     parser.add_argument("--as", dest="as_alias", help="log in as this alias before running")
@@ -1394,8 +1665,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
+    cell = parse_cell_arg(args.cell) if args.cell else None
+
     if args.bootstrap:
         device = bootstrap_device(args.bootstrap, port=args.port, wire=args.wire)
+        if cell is not None:
+            device.loc_set_cell(cell)
     else:
         hmac_key = base64.b64decode(args.hmac_key) if args.hmac_key else None
         device = DeviceClient(
@@ -1406,6 +1681,7 @@ def main(argv: list[str] | None = None) -> int:
             args.password,
             hmac_key=hmac_key,
             wire=args.wire,
+            cell=cell,
         )
     server = ServerClient(args.api, args.auth_url)
     shell = PagerShell(device, server, as_json=args.json)

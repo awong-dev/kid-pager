@@ -7,6 +7,10 @@ Requires FreeType (`pip install freetype-py`). Rendering is monochrome, hinted
 fetched or embedded. The Noto Sans CJK file is not in the repo; pass a local copy.
 
 Default image: DejaVu Sans for Latin/Greek/Cyrillic plus Noto Sans CJK, both pinned to the same
+--sans-axes "opsz=7,wght=500" sets variable-font design coordinates on the text face; it has no
+effect on a static font. --baseline "12=13,16=18" pins the per-size baseline, which by default is
+the text face's own ascender and positions every glyph, CJK included.
+
 CJK repertoire: `sc` is all 6763 GB2312 hanzi plus Big5 level 1's 5401 (0xA440-0xC67E), merged by
 """
 
@@ -141,10 +145,29 @@ def _render_glyph(face, size_px, cp):
     }
 
 
+def _apply_axes(face, axes):
+    """Set variable-font design coordinates from {"opsz": 7, "wght": 500}.
+    Axes not named keep the font's default. No-op for a static font."""
+    if not axes:
+        return
+    info = face.get_variation_info()
+    tags = {"OpticalSize": "opsz", "Weight": "wght", "Width": "wdth", "Italic": "ital",
+            "Slant": "slnt"}
+    coords = []
+    for axis in info.axes:
+        tag = tags.get(axis.name, axis.name)
+        value = axes.get(tag, axis.default)
+        coords.append(max(axis.minimum, min(axis.maximum, value)))
+    face.set_var_design_coords(coords)
+
+
     """entries: sorted [(codepoint, font), ...]. Returns the block's bytes
     (sub-header + codepoint table + record table + bitmap blob), per
     gfx.h's format doc."""
     sans_face.set_pixel_sizes(0, size_px)
+    # Defaults to the text face's ascender, which differs per font; --baseline pins it.
+    baseline = baseline_override if baseline_override is not None else round(
+        sans_face.size.ascender / 64)
     baseline = max(0, min(255, baseline))
 
     codepoints_bytes = bytearray()
@@ -173,6 +196,7 @@ def _render_glyph(face, size_px, cp):
 
 
     sans_face = freetype.Face(str(sans_font))
+    _apply_axes(sans_face, sans_axes)
     cjk_face = _open_cjk_face(cjk_font, lang, cjk_face_index)
 
     cjk_count = sum(1 for _, f in entries if f == "cjk")
@@ -181,6 +205,10 @@ def _render_glyph(face, size_px, cp):
         file=sys.stderr,
     )
 
+    blocks = [
+        _build_size_block(size_px, entries, sans_face, cjk_face,
+        for size_px in SIZES
+    ]
 
     header_len = 16
     total = header_len + sum(len(b) for b in blocks)
@@ -200,8 +228,19 @@ def main():
     ap.add_argument("--cjk-face-index", type=int, default=None,
                      help="face index within --cjk-font; default auto-selects by --lang "
                           "(see _open_cjk_face)")
+    ap.add_argument("--sans-axes", default="",
+                     help='variable-font axes for --sans-font, e.g. "opsz=7,wght=500"')
+    ap.add_argument("--baseline", default="",
+                     help='baseline in px per size, e.g. "12=13,16=18" (default: the text '
+                          "face's own ascender). Pin it when changing fonts so the UI's rows "
+                          "do not move.")
     args = ap.parse_args()
 
+    axes = {k.strip(): float(v) for k, v in
+            (kv.split("=") for kv in args.sans_axes.split(",") if kv.strip())}
+    baselines = {int(k): int(v) for k, v in
+                 (kv.split("=") for kv in args.baseline.split(",") if kv.strip())}
+    data = build_assets(args.lang, Path(args.sans_font), Path(args.cjk_font), args.cjk_face_index,
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
