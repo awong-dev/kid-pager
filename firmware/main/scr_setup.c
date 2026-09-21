@@ -63,6 +63,7 @@ static void setup_render(void)
     // static legend, not driven by state
     gfx_text(0, y, GFX_FONT_NORMAL, "network . broker . bundle . done");
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter submit  esc clear/back");
 }
 
 const ui_screen_t g_scr_setup = {

@@ -4,7 +4,9 @@
 #include "ui.h"
 #include "modes.h"
 #include "ident.h"
+#include "carrier.h"
 #include "lock.h"
+#include "msg.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +17,7 @@ typedef enum {
     MROW_TEXTSIZE,
     MROW_PASSCODE,
     MROW_AUTOLOCK,
+    MROW_CARRIER,
     MROW_SETUP_AGAIN,
     MROW_FACTORY_RESET,
     MROW_COUNT,
@@ -72,6 +75,7 @@ static void device_on_key_confirm(input_key_t key)
     case INPUT_KEY_ENTER:
         if (strcmp(s_confirm_buf, ident_get_dev_id()) == 0) {
             // Power effect: a few ms of NVS erase/commit (no RF), then a full ESP32 reset.
+            msg_history_erase();
             ident_erase();
             // Power effect: full ESP32 reset; the modem is left as it was until the next boot.
             esp_restart();
@@ -193,6 +197,18 @@ static void device_on_key(input_key_t key)
             lock_set_auto_min(k_autolock_steps[idx]);
             break;
         }
+        case MROW_CARRIER: {
+            // cycles Automatic, Carrier default, then each preset; a custom APN is replaced
+            size_t cur = CARRIER_PRESET_AUTO;
+            if (carrier_get_mode() == CARRIER_MODE_FIXED) {
+                int idx = carrier_get_apn()[0] == '\0' ? CARRIER_PRESET_BLANK
+                                                       : carrier_preset_index_for(carrier_get_apn());
+                cur = (idx < 0) ? carrier_preset_count() - 1 : (size_t) idx;
+            }
+            carrier_select_preset((cur + 1) % carrier_preset_count());
+            ui_show_toast("carrier saved - restart to apply");
+            break;
+        }
         case MROW_SETUP_AGAIN:
             ui_show_toast("use the USB console: setup <code>");
             break;
@@ -228,6 +244,7 @@ static void device_render_confirm(void)
     snprintf(line, sizeof(line), "> %s", s_confirm_buf);
     gfx_text(0, y, GFX_FONT_NORMAL, line);
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter confirm  esc cancel");
 }
 
 static void device_render_pw(void)
@@ -250,6 +267,7 @@ static void device_render_pw(void)
     mask[i] = '\0';
     gfx_text(0, y, GFX_FONT_NORMAL, mask);
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter submit  esc cancel");
 }
 
 // Info lines (not selectable) followed by the menu rows (selectable, in
@@ -293,6 +311,12 @@ static void device_render_normal(void)
         snprintf(lines[n], DEVICE_LINE_LEN, "Auto-lock: %u min", (unsigned) auto_min);
     }
     selectable[n++] = true;
+    if (carrier_get_mode() == CARRIER_MODE_AUTO && carrier_last_detected()[0]) {
+        snprintf(lines[n], DEVICE_LINE_LEN, "Carrier: auto (%s)", carrier_last_detected());
+    } else {
+        snprintf(lines[n], DEVICE_LINE_LEN, "Carrier: %s", carrier_get_label());
+    }
+    selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Set up again");
     selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Factory reset");
@@ -316,6 +340,7 @@ static void device_render_normal(void)
         gfx_text(10, y, GFX_FONT_NORMAL, lines[i]);
     }
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter select  esc back");
 }
 
 static void device_render(void)

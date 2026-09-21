@@ -8,6 +8,7 @@
 #include "disp.h"
 #include "gfx.h"
 #include "lock.h"
+#include "catrust.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -160,13 +161,28 @@ static void count_unread_unsent(int *unread, int *unsent)
     }
 }
 
+// Status-bar text line_top_y: the 12 px font has baseline 13 and its ink starts ~4 rows below the
+// line top, so -3 aligns it with the icons (rows 0-11).
+#define UI_STATUS_TEXT_Y (-3)
+
+#define UI_STATUS_ICON_GAP 4
+
 static void draw_status_bar(void)
 {
     int unread = 0, unsent = 0;
     count_unread_unsent(&unread, &unsent);
 
+    char buf[32];
+    snprintf(buf, sizeof(buf), "new: %d  unsent: %d", unread, unsent);
 
 
+    int bars = bars_from_rssi_dbm(modes_get_rssi_dbm());
+    // no registration-state bit is available, so "not registered" shows as 0 bars
+    gfx_icon(bars_x, 0, (gfx_icon_t) (GFX_ICON_SIGNAL_0 + bars));
+
+    net_mqtt_status_t st;
+    net_get_mqtt_status(&st);
+    int mqtt_x = bars_x - GFX_ICON_W - UI_STATUS_ICON_GAP;
 
     gfx_hline(0, GFX_SCREEN_W - 1, UI_STATUS_H);
 }
@@ -199,6 +215,7 @@ void ui_render_boot(void)
 // Repaints the top screen; the refresh policy decides partial or full.
 void ui_on_awake_lapse(void)
 {
+    paint_frame();
 }
 
 void ui_dispatch_key(input_key_t key)
@@ -237,6 +254,9 @@ void ui_on_button_long(void)
 bool ui_incoming(const char *from, bool was_asleep)
 {
     const ui_screen_t *top = ui_top();
+    // Chat already on top also steals: the message is repainted into the open view
+    bool steal = was_asleep || top == NULL || top == &g_scr_home || top == &g_scr_greeting ||
+                 top == &g_scr_chat;
 
     if (!steal) {
         char toast[40];
@@ -245,12 +265,22 @@ bool ui_incoming(const char *from, bool was_asleep)
     }
 
     // no scr_chat_mark_visible_read() here: this path acks `shown`, not `read`
+    if (top == &g_scr_greeting) {
+        // replace rather than push, so popping Chat lands on Home
+        ui_replace(&g_scr_chat);
+    } else if (top != &g_scr_chat) {
         ui_push(&g_scr_chat);
     }
     gfx_clear();
     draw_status_bar();
     if (g_scr_chat.render) {
         g_scr_chat.render();
+    }
+        // a partial over the large greeting text leaves it ghosted, so this one gets a full
+        // refresh; power effect: ~2-4 s instead of ~0.3-0.8 s
+        disp_full_refresh();
+    } else {
+        disp_partial_refresh();
     }
     return true;
 }

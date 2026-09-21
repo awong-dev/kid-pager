@@ -34,12 +34,15 @@ typedef struct {
     uint32_t flags;
     char label[IDENT_LABEL_MAX];
     uint8_t ca_hash[IDENT_CA_HASH_LEN];
+    /* replay counter epoch */
+    uint32_t n_epoch;
     uint8_t claimed;  /* set on the first verified `book`; display only */
 } ident_t;
 
 /* Loads the identity; false if a required field is missing or dev_id fails docs/PROTOCOL.md §1. */
 bool ident_load(void);
 
+/* Writes every field to NVS and, on success, updates the copy the getters read. No dev_id check. */
 bool ident_store(const ident_t *id);
 
 /* Erases the whole "ident" namespace, so the next ident_load() returns false. */
@@ -57,7 +60,18 @@ const char *ident_get_apn(void); /* empty string = carrier default */
 uint32_t ident_get_flags(void);
 const char *ident_get_label(void);
 const uint8_t *ident_get_ca_hash(void); /* IDENT_CA_HASH_LEN bytes */
+uint32_t ident_get_n_epoch(void);
 uint8_t ident_get_claimed(void);
+
+/* Whether modem TLS cert slot 12 is known to hold a certificate (own NVS read; false on error). */
+bool ident_get_slot12_populated(void);
+
+/* Records that slot 12 holds a certificate; same independence as the getter. */
+bool ident_set_slot12_populated(void);
+
+/* `tls_broken` byte in NVS, independent of ident_store(); cleared only by a validating connect. */
+bool ident_get_tls_broken(void);
+bool ident_set_tls_broken(bool broken);
 
 #ifdef __cplusplus
 }

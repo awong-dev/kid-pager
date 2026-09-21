@@ -40,6 +40,8 @@ typedef enum {
     GFX_ICON_SMS,
     GFX_ICON_WEB,
     GFX_ICON_CHAT,
+    GFX_ICON_TLS_PINNED,  /* closed padlock: CA pinned, last connect validated */
+    GFX_ICON_TLS_BROKEN,  /* broken padlock: CA pinned, running unvalidated */
     GFX_ICON_COUNT,
 } gfx_icon_t;
 #define GFX_ICON_W 12

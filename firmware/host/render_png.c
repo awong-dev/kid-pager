@@ -91,7 +91,9 @@ static uint8_t s_gray[GFX_SCREEN_H][GFX_SCREEN_W];
 
 static void snapshot_framebuffer(void)
 {
+    // gfx_set_pixel() maps x to native row (GFX_FB_ROWS - 1) - x; mirror it so the PNG is upright.
     for (int x = 0; x < GFX_SCREEN_W; x++) {
+        const uint8_t *row = gfx_fb_native_row((GFX_FB_ROWS - 1) - x);
         for (int y = 0; y < GFX_SCREEN_H; y++) {
             int bit = (row[y / 8] >> (7 - (y % 8))) & 1;
             s_gray[y][x] = bit ? 255 : 0;
@@ -179,13 +181,27 @@ static void render_tofu(void)
 /* Screen fixtures: hand-drawn mockups using gfx.c primitives only. UI_STATUS_H is 14 and
  * footers sit at UI_FOOTER_Y so glyph descenders are not clipped by gfx_set_pixel(). */
 
+#define FIXTURE_STATUS_H 14
 #define FIXTURE_BODY_TOP (FIXTURE_STATUS_H + 1)
+#define FIXTURE_FOOTER_Y (GFX_SCREEN_H - 16)
 
+// ui.c's UI_STATUS_TEXT_Y: y=1 puts the status text ink visibly below the icons.
+#define FIXTURE_STATUS_TEXT_Y (-3)
+#define FIXTURE_STATUS_ICON_GAP 4 /* matches ui.c's UI_STATUS_ICON_GAP */
+
+// Counts on the left; MQTT link, signal bars and battery right-aligned.
 {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "new: %d  unsent: %d", unread, unsent);
 
     int batt_x = GFX_SCREEN_W - GFX_ICON_W;
     gfx_icon(batt_x, 0, (gfx_icon_t) (GFX_ICON_BATTERY_0 + batt_segs));
 
+    int bars_x = batt_x - GFX_ICON_W - FIXTURE_STATUS_ICON_GAP;
+    gfx_icon(bars_x, 0, (gfx_icon_t) (GFX_ICON_SIGNAL_0 + bars));
+
+    int mqtt_x = bars_x - GFX_ICON_W - FIXTURE_STATUS_ICON_GAP;
+    gfx_icon(mqtt_x, 0, link_ok ? GFX_ICON_LINK_OK : GFX_ICON_LINK_X);
 
     gfx_hline(0, GFX_SCREEN_W - 1, FIXTURE_STATUS_H);
 }
@@ -213,19 +229,84 @@ static void render_screen_home(void)
     y += 12;
     gfx_text(10, y, GFX_FONT_NORMAL, "Lock now (needs passcode lock)");
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter open  hold=home");
 }
+
+/* Matches scr_chat.c's visible_rows() for GFX_FONT_NORMAL. */
+#define FIXTURE_CHAT_ROWS 6
+#define FIXTURE_CHAT_MAX_LINES 24
 
 {
     gfx_clear();
 
+    /* Flattens the thread into wrapped lines (header row, then indented continuation rows) and
+     * draws the last FIXTURE_CHAT_ROWS; the third message wraps onto several rows. */
     struct {
         const char *who, *ts, *body, *tag;
+    } msgs[] = {
         { "mom", "13:58", "where are you?", NULL },
         { "you", "13:59", "library, coming now", "sent" },
+        { "mom", "14:02",
+          "Pickup at 3:15 by the gym today - coach moved practice up front "
+          "because the fields are wet, so wait by the flagpole instead of "
+          "the usual spot by the equipment shed.",
+          "NEW" },
     };
-    int y = FIXTURE_BODY_TOP + 2;
+    size_t nmsgs = sizeof(msgs) / sizeof(msgs[0]);
+    const int indent = 8; /* CHAT_CONT_INDENT_PX, scr_chat.c */
+
+    static char all_lines[FIXTURE_CHAT_MAX_LINES][64];
+    int line_msg[FIXTURE_CHAT_MAX_LINES];
+    int line_row[FIXTURE_CHAT_MAX_LINES];
+    int total = 0;
+
+    for (size_t i = 0; i < nmsgs && total < FIXTURE_CHAT_MAX_LINES; i++) {
+        char prefix[40];
+        snprintf(prefix, sizeof(prefix), "%s %s ", msgs[i].who, msgs[i].ts);
+        int avail0 = GFX_SCREEN_W - gfx_text_width(GFX_FONT_NORMAL, prefix);
+        if (msgs[i].tag) {
+            avail0 -= gfx_text_width(GFX_FONT_NORMAL, msgs[i].tag) + 4;
+        }
+        int avail_cont = GFX_SCREEN_W - indent;
+        int width = (avail0 < avail_cont) ? avail0 : avail_cont;
+        if (width < 24) {
+            width = 24;
+        }
+
+        char lines[FIXTURE_CHAT_MAX_LINES][64];
+        int n = gfx_text_wrap(GFX_FONT_NORMAL, msgs[i].body, width, lines, FIXTURE_CHAT_MAX_LINES);
+        if (n < 0) {
+            n = FIXTURE_CHAT_MAX_LINES;
+        }
+        for (int row = 0; row < n && total < FIXTURE_CHAT_MAX_LINES; row++) {
+            memcpy(all_lines[total], lines[row], sizeof(all_lines[total]));
+            line_msg[total] = (int) i;
+            line_row[total] = row;
+            total++;
         }
     }
+
+    int start = (total > FIXTURE_CHAT_ROWS) ? (total - FIXTURE_CHAT_ROWS) : 0;
+    int y = FIXTURE_BODY_TOP + 2;
+    int pitch = 14; /* 12px glyph + 2px leading, matches scr_chat.c */
+    for (int i = start; i < total; i++) {
+        size_t mi = (size_t) line_msg[i];
+        if (line_row[i] == 0) {
+            int x = gfx_text(0, y, GFX_FONT_NORMAL, msgs[mi].who);
+            x = gfx_text(x, y, GFX_FONT_NORMAL, " ");
+            x = gfx_text(x, y, GFX_FONT_NORMAL, msgs[mi].ts);
+            x = gfx_text(x, y, GFX_FONT_NORMAL, " ");
+            gfx_text(x, y, GFX_FONT_NORMAL, all_lines[i]);
+            if (msgs[mi].tag) {
+                int tw = gfx_text_width(GFX_FONT_NORMAL, msgs[mi].tag);
+                gfx_text(GFX_SCREEN_W - tw, y, GFX_FONT_NORMAL, msgs[mi].tag);
+            }
+        } else {
+            gfx_text(indent, y, GFX_FONT_NORMAL, all_lines[i]);
+        }
+        y += pitch;
+    }
+
     gfx_hline(0, GFX_SCREEN_W - 1, y);
     y += 2;
 
@@ -254,6 +335,7 @@ static void render_screen_device(void)
     y += 12;
     gfx_text(10, y, GFX_FONT_NORMAL, "Text size: normal");
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter select  esc back");
 }
 
 static void render_screen_setup(void)
@@ -269,6 +351,7 @@ static void render_screen_setup(void)
     y += 16;
     gfx_text(0, y, GFX_FONT_NORMAL, "network . broker . bundle . done");
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "enter submit  esc clear/back");
 }
 
 static void render_screen_pick(void)
@@ -296,6 +379,7 @@ static void render_screen_pick(void)
         y += 12;
     }
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "enter choose   esc back");
 }
 
 static void render_screen_book(void)
@@ -326,6 +410,7 @@ static void render_screen_book(void)
         y += 12;
     }
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "up/down move   enter select   esc back");
 }
 
 static void render_screen_book_add(void)
@@ -341,6 +426,7 @@ static void render_screen_book_add(void)
     y += 12;
     gfx_text(8, y, GFX_FONT_NORMAL, "(or leave blank and type an @alias)");
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL,
              "tab next field   enter send for approval   esc cancel");
 }
 
@@ -357,6 +443,100 @@ static void render_screen_nickname(void)
     y += 12;
     gfx_text(0, y, GFX_FONT_NORMAL, "3/12");
 
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "enter save   esc cancel");
+}
+
+// Fixed name order instead of scr_greeting.c's random shuffle, so the PNG is deterministic.
+static void draw_centered_wrapped(const char *text)
+{
+    char wrapped[2][64];
+    int n = gfx_text_wrap(GFX_FONT_LARGE, text, GFX_SCREEN_W - 16, wrapped, 2);
+    int total_h = n * 20;
+    int y = FIXTURE_BODY_TOP + (GFX_SCREEN_H - FIXTURE_BODY_TOP - total_h) / 2;
+    for (int i = 0; i < n && i < 2; i++) {
+        int w = gfx_text_width(GFX_FONT_LARGE, wrapped[i]);
+        gfx_text((GFX_SCREEN_W - w) / 2, y, GFX_FONT_LARGE, wrapped[i]);
+        y += 20;
+    }
+}
+
+static void render_screen_greeting(void)
+{
+    gfx_clear();
+    draw_centered_wrapped("Hi Alice! Hi Bob! Hi Carol!");
+}
+
+static void draw_status_footer(const char *status)
+{
+    int fw = gfx_text_width(GFX_FONT_NORMAL, status);
+    gfx_text((GFX_SCREEN_W - fw) / 2, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, status);
+}
+
+static void render_screen_greeting_booting(void)
+{
+    gfx_clear();
+    draw_centered_wrapped("Hi Alice! Hi Bob! Hi Carol!");
+    draw_status_footer("booting");
+}
+
+static void render_screen_greeting_sim_missing(void)
+{
+    gfx_clear();
+    draw_centered_wrapped("Hi Alice! Hi Bob! Hi Carol!");
+    draw_status_footer("sim missing");
+}
+
+static void render_screen_greeting_shutting_down(void)
+{
+    gfx_clear();
+    draw_centered_wrapped("Hi Alice! Hi Bob! Hi Carol!");
+    draw_status_footer("shutting down");
+}
+
+// Padlock icons at 1x, 3x and 6x so the two shapes are easy to tell apart.
+static void draw_padlock_scaled(int x0, int y0, gfx_icon_t id, int scale)
+{
+    // Samples gfx_icon()'s 12x12 output from a scratch row, then blits each set pixel as a
+    // scale x scale block.
+    int scratch_y = GFX_SCREEN_H - GFX_ICON_H;
+    gfx_icon(0, scratch_y, id);
+    for (int iy = 0; iy < GFX_ICON_H; iy++) {
+        for (int ix = 0; ix < GFX_ICON_W; ix++) {
+            // Read back via gfx_fb_native_row() with snapshot_framebuffer()'s mirroring.
+            const uint8_t *row = gfx_fb_native_row((GFX_FB_ROWS - 1) - ix);
+            int y = scratch_y + iy;
+            int bit = (row[y / 8] >> (7 - (y % 8))) & 1; // 1 = white/unset, 0 = black/ink
+            if (bit == 0) {
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        gfx_set_pixel(x0 + ix * scale + sx, y0 + iy * scale + sy, true);
+                    }
+                }
+            }
+        }
+    }
+    // Erase the scratch row so it never shows up in the real frame.
+    for (int ix = 0; ix < GFX_ICON_W; ix++) {
+        for (int iy = 0; iy < GFX_ICON_H; iy++) {
+            gfx_set_pixel(ix, scratch_y + iy, false);
+        }
+    }
+}
+
+static void render_screen_tls_icons(void)
+{
+    gfx_clear();
+
+    int y = FIXTURE_BODY_TOP + 2;
+    gfx_text(0, y, GFX_FONT_NORMAL, "pinned (1x, 3x, 6x):");
+    draw_padlock_scaled(140, y - 2, GFX_ICON_TLS_PINNED, 1);
+    draw_padlock_scaled(160, y - 6, GFX_ICON_TLS_PINNED, 3);
+    draw_padlock_scaled(200, y - 10, GFX_ICON_TLS_PINNED, 6);
+    y += 40;
+    gfx_text(0, y, GFX_FONT_NORMAL, "broken (1x, 3x, 6x):");
+    draw_padlock_scaled(140, y - 2, GFX_ICON_TLS_BROKEN, 1);
+    draw_padlock_scaled(160, y - 6, GFX_ICON_TLS_BROKEN, 3);
+    draw_padlock_scaled(200, y - 10, GFX_ICON_TLS_BROKEN, 6);
 }
 
 int main(int argc, char **argv)
@@ -387,6 +567,11 @@ int main(int argc, char **argv)
         { "screen_book", render_screen_book },
         { "screen_book_add", render_screen_book_add },
         { "screen_nickname", render_screen_nickname },
+        { "screen_greeting", render_screen_greeting },
+        { "screen_greeting_booting", render_screen_greeting_booting },
+        { "screen_greeting_sim_missing", render_screen_greeting_sim_missing },
+        { "screen_greeting_shutting_down", render_screen_greeting_shutting_down },
+        { "screen_tls_icons", render_screen_tls_icons },
     };
 
     int status = 0;

@@ -226,6 +226,7 @@ static void add_render(void)
     y += 12;
     gfx_text(8, y, GFX_FONT_NORMAL, "(or leave blank and type an @alias)");
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL,
 }
 
 static char s_nick_alias[BOOK_ALIAS_MAX];
@@ -286,6 +287,7 @@ static void nick_render(void)
     snprintf(counter, sizeof(counter), "%u/12", (unsigned) s_nick_field.cp_count);
     gfx_text(0, y, GFX_FONT_NORMAL, counter);
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter save   esc cancel");
 }
 
 
@@ -382,6 +384,7 @@ static void list_render(void)
         }
     }
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "up/down move   enter select   esc back");
 }
 
 static void book_on_event(ui_evt_t evt)

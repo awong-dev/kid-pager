@@ -16,8 +16,11 @@ extern "C" {
 // CBOR `sig` suffix: key 13 + bstr(8) header + 8 tag bytes, PROTOCOL.md §14.3
 #define AUTH_SIG_SUFFIX_LEN (2 + AUTH_TAG_LEN)
 
+// n = (epoch << AUTH_UP_LO_BITS) | lo; 32-bit epoch gives up to 52 bits
 #define AUTH_UP_LO_BITS 20u
 #define AUTH_UP_LO_MASK ((1u << AUTH_UP_LO_BITS) - 1u) /* 0xFFFFF */
+#define AUTH_UP_EPOCH_BITS 32u
+#define AUTH_UP_EPOCH_MASK 0xFFFFFFFFu
 
 // /down replay window; narrower than the relay's 64-wide /up window
 #define AUTH_DOWN_WINDOW 32u
@@ -39,6 +42,7 @@ bool auth_sign(const char *topic, uint8_t *buf, size_t *len, size_t cap);
 bool auth_verify(const char *topic, uint8_t *buf, size_t *len);
 
 // Next /up,/status,/loc counter; *wrapped means the caller must bump and persist n_epoch.
+uint64_t auth_next_up_n(auth_rtc_t *rtc, uint32_t epoch, bool *wrapped);
 
 // Accepts a /down n inside the replay window; n == 0 is always rejected.
 bool auth_accept_down_n(auth_rtc_t *rtc, uint32_t n);

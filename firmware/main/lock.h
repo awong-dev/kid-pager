@@ -63,6 +63,8 @@ void lock_check_autolock(int64_t now_us);
 /* Locks now; no-op if no passcode is set. */
 void lock_now(void);
 
+/* Applies a `cfg.lock` sub-map (docs/PROTOCOL.md §10) and acks `shown`; malformed is dropped. */
+void lock_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id);
 
 /* Drains a pending toast; modes_run() task only (rendering must not run on the modem task). */
 bool lock_take_toast(char *out, size_t cap);

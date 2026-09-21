@@ -1,0 +1,839 @@
+// Location policy, tracking classifier, `/loc` CBOR and the GNSS attempt state machine.
+
+#include "loc.h"
+
+#include <string.h>
+
+#include "cbor.h"
+
+void loc_policy_init(loc_policy_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    p->long_budget_next = true; // cold boot: no ephemeris yet
+}
+
+uint32_t loc_next_backoff_s(uint32_t current_s)
+{
+    if (current_s == 0) {
+        return LOC_BACKOFF_MIN_S;
+    }
+    uint64_t next = (uint64_t) current_s * 2;
+    if (next > LOC_BACKOFF_MAX_S) {
+        next = LOC_BACKOFF_MAX_S;
+    }
+    return (uint32_t) next;
+}
+
+bool loc_battery_ok(int batt_mv)
+{
+    return batt_mv >= LOC_BATTERY_FLOOR_MV;
+}
+
+bool loc_fix_confidence_ok(double confidence_m)
+{
+    return confidence_m <= LOC_FIX_CONFIDENCE_MAX;
+}
+
+static bool loc_time_allowed(const loc_policy_t *p, int64_t now_us)
+{
+    int64_t backoff_until_us = p->last_attempt_us + (int64_t) p->backoff_s * 1000000;
+    if (now_us < backoff_until_us) {
+        return false;
+    }
+    if (p->trigger_floor_until_us != 0 && now_us < p->trigger_floor_until_us) {
+        return false;
+    }
+    return true;
+}
+
+static bool enqueue_id_locked(loc_policy_t *p, const char *id)
+{
+    if (!id || id[0] == '\0') {
+        return false;
+    }
+    if (p->queued_count >= LOC_MAX_QUEUED) {
+        return false; // full: this requester's answer is lost
+    }
+    strncpy(p->queued_ids[p->queued_count], id, LOC_ID_MAX - 1);
+    p->queued_ids[p->queued_count][LOC_ID_MAX - 1] = '\0';
+    p->queued_count++;
+    return true;
+}
+
+loc_decision_t loc_on_request(loc_policy_t *p, int64_t now_us, int batt_mv, const char *req_id)
+{
+    if (p->attempt_in_progress) {
+        enqueue_id_locked(p, req_id);
+        return LOC_ANSWER_NONE;
+    }
+    if (!loc_time_allowed(p, now_us) || !loc_battery_ok(batt_mv)) {
+        return LOC_ANSWER_CACHED;
+    }
+    p->attempt_in_progress = true;
+    p->last_attempt_us = now_us;
+    p->queued_count = 0;
+    enqueue_id_locked(p, req_id);
+    return LOC_ANSWER_START_ATTEMPT;
+}
+
+uint32_t loc_attempt_budget_s(const loc_policy_t *p)
+{
+    return p->long_budget_next ? LOC_FIRST_ATTEMPT_S : LOC_ATTEMPT_S;
+}
+
+void loc_policy_request_long_budget(loc_policy_t *p)
+{
+    p->long_budget_next = true;
+}
+
+void loc_on_attempt_done(loc_policy_t *p, bool success, double lat, double lon, bool have_acc,
+                          int32_t acc_m, int64_t fix_ts_epoch_s, uint8_t src)
+{
+    p->attempt_in_progress = false;
+    p->long_budget_next = false;
+    p->trigger_floor_until_us = 0; // consumed: its only job was delaying this attempt
+
+    if (success) {
+        p->backoff_s = 0;
+        p->have_fix = true;
+        p->fix_lat = lat;
+        p->fix_lon = lon;
+        p->fix_have_acc = have_acc;
+        p->fix_acc_m = acc_m;
+        p->fix_ts_epoch_s = fix_ts_epoch_s;
+        p->fix_src = src;
+    } else {
+        p->backoff_s = loc_next_backoff_s(p->backoff_s);
+    }
+}
+
+bool loc_take_queued_id(loc_policy_t *p, char *out, size_t cap)
+{
+    if (p->queued_count <= 0 || !out || cap == 0) {
+        return false;
+    }
+    p->queued_count--;
+    strncpy(out, p->queued_ids[p->queued_count], cap - 1);
+    out[cap - 1] = '\0';
+    return true;
+}
+
+bool loc_get_cached(const loc_policy_t *p, double *lat, double *lon, bool *have_acc,
+                    int32_t *acc_m, int64_t *fix_ts_epoch_s, uint8_t *src)
+{
+    if (!p->have_fix) {
+        return false;
+    }
+    if (lat) *lat = p->fix_lat;
+    if (lon) *lon = p->fix_lon;
+    if (have_acc) *have_acc = p->fix_have_acc;
+    if (acc_m) *acc_m = p->fix_acc_m;
+    if (fix_ts_epoch_s) *fix_ts_epoch_s = p->fix_ts_epoch_s;
+    if (src) *src = p->fix_src;
+    return true;
+}
+
+// Shared by both triggers: backoff -> 0, plus a floor measured from the last attempt (not now).
+static void apply_trigger_reset_locked(loc_policy_t *p)
+{
+    p->backoff_s = 0;
+    p->trigger_floor_until_us = p->last_attempt_us + (int64_t) LOC_TRIGGER_FLOOR_S * 1000000;
+}
+
+bool loc_trigger_cell_change(loc_policy_t *p, int64_t now_us, const char *cell_key)
+{
+    if (!cell_key || cell_key[0] == '\0') {
+        return false;
+    }
+    if (!p->have_cell_key) {
+        strncpy(p->cell_key, cell_key, sizeof(p->cell_key) - 1);
+        p->cell_key[sizeof(p->cell_key) - 1] = '\0';
+        p->have_cell_key = true;
+        return false; // first observation ever — nothing "changed" yet
+    }
+    if (strncmp(p->cell_key, cell_key, sizeof(p->cell_key)) == 0) {
+        return false; // not actually a change
+    }
+    strncpy(p->cell_key, cell_key, sizeof(p->cell_key) - 1);
+    p->cell_key[sizeof(p->cell_key) - 1] = '\0';
+
+    if (p->have_last_cell_trigger &&
+        (now_us - p->last_cell_trigger_us) < (int64_t) LOC_CELL_DEBOUNCE_S * 1000000) {
+        return false; // debounced: a stationary indoor modem flapping between cells
+    }
+    p->have_last_cell_trigger = true;
+    p->last_cell_trigger_us = now_us;
+    apply_trigger_reset_locked(p);
+    return true;
+}
+
+static void motion_evict_locked(loc_motion_ring_t *r, int64_t now_us)
+{
+    int64_t cutoff_us = now_us - (int64_t) LOC_MOTION_WINDOW_S * 1000000;
+    int i = 0;
+    while (i < r->n && r->events_us[i] < cutoff_us) {
+        i++;
+    }
+    if (i > 0) {
+        memmove(&r->events_us[0], &r->events_us[i], (size_t) (r->n - i) * sizeof(int64_t));
+        r->n -= i;
+    }
+}
+
+{
+    motion_evict_locked(r, now_us);
+
+    if (r->n == LOC_MOTION_RING) {
+        // Ring full: drop the oldest; this only shortens the measured span, never fakes a positive.
+        memmove(&r->events_us[0], &r->events_us[1], (LOC_MOTION_RING - 1) * sizeof(int64_t));
+        r->n--;
+    }
+    r->events_us[r->n++] = now_us;
+
+    if (r->n < 2) {
+        return false;
+    }
+    int64_t span_us = r->events_us[r->n - 1] - r->events_us[0];
+    if (span_us < (int64_t) LOC_MOTION_SUSTAIN_S * 1000000) {
+        return false;
+    }
+
+    r->n = 0;
+    apply_trigger_reset_locked(p);
+    return true;
+}
+// PROTOCOL.md §10 keymap subset this file writes/reads.
+#define LK_V 0
+#define LK_ID 1
+#define LK_TS 2
+#define LK_KIND 6
+#define LK_LOC 8
+#define LK_REQ 9
+#define LK_CACHED 10
+#define LK_ERR 11
+#define LK_N 12
+#define LK_CELL 49 // written right before `n`, out of key order (docs/PROTOCOL.md §13.2)
+// `loc` sub-map (docs/PROTOCOL.md §10 "Sub-map keys").
+#define LOCSUB_LAT 0
+#define LOCSUB_LON 1
+#define LOCSUB_ACC 2
+#define LOCSUB_FIXTS 3
+#define LOCSUB_SRC 4
+// `cell` sub-map (docs/PROTOCOL.md §10 "Sub-map keys").
+#define CELLSUB_MCC 0
+#define CELLSUB_MNC 1
+#define CELLSUB_TAC 2
+#define CELLSUB_CI 3
+#define CELLSUB_RSRP 4
+
+// `v` must be non-negative for cbor_w_uint(); rsrp is not.
+static bool cbor_w_int(cbor_w_t *w, uint32_t key, int64_t v)
+{
+    return (v < 0) ? cbor_w_nint(w, key, v) : cbor_w_uint(w, key, (uint64_t) v);
+}
+
+// False if `cell` is NULL or malformed (mcc not 3 digits, mnc not 2-3); callers then omit it.
+static bool cell_shape_ok(const loc_cell_t *cell)
+{
+    if (!cell) {
+        return false;
+    }
+    size_t mcc_len = strlen(cell->mcc), mnc_len = strlen(cell->mnc);
+    return mcc_len == 3 && (mnc_len == 2 || mnc_len == 3) && cell->tac <= 65535u &&
+           cell->ci <= 268435455u;
+}
+
+bool loc_build_cbor(uint8_t *out, size_t cap, size_t *out_len, bool signed_env, uint64_t n,
+                     const char *id, int64_t ts, bool have_fix, double lat, double lon,
+                     bool have_acc, int32_t acc_m, int64_t fix_ts, bool src_cell, const char *req,
+{
+    if (!out || !out_len || !id) {
+        return false;
+    }
+    if (have_fix == (err != NULL && err[0] != '\0')) {
+        // docs/PROTOCOL.md §13.2: `err` present iff `loc` is null.
+        return false;
+    }
+    bool have_cell = cell_shape_ok(cell);
+
+    uint32_t nfields = 3; // v, id, ts
+    nfields += 1;         // loc (map or null)
+    nfields += 1;         // req (tstr or null)
+    if (cached) {
+        nfields += 1;
+    }
+    if (!have_fix) {
+        nfields += 1; // err
+    }
+    if (have_cell) {
+        nfields += 1; // cell
+    }
+    if (signed_env) {
+        nfields += 2; // n (written below) + sig (appended by the caller's auth_sign())
+    }
+
+    cbor_w_t w;
+    cbor_w_init(&w, out, cap);
+    cbor_w_map(&w, nfields);
+    cbor_w_uint(&w, LK_V, 1);
+    cbor_w_tstr(&w, LK_ID, id, strlen(id));
+    cbor_w_uint(&w, LK_TS, (uint64_t) ts);
+
+    if (have_fix) {
+        uint32_t loc_n = 2; // lat, lon
+        loc_n += 1;         // fix_ts
+        if (have_acc) {
+            loc_n += 1;
+        }
+        if (src_cell) {
+            loc_n += 1;
+        }
+        cbor_w_map_key(&w, LK_LOC, loc_n);
+        cbor_w_f64(&w, LOCSUB_LAT, lat);
+        cbor_w_f64(&w, LOCSUB_LON, lon);
+        if (have_acc) {
+            cbor_w_uint(&w, LOCSUB_ACC, (uint64_t) acc_m);
+        }
+        cbor_w_uint(&w, LOCSUB_FIXTS, (uint64_t) fix_ts);
+        if (src_cell) {
+            cbor_w_tstr(&w, LOCSUB_SRC, "cell", 4);
+        }
+    } else {
+        cbor_w_null(&w, LK_LOC);
+    }
+
+    if (req) {
+        cbor_w_tstr(&w, LK_REQ, req, strlen(req));
+    } else {
+        cbor_w_null(&w, LK_REQ);
+    }
+    if (cached) {
+        cbor_w_bool(&w, LK_CACHED, true);
+    }
+    if (!have_fix) {
+        cbor_w_tstr(&w, LK_ERR, err, strlen(err));
+    }
+    if (have_cell) {
+        cbor_w_map_key(&w, LK_CELL, cell->have_rsrp ? 5 : 4);
+        cbor_w_tstr(&w, CELLSUB_MCC, cell->mcc, strlen(cell->mcc));
+        cbor_w_tstr(&w, CELLSUB_MNC, cell->mnc, strlen(cell->mnc));
+        cbor_w_uint(&w, CELLSUB_TAC, cell->tac);
+        cbor_w_uint(&w, CELLSUB_CI, cell->ci);
+        if (cell->have_rsrp) {
+            cbor_w_int(&w, CELLSUB_RSRP, cell->rsrp);
+        }
+    }
+    if (signed_env) {
+        cbor_w_uint(&w, LK_N, n);
+    }
+
+    if (w.err) {
+        return false;
+    }
+    *out_len = w.len;
+    return true;
+}
+
+bool loc_parse_req_cbor(const uint8_t *buf, uint16_t len, bool sig_pair_present, char *out_id,
+                        size_t out_id_cap)
+{
+    if (out_id && out_id_cap > 0) {
+        out_id[0] = '\0';
+    }
+
+    cbor_r_t r;
+    cbor_r_init(&r, buf, len);
+    uint32_t count;
+    if (!cbor_r_map(&r, &count) || count == 0) {
+        return false;
+    }
+    if (sig_pair_present) {
+        // auth_verify() trims the trailing `sig` pair but not the map header's pair count.
+        count -= 1;
+    }
+
+    bool is_loc_req = false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t key;
+        if (!cbor_r_key(&r, &key)) {
+            return false;
+        }
+        switch (key) {
+        case LK_ID: {
+            const char *s;
+            size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen)) {
+                return false;
+            }
+            if (out_id && slen < out_id_cap) {
+                memcpy(out_id, s, slen);
+                out_id[slen] = '\0';
+            }
+            break;
+        }
+        case LK_KIND: {
+            const char *s;
+            size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen)) {
+                return false;
+            }
+            is_loc_req = (slen == 7 && memcmp(s, "loc_req", 7) == 0);
+            break;
+        }
+        default:
+            if (!cbor_r_skip(&r)) {
+                return false;
+            }
+            break;
+        }
+    }
+
+    return is_loc_req && out_id && out_id[0] != '\0';
+}
+
+#ifdef ESP_PLATFORM
+
+#include "accel.h"
+#include "ident.h"
+#include "modes.h"
+#include "net.h"
+
+#include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "loc";
+
+// Defaults are no-ops so an accessor called before loc_bind() never dereferences NULL.
+
+static void loc_rtc_noop(void) {}
+
+static loc_rtc_t *s_rtc = NULL;
+static auth_rtc_t *s_auth_rtc = NULL;
+static loc_rtc_lock_fn s_lock = loc_rtc_noop;
+static loc_rtc_unlock_fn s_unlock = loc_rtc_noop;
+static loc_rtc_save_fn s_save = loc_rtc_noop;
+static loc_epoch_wrap_fn s_on_wrap = loc_rtc_noop;
+
+void loc_bind(loc_rtc_t *rtc, auth_rtc_t *auth_rtc, loc_rtc_lock_fn lock, loc_rtc_unlock_fn unlock,
+              loc_rtc_save_fn save, loc_epoch_wrap_fn on_wrap)
+{
+    s_rtc = rtc;
+    s_auth_rtc = auth_rtc;
+    s_lock = lock ? lock : loc_rtc_noop;
+    s_unlock = unlock ? unlock : loc_rtc_noop;
+    s_save = save ? save : loc_rtc_noop;
+    s_on_wrap = on_wrap ? on_wrap : loc_rtc_noop;
+}
+
+// The policy instance (RAM only), guarded by s_lock: loc_ingest_req_cbor() runs on the modem event
+// task while loc_service() runs on modes_run()'s task.
+static loc_policy_t s_policy;
+
+
+uint32_t loc_get_min_s(void) { return LOC_STATUS_MIN_S; }
+
+// Read every modes_run() iteration: keep it a cheap flag read, never an AT round trip.
+bool loc_attempt_in_progress(void)
+{
+    s_lock();
+    bool b = s_policy.attempt_in_progress;
+    s_unlock();
+    return b;
+}
+
+uint32_t loc_get_backoff_remaining_s(void)
+{
+    s_lock();
+    int64_t now_us = esp_timer_get_time();
+    int64_t backoff_until_us = s_policy.last_attempt_us + (int64_t) s_policy.backoff_s * 1000000;
+    int64_t floor_us = s_policy.trigger_floor_until_us;
+    int64_t deadline_us = backoff_until_us > floor_us ? backoff_until_us : floor_us;
+    s_unlock();
+    if (deadline_us <= now_us) {
+        return 0;
+    }
+    return (uint32_t) ((deadline_us - now_us + 999999) / 1000000); // round up
+}
+
+// Defined with the GNSS attempt state machine below.
+static void begin_attempt(uint32_t budget_s, bool extendable);
+
+// Converts the modem cell cache to a loc_cell_t; false if it was never read, in which case callers
+// omit `cell` (docs/PROTOCOL.md §13.2).
+static bool get_cell_snapshot(loc_cell_t *out)
+{
+    net_cell_info_t nci;
+    if (!net_get_cell_info(&nci)) {
+        return false;
+    }
+    strncpy(out->mcc, nci.mcc, sizeof(out->mcc) - 1);
+    out->mcc[sizeof(out->mcc) - 1] = '\0';
+    strncpy(out->mnc, nci.mnc, sizeof(out->mnc) - 1);
+    out->mnc[sizeof(out->mnc) - 1] = '\0';
+    out->tac = nci.tac;
+    out->ci = nci.ci;
+    out->have_rsrp = nci.have_rsrp;
+    out->rsrp = nci.rsrp;
+    return true;
+}
+
+// Attach `cell` to a cached answer once the fix is stale; an unknown age (no clock or fix
+// timestamp) is not stale.
+static bool cell_fix_is_stale(int64_t fix_ts_epoch_s)
+{
+    if (fix_ts_epoch_s <= 0) {
+        return false;
+    }
+    int64_t now_epoch = 0;
+    if (!net_get_clock(&now_epoch)) {
+        return false;
+    }
+    return (now_epoch - fix_ts_epoch_s) > (int64_t) LOC_CELL_STALE_FIX_S;
+}
+
+// req_id NULL is an unsolicited report (QoS 0), else QoS 1 (docs/PROTOCOL.md §13.1). `cell` is
+// attached at the caller's decision; `why` is the tracking reason, NULL on on-demand answers.
+static void publish_loc_answer(const char *req_id, bool success, double lat, double lon,
+                                bool have_acc, int32_t acc_m, int64_t fix_ts, uint8_t src,
+{
+    char id[LOC_ID_MAX];
+    snprintf(id, sizeof(id), "l_%08x", (unsigned) esp_random());
+
+    int64_t ts = 0;
+    net_get_clock(&ts); // best-effort: publish ts:0 on failure (docs/PROTOCOL.md §3.5)
+
+    bool signed_env = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
+    uint64_t n = 0;
+    bool wrapped = false;
+    if (signed_env) {
+        s_lock();
+        if (s_auth_rtc) {
+            n = auth_next_up_n(s_auth_rtc, ident_get_n_epoch(), &wrapped);
+        }
+        s_save();
+        s_unlock();
+    }
+
+    uint8_t buf[192]; // envelope + loc map
+    size_t len;
+    bool src_cell = (src == LOC_SRC_CELL);
+    if (!loc_build_cbor(buf, sizeof(buf), &len, signed_env, n, id, ts, success, lat, lon, have_acc,
+        ESP_LOGI(TAG, "/loc CBOR build failed for req=%s", req_id ? req_id : "(none)");
+        return;
+    }
+
+    char topic[48];
+    snprintf(topic, sizeof(topic), "pager/%s/loc", net_get_device_id());
+
+    if (signed_env) {
+        if (!auth_sign(topic, buf, &len, sizeof(buf))) {
+            ESP_LOGI(TAG, "/loc auth_sign() failed for req=%s", req_id ? req_id : "(none)");
+            return;
+        }
+        if (wrapped) {
+            s_on_wrap();
+        }
+    }
+
+    uint8_t qos = (req_id != NULL) ? 1 : 0; // docs/PROTOCOL.md §13.1
+    } else {
+    }
+}
+
+// Gives every queued request its own /loc carrying the one shared result and `cell` snapshot
+// (docs/PROTOCOL.md §13.3).
+static void drain_queue_and_publish(bool success, double lat, double lon, bool have_acc,
+                                     int32_t acc_m, int64_t fix_ts, uint8_t src,
+                                     const loc_cell_t *cell)
+{
+    char id[LOC_ID_MAX];
+    s_lock();
+    bool have = loc_take_queued_id(&s_policy, id, sizeof(id));
+    s_unlock();
+    while (have) {
+bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
+{
+    bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
+    char id[LOC_ID_MAX] = "";
+    if (!loc_parse_req_cbor(buf, len, sig_present, id, sizeof(id))) {
+        return false; // not loc_req (or malformed) — caller falls through
+    }
+
+    if (modes_coverage_owns_radio()) {
+        // A location attempt must not start while the coverage duty cycle owns the radio; answer
+        // from cache.
+        s_lock();
+        double lat = 0, lon = 0;
+        bool have_acc = false;
+        int32_t acc_m = 0;
+        int64_t fix_ts = 0;
+        uint8_t src = LOC_SRC_GNSS;
+        bool have_cached = loc_get_cached(&s_policy, &lat, &lon, &have_acc, &acc_m, &fix_ts, &src);
+        s_unlock();
+        ESP_LOGI(TAG, "loc_req %s answered from %s -- coverage duty cycle owns the radio right now",
+                 id, have_cached ? "cache" : "no_fix");
+        return true;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    s_lock();
+    loc_decision_t d = loc_on_request(&s_policy, now_us, batt_mv, id);
+    double lat = 0, lon = 0;
+    bool have_acc = false;
+    int32_t acc_m = 0;
+    int64_t fix_ts = 0;
+    uint8_t src = LOC_SRC_GNSS;
+    bool have_cached = loc_get_cached(&s_policy, &lat, &lon, &have_acc, &acc_m, &fix_ts, &src);
+    uint32_t budget_s = loc_attempt_budget_s(&s_policy);
+    s_save();
+    s_unlock();
+
+    switch (d) {
+    case LOC_ANSWER_NONE:
+        ESP_LOGI(TAG, "loc_req %s queued behind an in-flight attempt", id);
+        break;
+    case LOC_ANSWER_CACHED: {
+        // cell rides on every no-fix answer, and on a cached fix once stale (LOC_CELL_STALE_FIX_S).
+        bool want_cell = !have_cached || cell_fix_is_stale(fix_ts);
+        loc_cell_t cellbuf;
+        const loc_cell_t *cellp = (want_cell && get_cell_snapshot(&cellbuf)) ? &cellbuf : NULL;
+        publish_loc_answer(id, have_cached, lat, lon, have_acc, acc_m, fix_ts, src, have_cached,
+        break;
+    }
+    case LOC_ANSWER_START_ATTEMPT:
+        // loc_on_request() already queued `id`; begin_attempt() arms the state machine, which
+        // loc_service() then drives from modes_run()'s task.
+        ESP_LOGI(TAG, "loc_req %s starting a GNSS attempt (budget=%us)", id, (unsigned) budget_s);
+        begin_attempt(budget_s, /*extendable=*/true);
+        break;
+    }
+    return true;
+}
+
+// Called via net_set_cell_change_cb() with a de-duplicated "lac:ci" key; can run on the modem event
+{
+    int64_t now_us = esp_timer_get_time();
+    s_lock();
+    bool reset = loc_trigger_cell_change(&s_policy, now_us, cell_key);
+    s_save();
+    s_unlock();
+    if (reset) {
+        ESP_LOGI(TAG, "cell change (%s): backoff reset, 10min floor since last attempt applies",
+                 cell_key ? cell_key : "?");
+    }
+}
+
+void loc_on_motion_event(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    s_lock();
+    bool reset = loc_trigger_motion_event(&s_policy, now_us);
+    s_save();
+    s_unlock();
+    if (reset) {
+        ESP_LOGI(TAG, "sustained motion: backoff reset, 10min floor since last attempt applies");
+        // Also resets coverage.c's off-period backoff: moving is when coverage changes.
+        modes_note_motion_reset();
+    }
+}
+
+// GNSS attempt state machine: one bounded step per loc_service() call so modes_run() keeps
+// servicing input; slow waits are polled against a stored deadline.
+
+typedef enum {
+    LOC_PH_IDLE = 0,
+    LOC_PH_ASSIST_CHECK,
+    LOC_PH_ASSIST_UPDATE,
+    LOC_PH_DONE,
+} loc_phase_t;
+
+// s_phase: IDLE -> ASSIST_CHECK is written under s_lock by begin_attempt() from several tasks; all
+// later transitions run on modes_run()'s task. Other tasks poll s_policy.attempt_in_progress.
+static loc_phase_t s_phase = LOC_PH_IDLE;
+static uint32_t s_budget_s = LOC_ATTEMPT_S;
+static bool s_budget_extendable = true; // false only for loc_debug_run()'s explicit `seconds`
+static int64_t s_phase_deadline_us = 0;
+static int64_t s_attempt_start_us = 0;
+static net_gnss_event_t s_last_event;
+// gnsstest state: s_debug_mode is set before begin_attempt() and cleared after the attempt ends;
+// s_debug_done is set in finish_attempt()'s locked section, before attempt_in_progress clears.
+static bool s_debug_mode = false;
+static bool s_debug_done = false;
+
+static loc_phase_t get_phase(void)
+{
+    s_lock();
+    loc_phase_t ph = s_phase;
+    s_unlock();
+    return ph;
+}
+
+// Callable from the modem event task, the debug console and modes_run(). Sets attempt_in_progress
+static void begin_attempt(uint32_t budget_s, bool extendable)
+{
+    s_attempt_start_us = esp_timer_get_time();
+    s_budget_s = budget_s;
+    s_budget_extendable = extendable;
+    memset(&s_last_event, 0, sizeof(s_last_event));
+    s_lock();
+    s_policy.attempt_in_progress = true;
+    s_phase = LOC_PH_ASSIST_CHECK;
+    s_unlock();
+}
+
+static void finish_attempt(bool success)
+{
+    double lat = s_last_event.lat, lon = s_last_event.lon;
+    bool have_acc = success;
+    int32_t acc_m = success ? (int32_t) (s_last_event.confidence + 0.5) : 0;
+    int64_t fix_ts = s_last_event.fix_ts;
+
+
+    // Both branches update the cache/backoff; s_debug_done is set inside this locked section so
+    // loc_debug_run() cannot see the attempt finished before it.
+    s_lock();
+    loc_on_attempt_done(&s_policy, success, lat, lon, have_acc, acc_m, fix_ts, LOC_SRC_GNSS);
+    if (s_debug_mode) {
+        s_debug_done = true;
+    }
+    s_save();
+    s_unlock();
+
+    }
+    s_phase = LOC_PH_IDLE; // same-task write; the only cross-task readers use attempt_in_progress
+}
+
+void loc_service(void)
+{
+    switch (get_phase()) {
+
+    case LOC_PH_ASSIST_CHECK: {
+        int32_t stale_s = 0;
+            ESP_LOGI(TAG, "gnss assistance fresh for another %lds, skipping refresh", (long) stale_s);
+        } else {
+            s_phase = LOC_PH_ASSIST_UPDATE;
+        }
+        break;
+    }
+
+    case LOC_PH_ASSIST_UPDATE: {
+            s_budget_s = LOC_FIRST_ATTEMPT_S; // no ephemeris yet
+        }
+        break;
+    }
+
+        net_gnss_config(); // idempotent, persists across reboots per the vendor doc
+        if (!net_gnss_start_fix()) {
+            break;
+        }
+        s_phase_deadline_us = esp_timer_get_time() + (int64_t) s_budget_s * 1000000;
+        break;
+    }
+
+        net_gnss_event_t ev;
+        if (net_gnss_poll_event(&ev)) {
+            if (ev.kind == NET_GNSS_EVT_REFUSED) {
+                break;
+            }
+            s_last_event = ev;
+            finish_attempt(ev.kind == NET_GNSS_EVT_FIX && loc_fix_confidence_ok(ev.confidence));
+            break;
+        }
+        if (esp_timer_get_time() >= s_phase_deadline_us) {
+            net_gnss_cancel();
+        }
+        break; // still waiting; try again next loc_service() call
+    }
+
+        break;
+    }
+
+    }
+
+    }
+
+    }
+
+        }
+    }
+
+    }
+}
+
+// RAM cache of NVS loc/gnss; absent = enabled.
+void loc_init(void)
+{
+    s_lock();
+    loc_policy_init(&s_policy);
+    s_unlock();
+
+    net_set_cell_change_cb(loc_on_cell_change);
+
+    // accel_init() fails open (absent chip returns false); loc_track_init() needs it, so it runs first.
+
+}
+
+bool loc_debug_run(uint32_t seconds)
+{
+    if (seconds == 0 || seconds > 120) {
+        ESP_LOGI(TAG, "gnsstest: seconds must be 1..120");
+        return false;
+    }
+
+    if (modes_coverage_owns_radio()) {
+        // The debug console is the realistic way to race the duty cycle's radio-off window; refuse
+        // rather than fight it for the radio.
+        ESP_LOGI(TAG, "gnsstest: coverage duty cycle owns the radio right now (deliberately off) "
+                      "-- refusing to start an attempt");
+        return false;
+    }
+
+    s_lock();
+    bool busy = s_policy.attempt_in_progress;
+    s_unlock();
+    if (busy) {
+        ESP_LOGI(TAG, "gnsstest: an attempt is already in progress, not starting a second one");
+        return false;
+    }
+
+    net_mqtt_status_t before;
+    net_get_mqtt_status(&before);
+    ESP_LOGI(TAG, "gnsstest: starting one %us attempt (bypassing backoff/battery floor); "
+                  "mqtt_connected(before)=%d",
+             (unsigned) seconds, (int) before.mqtt_connected);
+
+    s_debug_mode = true; // published by begin_attempt()'s own s_lock/s_unlock below
+    s_debug_done = false;
+    begin_attempt(seconds, /*extendable=*/false);
+
+    // Wait on THIS task, never modes_run()'s: loc_service() drives the attempt, and two tasks
+    // stepping the phase machine would race.
+    int64_t deadline_us = esp_timer_get_time() + (int64_t) (seconds + 30) * 1000000; // generous overall cap
+    for (;;) {
+        s_lock();
+        bool done = !s_policy.attempt_in_progress;
+        s_unlock();
+        if (done) {
+            break;
+        }
+        if (esp_timer_get_time() >= deadline_us) {
+            ESP_LOGI(TAG, "gnsstest: gave up waiting for modes_run() to finish the attempt");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    s_debug_mode = false;
+
+    net_mqtt_status_t after;
+    net_get_mqtt_status(&after);
+    return s_debug_done;
+}
+
+#endif /* ESP_PLATFORM */

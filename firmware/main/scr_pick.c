@@ -2,17 +2,22 @@
 
 #include "ui.h"
 #include "book.h"
+#include "sms.h"
 
 #include <stdio.h>
 #include <string.h>
 
 
+static int s_sel = 0; /* index into book contacts followed by sms contacts */
+
+static size_t selectable_count(void) { return book_contact_count() + sms_contact_count(); }
 
 static void pick_on_event(ui_evt_t evt)
 {
     if (evt != UI_EVT_ENTER) {
         return;
     }
+    size_t n = selectable_count();
     if (s_sel < 0) {
         s_sel = 0;
     }
@@ -25,6 +30,7 @@ static void pick_on_event(ui_evt_t evt)
 
 static void pick_on_key(input_key_t key)
 {
+    size_t n = selectable_count();
     switch (key.type) {
     case INPUT_KEY_UP:
         if (s_sel > 0) {
@@ -37,6 +43,7 @@ static void pick_on_key(input_key_t key)
         }
         break;
         if (n == 0) {
+            break;
         }
         break;
     case INPUT_KEY_ESC:
@@ -49,6 +56,9 @@ static void pick_on_key(input_key_t key)
 
 static void pick_render(void)
 {
+    size_t n_book = book_contact_count();
+    size_t n_sms = sms_contact_count();
+    size_t n_contacts = n_book + n_sms;
 
     int y = UI_BODY_TOP + 2;
 
@@ -57,6 +67,7 @@ static void pick_render(void)
         gfx_text(0, y, GFX_FONT_NORMAL, "No address book yet.");
         y += 12;
         gfx_text(0, y, GFX_FONT_NORMAL, "Re-sync from the Device screen.");
+        gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "esc back");
         return;
     }
 
@@ -74,6 +85,7 @@ static void pick_render(void)
     bool have_default = book_get_default_alias(default_alias, sizeof(default_alias));
 
     for (int r = scroll_top; r < total_n && r < scroll_top + PICK_VISIBLE_ROWS; r++) {
+        if (r < (int) n_book) {
             book_contact_t c;
             if (!book_contact_at((size_t) r, &c)) {
                 continue;
@@ -90,9 +102,21 @@ static void pick_render(void)
             (void) x;
             int tw = gfx_text_width(GFX_FONT_NORMAL, c.type);
             gfx_text(GFX_SCREEN_W - tw, y, GFX_FONT_NORMAL, c.type);
+        } else if (r < (int) n_contacts) {
+            sms_contact_t sc;
+            if (!sms_contact_at((size_t) (r - (int) n_book), &sc)) {
+                continue;
+            }
+            if (r == sel_abs) {
+                gfx_text(0, y, GFX_FONT_NORMAL, ">");
+            }
+            gfx_text(10, y, GFX_FONT_NORMAL, sc.name);
+            int tw = gfx_text_width(GFX_FONT_NORMAL, "sms");
+            gfx_text(GFX_SCREEN_W - tw, y, GFX_FONT_NORMAL, "sms");
         }
     }
 
+    gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter choose   esc back");
 }
 
 const ui_screen_t g_scr_pick = {

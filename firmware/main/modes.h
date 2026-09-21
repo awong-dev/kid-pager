@@ -26,4 +26,23 @@ uint32_t modes_get_modem_resets(void);
 // Publishes a /status now; false if the MQTT session is not connected.
 bool modes_publish_status_now(void);
 
+/* Debug build only: open a timed window of real light sleep and print what was received.
+void modes_debug_sleeptest_report(void);
+
+// While true, the reconnect-retry loop and the modem-health check are skipped.
+void modes_set_ca_apply_suppress(bool suppress);
+
+// True while the radio is deliberately off to save battery out of coverage.
+bool modes_coverage_owns_radio(void);
+
+// Resets the coverage off-period backoff on sustained motion.
+void modes_note_motion_reset(void);
+
+// Debug console: prints the coverage duty-cycle state.
+void modes_coverage_debug_print(void);
+
+/* Alerts like an incoming page for an allow-listed inbound SMS already in the RAM thread;
+ * respects the lock screen and queues no `shown` ack. `from` is the contact's display name. */
+void modes_alert_incoming(const char *id, const char *from);
+
 #endif /* MODES_H */

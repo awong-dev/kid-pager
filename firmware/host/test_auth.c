@@ -1,5 +1,6 @@
 /* Host tests for auth.c: authvectors.json vectors, byte-flip rejection, up/down nonce windows. */
 #include "auth.h"
+#include "cbor.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -307,18 +308,36 @@ static void test_next_up_n(void)
     auth_rtc_t rtc = {0};
     bool wrapped;
 
+    uint64_t n0 = auth_next_up_n(&rtc, 0, &wrapped);
+    CHECK(n0 == 0, "first n with epoch=0 must be 0, got %llu", (unsigned long long) n0);
     CHECK(!wrapped, "first call must not report a wrap");
     CHECK(rtc.up_lo == 1, "up_lo must advance to 1, got %u", (unsigned) rtc.up_lo);
 
+    uint64_t n1 = auth_next_up_n(&rtc, 0, &wrapped);
+    CHECK(n1 == 1, "second n with epoch=0 must be 1, got %llu", (unsigned long long) n1);
     CHECK(!wrapped, "second call must not report a wrap");
 
+    uint64_t n_epoch = auth_next_up_n(&rtc, 3, NULL);
+    CHECK(n_epoch == (((uint64_t) 3u << AUTH_UP_LO_BITS) | 2u),
+          "epoch must shift into the high bits, got %llu", (unsigned long long) n_epoch);
 
     /* wrap: up_lo at AUTH_UP_LO_MASK must roll to 0 and report wrapped. */
     rtc.up_lo = AUTH_UP_LO_MASK;
+    uint64_t n_before_wrap = auth_next_up_n(&rtc, 5, &wrapped);
+    CHECK(n_before_wrap == (((uint64_t) 5u << AUTH_UP_LO_BITS) | AUTH_UP_LO_MASK),
+          "n just before wrap must report the max lo, got %llu", (unsigned long long) n_before_wrap);
     CHECK(wrapped, "up_lo rolling from AUTH_UP_LO_MASK to 0 must report wrapped=true");
     CHECK(rtc.up_lo == 0, "up_lo must roll to 0, got %u", (unsigned) rtc.up_lo);
 
+    /* The full 32-bit epoch appears in the high bits of a 64-bit n (>= 2^32). */
     auth_rtc_t rtc2 = {0};
+    uint64_t n_wide_epoch = auth_next_up_n(&rtc2, 0xFFFFFFFFu, NULL);
+    CHECK(n_wide_epoch == (((uint64_t) 0xFFFFFFFFu) << AUTH_UP_LO_BITS),
+          "a 32-bit epoch must appear in full in the high bits, got %llu",
+          (unsigned long long) n_wide_epoch);
+    CHECK(n_wide_epoch > 0xFFFFFFFFull,
+          "n from a near-max epoch must itself exceed 32 bits, got %llu",
+          (unsigned long long) n_wide_epoch);
 }
 
 static void test_accept_down_n(void)
@@ -361,6 +380,116 @@ static void test_accept_down_n(void)
     CHECK(rtc3.down_bits == 0, "a forward jump >= AUTH_DOWN_WINDOW must reset down_bits to 0");
 }
 
+/* Signed envelopes {v, id, ts, ack, n} with n = 2^32 and 2^53 - 1 (PROTOCOL.md §3.1 ceiling),
+ * made by relay/app/devauth.py sign_cbor() with key bytes(range(32)), topic pager/pgr-0001/up. */
+
+typedef struct {
+    const char *label;
+    uint64_t expect_n;
+    const uint8_t *cbor;
+    size_t cbor_len;
+} large_n_vector_t;
+
+/* n = 2^32 (4294967296, 0x100000000) */
+static const uint8_t k_n_2pow32[] = {
+    0xa6, 0x00, 0x01, 0x01, 0x6a, 0x6d, 0x5f, 0x37, 0x66, 0x33, 0x61, 0x32,
+    0x62, 0x31, 0x30, 0x02, 0x1a, 0x68, 0xc4, 0x60, 0x04, 0x05, 0x65, 0x73,
+    0x68, 0x6f, 0x77, 0x6e, 0x0c, 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x0d, 0x48, 0xc8, 0xc3, 0x76, 0x5a, 0xb8, 0x13, 0x47, 0xbb,
+};
+
+/* n = 2^53 - 1 (9007199254740991, 0x1fffffffffffff) */
+static const uint8_t k_n_2pow53_minus1[] = {
+    0xa6, 0x00, 0x01, 0x01, 0x6a, 0x6d, 0x5f, 0x37, 0x66, 0x33, 0x61, 0x32,
+    0x62, 0x31, 0x31, 0x02, 0x1a, 0x68, 0xc4, 0x60, 0x68, 0x05, 0x65, 0x73,
+    0x68, 0x6f, 0x77, 0x6e, 0x0c, 0x1b, 0x00, 0x1f, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0x0d, 0x48, 0x22, 0xd3, 0x2e, 0x2a, 0x96, 0x21, 0x1f, 0x71,
+};
+
+static const large_n_vector_t k_large_n_vectors[] = {
+    {"n_2pow32", 4294967296ull, k_n_2pow32, sizeof(k_n_2pow32)},
+    {"n_2pow53_minus1", 9007199254740991ull, k_n_2pow53_minus1, sizeof(k_n_2pow53_minus1)},
+};
+
+/* Finds CBOR key 12 (`n`, PROTOCOL.md §10) in a trimmed envelope with cbor_r_uint(). */
+static bool find_n_field(const uint8_t *buf, size_t len, uint64_t *out_n)
+{
+    cbor_r_t r;
+    cbor_r_init(&r, buf, len);
+    uint32_t count;
+    if (!cbor_r_map(&r, &count)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t key;
+        if (!cbor_r_key(&r, &key)) {
+            return false;
+        }
+        if (key == 12 /* MK_N, PROTOCOL.md §10 */) {
+            return cbor_r_uint(&r, out_n);
+        }
+        if (!cbor_r_skip(&r)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static void test_large_n_vectors(void)
+{
+    static const uint8_t key[AUTH_KDEV_LEN] = {
+        0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    };
+    static const char *topic = "pager/pgr-0001/up";
+
+    for (size_t i = 0; i < sizeof(k_large_n_vectors) / sizeof(k_large_n_vectors[0]); i++) {
+        const large_n_vector_t *v = &k_large_n_vectors[i];
+        auth_init(key);
+
+        uint8_t buf[64];
+        CHECK(v->cbor_len <= sizeof(buf), "%s: vector longer than the scratch buffer", v->label);
+        if (v->cbor_len > sizeof(buf)) {
+            continue;
+        }
+        memcpy(buf, v->cbor, v->cbor_len);
+        size_t len = v->cbor_len;
+
+        /* 1. auth_verify() accepts a wide n. */
+        bool ok = auth_verify(topic, buf, &len);
+        CHECK(ok, "%s: auth_verify() failed on a genuine large-n vector", v->label);
+        if (!ok) {
+            continue;
+        }
+        CHECK(len == v->cbor_len - AUTH_SIG_SUFFIX_LEN,
+              "%s: auth_verify() trimmed to %zu, expected %zu", v->label, len,
+              v->cbor_len - AUTH_SIG_SUFFIX_LEN);
+
+        /* 2. re-signing reproduces the original. */
+        uint8_t resigned[64];
+        memcpy(resigned, buf, len);
+        size_t resign_len = len;
+        ok = auth_sign(topic, resigned, &resign_len, sizeof(resigned));
+        CHECK(ok, "%s: auth_sign() failed re-signing", v->label);
+        CHECK(ok && resign_len == v->cbor_len && memcmp(resigned, v->cbor, v->cbor_len) == 0,
+              "%s: re-signed bytes differ from the original", v->label);
+
+        /* 3. cbor_r_uint() decodes the wide n exactly. */
+        uint64_t decoded_n = 0;
+        CHECK(find_n_field(buf, len, &decoded_n), "%s: `n` field not found/decodable", v->label);
+        CHECK(decoded_n == v->expect_n, "%s: decoded n=%llu, expected %llu", v->label,
+              (unsigned long long) decoded_n, (unsigned long long) v->expect_n);
+
+        /* 4. a corrupted byte inside the wide n must fail. */
+        uint8_t corrupted[64];
+        memcpy(corrupted, v->cbor, v->cbor_len);
+        corrupted[30] ^= 0x01; /* first byte of the 8-byte `n` payload, both vectors */
+        size_t clen = v->cbor_len;
+        CHECK(!auth_verify(topic, corrupted, &clen),
+              "%s: corrupting a byte inside the wide n payload was not detected", v->label);
+    }
+}
+
 int main(void)
 {
     test_sign_verify_without_init_fails();
@@ -368,6 +497,7 @@ int main(void)
     test_sign_rejects_when_cap_too_small();
     test_next_up_n();
     test_accept_down_n();
+    test_large_n_vectors();
 
     vector_t vectors[MAX_VECTORS];
     int n = load_vectors(AUTHVECTORS_PATH, vectors, MAX_VECTORS);

@@ -256,8 +256,11 @@ bool auth_verify(const char *topic, uint8_t *buf, size_t *len)
     return true;
 }
 
+uint64_t auth_next_up_n(auth_rtc_t *rtc, uint32_t epoch, bool *wrapped)
 {
     uint32_t lo = rtc->up_lo & AUTH_UP_LO_MASK;
+    // 64-bit shift: a uint32_t << 20 would drop the top bits of a large epoch
+    uint64_t n = (((uint64_t) (epoch & AUTH_UP_EPOCH_MASK)) << AUTH_UP_LO_BITS) | lo;
 
     uint32_t next_lo = (lo + 1u) & AUTH_UP_LO_MASK;
     bool did_wrap = (next_lo == 0u); /* wrapped past AUTH_UP_LO_MASK */

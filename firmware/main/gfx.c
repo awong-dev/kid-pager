@@ -25,6 +25,8 @@ void gfx_set_pixel(int x, int y, bool black)
     if (x < 0 || x >= GFX_SCREEN_W || y < 0 || y >= GFX_SCREEN_H) {
         return;
     }
+    // Native row 0 is at the opposite physical edge from x = 0, so x is mirrored.
+    int native_row = (GFX_FB_ROWS - 1) - x;
     int native_byte = y / 8;
     int bit = 7 - (y % 8);
     if (black) {
@@ -454,6 +456,28 @@ static void icon_battery(int x, int y, int filled /* 0..4 */)
     }
 }
 
+// Closed or broken padlock; broken opens the shackle on the right with a displaced stub.
+static void icon_padlock(int x, int y, bool broken)
+{
+    gfx_rect(x + 1, y + 5, 10, 7); // body
+    if (!broken) {
+        gfx_hline(x + 3, x + 8, y + 2);
+        gfx_set_pixel(x + 3, y + 3, true);
+        gfx_set_pixel(x + 3, y + 4, true);
+        gfx_set_pixel(x + 8, y + 3, true);
+        gfx_set_pixel(x + 8, y + 4, true);
+    } else {
+        gfx_hline(x + 3, x + 6, y + 2); // shackle: left side + top stub only
+        gfx_set_pixel(x + 3, y + 3, true);
+        gfx_set_pixel(x + 3, y + 4, true);
+        gfx_set_pixel(x + 9, y + 1, true); // the right side, displaced/open
+        gfx_set_pixel(x + 9, y + 2, true);
+        gfx_set_pixel(x + 9, y + 3, true);
+    }
+    gfx_set_pixel(x + 5, y + 8, true); // keyhole
+    gfx_set_pixel(x + 6, y + 8, true);
+}
+
 void gfx_icon(int x, int y, gfx_icon_t id)
 {
     switch (id) {
@@ -480,8 +504,35 @@ void gfx_icon(int x, int y, gfx_icon_t id)
             gfx_set_pixel(x + 5 + i, y + 9 - i, true);
         }
         break;
+    case GFX_ICON_LINK_X: {
+        /* circle outline (midpoint algorithm) plus a bottom-left to top-right slash */
+        int cx = x + GFX_ICON_W / 2;
+        int cy = y + GFX_ICON_H / 2;
+        int r = GFX_ICON_W / 2 - 1;
+        int dx = r, dy = 0, err = 0;
+        while (dx >= dy) {
+            gfx_set_pixel(cx + dx, cy + dy, true);
+            gfx_set_pixel(cx + dy, cy + dx, true);
+            gfx_set_pixel(cx - dy, cy + dx, true);
+            gfx_set_pixel(cx - dx, cy + dy, true);
+            gfx_set_pixel(cx - dx, cy - dy, true);
+            gfx_set_pixel(cx - dy, cy - dx, true);
+            gfx_set_pixel(cx + dy, cy - dx, true);
+            gfx_set_pixel(cx + dx, cy - dy, true);
+            dy++;
+            if (err <= 0) {
+                err += 2 * dy + 1;
+            }
+            if (err > 0) {
+                dx--;
+                err -= 2 * dx + 1;
+            }
+        }
+        for (int i = -r; i <= r; i++) {
+            gfx_set_pixel(cx + i, cy - i, true);
         }
         break;
+    }
     case GFX_ICON_PENDING:
         gfx_rect(x + 1, y + 1, 10, 10);
         gfx_set_pixel(x + 6, y + 6, true);
@@ -509,6 +560,12 @@ void gfx_icon(int x, int y, gfx_icon_t id)
         gfx_set_pixel(x + 2, y + GFX_ICON_H - 3, true);
         gfx_set_pixel(x + 3, y + GFX_ICON_H - 3, true);
         gfx_set_pixel(x + 2, y + GFX_ICON_H - 2, true);
+        break;
+    case GFX_ICON_TLS_PINNED:
+        icon_padlock(x, y, false);
+        break;
+    case GFX_ICON_TLS_BROKEN:
+        icon_padlock(x, y, true);
         break;
     default:
         gfx_rect(x, y, GFX_ICON_W, GFX_ICON_H);

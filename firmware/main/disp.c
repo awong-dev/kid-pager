@@ -46,12 +46,17 @@ static void disp_unlock(void)
 // 3426 ms (full).
 {
     int64_t start = esp_timer_get_time();
+    int entry_level = gpio_get_level(PAGER_PIN_DISP_BUSY);
+    int iters = 0;
     // BUSY high = busy.
     while (gpio_get_level(PAGER_PIN_DISP_BUSY) == 1) {
+        iters++;
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    ESP_LOGI(TAG, "BUSY: entry=%d exit=%d iters=%d elapsed=%lld us", entry_level,
+             gpio_get_level(PAGER_PIN_DISP_BUSY), iters, esp_timer_get_time() - start);
     return true;
 }
 
@@ -276,9 +281,12 @@ bool disp_init(void)
         return false;
     }
 
+
     // Power effect: VCC on for the duration of reset+init (a few tens of ms).
     disp_power_on();
+             gpio_get_level(PAGER_PIN_DISP_BUSY));
     disp_hw_reset();
+             gpio_get_level(PAGER_PIN_DISP_BUSY));
     if (!disp_run_init_sequence()) {
         ESP_LOGI(TAG, "init sequence BUSY timeout; retrying once");
         disp_hw_reset();

@@ -5,3 +5,5 @@ nvs,        data, nvs,      ,         0x6000,
 otadata,    data, ota,      ,         0x2000,
 ota_0,      app,  ota_0,    ,         0x200000,
 ota_1,      app,  ota_1,    ,         0x200000,
+# Rows below are append-only: adding one never moves the offsets above, so a flashed pager
+# needs only `idf.py partition-table-flash` to pick it up.

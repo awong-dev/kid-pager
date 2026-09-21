@@ -269,7 +269,14 @@ static const char *TAG = "book";
 static bool nickname_valid(const char *s, size_t len) { return text_field_valid(s, len, BOOK_NICK_MAX - 1, 12); }
 
 // accessors can run before book_bind(); a NULL hook would jump to address 0
+static void book_lock_noop(void) {}
+
 static auth_rtc_t *s_auth_rtc = NULL;
+static book_lock_fn s_lock = book_lock_noop;
+static book_unlock_fn s_unlock = book_lock_noop;
+static book_save_fn s_rtc_save = book_lock_noop; // auth_rtc_t mutation only
+                                                  // (next_up_n_locked) only, not the NVS blob
+static book_epoch_wrap_fn s_on_wrap = book_lock_noop;
 
 void book_bind(auth_rtc_t *auth_rtc, book_lock_fn lock, book_unlock_fn unlock, book_save_fn save,
                book_epoch_wrap_fn on_wrap)
@@ -282,6 +289,7 @@ void book_bind(auth_rtc_t *auth_rtc, book_lock_fn lock, book_unlock_fn unlock, b
 }
 
 // One strictly-increasing counter shared by /up,/status,/loc.
+static uint64_t next_up_n_locked(bool *wrapped)
 {
     if (wrapped) {
         *wrapped = false;
@@ -290,6 +298,7 @@ void book_bind(auth_rtc_t *auth_rtc, book_lock_fn lock, book_unlock_fn unlock, b
         return 0;
     }
     s_lock();
+    uint64_t n = auth_next_up_n(s_auth_rtc, ident_get_n_epoch(), wrapped);
     s_rtc_save();
     s_unlock();
     return n;
@@ -523,6 +532,7 @@ bool book_request(const char *name, const char *ph_or_alias)
     }
 
     bool wrapped = false;
+    uint64_t n = next_up_n_locked(&wrapped);
     cbor_w_uint(&w, BK_N, n);
     if (w.err) {
         return false;

@@ -121,7 +121,9 @@ bool ident_load(void)
     }
 
 
+    /* Required: no identity without these (`ca` below is the exception). */
     bool ok = true;
+    /* `ca` is optional: empty means no CA is pinned. Only a read error fails. */
 
         ok = false;
     }
@@ -137,6 +139,15 @@ bool ident_load(void)
 
     ok = ok && st != FIELD_ERROR;
 
+    /* "n_epoch32" (u32) is the current key; an older device wrote "n_epoch" (u16). Read that once so
+     * the replay counter continues rather than resetting; ident_store() writes only "n_epoch32". */
+    if (st == FIELD_MISSING) {
+        uint16_t legacy_epoch = 0;
+        field_status_t legacy_st = read_u16(h, "n_epoch", &legacy_epoch);
+        ok = ok && legacy_st != FIELD_ERROR;
+    } else {
+        ok = ok && st != FIELD_ERROR;
+    }
 
     ok = ok && st != FIELD_ERROR;
 
@@ -169,12 +180,20 @@ bool ident_store(const ident_t *id)
     ok = ok && nvs_set_u32(h, "flags", id->flags) == ESP_OK;
     ok = ok && nvs_set_str(h, "label", id->label) == ESP_OK;
     ok = ok && nvs_set_blob(h, "ca_hash", id->ca_hash, sizeof(id->ca_hash)) == ESP_OK;
+    /* The legacy "n_epoch" key stays; ident_load() reads it only if "n_epoch32" is absent. */
+    ok = ok && nvs_set_u32(h, "n_epoch32", id->n_epoch) == ESP_OK;
     ok = ok && nvs_set_u8(h, "claimed", id->claimed) == ESP_OK;
 
     if (ok) {
         ok = nvs_commit(h) == ESP_OK;
     }
     nvs_close(h);
+
+    if (ok) {
+        /* keep the in-memory copy current for ident_get_*() */
+        s_ident = *id;
+        s_ident.ca_len = strlen(s_ident.ca);
+    }
     return ok;
 }
 
@@ -203,4 +222,59 @@ const char *ident_get_apn(void) { return s_ident.apn; }
 uint32_t ident_get_flags(void) { return s_ident.flags; }
 const char *ident_get_label(void) { return s_ident.label; }
 const uint8_t *ident_get_ca_hash(void) { return s_ident.ca_hash; }
+uint32_t ident_get_n_epoch(void) { return s_ident.n_epoch; }
 uint8_t ident_get_claimed(void) { return s_ident.claimed; }
+
+/* Standalone NVS accessors for "slot12", usable before any identity exists. */
+bool ident_get_slot12_populated(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, "slot12", &v);
+    nvs_close(h);
+    return err == ESP_OK && v != 0;
+}
+
+bool ident_set_slot12_populated(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "nvs_open(\"%s\", RW) failed: 0x%x", NVS_NS, err);
+        return false;
+    }
+    bool ok = nvs_set_u8(h, "slot12", 1) == ESP_OK;
+    ok = ok && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+/* Standalone "tls_broken" byte, same independence as slot12. */
+bool ident_get_tls_broken(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t v = 0;
+    esp_err_t err = nvs_get_u8(h, "tls_broken", &v);
+    nvs_close(h);
+    return err == ESP_OK && v != 0;
+}
+
+bool ident_set_tls_broken(bool broken)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "nvs_open(\"%s\", RW) failed: 0x%x", NVS_NS, err);
+        return false;
+    }
+    bool ok = nvs_set_u8(h, "tls_broken", broken ? 1 : 0) == ESP_OK;
+    ok = ok && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}

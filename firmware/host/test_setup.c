@@ -154,13 +154,21 @@ typedef struct {
     char exp_k_b64[64];
     char exp_host[128];
     long exp_port;
+    /* exactly one shape per vector: inline `ca`, or the `ca_url`/`ca_sha_b64` pointer */
+    bool have_ca;
     char exp_ca[2048];
+    bool have_ca_ptr;
+    char exp_ca_url[256];
+    char exp_ca_sha_b64[64];
     long exp_flags;
     char exp_label[64];
     char bundle_nonce_b64[32];
     char bundle_ct_b64[1024];
 } vector_t;
 
+/* Scans the vector whose top-level `"label"` matches, reading fields in file order; the outer
+ * label is consumed locating the marker, so the later "label" read finds bundle_plain_obj.label. */
+static bool load_vector(const char *path, const char *label, vector_t *out)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -185,17 +193,62 @@ typedef struct {
     fclose(f);
     data[got] = '\0';
 
+    memset(out, 0, sizeof(*out));
+
+    char marker[64];
+    snprintf(marker, sizeof(marker), "\"label\": \"%s\"", label);
+    const char *found = find_after(data, got, 0, marker);
+    if (!found) {
+        free(data);
+        printf("FAIL label '%s' not found in %s\n", label, path);
+        return false;
+    }
+    size_t pos = (size_t) (found - data);
+
+    // Bound field searches to this vector's object ("\n  {" starts the next one at 2-space indent);
+    // otherwise a field absent here (e.g. "ca_url") would match the next vector's field.
+    const char *next_obj = find_after(data, got, pos, "\n  {");
+    size_t bound = next_obj ? (size_t) (next_obj - data) : got;
+
     bool ok = true;
+    ok = ok && copy_quoted_field(data, bound, pos, "\"token_b64\": \"", out->token_b64,
                                  sizeof(out->token_b64), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"code\": \"", out->code, sizeof(out->code), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"bid\": \"", out->bid, sizeof(out->bid), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"bpw\": \"", out->bpw, sizeof(out->bpw), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"bkey_b64\": \"", out->bkey_b64,
                                  sizeof(out->bkey_b64), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"id\": \"", out->exp_id, sizeof(out->exp_id), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"pw\": \"", out->exp_pw, sizeof(out->exp_pw), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"k_b64\": \"", out->exp_k_b64,
                                  sizeof(out->exp_k_b64), &pos);
     ok = ok &&
+        copy_quoted_field(data, bound, pos, "\"host\": \"", out->exp_host, sizeof(out->exp_host), &pos);
+    ok = ok && copy_number_field(data, bound, pos, "\"port\": ", &out->exp_port, &pos);
+
+    size_t after_port = pos;
+    if (copy_quoted_field(data, bound, after_port, "\"ca_url\": \"", out->exp_ca_url,
+                          sizeof(out->exp_ca_url), &pos)) {
+        out->have_ca_ptr = true;
+        ok = ok && copy_quoted_field(data, bound, pos, "\"ca_sha_b64\": \"", out->exp_ca_sha_b64,
+                                     sizeof(out->exp_ca_sha_b64), &pos);
+    } else {
+        pos = after_port;
+        ok = ok && copy_quoted_field(data, bound, pos, "\"ca\": \"", out->exp_ca, sizeof(out->exp_ca), &pos);
+        out->have_ca = ok;
+    }
+
+    ok = ok && copy_number_field(data, bound, pos, "\"flags\": ", &out->exp_flags, &pos);
     ok = ok &&
+        copy_quoted_field(data, bound, pos, "\"label\": \"", out->exp_label, sizeof(out->exp_label), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"bundle_nonce_b64\": \"", out->bundle_nonce_b64,
                                  sizeof(out->bundle_nonce_b64), &pos);
+    ok = ok && copy_quoted_field(data, bound, pos, "\"bundle_ct_b64\": \"", out->bundle_ct_b64,
                                  sizeof(out->bundle_ct_b64), &pos);
 
     free(data);
     if (!ok) {
+        printf("FAIL could not scan every expected field out of %s (label=%s)\n", path, label);
         return false;
     }
     return true;
@@ -218,6 +271,17 @@ static void test_parse_and_derive(const vector_t *v, uint8_t bkey_out[32])
     }
     CHECK(memcmp(sc.token, exp_token, SETUP_TOKEN_LEN) == 0,
           "setup_parse_code() decoded a different token than the vector's token_b64");
+    /* both vectors are "<token> @ <host>" with no port or ;apn= suffix: default port, empty apn */
+    const char *at = strchr(v->code, '@');
+    CHECK(at != NULL, "test fixture: vector code '%s' has no '@'", v->code);
+    if (at) {
+        const char *exp_host = at + 1;
+        while (*exp_host == ' ') {
+            exp_host++;
+        }
+        CHECK(strcmp(sc.host, exp_host) == 0, "unexpected host '%s', expected '%s' (from vector code)",
+              sc.host, exp_host);
+    }
     CHECK(sc.port == 8883, "unexpected port %u, expected the 8883 default", (unsigned) sc.port);
     CHECK(sc.apn[0] == '\0', "unexpected apn '%s', expected empty (carrier default)", sc.apn);
 
@@ -300,7 +364,17 @@ static void test_decrypt_and_decode(const vector_t *v, const uint8_t bkey[32])
               exp_k_len == 32,
           "vector k_b64 did not decode to 32 bytes");
 
+    uint8_t exp_ca_sha[32] = { 0 };
+    if (v->have_ca_ptr) {
+        size_t exp_ca_sha_len;
+        CHECK(base64_decode(v->exp_ca_sha_b64, strlen(v->exp_ca_sha_b64), exp_ca_sha, sizeof(exp_ca_sha),
+                            &exp_ca_sha_len) &&
+                  exp_ca_sha_len == 32,
+              "vector ca_sha_b64 did not decode to 32 bytes");
+    }
+
     bool saw_id = false, saw_pw = false, saw_k = false, saw_host = false, saw_port = false,
+        saw_ca = false, saw_ca_url = false, saw_ca_sha = false, saw_flags = false, saw_label = false;
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t key;
@@ -351,8 +425,25 @@ static void test_decrypt_and_decode(const vector_t *v, const uint8_t bkey[32])
         case 34: { /* ca */
             const char *s; size_t slen;
             CHECK(cbor_r_tstr(&r, &s, &slen), "bundle 'ca' is not a tstr");
+            CHECK(v->have_ca, "bundle unexpectedly carries inline 'ca' for a pointer-shaped vector");
             CHECK(slen == strlen(v->exp_ca) && memcmp(s, v->exp_ca, slen) == 0, "bundle 'ca' mismatch");
             saw_ca = true;
+            break;
+        }
+        case 40: { /* ca_url */
+            const char *s; size_t slen;
+            CHECK(cbor_r_tstr(&r, &s, &slen), "bundle 'ca_url' is not a tstr");
+            CHECK(v->have_ca_ptr, "bundle unexpectedly carries 'ca_url' for an inline-ca-shaped vector");
+            CHECK(slen == strlen(v->exp_ca_url) && memcmp(s, v->exp_ca_url, slen) == 0,
+                  "bundle 'ca_url' != vector ca_url '%s'", v->exp_ca_url);
+            saw_ca_url = true;
+            break;
+        }
+        case 41: { /* ca_sha */
+            const uint8_t *b; size_t blen;
+            CHECK(cbor_r_bstr(&r, &b, &blen), "bundle 'ca_sha' is not a bstr");
+            CHECK(blen == 32 && memcmp(b, exp_ca_sha, 32) == 0, "bundle 'ca_sha' != vector ca_sha_b64");
+            saw_ca_sha = true;
             break;
         }
         case 35: { /* flags */
@@ -375,7 +466,15 @@ static void test_decrypt_and_decode(const vector_t *v, const uint8_t bkey[32])
             break;
         }
     }
+    CHECK(saw_id && saw_pw && saw_k && saw_host && saw_port && saw_flags && saw_label,
           "the decoded bundle is missing at least one required field");
+    if (v->have_ca_ptr) {
+        CHECK(saw_ca_url && saw_ca_sha, "a pointer-shaped vector must carry both 'ca_url' and 'ca_sha'");
+        CHECK(!saw_ca, "a pointer-shaped vector must not also carry inline 'ca'");
+    } else {
+        CHECK(saw_ca, "an inline-ca-shaped vector must carry 'ca'");
+        CHECK(!saw_ca_url && !saw_ca_sha, "an inline-ca-shaped vector must not carry 'ca_url'/'ca_sha'");
+    }
 
     /* Negative: a flipped ciphertext byte must fail the GCM tag check. */
     uint8_t corrupted[1024];
@@ -395,14 +494,29 @@ static void test_decrypt_and_decode(const vector_t *v, const uint8_t bkey[32])
           "the wrong key must fail to decrypt");
 }
 
+static void run_vector(const char *label)
 {
     vector_t v;
+    if (!load_vector(VECTORS_PATH, label, &v)) {
+        g_failures++;
+        return;
     }
+    printf("loaded vector '%s' from %s (%s)\n", label, VECTORS_PATH,
+           v.have_ca_ptr ? "ca pointer" : "inline ca");
 
     uint8_t bkey[32];
     test_parse_and_derive(&v, bkey);
     test_parse_rejects_typo(&v);
     test_decrypt_and_decode(&v, bkey);
+}
+
+int main(void)
+{
+    test_parse_rejects_malformed();
+
+    /* inline ca (key 34) and ca pointer (keys 40/41) must both be accepted */
+    run_vector("boot_bundle");
+    run_vector("boot_bundle_ca_pointer");
 
     if (g_failures == 0) {
         printf("PASS: setup_parse_code/setup_derive/setup_decrypt_bundle, 0 failures\n");

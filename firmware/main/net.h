@@ -45,9 +45,30 @@ bool net_bootstrap_connect(const char *client_id, const char *password, const ch
 /* Writes `ca_pem` to modem cert slot 12 (PAGER_TLS_CA_SLOT). Power: one modem NVRAM write. */
 bool net_write_ca(const char *ca_pem);
 
+#define NET_TLS_CA_SLOT 12
+#define NET_TLS_CA_SCRATCH_SLOT 13 /* production profile 2 must never be left pointing here */
+
+/* Writes `ca_pem` to cert slot `slot`. Power: one modem NVRAM write. */
+bool net_write_ca_slot(uint8_t slot, const char *ca_pem);
+
+/* Points MQTT profile 2 at `ca_slot` (always named: an unnamed slot sends a plaintext CONNECT). */
+bool net_tls_configure(uint8_t ca_slot, bool validated);
+
+/* Opens a TLS profile 3 socket and dials `host:port`; BLOCKS through the TLS handshake. */
+bool net_ca_fetch_open(const char *host, uint16_t port);
+
+/* Sends `len` bytes on the cafetch socket. */
+bool net_ca_fetch_send(const uint8_t *buf, uint16_t len);
+
+/* Non-blocking: reads one `+SQNSRING` (<=1500 B) or reports the close; false if neither. */
+
+/* Best-effort AT+SQNSH on the cafetch socket. */
+void net_ca_fetch_close(void);
+
 /* Issues mqttConnect(); never on a timer (PROTOCOL.md §6.1). Power: one TLS handshake, ~5 kB. */
 bool net_session_up(void);
 
+/* Explicit MQTT disconnect for a clean modem-side teardown; clears the connect-in-flight state. */
 void net_session_down(void);
 
 /* Publishes `buf` (mutable); len > 1280 is refused (PROTOCOL.md §3.3). */
@@ -91,6 +112,123 @@ uint32_t net_take_oversize_delta(void);
 
 /* The device_id / MQTT client id (identical, PROTOCOL.md §1). */
 const char *net_get_device_id(void);
+
+/* SIM presence check for the pre-provisioning screen; brings the modem up itself, no attach. */
+bool net_check_sim(void);
+
+bool net_check_tcp(const char *host, uint16_t port, bool udp, bool tls);
+
+/* Plain TCP with an HTTP/1.0 GET padded to `bytes`, then waits 12 s for a +SQNSRING. */
+bool net_check_tcp_sized(const char *host, uint16_t port, size_t bytes);
+
+/* Debug build only: send one raw AT command; the reply shows in the AT trace. */
+bool net_debug_at(const char *cmd);
+
+/* True once after the pager goes from unregistered to registered. */
+bool net_take_registered_edge(void);
+/* Seconds without a network; 0 when registered. */
+uint32_t net_unregistered_for_s(void);
+
+bool net_check_mqtt(const char *host, uint16_t port, int tls_mode);
+
+/* GNSS. loc.c is the only caller. */
+
+typedef enum {
+    NET_GNSS_EVT_NONE = 0,  /* net_gnss_poll_event() found nothing new */
+    NET_GNSS_EVT_FIX,       /* WMGNSSFixEvent status READY; fields below valid */
+    NET_GNSS_EVT_NO_FIX,    /* status STOPPED_BY_USER/NO_RTC: attempt ended, no position */
+    NET_GNSS_EVT_REFUSED,   /* status LTE_CONCURRENCY: modem refused a fix while attached */
+} net_gnss_evt_t;
+
+typedef struct {
+    net_gnss_evt_t kind;
+    double lat, lon;
+    double confidence;  /* estimatedConfidence, metres */
+    int64_t fix_ts;     /* unix seconds the fix was taken */
+    uint8_t sat_count;
+} net_gnss_event_t;
+
+/* gnssConfig(): high sensitivity, cold/warm start, on-device location; repeats are harmless. */
+bool net_gnss_config(void);
+
+/* Ephemeris due check: *out_seconds_to_update <= 0 means due now; false means assume due. */
+bool net_gnss_assistance_due(int32_t *out_seconds_to_update);
+
+/* Downloads real-time ephemeris over the attached session; blocking. Power: a few kB of data. */
+bool net_gnss_update_assistance(void);
+
+/* True means the modem accepted the request; the result comes via net_gnss_poll_event(). */
+bool net_gnss_start_fix(void);
+
+/* Best-effort cancel. Power: stops the GNSS receiver. */
+void net_gnss_cancel(void);
+
+/* Non-blocking: true and fills *out at most once per net_gnss_start_fix(). */
+bool net_gnss_poll_event(net_gnss_event_t *out);
+
+bool net_radio_off(void);
+
+/* OPSTATE_FULL; does not wait for re-attach (poll net_is_attached()). Power: re-attach begins. */
+bool net_radio_on(void);
+
+/* getNetworkRegState() == HOME/ROAMING. Power: one AT round trip. */
+bool net_is_attached(void);
+
+/* Calls `cb` from the modem event task with a "lac:ci" key when the cell changes. */
+void net_set_cell_change_cb(void (*cb)(const char *cell_key));
+
+/* Serving-cell snapshot for the `/loc` `cell` sub-map (PROTOCOL.md §13.2); serving MCC/MNC. */
+typedef struct {
+    bool valid;       /* false: never read this power session; omit `cell` */
+    char mcc[4];       /* 3 ASCII digits + NUL */
+    char mnc[4];       /* 2-3 ASCII digits + NUL, leading zeros kept */
+    uint16_t tac;      /* 0..65535 */
+    uint32_t ci;       /* 28-bit E-UTRAN cell id, 0..268435455 */
+    bool have_rsrp;
+    int rsrp;          /* dBm, -156..-30 when have_rsrp */
+} net_cell_info_t;
+
+/* Cached cell snapshot, refreshed by one AT+SQNMONI only when stale; returns out->valid. */
+bool net_get_cell_info(net_cell_info_t *out);
+
+void net_enable_accel_wake(void);
+
+/* SMS. main/sms.c is the only caller. */
+
+typedef struct {
+    bool used_ira;      /* true: AT+CSCS="IRA" was accepted; false: fell back to "GSM" */
+    int storage_used;   /* AT+CPMS <usedr>; -1 if unknown */
+    int storage_total;  /* AT+CPMS <totalr>; -1 if unknown */
+} net_sms_config_result_t;
+
+/* One-time text-mode SMS setup; false means SMS is unavailable this boot. `out` is nullable. */
+bool net_sms_config(net_sms_config_result_t *out);
+
+/* Sends one SMS; `text` is plain 7-bit text or, with `use_ucs2`, big-endian UTF-16 hex. */
+bool net_sms_send(const char *number, const char *text, bool use_ucs2);
+
+typedef struct {
+    bool valid;         /* false: the index was empty (still "OK", not a command failure) */
+    char sender[32];    /* raw <oa>, ASCII digits, not charset-decoded */
+    char timestamp[32]; /* raw <scts>, ASCII */
+    int dcs;            /* 3GPP TS 23.038 §4 coding scheme, -1 if +CMGR fields absent */
+    char body[281];     /* GSM-7 text, or UCS-2 hex; `dcs` tells them apart */
+    uint16_t body_len;
+} net_sms_read_t;
+
+/* Reads one SMS (AT+CMGR); false only on a command failure, an empty index sets `valid` false. */
+bool net_sms_read(int index, net_sms_read_t *out);
+
+/* Deletes one SMS (AT+CMGD). */
+bool net_sms_delete(int index);
+
+typedef struct {
+    uint16_t index;
+    char mem[8]; /* storage name the modem reported, e.g. "ME" */
+} net_sms_event_t;
+
+/* Non-blocking: true and fills *out at most once per `+CMTI` URC. */
+bool net_sms_poll_event(net_sms_event_t *out);
 
 #ifdef __cplusplus
 }

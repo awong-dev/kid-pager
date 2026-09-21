@@ -39,6 +39,14 @@ extern const ui_screen_t g_scr_lock;
 extern const ui_screen_t g_scr_pick;
 extern const ui_screen_t g_scr_book;
 
+typedef enum {
+    GREETING_HELLO = 0,
+} scr_greeting_mode_t;
+void scr_greeting_set_mode(scr_greeting_mode_t mode);
+
+void scr_greeting_set_status(const char *status);
+extern const ui_screen_t g_scr_greeting;
+
 /* Marks every visible down message in the open chat read. Not called from the incoming-message
  * path, which acks `shown` only. */
 void scr_chat_mark_visible_read(void);
@@ -62,7 +70,10 @@ void ui_go_home(void);
 const ui_screen_t *ui_top(void);
 
 /* Status bar height; 12 px icons plus the glyphs of the 12 px font (baseline 13) need 14. */
+#define UI_STATUS_H 14
 #define UI_BODY_TOP (UI_STATUS_H + 1)
+
+/* Footer row; 18 px up keeps the 12 px font's descenders (row 16 from the line top) on screen. */
 
 /* Draws the status bar and top screen, then a partial refresh (a due full refresh waits for
  * ui_on_awake_lapse()). Power effect: ~0.3-0.8 s; a cheap no-op if the display is dead. */

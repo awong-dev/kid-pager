@@ -148,6 +148,119 @@ static void test_reset_clears_partial_sequence(void)
     CHECK(msg_composer_len() == 1 && msg_composer_codepoint_count() == 1,
           "push after reset did not land as a clean single-byte code point");
 }
+
+static msg_t make_msg(const char *id, const char *from, const char *to, const char *body,
+                      uint8_t dir, uint8_t ack_state, uint8_t flags, int64_t ts)
+{
+    msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.ts = ts;
+    strncpy(m.id, id, sizeof(m.id) - 1);
+    strncpy(m.from, from, sizeof(m.from) - 1);
+    strncpy(m.to, to, sizeof(m.to) - 1);
+    m.dir = dir;
+    m.ack_state = ack_state;
+    m.flags = flags;
+    m.in_use = true;
+    return m;
+}
+
+static void test_msghist_roundtrip_basic(void)
+{
+    msg_t m = make_msg("m_7f3a", "mom", "", "Pickup at 3:15 by the gym", MSG_DIR_DOWN,
+                       MSG_ACK_SHOWN, MSG_F_RECOVERED, 1757700000);
+    uint8_t buf[MSGHIST_REC_MAX];
+    CHECK(len > 0, "encode of a normal record returned 0");
+
+    msg_t out;
+    uint32_t seq = 0;
+    CHECK(seq == 42, "seq == %u, want 42", (unsigned) seq);
+    CHECK(strcmp(out.id, m.id) == 0, "id mismatch after round trip: '%s' != '%s'", out.id, m.id);
+    CHECK(strcmp(out.from, m.from) == 0, "from mismatch after round trip");
+    CHECK(out.body_len == m.body_len, "body_len == %u, want %u", (unsigned) out.body_len,
+          (unsigned) m.body_len);
+    CHECK(out.ts == m.ts, "ts mismatch after round trip");
+    CHECK(out.dir == m.dir, "dir mismatch after round trip");
+    CHECK(out.ack_state == m.ack_state, "ack_state mismatch after round trip");
+    CHECK(out.flags == m.flags, "flags mismatch after round trip");
+    CHECK(out.hist_seq == 42, "decoded hist_seq == %u, want 42", (unsigned) out.hist_seq);
+    CHECK(out.in_use, "decoded record not marked in_use");
+}
+
+static void test_msghist_roundtrip_edges(void)
+{
+    msg_t empty = make_msg("u_00000001", "student", "mom", "", MSG_DIR_UP, MSG_ACK_UP_PENDING, 0, 0);
+    uint8_t buf[MSGHIST_REC_MAX];
+    CHECK(len > 0, "encode of an empty-body record returned 0");
+    msg_t out;
+    uint32_t seq;
+    CHECK(out.body_len == 0, "decoded body_len == %u, want 0", (unsigned) out.body_len);
+
+    msg_t full = make_msg("m_deadbeef", "mom", "", full_body, MSG_DIR_DOWN, MSG_ACK_UNSHOWN, 0,
+                          1700000000);
+          (unsigned) len);
+}
+
+static void test_msghist_decode_rejects_corruption(void)
+{
+    msg_t m = make_msg("m_7f3a", "mom", "", "ok", MSG_DIR_DOWN, MSG_ACK_READ, 0, 1700000000);
+    uint8_t buf[MSGHIST_REC_MAX];
+    CHECK(len > 0, "encode failed");
+
+    for (size_t i = 0; i < len; i++) {
+        uint8_t saved = buf[i];
+        buf[i] ^= 0xFF;
+        msg_t out;
+        uint32_t seq;
+        buf[i] = saved;
+        CHECK(!ok, "corrupting byte %u of a valid record was NOT detected", (unsigned) i);
+    }
+
+    for (size_t trunc = 0; trunc < len; trunc++) {
+        msg_t out;
+        uint32_t seq;
+              "a %u-byte truncation of a %u-byte record was NOT detected", (unsigned) trunc,
+              (unsigned) len);
+    }
+
+    uint8_t bad_version[MSGHIST_REC_MAX];
+    memcpy(bad_version, buf, len);
+    bad_version[0] = (uint8_t) (MSGHIST_REC_VERSION + 1);
+    msg_t out;
+    uint32_t seq;
+          "a record with an unknown version was accepted");
+}
+
+static void test_msghist_terminal_ack(void)
+{
+    CHECK(!msghist_is_terminal_ack(MSG_DIR_DOWN, MSG_ACK_UNSHOWN), "UNSHOWN reported terminal");
+    CHECK(!msghist_is_terminal_ack(MSG_DIR_DOWN, MSG_ACK_SHOWN), "SHOWN reported terminal");
+    CHECK(msghist_is_terminal_ack(MSG_DIR_DOWN, MSG_ACK_READ), "READ not reported terminal");
+    CHECK(!msghist_is_terminal_ack(MSG_DIR_UP, MSG_ACK_UP_PENDING), "UP_PENDING reported terminal");
+    CHECK(msghist_is_terminal_ack(MSG_DIR_UP, MSG_ACK_UP_SENT), "UP_SENT not reported terminal");
+    CHECK(msghist_is_terminal_ack(MSG_DIR_UP, MSG_ACK_UP_FAILED), "UP_FAILED not reported terminal");
+}
+
+static void test_msghist_restore_order(void)
+{
+    /* seqs in slot order, not insertion order */
+    uint32_t seqs[5] = { 103, 101, 105, 102, 104 };
+    int order[5];
+    int n = msghist_restore_order(seqs, 5, order, 5);
+    CHECK(n == 5, "n == %d, want 5", n);
+    uint32_t expect_desc[5] = { 105, 104, 103, 102, 101 };
+    for (int i = 0; i < 5; i++) {
+        CHECK(order[i] >= 0 && order[i] < 5, "order[%d] == %d out of range", i, order[i]);
+        CHECK(seqs[order[i]] == expect_desc[i], "order[%d] -> seq %u, want %u (newest-first)", i,
+              (unsigned) seqs[order[i]], (unsigned) expect_desc[i]);
+    }
+
+    /* n is clamped to max_out */
+    int order2[2];
+    int n2 = msghist_restore_order(seqs, 5, order2, 2);
+    CHECK(n2 == 2, "clamped n == %d, want 2", n2);
+}
+
 int main(void)
 {
     test_ascii_byte_cap();
@@ -155,6 +268,12 @@ int main(void)
     test_three_byte_codepoint_refused_at_byte_cap();
     test_backspace_removes_whole_codepoint();
     test_reset_clears_partial_sequence();
+
+    test_msghist_roundtrip_basic();
+    test_msghist_roundtrip_edges();
+    test_msghist_decode_rejects_corruption();
+    test_msghist_terminal_ack();
+    test_msghist_restore_order();
 
     if (g_failures == 0) {
         return 0;

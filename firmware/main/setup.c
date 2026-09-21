@@ -309,6 +309,8 @@ bool setup_decrypt_bundle(const uint8_t bkey[32], const uint8_t *blob, size_t bl
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 
+#include "cafetch.h"
+#include "catrust.h"
 #include "cbor.h"
 #include "ident.h"
 #include "net.h"
@@ -330,6 +332,8 @@ static const char *TAG = "setup";
 #define BOOT_KEY_FLAGS 35
 #define BOOT_KEY_LABEL 36
 #define BOOT_KEY_APN 37
+#define BOOT_KEY_CA_URL 40
+#define BOOT_KEY_CA_SHA 41
 
 #define SETUP_POLL_MS 200
 #define SETUP_CONNECT_TIMEOUT_MS 30000 /* TLS handshake + CONNECTED + SUBSCRIBED */
@@ -355,9 +359,21 @@ static bool valid_dev_id(const char *s, size_t len)
     return true;
 }
 
+/* The CA pointer half of a bundle (boot keys 40/41), fetched after decoding. */
+typedef struct {
+    bool have_ptr; /* ca_url and ca_sha both present */
+    char url[CATRUST_URL_MAX];
+    uint8_t sha[32];
+} setup_ca_ptr_t;
+
 /* CBOR-decodes and validates the plaintext bundle into an ident_t; apn/flags are optional. Does
+ * not compute ca_hash. ca_url and ca_sha must appear together, otherwise the bundle is rejected. */
+static bool decode_and_validate_bundle(const uint8_t *plain, size_t plain_len, ident_t *out,
+                                       setup_ca_ptr_t *out_ptr)
 {
     memset(out, 0, sizeof(*out));
+    memset(out_ptr, 0, sizeof(*out_ptr));
+    bool have_ca_url = false, have_ca_sha = false;
 
     cbor_r_t r;
     cbor_r_init(&r, plain, plain_len);
@@ -438,6 +454,8 @@ static bool valid_dev_id(const char *s, size_t len)
         case BOOT_KEY_CA: {
             const char *s;
             size_t slen;
+            /* empty is legal: no CA pinned, the session runs with validation off */
+            if (!cbor_r_tstr(&r, &s, &slen) || slen >= sizeof(out->ca)) {
                 return false;
             }
             memcpy(out->ca, s, slen);
@@ -475,6 +493,27 @@ static bool valid_dev_id(const char *s, size_t len)
             out->apn[slen] = '\0';
             break;
         }
+        case BOOT_KEY_CA_URL: {
+            const char *s;
+            size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen) || slen >= sizeof(out_ptr->url)) {
+                return false;
+            }
+            memcpy(out_ptr->url, s, slen);
+            out_ptr->url[slen] = '\0';
+            have_ca_url = true;
+            break;
+        }
+        case BOOT_KEY_CA_SHA: {
+            const uint8_t *b;
+            size_t blen;
+            if (!cbor_r_bstr(&r, &b, &blen) || blen != sizeof(out_ptr->sha)) {
+                return false;
+            }
+            memcpy(out_ptr->sha, b, blen);
+            have_ca_sha = true;
+            break;
+        }
         default:
             if (!cbor_r_skip(&r)) {
                 return false;
@@ -483,8 +522,14 @@ static bool valid_dev_id(const char *s, size_t len)
         }
     }
 
+    (void) have_ca;
+    if (!(have_id && have_pw && have_k && have_host && have_port && have_label)) {
         return false;
     }
+    if (have_ca_url != have_ca_sha) {
+        return false;
+    }
+    out_ptr->have_ptr = have_ca_url && have_ca_sha;
 
     out->n_epoch = 0;
     out->claimed = 0;
@@ -602,16 +647,44 @@ bool setup_run(const char *code)
 
     static uint8_t plain[SETUP_BUNDLE_MAX];
     size_t plain_len = 0;
+    ESP_LOGI(TAG, "bundle received: %u bytes", (unsigned) s_bundle_len);
     if (!setup_decrypt_bundle(bkey, s_bundle_buf, s_bundle_len, plain, sizeof(plain), &plain_len)) {
         net_session_down();
+        ESP_LOGI(TAG, "bundle AES-GCM decrypt failed (bad tag: wrong key or corrupted bytes)");
         return fail(ui_ok, "code damaged");
     }
 
+    static setup_ca_ptr_t ca_ptr;
         net_session_down();
+        ESP_LOGI(TAG, "bundle decrypted (%u bytes) but CBOR decode/validate failed",
+                 (unsigned) plain_len);
         return fail(ui_ok, "code damaged");
     }
 
+    // The pointer is fetched over the bootstrap attach, with the bootstrap MQTT session still up;
+    // the fetched PEM overwrites any inline ca.
+        static char fetched_pem[CAFETCH_PEM_MAX];
+        size_t fetched_len = 0;
+        int http_status = 0;
+        size_t bytes = 0;
+        uint32_t elapsed_ms = 0;
+        bool mqtt_survived = false;
+        bool fetch_ok = cafetch_run_blocking(ca_ptr.url, ca_ptr.sha, fetched_pem, sizeof(fetched_pem),
+                                             &fetched_len, &http_status, &bytes, &elapsed_ms,
+                                             &mqtt_survived);
+        ESP_LOGI(TAG,
+                 "SETUP CA fetch: url=%s http_status=%d bytes=%u elapsed=%ums ok=%d "
+                 "mqtt_survived_second_socket=%d",
+                 ca_ptr.url, http_status, (unsigned) bytes, (unsigned) elapsed_ms, (int) fetch_ok,
+                 (int) mqtt_survived);
+            net_session_down();
+            return fail(ui_ok, "cannot reach broker");
+        }
+    }
+    // hash of whatever ended up in id->ca (empty, inline or fetched)
+
         net_session_down();
+        ESP_LOGI(TAG, "bundle valid but ident_store() (NVS write) failed");
         return fail(ui_ok, "code damaged"); /* NVS write failure */
     }
 

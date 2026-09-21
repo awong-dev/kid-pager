@@ -52,7 +52,26 @@ typedef struct {
     uint8_t ack_state; /* depends on dir */
     uint8_t flags;
     bool in_use;
+    /* msghist sequence this entry is persisted under; 0 = never persisted. msg.c internal. */
+    uint32_t hist_seq;
 } msg_t;
+
+/* Persisted history: NVS keys "m0".."m31" in the `msghist` partition, key = seq % 32; written at
+ * insert and at the terminal ack state (a restored older state is safe: acks are idempotent, §4.1). */
+
+/* Record format version: 2 added `sndr`, 3 added `rsn`. The decoder accepts 1 to 3; an older
+ * firmware skips a version-3 record. */
+
+/* `body` is the UTF-8 text (m->body_len bytes; may be NULL only when body_len == 0). Returns the
+
+/* False, leaving `out` untouched, for an unknown version, truncation, bad CRC or oversize body. `body_out`
+
+/* True once `ack_state` is the last state this direction reaches. */
+bool msghist_is_terminal_ack(uint8_t dir, uint8_t ack_state);
+
+/* Sorts indices [0, n) by seqs[i] descending into order_out; n is clamped to max_out. Returns the
+ * number of indices written. */
+int msghist_restore_order(const uint32_t *seqs, int n, int *order_out, int max_out);
 
 /* RTC-resident sub-struct, PROTOCOL.md §9.3. */
 typedef struct {
@@ -122,16 +141,30 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
 const char *msg_last_ingest_id(void);
 
 /* down message: state -> shown, queues a pending_ack. Returns false if the table is full; the RAM
+ * ack_state is then not advanced, so a later call retries. */
 bool msg_mark_shown(const char *id);
 
 /* down message: state -> read, queues a pending_ack, clears rtc unread[0] if it matches. */
 bool msg_mark_read(const char *id);
 
+/* Queues a `shown` ack for every down message still at MSG_ACK_UNSHOWN; entries that do not fit
+ * stay UNSHOWN and are retried on the next call. */
 void msg_mark_all_unshown(void);
 
 /* Student reply; false (never truncating, §9.4) if the body breaks §3.1, pending_up is full or the NVS
  * write fails. `to` is a peer alias or "" for the default recipient (key 7 omitted). */
 bool msg_queue_reply(const char *to, const char *body, uint16_t len);
+
+/* Inserts a DOWN entry for an inbound SMS, already READ so it is never acked (PROTOCOL.md §3.6);
+
+/* Inserts a PENDING UP entry for a direct SMS send. It is never retried by msg_pump() and never
+ * published over MQTT (PROTOCOL.md §3.6). `out_id` receives a fresh "x_" id. */
+bool msg_insert_sms_out_pending(const char *to, const char *body, uint16_t body_len, char *out_id,
+                                size_t out_id_cap);
+
+/* Resolves an entry from msg_insert_sms_out_pending() to SENT or FAILED. False if the id has
+ * scrolled out of the thread. */
+bool msg_finish_sms_out(const char *id, bool ok);
 
 /* Publishes at most one message per call: pending acks first, then replies; 3 attempts or 2h
  * (created_us) marks a reply MSG_F_SEND_FAILED (§4.2). */
@@ -145,6 +178,9 @@ const msg_t *msg_thread_at(size_t index); /* 0 = newest; NULL if index >= msg_th
 const msg_t *msg_newest_unread(void);     /* NULL if none */
 
 typedef void (*msg_iter_peer_cb)(const msg_t *m, void *ctx);
+
+/* Erases the `msghist` partition contents and the `msgq` pending-reply/unread bodies. */
+void msg_history_erase(void);
 
 /* Counts an envelope rejected before msg_ingest_down_cbor() (e.g. failed auth_verify()). */
 void msg_count_malformed(void);

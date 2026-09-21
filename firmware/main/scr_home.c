@@ -69,6 +69,7 @@ static void home_render(void)
         }
     }
 
+    gfx_text(0, UI_FOOTER_Y, sz, "up/down move  enter open  hold=home");
 }
 
 const ui_screen_t g_scr_home = {

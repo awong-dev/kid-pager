@@ -181,12 +181,21 @@ bool lock_parse_cfg(const uint8_t *buf, uint16_t len, bool sig_pair_present, cha
 #include "ident.h"
 #include "msg.h"
 
+#include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "nvs.h"
 
+static const char *TAG = "lock";
+
 // Accessors can run before lock_bind_rtc() (the setup flow starts the UI first); default to no-ops
+// so a NULL callback is never called.
+static void lock_rtc_lock_noop(void) {}
+
 static lock_rtc_t *s_rtc = NULL;
+static lock_rtc_lock_fn s_lock = lock_rtc_lock_noop;
+static lock_rtc_unlock_fn s_unlock = lock_rtc_lock_noop;
+static lock_rtc_save_fn s_save = lock_rtc_lock_noop;
 
 void lock_bind_rtc(lock_rtc_t *rtc, lock_rtc_lock_fn lock, lock_rtc_unlock_fn unlock,
                     lock_rtc_save_fn save)
@@ -428,10 +437,16 @@ bool lock_take_toast(char *out, size_t cap)
     return pending;
 }
 
+void lock_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id)
 {
+    cbor_r_t r;
+    cbor_r_init(&r, buf, len);
     bool have_clear = false, clear = false, have_auto = false;
     uint8_t auto_min = 0;
 
+    if (!parse_lock_submap(&r, &have_clear, &clear, &have_auto, &auto_min)) {
+        ESP_LOGI(TAG, "malformed cfg.lock sub-map dropped (id=%s)", id ? id : "");
+        return;
     }
 
     if (have_clear && clear) {
@@ -441,6 +456,7 @@ bool lock_take_toast(char *out, size_t cap)
     if (have_auto) {
         lock_set_auto_min(auto_min);
     }
+    if (id && id[0] != '\0') {
         // Acked `shown` on apply regardless of lock state (PROTOCOL.md §3.2); msg_mark_shown() needs
         // only the id.
         msg_mark_shown(id);

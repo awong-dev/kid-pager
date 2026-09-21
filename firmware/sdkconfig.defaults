@@ -9,3 +9,19 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
 # setup_derive() needs mbedtls_hkdf(); off by default in ESP-IDF 5.2.
 CONFIG_MBEDTLS_HKDF_C=y
+
+# The only USB connector is the ESP32-S3 USB-Serial/JTAG peripheral, so the console must be primary
+# on it for `setup <code>` input to work; esp_console_new_repl_usb_serial_jtag() needs this symbol.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# modes_run() drives ui/gfx, mbedtls HMAC and the modem library; the 3584-byte default overflows.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# The CA fetch uses TLS profile 3; an sdkconfig created with fewer profiles makes
+# tlsConfigProfile(3) fail with NO_SUCH_PROFILE.
+CONFIG_WALTER_MODEM_MAX_TLS_PROFILES=6
+
+# The task watchdog reboots rather than just printing. 60 s is the Kconfig maximum; the main loop
+# has legitimate waits of tens of seconds (modem recovery, assistance data download).
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
