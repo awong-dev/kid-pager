@@ -12,7 +12,14 @@ import {
   getFirestore,
 } from "firebase/firestore";
 
+// `||`, not `??`: an unset workflow variable is inlined as `""`, which `??` would keep.
 const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "demo-api-key",
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN || "demo-pager.firebaseapp.com",
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || "demo-pager",
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET || "demo-pager.appspot.com",
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID || "0",
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID || "1:0:web:0",
 };
 
 const USE_EMULATORS = process.env.NEXT_PUBLIC_USE_EMULATORS === "1";

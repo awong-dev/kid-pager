@@ -22,6 +22,7 @@ import NotificationWatcher from "./NotificationWatcher";
 const settingsLinks = [
   { href: "/settings/backends", label: "Backends" },
   { href: "/settings/notifications", label: "Notifications" },
+  { href: "/settings/devices", label: "My devices" },
 ];
 
 const adminLinks = [

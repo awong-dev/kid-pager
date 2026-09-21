@@ -29,6 +29,7 @@ export interface AllowEdgeDoc {
   locate: boolean;
 }
 
+
 export interface DeviceStatusDoc {
   state: string | null;
   mode: string | null;
@@ -39,6 +40,13 @@ export interface DeviceStatusDoc {
   fw: string | null;
   locPeriodS: number | null;
   locMinS: number | null;
+  // CA trust state and the pinned CA's short fingerprint.
+  tls?: TlsState | null;
+  caFp?: string | null;
+  // Seconds until the next GPS attempt is allowed, 0 = now.
+  locBackoffS?: number | null;
+  // Audit-queue SMS entries dropped on the pager before upload.
+  smsLost?: number | null;
   updatedAt: Timestamp | null;
 }
 

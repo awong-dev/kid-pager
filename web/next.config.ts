@@ -12,6 +12,10 @@ const nextConfig: NextConfig = {
     return {
       // Dev stand-in for `firebase.json`'s Hosting rewrites. `beforeFiles` is required because
       // `/chat/[alias]` is a real filesystem route.
+      beforeFiles: [
+        { source: "/chat/:alias", destination: "/chat/_" },
+        { source: "/devices/:id", destination: "/devices/_" },
+      ],
       afterFiles: [
         { source: "/api/:path*", destination: "http://localhost:8000/api/:path*" },
         { source: "/webhooks/:path*", destination: "http://localhost:8000/webhooks/:path*" },

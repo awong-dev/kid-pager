@@ -1,12 +1,14 @@
 "use client";
 
 /** `/login`: email (link flow back here with `?finish=1`, or password) or phone (reCAPTCHA, code)
+ * over Firebase Auth. A 403 from `GET /api/me` arrives as `notRegisteredMessage`. */
 
 import {
   type ConfirmationResult,
   RecaptchaVerifier,
   isSignInWithEmailLink,
   sendSignInLinkToEmail,
+  signInWithEmailAndPassword,
   signInWithEmailLink,
   signInWithPhoneNumber,
 } from "firebase/auth";
@@ -35,6 +37,7 @@ export default function LoginPage() {
 
   const [mode, setMode] = useState<Mode>("enter-identifier");
   const [identifier, setIdentifier] = useState("");
+  const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -85,12 +88,18 @@ export default function LoginPage() {
     if (!value) return;
     setBusy(true);
     try {
+      if (value.includes("@") && password) {
+        const auth = getFirebaseAuth();
+        await signInWithEmailAndPassword(auth, value, password);
+      } else if (value.includes("@")) {
         const auth = getFirebaseAuth();
         const url = new URL(window.location.href);
         url.search = "?finish=1";
         await sendSignInLinkToEmail(auth, value, {
           url: url.toString(),
           handleCodeInApp: true,
+          // no linkDomain: Google rejects it (auth/invalid-hosting-link-domain) on the default
+          // web.app/firebaseapp.com domain
         });
         window.localStorage.setItem(EMAIL_LINK_STORAGE_KEY, value);
         setMode("email-sent");
@@ -149,10 +158,28 @@ export default function LoginPage() {
               label="Email or phone (+1XXXXXXXXXX)"
               value={identifier}
               onChange={(e) => setIdentifier(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !password && void handleSubmitIdentifier()}
               autoFocus
               fullWidth
             />
+            {identifier.includes("@") && (
+              <TextField
+                label="Password (leave blank for an emailed sign-in link instead)"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && void handleSubmitIdentifier()}
+                fullWidth
+              />
+            )}
             <Button variant="contained" disabled={busy} onClick={() => void handleSubmitIdentifier()}>
+              {busy
+                ? identifier.includes("@") && password
+                  ? "Signing in..."
+                  : "Sending..."
+                : identifier.includes("@") && password
+                  ? "Sign in"
+                  : "Continue"}
             </Button>
           </Stack>
         )}
