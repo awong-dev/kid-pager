@@ -458,9 +458,14 @@ broker-generated LWT.
 | `ca_fp` | string | no | 16 lowercase hex chars | First 16 hex characters of the SHA-256 of the pinned CA PEM (the same digest carried in the bootstrap bundle's `ca_sha`/a `cfg.ca.sha` push, `V02_DESIGN.md` §4.4). Absent when `tls` is `unpinned` or absent. |
 | `loc_backoff_s` | int | no | 0…86400 | *(§13.3)* Seconds until the device's own growing location-attempt backoff next allows a fresh fix attempt; `0` = an attempt is allowed now. See §13.3's amendment for how this relates to `loc_min_s`. |
 | `sms_lost` | int | no | ≥ 0 | *(§3.6 — device-direct SMS)* Count of `sms_log` audit entries dropped from the device's NVS queue for lack of space; normally 0. |
+| `link` | int | no | ≥ 0 | *(§9.5 — MQTT session liveness)* Counter incremented on every MQTT session restart within the current boot (starts at 1 per boot); `session` alone cannot tell a silent modem-initiated resume from an unbroken session. Absent means firmware older than §9. The relay treats a changed `link` exactly like a changed `session` for §5.3's online-edge re-publish. |
 
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
+server-settable would need a `/cfg` topic, which §11 still only reserves. `link` is the one
+exception: the relay does not merely display it, it compares it against the stored value to decide
+whether to re-publish unacked `/down` messages, exactly as it already does for `session` — §5.3.)*
+They are optional, so
 a `/status` without them remains valid, and a relay MUST treat their absence as "unknown", not as `0`.
 
 ### 5.2 LWT payload (48 bytes)
@@ -480,6 +485,10 @@ keeps the TLS+MQTT session up on eDRX while the ESP32 is in deep sleep; that dev
 
 - On a retained `offline` or an LWT `offline`: mark the device offline; the parent UI shows
   "last seen <time>". No message state changes (§4.1 rule 5).
+- On an `online` whose `session` **differs from the last seen `session`**, whose `link` differs
+  from the last seen `link` (§9.5 — both values present and unequal; a `link` that is absent
+  either now or previously never counts as a change, so older firmware and a device's first
+  `link`-carrying `/status` are unaffected), or on any
   offline→online edge: **re-publish unacked messages and the newest `book` and `cfg`**. Broker QoS 1
   covers the common case; this covers session loss.
   - Order: oldest first.
@@ -537,6 +546,10 @@ it. The broker must therefore still support an LWT and QoS 1 in both directions 
 
 | Parameter | Value |
 |---|---|
+| ESP32 RTC-timer wake for the ping | **None** — it rides the existing 5 s wake (§8), so it adds no wake source. The library exposes no `mqttPing()`, and there is no ping in the Sequans MQTT AT command set at all. |
+
+Energy arithmetic, unchanged in form: an uplink packet needs an RRC connection, roughly 3 s at
+
 
 ### 6.3 eDRX (sleep mode)
 
@@ -680,6 +693,7 @@ relay container (no fake transport, no unit-test mocks), with one simulated devi
 (`paho-mqtt`, matching `tools/pager_client.py`'s device side) connected over plain TCP on the Docker
 bridge network. Traffic sent, matching the "measurable, non-modem" slice of §7.3's nominal profile
 over a fixed synthetic load: **20 down messages, each fully acked `shown` then `read`, plus 5
+student replies** (the modem-side keepalives are not reproducible here — there is no modem, and the
 relay's own keepalive is a plain 60 s service keepalive per `RELAY_KEEPALIVE_S`
 excluded from this measurement, not estimated).
 
@@ -811,6 +825,7 @@ Two v1.5.0 features the design relies on:
   `_eventProcessingTask` (`src/WalterModem.cpp:1595-1626`), **not** from the RX ISR/task. Calling
   modem APIs from the handler is supported and is what the vendor example does. Note the task
   polls its queue on a 10 ms tick and adds a further 10 ms settle delay before dispatch, so budget
+  **≥200 ms of awake time** for reliable delivery of held events to surface; see §8.2.
 - **`+SQNSMQTTMEMORYFULL` → `WALTER_MODEM_MQTT_EVENT_MEMORY_FULL`** (`src/WalterModem.cpp:3398-3405`)
   tells us the modem's own message buffer overflowed. That is the direct signal that the
   wake-and-drain cycle is falling behind, and firmware should count it (§8.4).
@@ -849,21 +864,34 @@ Per-wake energy, ESP32 side, at an assumed **40 mA** active draw (ESP32-S3, radi
 
 | | awake time per cycle | why |
 |---|---|---|
+| Light-sleep cycle | **200 ms** (measured) | CPU resumes in place. The modem holds `+SQNSMQTTONMESSAGE` URCs while RTS is deasserted; the ESP32 must stay awake long enough for the library's event task (10 ms tick, 10 ms settle) and the URC dispatch to complete (§8.0). Field measurement: 50 ms is too short — pages sent during a sleep window vanished entirely; 150 ms worked (pages delivered 35 s and 136 s after sending); the firmware uses 200 ms. Cost: 200 ms per 5 s wake is **4% awake**, against the ~1% the design assumed. |
 | Deep-sleep cycle | **600 ms** (estimate) | Deep sleep restarts program execution. Bootloader + `app_main` ≈ 300 ms, then `WalterModem::begin()` must re-open the UART, spawn its tasks, run `_sleepWakeup()` — which itself issues a `checkComm()` (`src/WalterModem.cpp:4097-4100`) — and then `configCMEErrorReports()` + `configCEREGReports()`, i.e. at least three AT round trips (`src/WalterModem.cpp:4258-4276`). |
 
 ESP32-side average current as a function of the poll interval `T`:
 
 ```
+I_light(T) = 1.0 + 40 x (0.200 / T) = 1.0 + 8.0 / T mA
 I_deep(T) = 0.0095 + 40 x (0.600 / T) = 0.0095 + 24 / T mA
 
+crossover: 1.0 + 8/T = 0.0095 + 24/T -> 0.99 = 16/T -> T = 16.2 s
 ```
 
+**Deep sleep only wins above a 16-second wake interval.** §6.5 caps the interval at
 30 − 20.48 − 0.3 − 1.5 = **7.7 s**. The two requirements do not overlap, so light sleep wins, and it
 is not close:
 
 | `T` | `I_light` | `I_deep` | sleep-mode worst-case latency |
 |---|---|---|---|
+| 2 s | 5.00 mA | 12.0 mA | 24.3 s |
+| **5 s** | **2.60 mA** | **4.81 mA** | **27.3 s** |
+| 7 s | 2.14 mA | 3.44 mA | 29.3 s |
+| 16.2 s | 1.49 mA | 1.49 mA | 38.5 s — **misses the 30 s target** |
 
+`T` = **5 s** is the choice. With the measured 200 ms window the light-sleep term is 2.60 mA, where
+the original 50 ms estimate gave 1.40 mA: the wake window is the largest single term in §8.4.
+Moving to 7 s would save 0.46 mA (about 11 mAh/day) but leaves only 0.7 s of margin on the 30 s
+target. Shrinking the window is the better lever, and it has not been bisected below 150 ms. `PAGER_WAKE_INTERVAL_SLEEP_MS` / `PAGER_WAKE_INTERVAL_ACTIVE_MS` are
+compile-time constants so this can be retuned against a current trace without touching logic.
 
 ### 8.3 Deep sleep: why it is not used, and the one way back
 
@@ -905,6 +933,7 @@ real hardware (`firmware/README.md`).
 | Term | Value | Assumption |
 |---|---|---|
 | ESP32-S3 light sleep, board level | **1.00 mA** *(vendor)* | `WalterModem::sleep()` doc comment; RAM retained, UART domain powered |
+| Wake-and-drain overhead, `T` = 5 s | 1.60 mA (estimate) | 200 ms awake at an assumed 40 mA every 5 s (§8.2); the 200 ms is measured, the current is not |
 | Modem eDRX paging | 0.2–0.5 mA (estimate) | 2 paging occasions per 20.48 s cycle, ~50 ms each at ~50 mA RX, plus warm-up |
 | Modem idle floor | 0.01–0.05 mA (estimate) | Sequans GM02SP deep-sleep-between-paging |
 
@@ -1107,6 +1136,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 47 | `sms_ts` | int | `/up` `sms_log` (§3.6 — when the SMS itself was sent/received) |
 | 48 | `sms_lost` | int | `/status` (§3.6 — device SMS audit-drop counter) |
 | 49 | `cell` | map | `/loc` envelope, optional (§13.2 — cell-tower location fallback) |
+| 50 | `link` | int | `/status` (§9.5 — MQTT-session generation within a boot, optional) |
 
 **Sub-map keys:**
 
@@ -1185,6 +1215,8 @@ the future.
   and nothing collides with `pins.h`. **No GPIO change is requested and none is needed.**
   What replaced it is a library question, settled by the experiment in item 4 below. See §8.0: the library discards
   incoming-message state across an ESP32 restart, so deep sleep loses messages regardless of how we
+  wake. The documented consequence is §8.4's estimate: **≈4.0–4.5 mA / 95–107 mAh/day, several
+  times worse than the 0.6–1.2 mA a modem-wake design would give**, i.e. ~14–16 days of idle life
   instead of ~50–100.
 
 2. **`NEEDS HUMAN DECISION` — broker free-tier limits.** This contract needs,
@@ -1206,6 +1238,7 @@ the future.
 
 4. **Not a decision, but the highest-value experiment in this document.** Settle whether the modem's
   MQTT session is persistent across an ESP32 restart (§6.1 clean session). If it is, §8.3 (b)
+  becomes implementable and idle battery life goes from ~14–16 days back to roughly 80–120 days.
   ~20 minutes on hardware. Nobody should redesign anything for it until it has been run.
 
 5. **Device provisioning is owned by `DEVICE_PLAN.md` §3 (phase 0/1/2b/3).** One-time setup
@@ -1257,6 +1290,9 @@ the future.
   the thing that actually sets it).** §13 gives the device a periodic fix and an on-demand fix, and
   §7.3 shows the *data* cost is small (0.29 kB per fix). **The real cost is energy, and it is not
   estimated anywhere in this document.** A cold GNSS fix on the GM02SP can run for tens of seconds
+  at tens of mA; at §8.4's sleep-mode budget of 95–107 mAh/day, even one 30 s fix at 30 mA is
+  0.25 mAh, so a 15-minute interval would be ≈ 24 mAh/day — **roughly a 25 % increase in idle
+  drain, taking ~14–16 days of idle life to ~11–13**. That arithmetic uses two made-up numbers and
   is offered only to show the term is not negligible. **Nobody should pick `loc_period_s` until
   fix time and fix current have been measured on hardware** (assisted vs cold, indoors vs
   outdoors, and how much of it warm-start assistance data removes); the interval should then be
@@ -1285,6 +1321,7 @@ the future.
 | 8.4 | All current figures except the two vendor ones | Not verified | Current-trace measurement; record in `firmware/README.md` |
 | 6.5 | SSD1680 partial refresh completes in <1.5 s at room temperature | **Not verified** — §6.5 breaks if it does not; only 2.7 s of slack at `T`=5 s | Toggle a GPIO around `ui_refresh()`, scope the pulse width; also log `esp_timer` deltas around the BUSY wait |
 | 9.4 | The M5Stack CardKB emits one ASCII byte per keypress (no multi-byte sequences) | **Not verified; load-bearing for §9.4** — if it can emit >0x7F, a 160-byte RTC reply slot is no longer 160 characters | Poll 0x5F over I2C, dump every non-zero byte for a full pass over the keyboard incl. Fn/sym combos; 15 min on hardware |
+| 8.4 | ESP32 draws ~40 mA awake for 200 ms per wake-and-drain cycle | The 200 ms is measured as sufficient (50 ms loses pages, 150 ms works); the current is not verified, and the overhead term (1.60 mA of 4.0–4.5 mA) rests on it | Toggle a GPIO around the awake window and read the duty cycle on a scope; a current trace gives both numbers at once |
 | 12.6 | `getVoltage()`/`AT+SQNVMON` reports real battery voltage, not a fixed regulated rail | **Not verified; cheap to confirm** — inferred from Walter's public schematics (§12 item 6), not from Walter's own unpublished internal routing | Compare `getVoltage()`'s reported `batt_mv` against a multimeter reading of the actual battery on first hardware bring-up; 5 min, no code change either way |
 | 13 | Energy per GNSS fix (time-to-fix and mean current) — **no figure exists**, and §13's periodic interval cannot be chosen without one | **Not verified (§12 item 8); load-bearing for the battery budget** | Trigger a fix inside §8.4's current trace; log time-to-fix cold and warm, mean current, mAh per fix |
 | 13 | `walter-modem` v1.5.0 exposes a usable GNSS fix API with a bounded timeout and assistance data | **Not verified**; assumed by §13, not yet read against the component source | Grep `src/` for the GNSS/GPS API and read it, as was done for MQTT; 30 min, no hardware |

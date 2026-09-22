@@ -1,5 +1,10 @@
 # Vendor bug reports: Sequans modem and DPTechnics library
 
+Draft reports for the vendors. Modem reports go to Sequans (their forum, or through DPTechnics);
+library reports go to <https://github.com/QuickSpot/walter-esp-idf/issues> (reports with mixed
+addressees are split in the body). Every library bug below is fixed in this repo's vendored copy;
+`firmware/components/dptechnics__walter-modem/PATCHES.md` has the patches, which can be offered
+upstream as they are.
 
 Common details:
 
@@ -105,3 +110,53 @@ the PSM timer fields, so with `AT+CEREG=2` the cell identity is lost.
 **To: DPTechnics.** Right after attach `AT+CCLK?` can still return `70/01/01,...`. `getClock()`
 reads the year as 2070 and returns a valid-looking epoch of 3155760008. Reject years before the
 library's own build year, or return failure.
+
+## 9. Session liveness: no PINGREQ at keepalive 480 s, and mqttSubscribe() disabled after resume
+
+**To: Sequans and DPTechnics (`walter-esp-idf`).** Two related defects: the built-in MQTT client
+sends no keepalive pings at the 480 s keepalive used on the AT&T path, and after a server-dropped
+resumption the library cannot re-subscribe.
+
+**Part A: Sequans**
+
+**Steps**
+
+```
+AT+SQNSMQTTCFG=0,"client","user","pass",2
+AT+SQNSMQTTCONNECT=0,"<broker>",8883,480
+```
+
+Wait idle with no uplink traffic. Observe the broker's per-client `recv_pkt` counter over 12+ minutes.
+
+**Observed**, over three consecutive sessions: EMQX's `recv_pkt` for the client
+remains at 1 (the initial CONNECT) for the entire session, despite `keepAlive=480` negotiated and
+acknowledged in the CONNACK. The host issues no `AT+SQNSMQTTSUBSCRIBE` or `AT+SQNSMQTTPUBLISH` in that time, so the only
+packet the broker could have counted is a PINGREQ, and none arrives. At 1.5 × keepAlive (720 s / ~12 min for
+`keepAlive=480`; ~45 min for `keepAlive=1800`) the broker closes the connection. No
+`+SQNSMQTTONDISCONNECT` URC is ever raised. About 6 minutes later, the modem reconnects on its own
+and emits `+SQNSMQTTONCONNECT:0,0` unsolicited.
+
+*Other keepalive values, on the same path (`docs/MODEM_KEEPALIVE_EVAL.md`): PINGREQs arrived at about
+60 s and 240 s; none arrived at 360 s or 480 s. On Soracom direct, PINGREQs arrived at every keepalive
+tested, from 60 s to 1800 s.*
+
+**Expected**: per the Monarch 2 AT manual, the keepalive argument of `AT+SQNSMQTTCONNECT` controls
+"the rate at which the client sends ping messages to the broker." A PINGREQ should be sent at least
+every `keepAlive` seconds during idle periods.
+
+**Questions**: is this known, and is it fixed in a later firmware release? Can we obtain
+`LR8.2.2.x` or `LR8.2.3.x` for the **GM02SP**?
+
+**Part B: DPTechnics (note for Sequans: see above)**
+
+When a server drop is silently resumed by the modem without an `AT+SQNSMQTTCONNECT` from the host,
+the AT manual is explicit: "If the MQTT connection was dropped by the server and automatically
+resumed by the modem … the MCU must re-subscribe to carry on receiving MQTT messages." Our host code
+does attempt this on the CONNECTED event, but `WalterModem::mqttSubscribe()` returns `OK` without sending `AT+SQNSMQTTSUBSCRIBE`
+when the topic is already in its internal table (`src/proto/WalterMQTT.cpp:120-123`, "Topic already in use").
+That table is cleared only by `mqttConnect()`, which is never called during a modem-initiated resume.
+A user cannot repair the subscription without a full disconnect and reconnect.
+
+**Suggested fix**: on a `+SQNSMQTTONCONNECT` URC that was not preceded by
+`+SQNSMQTTONDISCONNECT`, clear the topic table (or expose a force-resubscribe flag on
+`mqttSubscribe()`).

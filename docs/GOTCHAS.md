@@ -37,6 +37,43 @@ data at all, so a table entry must match narrowly, and near misses are tested
 (`firmware/host/test_carrier.c`). Precedence: `;apn=` typed with the setup code, a choice made on
 the pager (`carrier` console command, Device → Carrier), detection, the bundle's APN, blank.
 
+## Pages never arrive while the pager sleeps
+
+**Symptom:** pages sent during a sleep window do not appear during that boot; they arrive in a later boot.
+
+**Cause:** the ESP32 light-sleeps with RTS deasserted, and the modem holds `+SQNSMQTTONMESSAGE` URCs
+until the device is awake and ready to receive them. With a 50 ms wake window after each 5 s sleep
+cycle, the modem never hands them over because the window is too short (two pages were lost in one
+4-minute window).
+
+**Rule:** the post-wake window must be long enough for the modem to deliver all held events. 50 ms
+was too short; 150 ms worked (pages delivered 35 s and 136 s after sending). The firmware uses
+200 ms (about 4% awake, against the 1% the design assumed).
+
+Limitations: the exact minimum was not bisected between 50 and 150 ms; the 136 s delivery is not
+explained; a bare `AT` right after wake was not tested as a way to allow a shorter window.
+
+## Pages stop arriving after about ten minutes, then resume much later
+
+**Symptom:** the web app shows the pager online; new pages vanish; the pager's log shows no disconnect; the session comes back by itself several minutes later.
+
+
+Worse, after the modem resumes the session by itself (`+SQNSMQTTONCONNECT:0,0`, no connect command
+from us) the pager is **subscribed to nothing**: the AT manual requires the host to re-subscribe, and
+`mqttSubscribe()` silently does nothing when the topic is still in its local table. No
+`AT+SQNSMQTTSUBSCRIBE` was sent for either resume in a 40-minute log. No `+SQNSMQTTONDISCONNECT` is
+ever raised either, so the firmware never notices any of it.
+
+
+
+## The pager dies after losing signal
+
+**Symptom:** the pager works normally; it walks into an area with no coverage; after coverage returns, the pager is not reachable and will not send or receive pages until a power cycle.
+
+**Cause (fixed):** a health check used to treat "no signal" as "modem unresponsive" and hard-reset the modem, which erased its MQTT and TLS configuration. With no coverage, the re-init gave up and nothing redid it.
+
+**Rule:** losing coverage must never reset the modem. Radio bring-up and session configuration are separate. Regained coverage triggers an immediate reconnect (an existing session is torn down first, because it may be silently dead), and the modem is reset only if it stops answering or after 30 minutes with no network. Verified on hardware: radio off for 70 s and 12 minutes, then on; no reset, the session was usable 3 s after coverage returned, and a page was delivered afterwards.
+
 ## The modem's MQTT client and TLS
 
   `AT+SQNSPCFG=2,2,"",0,,,,` the modem sends an unencrypted MQTT CONNECT, password included, to
@@ -61,6 +98,10 @@ the pager (`carrier` console command, Device → Carrier), detection, the bundle
 every change, each marked `PAGER PATCH` in the source. The ones to know about: a result line with
 no command pending used to crash the pager; receive paths could read and write past the 1540-byte
 buffer; only socket id 1 could be looked up; a payload ending in a newline left the final `OK`
+unmatched and the read timed out; SMS and SIM-file reads did not exist; the synchronous
+command wait was untimed, so one slow command (`AT+COPS=0` during a search: up to 3 × 30 s)
+blocked every other task's next command behind it and tripped the 60 s task watchdog (patch
+1.10 feeds the watchdogs for up to 95 s while blocked, then lets a wedged modem reset the chip).
 **A single MQTT message larger than about 1.5 kB cannot be received**, which is why the CA travels as
 a URL and a hash and not inside the setup bundle (a Let's Encrypt root is 1.9 kB).
 
@@ -76,6 +117,11 @@ a URL and a hash and not inside the setup bundle (a Let's Encrypt root is 1.9 kB
 - CI applies Terraform with values from GitHub repo variables. `BROKER_CA_PEM_FILE` and
   `PUBLIC_BASE_URL` must be set there, or a deploy silently un-pins new setup codes or refuses to
   issue them.
+- **Never run `npm install` for the web app on a Mac.** It prunes Linux-only optional
+  dependencies (`@emnapi/core`, `@emnapi/runtime`, sharp's wasm fallback) from the lockfile, and
+  the deploy's `npm ci` on Linux then fails while the relay half of the same push deploys. Change
+  dependencies inside the `node:24` image: `docker run --rm -v "$PWD":/work -w /work node:24 npm
+  install <pkg>`.
 - **Deploy the relay before flashing firmware that adds fields.** A relay older than v0.2 drops a
   whole envelope over one unknown CBOR key.
 
@@ -97,8 +143,48 @@ a URL and a hash and not inside the setup bundle (a Let's Encrypt root is 1.9 kB
 
 ## Display
 
+**Symptom:** the screen freezes on one image while the log shows screens changing and
+`disp: BUSY: entry=0 exit=0 iters=0 elapsed=12 us` on every refresh. A healthy refresh shows
+`entry=1` and 450 ms (partial) or 1.4-3.4 s (full). **Cause:** the panel's BUSY wire (IO18, Walter
+pin 22, next to the keyboard's pins) was loose, so the driver believed each refresh had finished
+at once and cut the panel's power before it drew. The driver now waits a fixed 700 ms / 3.5 s
+when BUSY never rises, and logs "BUSY line never asserted" once per boot, so the symptom becomes
+a slow display plus that line.
+
 E-paper partial refreshes ghost. A message that *changes the screen* (greeting to chat) takes a
 full refresh; messages into an open chat stay partial.
+
+## The SSD1680 two-plane differential update
+
+**Symptom:** vertical bands about one character wide remain garbled after typing in the chat
+composer stops — only a full refresh (at boot, or every 20th partial) resyncs them. Firmware-side
+everything is right: keys arrive, the composer holds the text, the reply publishes. The panel
+image diverges from the framebuffer on partial refreshes.
+
+**Root cause:** the SSD1680 controller inside this panel has two image planes in RAM (new at 0x24,
+old at 0x26). A mode-2 differential update compares the new plane against the old to decide which
+pixels to refresh. The driver wrote the changed band to 0x24 and ran the update, but only
+re-synced 0x26 afterwards — the two planes were left unequal. The next differential update on
+an adjacent band then compared against a plane that never held the displayed image, so rows
+unchanged by the host were never detected as changed again, and stayed wrong until the next full
+refresh.
+
+**Rule:** after a SSD1680 mode-2 partial update, both planes MUST be equal. Write the band to
+plane 0x26 first, then to 0x24, each preceded by its own `set RAM window` (0x44/0x45) and
+`set RAM counter` (0x4E/0x4F) sequence. Full refreshes must also re-set the window before
+writing 0x26, because the address pointer has run to the end after 296 rows of 0x24 data.
+Reference implementations: GxEPD2's `GxEPD2_290_T94.cpp` / `GxEPD2_290_T94_V2.cpp`,
+function `writeImageAgain()`. Waveshare's own 2.9" V2 driver example documents why:
+
+> there are 2 memory areas embedded in the e-paper display and once the display is refreshed,
+> the memory area will be auto-toggled, i.e. the next action of SetFrameMemory will set the
+> other memory area therefore you have to set the frame memory and refresh the display twice.
+
+**Gotcha in bench testing `disptest seq`:** this harness does not touch any band below the
+starting row, so with the default `seq 2 12` the two leftmost bars never change — easily
+misread as "the leftmost band did not flip". Always start at `seq 0` when judging correctness
+by eye, and predict the expected black/white bar pattern in advance (e.g. `w b w b w b ...`).
+Read the bars off the glass as a `b w b w ...` list and diff that against the prediction.
 
 ## Finding out what the modem really sends
 

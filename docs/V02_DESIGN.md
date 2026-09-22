@@ -194,6 +194,10 @@ failed or wrong fix is an acceptable answer, and battery matters more than fresh
 - **Relay/protocol**: §13.3 item 1 is amended. The device's window is the growing backoff above,
   reported in `/status`; the relay's own mirrored 60 s rule is unchanged. `tools/pager_client.py`
   answers `loc_req` the same way (a `--loc lat,lon` option, else `no_fix`), so the e2e suite covers the
+  lifecycle. On a `no_fix` answer the pager sends its serving cell (`PROTOCOL.md` §13.2, envelope key 49
+  `cell`), and the relay resolves it to a coarse position through pluggable geolocation (Google
+  Geolocation API or OpenCelliD), stored as a fix with `src: "cell"`. This gives a coarse answer
+  indoors; GNSS improves accuracy outdoors but is not the only source.
 
 ## 6. Device-direct SMS
 
@@ -242,6 +246,7 @@ Envelope keys:
 | 46 | `st` | tstr | `/up` `sms_log` |
 | 47 | `sms_ts` | int | `/up` `sms_log` |
 | 48 | `sms_lost` | int | `/status` (audit entries dropped, normally 0) |
+| 50 | `link` | int | `/status` (MQTT-session generation within a boot, §9.5; key 49 is `cell`) |
 
 `kind` gains `sms_log` (`/up`). `cfg` sub-map: `lock=0` (existing), **`ca=1`** `{url=0 tstr,
 sha=1 bstr(32)}`, **`sms=2`** array of `{n=0 tstr name, p=1 tstr phone}`. In JSON the same names
@@ -259,3 +264,81 @@ are used; `ca_sha`/`sha` are base64url without padding, like `sig`.
   `ca_push`, `sms_log` with `pager_client.py`.
 - Web: `npm run build`, lint.
 - Hardware, by hand, using the debug console: every item marked not verified in this document.
+
+
+### 9.1 Findings
+
+`AT+SQNSMQTTCONNECT`'s fourth argument is documented as the maximum period between communications with
+the broker, after which the client sends pings. The firmware's negotiated keepalive is confirmed by the
+broker (480 s), so the value is used; the cut happens on the network side.
+
+Consequences:
+
+1. **Idle flows are cut by the carrier**: at 240–360 s on AT&T, and not before 1800 s on Soracom direct.
+   The broker also drops a client at 1.5 × keepalive.
+2. **After a silent resume the pager is deaf.** The modem reconnects on its own and emits
+   `+SQNSMQTTONCONNECT:0,0` with no preceding `AT+SQNSMQTTCONNECT` from us. The AT manual says that
+   after a server drop and automatic resume, the MCU must re-subscribe. The firmware's handler tries,
+   but `WalterModem::mqttSubscribe()` returns `OK` **without sending anything** when the topic is already
+   in the library's local table, and only `mqttConnect()` clears that table, which a modem-initiated
+   resume never calls. No `AT+SQNSMQTTSUBSCRIBE` was sent in the logged resumes.
+3. **No disconnect is reported.** No `+SQNSMQTTONDISCONNECT` arrived over three broker drops. The handler
+   logs on every rc, so the URC is simply not raised. `s_mqtt_connected` therefore stays `true`: no
+   disconnect edge, no F1/F3 backoff, no `net_session_up()`, no rising edge, and no `published /status
+   online`. The relay's §5.3 re-publish of unacked pages never runs.
+4. **The session is not persistent.** While the client was gone, the broker's client endpoint returned
+   404 rather than a disconnected session, so the broker keeps nothing: the subscription and any queued
+   QoS 1 `/down` are discarded on every drop (inferred from the 404s). Clean-session is not settable on
+   this firmware. A later modem firmware adds `AT+SQNSMQTTCFG=…[,<retain>[,<clear>]]`.
+
+### 9.2 Decision
+
+
+Why a re-SUBSCRIBE and not a publish: the SUBACK proves the round trip (a QoS 0 publish proves
+nothing), it needs no ACL change and no relay-side tolerance (the broker rule forwards `/up`, `/status`,
+`/loc`, `boot/+/up` only), and it is *also* the repair item 2 above requires, so one mechanism fixes
+both. It is safe to repeat: the broker replaces the subscription, and `/down` is published with
+`retain=False` (`relay/app/broker.py`), so no page is re-delivered.
+
+
+### 9.3 Cost
+
+| Term | Number | Assumption |
+|---|---|---|
+| Per ping | ~0.1 mAh (estimate) | §6.2's RRC figure: ~3 s at ~120 mA. **The weakest number here**: an RRC release tail of 10 s instead of 3 s would make it 0.28 mAh |
+
+
+### 9.4 Mechanism
+
+1. `net.cpp` tracks `s_last_uplink_us` (set on every successful publish and on every SUBACK) and a
+   `s_resub_pending` flag.
+2. `+SQNSMQTTONCONNECT` while the firmware already believes it is connected = a modem-initiated resume:
+   it is logged, sets `s_resub_pending`, and does not touch `s_mqtt_connected` (publishes still work).
+3. `net_service_session()`, called once per wake-and-drain iteration from `modes.c` (the ESP32 is already
+   awake at each sleep-cycle wake, so the timer check is free), sends the raw
+   `AT+SQNSMQTTSUBSCRIBE=0,"pager/{id}/down",1` when `s_resub_pending`, or when
+   edge**, so `modes.c` runs the existing `catrust_on_mqtt_connected()` + `publish_status_online()` block.
+   raise the ordinary disconnect edge, so F1/F3 backoff and `net_session_up()` run. `mqttConnect()` frees
+   the topic table, so the subscribe after a real reconnect is a normal one. **This is the early death
+   detection the firmware otherwise lacks**: ≤30 s instead of the modem's ~6 min.
+
+No new wake source and no new RTC state. `s_last_uplink_us` and the flags live in RAM, which light sleep
+retains, and after a reset the session is rebuilt from scratch anyway.
+
+### 9.5 Relay
+
+A resume still leaves a window of up to 10 s with no subscription at the broker, and a QoS 1 `/down`
+published into it is discarded (§9.1 item 4). The relay re-publishes unacked pages only on a `session`
+change or an offline→online edge (`relay/app/ingest.py`), and `session` is a cold-boot id (§5.1), so a
+resume triggers neither. The fix: `/status` has optional **`link`** (key 50, §7), a counter incremented on
+every MQTT session within a boot, and the relay treats a changed `link` exactly like a changed `session`.
+It is an optional field, so an older relay is unaffected.
+
+### 9.6 Acceptance and measurements
+
+   never changes, and a page sent at t+90 min arrives. This is the acceptance test.
+2. **Per-ping energy.** A current trace across one ping: peak, duration to RRC release, mAh. This feeds
+3. **The real idle-death time.** `keepalive=1800` (which removes the broker as a killer), no host ping,
+   polling the broker every 10 s. This gives the carrier's timeout directly, and with it the largest `N`
+   within one wake cycle, that `+SQNSMQTTONSUBSCRIBE` returns, that `/status online` is published, and
+   that a page sent 10 s later arrives.

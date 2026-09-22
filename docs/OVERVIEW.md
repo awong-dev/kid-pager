@@ -94,6 +94,14 @@ is the same flow with a new code.
 The modem stays registered with **eDRX** (a 20.48 s paging cycle, PSM off), so a page arrives
 within about 20 s without the radio being on. The modem's built-in MQTT client owns the session.
 Whether it sends pings on its own depends on the carrier and the keepalive value
+(`MODEM_KEEPALIVE_EVAL.md`), so the firmware does not rely on it. It re-subscribes to its topic after a
+fixed period of uplink silence, from a wake it takes anyway: 240 s on the default and AT&T presets
+attentive window is open, and on a deliberate shake, to collect events the modem holds. Wake timing
+and the held-event window are described in `PROTOCOL.md` §8.
+
+After losing coverage, the radio runs a duty cycle: 3 minutes unregistered, then off for 2/5/10/15
+minutes (capped) with a 150 s search window between. Any registration resets the backoff; sustained
+motion resets it too.
 
 The data budget is dominated by TLS reconnects (about 5 kB each), not by messages:
 roughly 1-2 MB a month nominal (`PROTOCOL.md` §7).
