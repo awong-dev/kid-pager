@@ -4,6 +4,7 @@
 #define DISP_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,16 @@ void disp_full_refresh(void);
 
 /* Sends only the changed row band; no-op if nothing changed; full every 20th partial. */
 void disp_partial_refresh(void);
+
+/* true also re-writes the new-image plane after a partial (vendor behaviour). */
+void disp_set_partial_write_again(bool on);
+bool disp_partial_write_again(void);
+
+/* Native rows where the framebuffer differs from the shadow plane. */
+int disp_dirty_rows(void);
+
+/* Partials since the last full refresh. */
+uint32_t disp_partial_count(void);
 
 #ifdef __cplusplus
 }

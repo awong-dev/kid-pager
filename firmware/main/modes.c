@@ -52,8 +52,13 @@ static const char *TAG = "modes";
 
 // The modem releases a held URC only when it accepts a host command, never within 200 ms of RTS
 // being re-asserted; a 20 s cadence with the probe held open until answered delivers reliably.
+// Minimum interval between msg_pump() calls: caps the pump at 5 Hz on the 100 ms UI-awake cadence.
+#define PAGER_PUMP_MIN_INTERVAL_US (200 * 1000)
 // Sleep-mode wake interval while unregistered: there is nothing to receive.
 #define PAGER_WAKE_INTERVAL_UNREGISTERED_MS 30000u
+// Awake time with RTS asserted after each timer wake. The modem holds URCs while RTS is deasserted
+// and does not hand them over within 50 ms.
+#define PAGER_POST_WAKE_YIELD_MS 200u
 #define PAGER_ACTIVE_IDLE_TIMEOUT_S (10 * 60) // 10 min
 #define PAGER_STATUS_HEARTBEAT_S 3600u         // §5.4(d)
 #define PAGER_CHECKCOMM_EVERY_N_WAKES 60u      // modem health check cadence
@@ -136,11 +141,16 @@ static void rtc_unlock(void) { xSemaphoreGive(s_rtc_mutex); }
 static bool s_was_mqtt_connected = false;
 static bool s_ui_awake_prev = false; // edge-detects input_awake()
 
+static uint32_t s_mqtt_link_counter = 0;
+
 // mqttConnect() can wedge with neither CONNECTED nor DISCONNECTED firing: s_connect_attempt_us is
 // the outstanding attempt's issue time (0 = none); the count is consecutive silent timeouts.
 static int64_t s_connect_attempt_us = 0;
 static uint32_t s_connect_watchdog_count = 0;
 #define PAGER_CONNECT_WATCHDOG_US ((int64_t) 60 * 1000000)
+
+// Earliest next msg_pump() call; 0 = run immediately.
+static int64_t s_next_pump_us = 0;
 
 static volatile bool s_ca_apply_suppress = false;
 
@@ -248,6 +258,7 @@ static void on_auth_epoch_wrap(void)
 #define STK_LOC_MIN_S 28
 #define STK_LOC_BACKOFF_S 43
 #define STK_TLS 39           // "unpinned"/"pinned"/"broken"/"proxy"
+#define STK_CA_FP 42         // absent when unpinned
 
 #define PAGER_RSSI_UNSET (-1000) // outside net_get_rssi()'s valid [-113,-51] range
 
@@ -288,6 +299,7 @@ static void ui_wake_status_refresh(void)
 }
 
 int modes_get_rssi_dbm(void) { return (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : -113; }
+bool modes_batt_mv_known(void) { return s_last_batt_mv != 0; }
 const char *modes_get_session_id(void) { return g_rtc.session_id; }
 uint32_t modes_get_memfull_count(void) { return g_rtc.mqtt_memfull_count; }
 uint32_t modes_get_oversize_drop_count(void) { return g_rtc.oversize_drop_count; }
@@ -338,6 +350,8 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
         cbor_w_tstr(&w, STK_CA_FP, ca_fp, strlen(ca_fp));
     }
     cbor_w_uint(&w, STK_SMS_LOST, sms_get_lost_count());
+    // Always present: callers build this only while mqtt_connected, after the counter is incremented.
+    cbor_w_uint(&w, STK_LINK, s_mqtt_link_counter);
 
     if (!signed_env) {
         *out_len = w.len;
@@ -1096,6 +1110,8 @@ void modes_run(void)
         bool btn_busy = input_button_busy();
         bool btn_stuck = input_button_stuck();
         bool ui_awake = input_awake();
+        // pump_blocked keys only on net_modem_busy() (the UART/RTS interlock with the MQTT event handler);
+        bool pump_blocked = net_modem_busy();
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
         // Debug builds behave as if the UI were always awake (no light sleep, log alive), except inside a
         // `sleeptest` window. pump_blocked keeps its value so acks still publish.
@@ -1203,6 +1219,7 @@ void modes_run(void)
             ui_show_toast(lock_toast);
         }
 
+        if (render_now) {
             // Always a partial; cheap when nothing changed.
             ui_render();
         } else if (ui_awake_edge_out) {
@@ -1272,6 +1289,15 @@ void modes_run(void)
             next_session_retry_us = 0;
         }
 
+        if ((st.mqtt_connected && !s_was_mqtt_connected) || st.session_restart_edge) {
+            // A session_restart_edge is a silent modem-initiated resume that net_service_session()
+            // repaired; mqtt_connected never dropped, so it needs its own trigger into this block.
+            if (st.session_restart_edge) {
+                net_ack_session_restart_edge();
+            }
+            // New MQTT session within this boot: bump before publish_status_online() so the first status
+            // carries the new `link`.
+            s_mqtt_link_counter++;
             // Session usable (docs/PROTOCOL.md §5.4a). Must run before the status publish: catrust heals
             // broken -> pinned, or the relay sees `tls:"broken"` for a session that just validated.
             catrust_on_mqtt_connected();
@@ -1333,10 +1359,15 @@ void modes_run(void)
             backoff_index = 0;
         }
 
+        // At most one publish per pump call, only while connected and not net_modem_busy(), rate-limited
+        // so the 100 ms UI-awake poll cadence does not become an AT transaction every 100 ms.
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
 #endif
+        // Idle-uplink liveness ping / silent-resume repair, once per iteration. The LTE transport is
+
         watchdog_kick(WD_PUMP);
             msg_pump();
+            s_next_pump_us = esp_timer_get_time() + PAGER_PUMP_MIN_INTERVAL_US;
         }
 
             g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP &&

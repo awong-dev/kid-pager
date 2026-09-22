@@ -22,6 +22,9 @@ extern "C" {
 
 #define LOC_FIX_CONFIDENCE_MAX 100.0 /* vendor demo threshold */
 
+/* `batt_mv` sentinel for "no reading yet"; loc_battery_ok() passes it. Pass this constant exactly. */
+#define LOC_BATTERY_UNKNOWN_MV INT32_MIN
+
 #define LOC_STATUS_MIN_S 600u    /* reported /status loc_min_s */
 #define LOC_STATUS_PERIOD_S 0u   /* reported /status loc_period_s */
 

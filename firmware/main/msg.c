@@ -1619,6 +1619,9 @@ void msg_pump(void)
 {
     s_lock();
 
+    // Replies go before acks so a typed reply is not stuck behind a pending-ack drain; with
+    // MSG_PENDING_UP_MAX at 2, acks are delayed by at most 2 publishes.
+    // A reply the modem accepted stays pending_up (body in NVS) until the broker's PUBACK URC for its
     for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
         if (!s_rtc->pending_up[i].in_use) {
             continue;
@@ -1677,9 +1680,39 @@ void msg_pump(void)
         return;
     }
 
+    for (int i = 0; i < MSG_PENDING_ACKS_MAX; i++) {
+        if (!s_rtc->pending_acks[i].in_use) {
+            continue;
+        }
+        msg_pending_ack_t *a = &s_rtc->pending_acks[i];
+        const char *ack_str = (a->state == 0) ? "shown" : "read";
+        char id_copy[MSG_ID_MAX];
+        strncpy(id_copy, a->id, MSG_ID_MAX - 1);
+        id_copy[MSG_ID_MAX - 1] = '\0';
+        uint8_t state = a->state;
+        s_unlock();
+
+        bool ok = publish_ack(id_copy, ack_str);
+
+        s_lock();
+        if (ok) {
+            a->in_use = false;
+        } else {
+            a->attempts++;
+            if (a->attempts >= 3) {
+                a->in_use = false; // §4.1 rule 6: drop after 3 attempts
+            }
+        }
+        (void) state;
+        s_save();
+        s_unlock();
+        return;
+    }
+
     s_unlock();
 
     // Reached only when no reply or ack was pending: the sms_log audit queue shares the
+    // one-publish-per-call rule.
     sms_try_publish_one();
 }
 

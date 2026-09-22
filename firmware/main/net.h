@@ -25,6 +25,7 @@ typedef struct {
     bool                 disconnect_edge;  /* set once per fresh loss; caller must ack it */
     int                  last_rc;          /* raw WMMQTTConnRC from the event that set the edge */
     net_mqtt_rc_class_t  last_class;       /* classification of last_rc */
+    bool                 session_restart_edge; /* silent resume repaired; ack it */
 } net_mqtt_status_t;
 
 /* Cold-boot modem bring-up through attach and mqttConfig; repeatable after net_recover_modem(). */
@@ -102,6 +103,12 @@ void net_get_mqtt_status(net_mqtt_status_t *out);
 
 /* Clears the disconnect edge once acted on. */
 void net_ack_disconnect_edge(void);
+
+/* Liveness ping and silent-resume repair; no SUBACK in 30s or a stuck connect marks it dead. */
+void net_service_session(void);
+
+/* Clears the session_restart_edge. */
+void net_ack_session_restart_edge(void);
 
 /* True while the event handler is inside an AT transaction; do not light-sleep meanwhile. */
 bool net_modem_busy(void);

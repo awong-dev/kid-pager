@@ -120,3 +120,24 @@ digit width (`"05"` and `"5"` are both 5) and cannot hold a 3-digit MNC such as 
 run 0-999). `strToUint8()` failed on the range check and left `nc` at 0 while the surrounding code
 set the digit count from the field's text width regardless, so a failed parse looked like a
 genuine `"000"`.
+
+**Fix**: `WalterModemCellInformation.nc` is a `uint16_t` parsed with `strToUint16()`, and a new
+`ncDigits` field (2 or 3, set from the text width) is set only when the numeric parse succeeded; 0
+means unknown.
+
+## 1.10 Bounded, watchdog-feeding synchronous command wait (`src/WalterDefines.h`, `src/WalterModem.cpp`)
+
+The command queue is single-threaded, and a slow command holds it for the retry logic's full
+`3 * CONFIG_WALTER_MODEM_CMD_TIMEOUT_MS` (90 s at 30 s), which is past a 60 s task watchdog. The
+three synchronous wait sites waited on their condition variable with no timeout, so nothing fed
+either watchdog while a command was stuck (e.g. a slow `AT+COPS=0` during a network search).
+
+**Fix**: all three untimed `cond.wait(lock, pred)` sites loop on
+`cond.wait_for(lock, std::chrono::milliseconds(1000), pred)` and call
+`walter_modem_block_tick()` every second the predicate is still false. The sites are the
+`_returnAfterReply()` macro in `WalterDefines.h`, `_waitCmdResult()` and `getNetworkRegState()`
+in `WalterModem.cpp`; each keeps its own predicate.
+
+`walter_modem_block_tick()` is `extern "C"` in `WalterDefines.h`, with a weak no-op default in
+`WalterModem.cpp` so the component links standalone. The application overrides it to feed its
+watchdogs for a bounded time per stage.

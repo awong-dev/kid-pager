@@ -166,6 +166,16 @@ static void test_battery_floor(void)
     CHECK(d == LOC_ANSWER_CACHED, "a request below the battery floor must never start GNSS");
 }
 
+static void test_battery_unknown_sentinel(void)
+{
+    CHECK(loc_battery_ok(LOC_BATTERY_UNKNOWN_MV), "an unknown battery reading must pass the floor");
+
+    loc_policy_t p;
+    loc_policy_init(&p);
+    loc_decision_t d = loc_on_request(&p, 0, LOC_BATTERY_UNKNOWN_MV, "l_unknownbatt");
+    CHECK(d == LOC_ANSWER_START_ATTEMPT, "an unknown battery reading must not block a GNSS attempt");
+}
+
 /* A fresh policy (cold boot or reset) has no cached fix: the cache is RAM-only. */
 static void test_cached_only_this_session(void)
 {
@@ -379,6 +389,7 @@ int main(void)
     test_cell_change_debounce();
     test_motion_classifier();
     test_battery_floor();
+    test_battery_unknown_sentinel();
     test_cached_only_this_session();
     test_mid_attempt_requests_share_result();
     test_attempt_budget();

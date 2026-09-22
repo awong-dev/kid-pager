@@ -26,6 +26,10 @@ uint32_t loc_next_backoff_s(uint32_t current_s)
 
 bool loc_battery_ok(int batt_mv)
 {
+    // An unknown reading must never block a GNSS attempt.
+    if (batt_mv == LOC_BATTERY_UNKNOWN_MV) {
+        return true;
+    }
     return batt_mv >= LOC_BATTERY_FLOOR_MV;
 }
 
@@ -557,6 +561,12 @@ static void drain_queue_and_publish(bool success, double lat, double lon, bool h
     bool have = loc_take_queued_id(&s_policy, id, sizeof(id));
     s_unlock();
     while (have) {
+        s_lock();
+        have = loc_take_queued_id(&s_policy, id, sizeof(id));
+        s_unlock();
+    }
+}
+
 bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
 {
     bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
@@ -581,6 +591,8 @@ bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
         return true;
     }
 
+    // modes_get_batt_mv() returns a placeholder before the first good reading;
+    int batt_mv = modes_batt_mv_known() ? modes_get_batt_mv() : LOC_BATTERY_UNKNOWN_MV;
     int64_t now_us = esp_timer_get_time();
 
     s_lock();
@@ -604,6 +616,13 @@ bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
         bool want_cell = !have_cached || cell_fix_is_stale(fix_ts);
         loc_cell_t cellbuf;
         const loc_cell_t *cellp = (want_cell && get_cell_snapshot(&cellbuf)) ? &cellbuf : NULL;
+        if (batt_mv == LOC_BATTERY_UNKNOWN_MV) {
+            ESP_LOGI(TAG, "loc_req %s answered from %s (batt=unknown) without powering GNSS%s", id,
+                     have_cached ? "cache" : "no_fix", cellp ? ", cell attached" : "");
+        } else {
+            ESP_LOGI(TAG, "loc_req %s answered from %s (batt=%dmV) without powering GNSS%s", id,
+                     have_cached ? "cache" : "no_fix", batt_mv, cellp ? ", cell attached" : "");
+        }
         publish_loc_answer(id, have_cached, lat, lon, have_acc, acc_m, fix_ts, src, have_cached,
         break;
     }
@@ -662,6 +681,7 @@ static bool s_budget_extendable = true; // false only for loc_debug_run()'s expl
 static int64_t s_phase_deadline_us = 0;
 static int64_t s_attempt_start_us = 0;
 static net_gnss_event_t s_last_event;
+
 // gnsstest state: s_debug_mode is set before begin_attempt() and cleared after the attempt ends;
 // s_debug_done is set in finish_attempt()'s locked section, before attempt_in_progress clears.
 static bool s_debug_mode = false;
@@ -695,6 +715,7 @@ static void finish_attempt(bool success)
     int32_t acc_m = success ? (int32_t) (s_last_event.confidence + 0.5) : 0;
     int64_t fix_ts = s_last_event.fix_ts;
 
+             (long long) ((esp_timer_get_time() - s_attempt_start_us) / 1000000),
 
     // Both branches update the cache/backoff; s_debug_done is set inside this locked section so
     // loc_debug_run() cannot see the attempt finished before it.
@@ -706,6 +727,9 @@ static void finish_attempt(bool success)
     s_save();
     s_unlock();
 
+        }
+
+        }
     }
     s_phase = LOC_PH_IDLE; // same-task write; the only cross-task readers use attempt_in_progress
 }

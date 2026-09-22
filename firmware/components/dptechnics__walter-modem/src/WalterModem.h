@@ -2330,10 +2330,14 @@ typedef struct {
 
   /**
    * @brief Mobile network operator code.
+   *
+   * PAGER PATCH: 1.9 -- widened from uint8_t: a 3-digit MNC (e.g. 410) needs 10 bits.
    */
+  uint16_t nc;
 
   /**
    * @brief PAGER PATCH: 1.9 -- digits of the "Nc:" field (2 or 3), 0 if unknown or the numeric
+   * parse failed; keeps a leading zero ("05") that `nc` cannot.
    */
   uint8_t ncDigits;
 

@@ -36,6 +36,12 @@ void watchdog_loop_begin(void);
 void watchdog_kick(wd_stage_t stage);
 /* For long waits outside the main loop. */
 void watchdog_feed(void);
+/* Resets the whole chip through the RTC watchdog. Unlike esp_restart() this also resets the
+ * USB-Serial-JTAG block, which was seen to stay dead after light sleep. Does not return. */
+void watchdog_hard_reset(void);
+
+/* Overrides the walter-modem weak hook, called once a second from its command wait. One stalled
+void walter_modem_block_tick(void);
 
 #ifdef __cplusplus
 }

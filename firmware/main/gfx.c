@@ -84,6 +84,7 @@ void gfx_invert_rect(int x, int y, int w, int h)
             if (xx < 0 || xx >= GFX_SCREEN_W) {
                 continue;
             }
+            int native_row = (GFX_FB_ROWS - 1) - xx;
             int native_byte = yy / 8;
             int bit = 7 - (yy % 8);
             s_fb[native_row][native_byte] ^= (uint8_t) (1u << bit);

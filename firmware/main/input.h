@@ -59,6 +59,9 @@ bool input_get_event(input_event_t *out);
 
 bool input_awake(void);
 
+/* Arms the UI-awake window without an event (console `wake`). */
+void input_arm_awake(void);
+
 /* True while the FSM is mid-press or mid-hold, which needs fast polling. */
 bool input_button_busy(void);
 

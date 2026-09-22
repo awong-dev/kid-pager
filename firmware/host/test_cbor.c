@@ -435,6 +435,29 @@ static void test_skip_unknown_key(void)
     CHECK(cbor_r_tstr(&r, &s, &slen) && slen == 4 && memcmp(s, "kept", 4) == 0, "skip: value 2");
 }
 
+/* PROTOCOL.md §10 key 50 (`link`): cbor_w_uint() encodes it as a1183201 / a1183203, matching the
+ * relay's pinned vectors in relay/tests/test_devauth.py. */
+static void test_link_key_50_matches_relay_vector(void)
+{
+    uint8_t buf[8];
+    cbor_w_t w;
+
+    cbor_w_init(&w, buf, sizeof(buf));
+    CHECK(cbor_w_map(&w, 1), "link=1: map header");
+    CHECK(cbor_w_uint(&w, 50, 1), "link=1: key 50 = 1");
+    static const uint8_t expect_link1[] = {0xa1, 0x18, 0x32, 0x01};
+    CHECK(w.len == sizeof(expect_link1) && memcmp(buf, expect_link1, sizeof(expect_link1)) == 0,
+          "link=1: bytes must match relay's cbor2.dumps({50: 1}) == a1183201");
+
+    cbor_w_init(&w, buf, sizeof(buf));
+    CHECK(cbor_w_map(&w, 1), "link=3: map header");
+    CHECK(cbor_w_uint(&w, 50, 3), "link=3: key 50 = 3");
+    static const uint8_t expect_link3[] = {0xa1, 0x18, 0x32, 0x03};
+    CHECK(w.len == sizeof(expect_link3) && memcmp(buf, expect_link3, sizeof(expect_link3)) == 0,
+          "link=3: bytes must match relay's cbor2.dumps({50: 3}) == a1183203, the tail of "
+          "test_devauth.py's test_status_envelope_with_link_example_cbor_hex");
+}
+
 int main(void)
 {
     test_overflow();
@@ -442,6 +465,7 @@ int main(void)
     test_indefinite_length_rejected();
     test_roundtrip_scalars();
     test_skip_unknown_key();
+    test_link_key_50_matches_relay_vector();
 
     vector_t vectors[MAX_VECTORS];
     int n = load_vectors(AUTHVECTORS_PATH, vectors, MAX_VECTORS);

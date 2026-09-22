@@ -74,6 +74,10 @@
 #include <esp_partition.h>
 
 #endif
+
+// PAGER PATCH: 1.10 -- weak default of the watchdog-feed hook so the component links standalone.
+extern "C" __attribute__((weak)) void walter_modem_block_tick(void) {}
+
 #pragma region CONFIG
 
 /**
@@ -2476,7 +2480,11 @@ void WalterModem::_processModemRSP(WalterModemCmd* cmd, WalterModemBuffer* buff)
           if(strncmp("Cc", key, key_len) == 0) {
             strToUint16(value, value_len, &(cmd->rsp->data.cellInformation.cc));
           } else if(strncmp("Nc", key, key_len) == 0) {
+            /* PAGER PATCH: 1.9 -- a 3-digit MNC (e.g. 410) does not fit uint8_t, so parse as uint16_t and
+             * report ncDigits only when the parse succeeded (0 = unknown). */
+            bool nc_ok = strToUint16(value, value_len, &(cmd->rsp->data.cellInformation.nc));
             cmd->rsp->data.cellInformation.ncDigits =
+                (nc_ok && value_len > 0 && value_len <= 3) ? (uint8_t) value_len : 0;
           } else if(strncmp("RSRP", key, key_len) == 0) {
             strToFloat(value, value_len, &(cmd->rsp->data.cellInformation.rsrp));
           } else if(strncmp("CINR", key, key_len) == 0) {
@@ -4185,6 +4193,12 @@ static bool _waitCmdResult(WalterModemCmd* cmd, std::unique_lock<std::mutex>& lo
     lock.unlock();
     return true;
   }
+  // PAGER PATCH: 1.10
+  while(!cmd->cmdLock.cond.wait_for(lock, std::chrono::milliseconds(1000), [cmd] {
+    return cmd->state == WALTER_MODEM_CMD_STATE_SYNC_LOCK_NOTIFIED;
+  })) {
+    walter_modem_block_tick();
+  }
   WalterModemState rspResult = cmd->rsp->result;
   cmd->state = WALTER_MODEM_CMD_STATE_COMPLETE;
   lock.unlock();
@@ -4890,8 +4904,13 @@ WalterModemNetworkRegState WalterModem::getNetworkRegState()
   }
 
   std::unique_lock<std::mutex> lock { cmd->cmdLock.mutex };
+  // PAGER PATCH: 1.10
+  while(!cmd->cmdLock.cond.wait_for(lock, std::chrono::milliseconds(1000), [cmd] {
     return cmd->state == WALTER_MODEM_CMD_STATE_SYNC_LOCK_NOTIFIED;
     ;
+  })) {
+    walter_modem_block_tick();
+  }
   cmd->state = WALTER_MODEM_CMD_STATE_COMPLETE;
   lock.unlock();
 

@@ -315,6 +315,7 @@ static void i2c_kb_init(void)
 
 {
     }
+    }
 
     }
 }

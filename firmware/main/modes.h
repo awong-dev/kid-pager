@@ -17,6 +17,8 @@ void modes_note_activity(void);
 // Cached values only; no AT round trip.
 int modes_get_rssi_dbm(void);
 int modes_get_batt_mv(void);
+
+bool modes_batt_mv_known(void);
 const char *modes_get_fw_version(void);
 const char *modes_get_session_id(void);
 uint32_t modes_get_memfull_count(void);

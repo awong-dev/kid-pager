@@ -51,6 +51,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include <chrono> // PAGER PATCH: 1.10
+
+// PAGER PATCH: 1.10 -- overridden by the application; called while a synchronous command wait
+// runs long (up to 90 s) so the task watchdog stays fed. WalterModem.cpp has a weak default.
+extern "C" void walter_modem_block_tick(void);
 
 // NOLINT(readability-identifier-naming.PrivateFunctionPrefix)
 /**
@@ -275,6 +280,12 @@ bool strToFloat(const char* str, int len, float* result);
     lock.unlock();                                                                                 \
     return true;                                                                                   \
   }                                                                                                \
+  /* PAGER PATCH: 1.10 */                                                                          \
+  while(!cmd->cmdLock.cond.wait_for(lock, std::chrono::milliseconds(1000), [cmd] {                 \
+    return cmd->state == WALTER_MODEM_CMD_STATE_SYNC_LOCK_NOTIFIED;                                \
+  })) {                                                                                             \
+    walter_modem_block_tick();                                                                     \
+  }                                                                                                 \
   WalterModemState rspResult = cmd->rsp->result;                                                   \
   cmd->state = WALTER_MODEM_CMD_STATE_COMPLETE;                                                    \
   lock.unlock();                                                                                   \

@@ -54,6 +54,12 @@ static void home_on_key(input_key_t key)
             }
         }
         break;
+    case INPUT_KEY_CHAR:
+        // typing opens the newest chat (or the default peer) and passes the key on
+        if (g_scr_chat.on_key) {
+            g_scr_chat.on_key(key);
+        }
+        break;
     default:
         break;
     }

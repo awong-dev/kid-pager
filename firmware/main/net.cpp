@@ -67,6 +67,7 @@ static constexpr int PAGER_CA_FETCH_SOCKET_ID = 4;
 // caps profiles at 0-2 and profile 1 is reserved for BlueCherry: using it hangs the MQTT connect.
 static constexpr int PAGER_TLS_BOOTSTRAP_PROFILE_ID = PAGER_TLS_PROFILE_ID;
 
+
 // The bootstrap session lasts a few seconds, so a short keepalive suffices.
 static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
 
@@ -700,11 +701,21 @@ extern "C" bool net_get_rssi(int *dbm)
     return true;
 }
 
+extern "C" void net_service_session(void)
+{
+        return;
+    }
+}
+
 extern "C" void net_get_mqtt_status(net_mqtt_status_t *out)
 {
 }
 
 extern "C" void net_ack_disconnect_edge(void)
+{
+}
+
+extern "C" void net_ack_session_restart_edge(void)
 {
 }
 
@@ -1019,6 +1030,13 @@ extern "C" bool net_get_cell_info(net_cell_info_t *out)
                 cc %= 1000u;
             }
             snprintf(s_cell_cache.mcc, sizeof(s_cell_cache.mcc), "%03u", cc);
+            // `nc` is uint16_t; the raw field is 1-3 digits, so clamp as for `cc`.
+            unsigned nc = (unsigned) ci.nc;
+            if (nc > 999) {
+                ESP_LOGI(TAG, "cell info: implausible MNC %u from AT+SQNMONI (clamped)", nc);
+                nc %= 1000u;
+            }
+            snprintf(s_cell_cache.mnc, sizeof(s_cell_cache.mnc), "%0*u", (int) mnc_digits, nc);
             s_cell_cache.tac = ci.tac;
             s_cell_cache.ci = ci.cid & 0x0FFFFFFFu; // 28 bits, PROTOCOL.md §13.2
             s_cell_cache.have_rsrp = (ci.rsrp <= -30.0f && ci.rsrp >= -156.0f);

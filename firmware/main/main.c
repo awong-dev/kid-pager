@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 
 #include <stdio.h>
 
@@ -17,6 +18,9 @@
 #include "ident.h"
 #include "watchdog.h"
 #include "carrier.h"
+#include "disp.h"
+#include "gfx.h"
+#include "input.h"
 #include "loc.h"
 #include "modes.h"
 #include "net.h"
@@ -194,6 +198,114 @@ static int cmd_carrier(int argc, char **argv)
     return 0;
 }
 
+// `wake`: arm the UI-awake window so the CardKB is polled (a bench with no
+// button). `key <text>`: feed bytes as if typed; "\n" = enter, "\e" = esc.
+static int cmd_wake(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    input_arm_awake();
+    printf("wake: UI awake; the keyboard is polled now\n");
+    return 0;
+}
+
+static int cmd_key(int argc, char **argv)
+{
+    input_arm_awake();
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) {
+            input_feed_key(' ');
+        }
+        for (const char *p = argv[i]; *p; p++) {
+            if (p[0] == '\\' && p[1] == 'n') {
+                input_feed_key(0x0D);
+                p++;
+            } else if (p[0] == '\\' && p[1] == 'e') {
+                input_feed_key(0x1B);
+                p++;
+            } else {
+                input_feed_key((uint8_t) *p);
+            }
+        }
+    }
+    return 0;
+}
+
+// print who ACKs. Bench aid: tells wiring faults from a dead keyboard.
+static int cmd_i2cscan(int argc, char **argv)
+{
+    bool swap = (argc >= 2) && (strcmp(argv[1], "swap") == 0);
+    if (swap) {
+        i2c_driver_delete(I2C_NUM_0);
+        i2c_config_t conf = {
+            .mode = I2C_MODE_MASTER,
+            .sda_io_num = sda,
+            .scl_io_num = scl,
+            .sda_pullup_en = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en = GPIO_PULLUP_ENABLE,
+            .master.clk_speed = 100000,
+        };
+        i2c_param_config(I2C_NUM_0, &conf);
+        i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+    }
+    int found = 0, nack = 0, timeout = 0, other = 0;
+    for (uint8_t a = 0x08; a <= 0x77; a++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (uint8_t) ((a << 1) | I2C_MASTER_WRITE), true);
+        i2c_master_stop(cmd);
+        i2c_cmd_link_delete(cmd);
+        if (err == ESP_OK) {
+            printf("i2cscan: device at 0x%02x%s\n", a,
+                   a == PAGER_I2C_ADDR_CARDKB ? " (CardKB)" : a == PAGER_I2C_ADDR_LIS3DH ? " (LIS3DH)" : "");
+            found++;
+        } else if (err == ESP_FAIL) {
+            nack++; // nobody answered: a normal empty address
+        } else if (err == ESP_ERR_TIMEOUT) {
+            timeout++; // the bus never completed: a line held low or floating
+        } else {
+            other++;
+            if (other == 1) {
+                printf("i2cscan: error %s at 0x%02x\n", esp_err_to_name(err), a);
+            }
+        }
+    }
+    printf("i2cscan: %d device(s) on SDA=IO%d SCL=IO%d; %d no-answer, %d timeout, %d other. "
+           "Lines idle: SDA=%d SCL=%d (1 = pulled up, as they should be)\n",
+           found, sda, scl, nack, timeout, other, gpio_get_level((gpio_num_t) sda),
+           gpio_get_level((gpio_num_t) scl));
+    if (timeout > 0) {
+        printf("i2cscan: timeouts mean a line is stuck: check for a short, a swapped pair, or a "
+               "keyboard powered from the wrong rail\n");
+    }
+    return 0;
+}
+
+static void register_input_cmds(void)
+{
+    const esp_console_cmd_t scan_cmd = {
+        .command = "i2cscan",
+        .help = "i2cscan -- list the devices that answer on the keyboard I2C bus",
+        .hint = NULL,
+        .func = &cmd_i2cscan,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_cmd));
+    const esp_console_cmd_t wake_cmd = {
+        .command = "wake",
+        .help = "wake -- arm the UI-awake window so the keyboard is polled",
+        .hint = NULL,
+        .func = &cmd_wake,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wake_cmd));
+    const esp_console_cmd_t key_cmd = {
+        .command = "key",
+        .help = "key <text> -- type text as if on the keyboard (\\n enter, \\e esc)",
+        .hint = NULL,
+        .func = &cmd_key,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&key_cmd));
+}
+
 static void register_carrier_cmd(void)
 {
     const esp_console_cmd_t carrier_cmd = {
@@ -230,6 +342,7 @@ static void start_setup_console(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&setup_cmd));
     register_carrier_cmd();
+    register_input_cmds();
 
     const esp_console_cmd_t nettest_cmd = {
         .command = "nettest",
@@ -318,6 +431,158 @@ static int cmd_smslist(int argc, char **argv)
     return 0;
 }
 
+// Debug build: paints a known pattern and drives partial/full refreshes directly, to correlate a
+// screen-x range with disp.c's "partial: native rows" log line.
+#define DISPTEST_COL_PX 8
+#define DISPTEST_MAX_STEP (GFX_SCREEN_W / DISPTEST_COL_PX) /* n must be < this */
+#define DISPTEST_SEQ_MAX_COUNT 36
+#define DISPTEST_SEQ_MIN_MS 200
+#define DISPTEST_SEQ_MAX_MS 5000
+
+static const char *DISPTEST_USAGE =
+    "disptest                     -- same as `disptest info`\n"
+    "disptest info                -- print again-mode, partial count, disp_dirty_rows()\n"
+    "disptest again <0|1>         -- set the partial-write-again A/B flag\n"
+    "disptest bars                -- paint the baseline pattern and FULL refresh\n"
+    "disptest step <n>            -- invert the 8px screen column at x=n*8 (full height), then "
+    "ONE partial refresh; n must be 0..(GFX_SCREEN_W/8 - 1)\n"
+    "disptest seq [n0] [n1] [ms]  -- `step` for n = n0..n1, ms apart (defaults 2 12 1500; "
+    "count clamped to 36, ms clamped to 200..5000)\n"
+    "disptest full                -- force one full refresh of whatever is in the framebuffer\n"
+    "NOTE: do not use `wake` or `key` while disptest is running -- the UI render task would "
+    "repaint over the test pattern.\n";
+
+// Baseline pattern: 8 px black and 8 px white columns across the screen.
+static void disptest_paint_bars(void)
+{
+    gfx_clear();
+    for (int x0 = 0; x0 < GFX_SCREEN_W; x0 += 2 * DISPTEST_COL_PX) {
+        for (int dx = 0; dx < DISPTEST_COL_PX && x0 + dx < GFX_SCREEN_W; dx++) {
+            for (int y = 0; y < GFX_SCREEN_H; y++) {
+                gfx_set_pixel(x0 + dx, y, true);
+            }
+        }
+    }
+}
+
+// Inverts the n'th 8 px screen column and fires one partial refresh; logs the native-row range it
+// maps to (x -> (GFX_FB_ROWS-1)-x mirror).
+static void disptest_step(int n)
+{
+    int x = n * DISPTEST_COL_PX;
+    int x_hi = x + DISPTEST_COL_PX - 1;
+    int native_lo = (GFX_FB_ROWS - 1) - x_hi;
+    int native_hi = (GFX_FB_ROWS - 1) - x;
+    printf("disptest: step %d asked for x %d..%d => native rows %d..%d\n", n, x, x_hi, native_lo,
+           native_hi);
+    gfx_invert_rect(x, 0, DISPTEST_COL_PX, GFX_SCREEN_H);
+    disp_partial_refresh();
+}
+
+static int cmd_disptest(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "info") == 0) {
+        return 0;
+    }
+    if (strcmp(argv[1], "again") == 0) {
+        if (argc != 3 || (strcmp(argv[2], "0") != 0 && strcmp(argv[2], "1") != 0)) {
+            printf("usage: disptest again <0|1>\n");
+            return 1;
+        }
+        disp_set_partial_write_again(strcmp(argv[2], "1") == 0);
+        printf("disptest: again=%d\n", (int) disp_partial_write_again());
+        return 0;
+    }
+    if (strcmp(argv[1], "bars") == 0) {
+        if (argc != 2) {
+            printf("usage: disptest bars\n");
+            return 1;
+        }
+        disptest_paint_bars();
+        disp_full_refresh();
+        printf("disptest: bars painted, full refresh done\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "step") == 0) {
+        if (argc != 3) {
+            printf("usage: disptest step <n>\n");
+            return 1;
+        }
+        char *end = NULL;
+        long n = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || n < 0 || n >= DISPTEST_MAX_STEP) {
+            printf("disptest: n must be 0..%d\n", DISPTEST_MAX_STEP - 1);
+            printf("usage: disptest step <n>\n");
+            return 1;
+        }
+        disptest_step((int) n);
+        return 0;
+    }
+    if (strcmp(argv[1], "seq") == 0) {
+        if (argc > 5) {
+            printf("usage: disptest seq [n0] [n1] [ms]\n");
+            return 1;
+        }
+        long n0 = 2, n1 = 12, ms = 1500;
+        char *end = NULL;
+        if (argc >= 3) {
+            n0 = strtol(argv[2], &end, 10);
+            if (!end || *end != '\0') {
+                printf("usage: disptest seq [n0] [n1] [ms]\n");
+                return 1;
+            }
+        }
+        if (argc >= 4) {
+            n1 = strtol(argv[3], &end, 10);
+            if (!end || *end != '\0') {
+                printf("usage: disptest seq [n0] [n1] [ms]\n");
+                return 1;
+            }
+        }
+        if (argc >= 5) {
+            ms = strtol(argv[4], &end, 10);
+            if (!end || *end != '\0') {
+                printf("usage: disptest seq [n0] [n1] [ms]\n");
+                return 1;
+            }
+        }
+        if (n0 < 0 || n0 >= DISPTEST_MAX_STEP || n1 < 0 || n1 >= DISPTEST_MAX_STEP || n1 < n0) {
+            printf("disptest: n0/n1 must be 0..%d with n1 >= n0\n", DISPTEST_MAX_STEP - 1);
+            printf("usage: disptest seq [n0] [n1] [ms]\n");
+            return 1;
+        }
+        if (n1 - n0 + 1 > DISPTEST_SEQ_MAX_COUNT) {
+            n1 = n0 + DISPTEST_SEQ_MAX_COUNT - 1;
+            printf("disptest: clamped to %d steps (n0=%ld n1=%ld)\n", DISPTEST_SEQ_MAX_COUNT, n0,
+                   n1);
+        }
+        if (ms < DISPTEST_SEQ_MIN_MS) {
+            ms = DISPTEST_SEQ_MIN_MS;
+        } else if (ms > DISPTEST_SEQ_MAX_MS) {
+            ms = DISPTEST_SEQ_MAX_MS;
+        }
+        printf("disptest: seq n=%ld..%ld, %ld ms apart\n", n0, n1, ms);
+        for (long n = n0; n <= n1; n++) {
+            disptest_step((int) n);
+            if (n != n1) {
+                vTaskDelay(pdMS_TO_TICKS(ms));
+            }
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "full") == 0) {
+        if (argc != 2) {
+            printf("usage: disptest full\n");
+            return 1;
+        }
+        disp_full_refresh();
+        printf("disptest: full refresh done\n");
+        return 0;
+    }
+    printf("%s", DISPTEST_USAGE);
+    return 1;
+}
+
 static void start_normal_console(void)
 {
     esp_console_repl_t *repl = NULL;
@@ -363,6 +628,7 @@ static void start_normal_console(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&at_cmd));
 
     register_carrier_cmd();
+    register_input_cmds();
 
     const esp_console_cmd_t gnsstest_cmd = {
         .command = "gnsstest",
@@ -404,6 +670,17 @@ static void start_normal_console(void)
         .func = &cmd_smslist,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&smslist_cmd));
+
+    const esp_console_cmd_t disptest_cmd = {
+        .command = "disptest",
+                 "deterministic e-paper partial-refresh bench harness; "
+                 "run `disptest` with no args for the full usage. NOTE: do not use `wake` or "
+                 "`key` while this is running -- the UI render task would repaint over the test "
+                 "pattern.",
+        .hint = NULL,
+        .func = &cmd_disptest,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&disptest_cmd));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }

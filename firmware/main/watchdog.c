@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/wdt_hal.h"
@@ -15,6 +16,10 @@ static TaskHandle_t s_loop_task = NULL; // the one task subscribed to the task w
 
 #define WD_MAGIC 0x57444f47u /* "WDOG" */
 #define WD_RTC_TIMEOUT_MS 180000u
+/* Longer than one wedged AT command wait (3 retries * 30 s = 90 s) and shorter than the RTC
+ * watchdog: a slow command is fed through, a wedged one still trips the task watchdog. */
+#define WD_MODEM_BLOCK_BUDGET_MS 95000u
+static int64_t s_block_start_us;
 
 // RTC_NOINIT: survives software, panic and watchdog resets; garbage after a power-on, hence the
 // magic.
@@ -53,6 +58,8 @@ void watchdog_boot(void)
     bool valid = (s_magic == WD_MAGIC);
     bool abnormal = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT ||
                      r == ESP_RST_WDT || r == ESP_RST_BROWNOUT);
+        abnormal = false; // deliberate watchdog_hard_reset()
+    }
     if (!valid) {
         s_magic = WD_MAGIC;
         s_resets = 0;
@@ -93,11 +100,17 @@ void watchdog_loop_begin(void)
     }
 }
 
+static void rtc_feed(void)
 {
     wdt_hal_context_t ctx = RWDT_HAL_CONTEXT_DEFAULT();
     wdt_hal_write_protect_disable(&ctx);
     wdt_hal_feed(&ctx);
     wdt_hal_write_protect_enable(&ctx);
+}
+
+void watchdog_feed(void)
+{
+    rtc_feed();
     // only the subscribed task may reset the task watchdog; from another task it logs an error
     if (s_loop_task != NULL && xTaskGetCurrentTaskHandle() == s_loop_task) {
         esp_task_wdt_reset();
@@ -107,6 +120,34 @@ void watchdog_loop_begin(void)
 void watchdog_kick(wd_stage_t stage)
 {
     s_stage = (uint32_t) stage;
+    s_block_start_us = 0; // fresh block budget for this stage
     watchdog_feed();
 }
 
+// Called about once a second from inside the walter-modem component's untimed synchronous command
+// wait. Power effect: none; it only feeds both watchdogs.
+void walter_modem_block_tick(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_block_start_us == 0) {
+        s_block_start_us = now;
+    }
+        rtc_feed();
+        if (s_loop_task != NULL && xTaskGetCurrentTaskHandle() == s_loop_task) {
+            esp_task_wdt_reset();
+        }
+    }
+    // past the budget nothing is fed, so a wedged modem trips the task watchdog
+}
+
+{
+    wdt_hal_context_t ctx = RWDT_HAL_CONTEXT_DEFAULT();
+    uint32_t ticks = (uint32_t) ((uint64_t) 200 * rtc_clk_slow_freq_get_hz() / 1000ULL); // 200 ms
+    wdt_hal_write_protect_disable(&ctx);
+    wdt_hal_init(&ctx, WDT_RWDT, 0, false);
+    wdt_hal_config_stage(&ctx, WDT_STAGE0, ticks, WDT_STAGE_ACTION_RESET_RTC);
+    wdt_hal_enable(&ctx);
+    wdt_hal_write_protect_enable(&ctx);
+    for (;;) {
+    }
+}
