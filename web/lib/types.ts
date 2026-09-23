@@ -117,12 +117,22 @@ export interface MessageDoc {
   createdAt: Timestamp | null;
   deliveries: Record<string, DeliveryDoc>;
   pendingDeviceIds: string[];
+  // One id shared by every copy of a group message (the client dedupes bubbles on it) and the
+  // author's alias; both null on a DM or pager-originated message.
+  groupMsgId: string | null;
+  senderAlias: string | null;
 }
 
 export interface ConversationDoc {
+  // A DM has exactly two `uids`, and no `kind`/`name`/`alias`/`createdBy`; absent `kind` is `"dm"`.
+  uids: string[];
   lastMessageAt: Timestamp | null;
   lastPreview: string;
   unread: Record<string, number>;
+  kind?: "dm" | "group";
+  name?: string;
+  alias?: string;
+  createdBy?: string;
 }
 
 
