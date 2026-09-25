@@ -3,6 +3,7 @@ endpoint."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 
 import pytest
@@ -13,6 +14,7 @@ from app.config import Settings
 from app.main import create_app
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.store import users as users_store
@@ -46,6 +48,26 @@ def _make_user(uid: str, alias: str) -> dict[str, str]:
     fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
     users_store.create_user(uid=uid, alias=alias, display_name=alias)
     return auth_header(uid)
+
+
+def _make_admin(uid: str, alias: str) -> dict[str, str]:
+    fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    return auth_header(uid)
+
+
+def _make_pager_device(device_id: str, owner_uid: str) -> None:
+    # A `password`-auth pager device needs no `deviceSecrets` row for `publish_down` to succeed.
+    devices_store.create_device(
+        device_id=device_id,
+        owner_uid=owner_uid,
+        label="d",
+        mqtt_username=device_id,
+        mqtt_password_hash="x",
+        auth_mode="password",
+    )
+    backends_store.create_backend(
+        owner_uid, kind="pager", config={"deviceId": device_id}, enabled=True
+    )
 
 
 def test_send_message_success_returns_201_with_id(client: TestClient):
@@ -252,3 +274,169 @@ def test_locate_target_with_no_device_is_409(client: TestClient):
 def test_locate_requires_auth(client: TestClient):
     resp = client.post("/api/conversations/kid7/locate")
     assert resp.status_code == 401
+
+
+def test_send_group_message_and_mark_read(client: TestClient):
+
+    created = client.post(
+        json={
+            "name": "Family",
+            "alias": "gapi-fam5",
+            "memberUids": ["gapi-admin5", "gapi-kid5", "gapi-kid6"],
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    send_resp = client.post(
+        "/api/conversations/gapi-fam5/messages", json={"body": "hi family"}, headers=admin_headers
+    )
+    assert send_resp.status_code == 201, send_resp.text
+    msg_id = send_resp.json()["id"]
+
+    msg = messages_store.get_message(msg_id)
+    assert msg is not None
+    assert msg.senderAlias == "gapi-admin5"
+    assert msg.groupMsgId is not None
+
+    read_resp = client.post(
+        f"/api/conversations/gapi-fam5/messages/{msg_id}/read", headers=kid_headers
+    )
+    assert read_resp.status_code == 200, read_resp.text
+
+
+def test_send_group_message_by_non_member_is_403(client: TestClient):
+    outsider_headers = _make_user("gapi-outsider", "gapi-outsider")
+
+    created = client.post(
+        json={
+            "name": "Family",
+            "alias": "gapi-fam6",
+            "memberUids": ["gapi-admin6", "gapi-kid7"],
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/api/conversations/gapi-fam6/messages", json={"body": "hi"}, headers=outsider_headers
+    )
+    assert resp.status_code == 403
+
+
+def test_add_member_then_leave(client: TestClient):
+    _make_user("gapi-newmem", "gapi-newmem")
+
+    created = client.post(
+        json={
+            "name": "Family",
+            "alias": "gapi-fam7",
+            "memberUids": ["gapi-admin7", "gapi-kid8"],
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+    conv_key = created.json()["convKey"]
+
+    add_resp = client.post(
+        "/api/conversations/gapi-fam7/members", json={"uid": "gapi-newmem"}, headers=admin_headers
+    )
+    assert add_resp.status_code == 200, add_resp.text
+    assert "gapi-newmem" in add_resp.json()["uids"]
+    assert allow_store.is_message_allowed("gapi-newmem", "gapi-admin7")
+    assert allow_store.is_message_allowed("gapi-admin7", "gapi-newmem")
+
+    leave_resp = client.delete("/api/conversations/gapi-fam7/members/me", headers=kid_headers)
+    assert leave_resp.status_code == 200, leave_resp.text
+    assert "gapi-kid8" not in leave_resp.json()["uids"]
+
+    conv = messages_store.get_conversation(conv_key)
+    assert conv is not None
+    assert "gapi-kid8" not in conv.uids
+    assert conversations_store.is_member(conv_key, "gapi-newmem")
+
+
+def test_add_member_by_non_member_is_403(client: TestClient):
+    outsider_headers = _make_user("gapi-outsider2", "gapi-outsider2")
+    _make_user("gapi-target", "gapi-target")
+
+    created = client.post(
+        json={
+            "name": "Family",
+            "alias": "gapi-fam8",
+            "memberUids": ["gapi-admin8", "gapi-kid9"],
+        },
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/api/conversations/gapi-fam8/members",
+        json={"uid": "gapi-target"},
+        headers=outsider_headers,
+    )
+    assert resp.status_code == 403
+
+
+
+        json={
+            "name": "Family",
+        },
+        headers=admin_headers,
+    )
+
+    resp = client.post(
+        headers=admin_headers,
+    )
+
+
+
+def test_add_member_pushes_book_to_new_pager_member(client: TestClient):
+    _make_user("gbk-newmem3", "gbk-newmem3")
+    _make_pager_device("gbk-dev3", "gbk-newmem3")
+
+    created = client.post(
+        json={"name": "Family", "alias": "gbk-fam3", "memberUids": ["gbk-admin3", "gbk-kid3"]},
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    broker = client.app.state.broker
+    broker.published.clear()
+
+    add_resp = client.post(
+        "/api/conversations/gbk-fam3/members",
+        json={"uid": "gbk-newmem3"},
+        headers=admin_headers,
+    )
+    assert add_resp.status_code == 200, add_resp.text
+
+    pushes = [p for p in broker.published if p.topic == "pager/gbk-dev3/down"]
+    assert len(pushes) == 1
+    sent = json.loads(pushes[0].payload)
+    assert sent["kind"] == "book"
+    assert {"a": "gbk-fam3", "n": "Family", "t": "grp"} in sent["c"]
+
+
+def test_leave_group_pushes_book_to_leaving_pager_member_only(client: TestClient):
+    _make_pager_device("gbk-dev4-admin", "gbk-admin4")
+    _make_pager_device("gbk-dev4-kid", "gbk-kid4")
+
+    created = client.post(
+        json={"name": "Family", "alias": "gbk-fam4", "memberUids": ["gbk-admin4", "gbk-kid4"]},
+        headers=admin_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    broker = client.app.state.broker
+    broker.published.clear()
+
+    leave_resp = client.delete("/api/conversations/gbk-fam4/members/me", headers=kid_headers)
+    assert leave_resp.status_code == 200, leave_resp.text
+
+    # Only the leaver's device is pushed to; the remaining member's book content did not change.
+    topics = {p.topic for p in broker.published}
+    assert topics == {"pager/gbk-dev4-kid/down"}
+    sent = json.loads(broker.published[0].payload)
+    assert sent["kind"] == "book"
+    assert all(c["a"] != "gbk-fam4" for c in sent["c"])

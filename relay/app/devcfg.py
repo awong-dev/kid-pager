@@ -15,6 +15,7 @@ from app.config import Settings
 from app.db.firestore import get_db
 from app.ids import new_message_id
 from app.store import backends as backends_store
+from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import users as users_store
 from app.wirecbor import encode as cbor_encode
@@ -22,7 +23,11 @@ from app.wirecbor import to_json_safe
 
 logger = logging.getLogger("relay.devcfg")
 
+# docs/PROTOCOL.md §3.7's gate).
 MAX_APPROVED_CONTACTS = 10
+# docs/PROTOCOL.md §3.7: the §14.7 fetch response's own `c[]` cap (the device's stored
+# capacity).
+MAX_PULL_CONTACTS = 32
 
 # docs/PROTOCOL.md §3.1: c[].n / p[].n are display names with a 16-code-point cap, truncated
 # here rather than rejected since a stored `displayName` may already exceed it.
@@ -77,6 +82,31 @@ def _contact_type_hint(uid: str) -> str:
     return "web"
 
 
+def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
+    """Every group `owner_uid` belongs to as a `t: "grp"` contact; alias-less groups are skipped."""
+    return [
+        {"a": conv.alias, "n": (conv.name or conv.alias)[:_BOOK_NAME_MAX_CODEPOINTS], "t": "grp"}
+        for conv in conversations_store.list_groups_for_member(owner_uid)
+        if conv.alias is not None
+    ]
+
+
+
+
+def _contact_sort_key(contact: dict[str, Any], default_alias: str | None) -> tuple[int, str, str]:
+    """docs/PROTOCOL.md §3.7 `c[]` order: `d` first, then groups, then the rest by display name."""
+    if contact["a"] == default_alias:
+        rank = 0
+    elif contact["t"] == "grp":
+        rank = 1
+    else:
+        rank = 2
+    return (rank, contact["n"].casefold(), contact["a"])
+
+
+    """`_approved_contacts` in §3.7 `c[]` order, uncapped."""
+    contacts.sort(key=lambda c: _contact_sort_key(c, default_alias))
+    return contacts
 
 
 # `sig` is 11 base64url characters at runtime (8 raw bytes, `app/devauth.py`'s 64-bit
@@ -109,6 +139,7 @@ def _assert_within_envelope_limit(obj: dict[str, Any]) -> None:
 
 
 def build_book(device_id: str) -> dict[str, Any]:
+    """The legacy full `/down book` envelope, capped at `MAX_APPROVED_CONTACTS`."""
     device = devices_store.get_device(device_id)
     if device is None:
         raise ValueError(f"no such device: {device_id!r}")
@@ -128,13 +159,97 @@ def build_book(device_id: str) -> dict[str, Any]:
     return obj
 
 
+def build_book_body(device_id: str) -> dict[str, Any]:
+    """The §14.7 fetch response body (§3.7): unsigned, no `id`/`ack`, `c[]` capped at 32."""
+    device = devices_store.get_device(device_id)
+    if device is None:
+        raise ValueError(f"no such device: {device_id!r}")
+
+    default_alias = _default_alias(device)
+    truncated = len(contacts) > MAX_PULL_CONTACTS
+
+    obj: dict[str, Any] = {
+        "v": 1,
+        "ts": int(time.time()),
+        "kind": "book",
+        "bv": get_book_version(device_id),
+    }
+    if default_alias is not None:
+        obj["d"] = default_alias
+    obj["c"] = contacts[:MAX_PULL_CONTACTS]
+    if truncated:
+        obj["more"] = True
+    return obj
+
+
+def build_nudge(device_id: str, url: str) -> dict[str, Any]:
+    """docs/PROTOCOL.md §3.7: the `/down book` nudge, `bv` and `url` only."""
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "book",
+        "bv": get_book_version(device_id),
+        "url": url,
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    return obj
+
+
 def _set_pending(device_id: str, field: str, obj: dict[str, Any]) -> None:
 
 
+def push_book(
+    device_id: str, broker: BrokerClient, *, settings: Settings | None = None
+) -> bool:
+    """Build and publish the pending book; a nudge only if `bpull == 1`, hmac, base URL (§3.7)."""
+    device = devices_store.get_device(device_id)
+    if device is None:
         logger.warning("push_book: no such device %s", device_id)
         return False
+
+    obj: dict[str, Any] | None = None
+    if device.status.bpull == 1 and device.authMode == "hmac":
+        settings = settings if settings is not None else Settings.from_env()
+        base = settings.public_base_url
+        if base:
+            obj = build_nudge(device_id, f"{base.rstrip('/')}/api/device/book")
+        else:
+            logger.error(
+                "push_book: device %s advertises bpull=1 but "
+                "settings.public_base_url is not configured -- falling "
+                "back to the legacy full book (never publishing a nudge "
+                "without a url)",
+                device_id,
+            )
+    if obj is None:
+        obj = build_book(device_id)
+
     _set_pending(device_id, _PENDING_BOOK_FIELD, obj)
     return broker.publish_down(device_id, obj)
+
+
+def renudge_if_behind(
+    device_id: str, reported_bv: int, broker: BrokerClient, *, settings: Settings | None = None
+) -> bool:
+    """docs/PROTOCOL.md §5.3: re-publish the pending nudge if its `bv` is current, else push."""
+    current_bv = get_book_version(device_id)
+    snap = _devices().document(device_id).get()
+    data = (snap.to_dict() or {}) if snap.exists else {}
+    pending = data.get(_PENDING_BOOK_FIELD)
+    if isinstance(pending, dict) and not pending.get("acked", False):
+        obj = pending.get("obj")
+        if isinstance(obj, dict) and "url" in obj and obj.get("bv") == current_bv:
+            logger.info(
+                "re-publishing pending unacked book nudge %s to device %s "
+                "(reported bv=%s behind bv=%s, pending nudge already matches)",
+                obj.get("id"),
+                device_id,
+                reported_bv,
+                current_bv,
+            )
+    return push_book(device_id, broker, settings=settings)
 
 
 def push_cfg(device_id: str, lock: dict[str, Any], broker: BrokerClient) -> bool:
@@ -213,6 +328,8 @@ def push_sms_contacts(
     _assert_within_envelope_limit(obj)
     _set_pending(device_id, _PENDING_CFG_SMS_FIELD, obj)
     return broker.publish_down(device_id, obj)
+
+
 
 
 def sms_pending(device_id: str) -> bool:

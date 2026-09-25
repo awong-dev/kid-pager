@@ -58,6 +58,19 @@ class DeviceStatus(BaseModel):
     locBackoffS: int | None = None
     # Device SMS audit-queue drop counter.
     smsLost: int | None = None
+    # MQTT-session generation within the current boot; a changed `link` triggers the online-edge
+    # republish like a changed `session`.
+    link: int | None = None
+    # Crash diagnostics (docs/PROTOCOL.md §5.1): display only, stored as reported.
+    rst: int | None = None
+    stage: int | None = None
+    abn: int | None = None
+    # Crash diagnostics (docs/PROTOCOL.md §5.1): the AT command the main loop was stuck on before
+    # the last abnormal reset.
+    stallcmd: str | None = None
+    # `bpull` (docs/PROTOCOL.md §3.7/§5.1): nudges are sent only while the last online `/status`
+    # carried it; only ever `1`.
+    bpull: int | None = None
     updatedAt: datetime | None = None
     # Set once `sigFailures` crosses AUTH_ALARM_THRESHOLD within AUTH_ALARM_WINDOW_S; cleared on
     # key rotation.

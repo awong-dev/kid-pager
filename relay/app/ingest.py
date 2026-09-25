@@ -24,12 +24,28 @@ from app.wire import (
     StatusEnvelope,
     UpEnvelope,
     resolve_ts,
+    stage_name,
 )
 
 logger = logging.getLogger("relay.ingest")
 
 # PROTOCOL.md §4.2 case 3: the one exception to "never auto-reply on MQTT".
 UNKNOWN_RECIPIENT_BODY = "unknown recipient"
+
+def record_bad_sig(device_id: str) -> None:
+    """Count a bad signature as `sigFailures` and raise `devices/{d}.status.authAlarm` after more than
+    20 in 10 minutes (docs/PROTOCOL.md §14.4)."""
+    device_secrets_store.bump_sig_failures(device_id)
+    window_count = devices_store.record_sig_failure(device_id)
+    if window_count >= devices_store.AUTH_ALARM_THRESHOLD:
+        logger.error(
+            "SECURITY authAlarm device=%s: %d bad signatures in the last %ds",
+            device_id,
+            window_count,
+            devices_store.AUTH_ALARM_WINDOW_S,
+        )
+        devices_store.set_auth_alarm(device_id, True)
+
 
 # docs/PROTOCOL.md §3.2/§3.1: `name` is 1-16 code points, <=48 UTF-8 bytes.
 _CONTACT_NAME_MAX_CODEPOINTS = 16
@@ -180,6 +196,7 @@ class Ingest:
                 "SECURITY bad-sig device=%s topic=%s first64=%r", device_id, topic, payload[:64]
             )
             if secret is not None:
+                record_bad_sig(device_id)
             return None
 
         decoded = wire.decode_envelope_bytes(unsigned)
@@ -410,6 +427,18 @@ class Ingest:
             wire.log_malformed(topic, payload, str(exc))
             return
 
+        # One INFO line per accepted status for crash diagnostics: reset reason, stage name (raw
+        # int if unknown) and abnormal-reset count; `None` on older firmware.
+        logger.info(
+            device_id,
+            env.state,
+            env.link,
+            env.rst,
+            stage_name(env.stage),
+            env.abn,
+            env.stallcmd if env.stallcmd is not None else "-",
+        )
+
         previous_status = device.status
         resolved_ts = resolve_ts(env.ts) if env.ts is not None else None
         devices_store.update_status(
@@ -427,6 +456,12 @@ class Ingest:
             caFp=env.ca_fp,
             locBackoffS=env.loc_backoff_s,
             smsLost=env.sms_lost,
+            link=env.link,
+            rst=env.rst,
+            stage=env.stage,
+            abn=env.abn,
+            bpull=env.bpull,
+            stallcmd=env.stallcmd,
         )
 
         # On a transition into `broken`, log a security event.
@@ -443,15 +478,29 @@ class Ingest:
 
         # Republish before the bv-triggered push so a fresh book is published once. A changed `link`
         # (silent modem session resume, <= 10 s subscription gap) also triggers it.
+        link_changed = (
+            previous_status.link is not None
+            and env.link is not None
+            and previous_status.link != env.link
+        )
+        session_changed = previous_status.session != env.session or link_changed
         offline_to_online = previous_status.state == "offline"
         if session_changed or offline_to_online:
             self._republish_unacked(device_id)
 
+        # docs/PROTOCOL.md §5.3/§3.7: bump a zero `bookVersion` to 1 and publish, else re-nudge if
+        # the reported `bv` is behind. `bv` comes from the raw dict (`StatusEnvelope` lacks it).
         reported_bv = data.get("bv")
+        if contacts_store.bootstrap_book_version(device_id):
+            logger.info("status bv=%s bootstraps devices/%s.bookVersion to 1", reported_bv, device_id)
+            devcfg.push_book(device_id, self._broker)
+        elif isinstance(reported_bv, int) and reported_bv < devcfg.get_book_version(device_id):
             logger.info(
+                "status bv=%s behind devices/%s.bookVersion -- re-nudging/re-pushing book",
                 reported_bv,
                 device_id,
             )
+            devcfg.renudge_if_behind(device_id, reported_bv, self._broker)
 
     def _republish_unacked(self, device_id: str) -> None:
         """The online-edge re-publish (docs/PROTOCOL.md §5.3): pending messages from `pendingDeviceIds`

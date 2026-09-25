@@ -64,6 +64,10 @@ class Message(BaseModel):
     createdAt: datetime | None = None
     deliveries: dict[str, Delivery] = {}
     pendingDeviceIds: list[str] = []
+    # One id shared by every copy of a group message (dedupe / push collapse key) and the author's
+    # alias, denormalised to avoid a `users` read per delivery. Both `None` on a DM copy.
+    groupMsgId: str | None = None
+    senderAlias: str | None = None
 
 
 class Conversation(BaseModel):
@@ -71,6 +75,11 @@ class Conversation(BaseModel):
 
     convKey: str
     uids: list[str]
+    # Absent MUST be read as 'dm'.
+    kind: Literal["dm", "group"] = "dm"
+    name: str | None = None
+    alias: str | None = None
+    createdBy: str | None = None
     lastMessageAt: datetime | None = None
     lastPreview: str = ""
     unread: dict[str, int] = {}
@@ -78,6 +87,10 @@ class Conversation(BaseModel):
 
 def conv_key(uid_a: str, uid_b: str) -> str:
     return "_".join(sorted([uid_a, uid_b]))
+
+
+# `create_message`'s `conv_key` argument shadows `conv_key`; this alias derives the default key.
+_derive_conv_key = conv_key
 
 
 def _messages():
@@ -96,6 +109,24 @@ def _meta_ref():
     return get_db().collection("settings").document("meta")
 
 
+def allocate_seq() -> int:
+    """Mints one `seq` in its own transaction, shared by every copy of a group message."""
+    meta_ref = _meta_ref()
+
+    def _txn(transaction: Transaction) -> int:
+        meta_snap = meta_ref.get(transaction=transaction)
+        seq = ((meta_snap.get("seqCounter") if meta_snap.exists else 0) or 0) + 1
+        if meta_snap.exists:
+            transaction.update(meta_ref, {"seqCounter": seq})
+        else:
+            transaction.set(
+                meta_ref, {"schemaVersion": 2, "lastSweepAt": None, "seqCounter": seq}
+            )
+        return seq
+
+    return run_transaction(_txn)
+
+
 def create_message(
     *,
     sender_uid: str,
@@ -109,9 +140,16 @@ def create_message(
     origin_backend_id: str | None = None,
     deliveries: dict[str, dict] | None = None,
     pending_device_ids: list[str] | None = None,
+    conv_key: str | None = None,
+    uids: list[str] | None = None,
+    seq: int | None = None,
+    group_msg_id: str | None = None,
+    sender_alias: str | None = None,
 ) -> Message | None:
     """One transaction: `wireId` dedup (None if seen), `seq`, message create, conversation."""
     msg_id = new_id("m_")
+    key = conv_key if conv_key is not None else _derive_conv_key(sender_uid, recipient_uid)
+    pair = uids if uids is not None else sorted([sender_uid, recipient_uid])
     msg_ref = _messages().document(msg_id)
     conv_ref = _conversations().document(key)
     meta_ref = _meta_ref()
@@ -120,6 +158,7 @@ def create_message(
 
     def _txn(transaction: Transaction) -> None:
         # Reads precede writes (Firestore transaction rule); the dedup `create()` is staged after.
+        meta_snap = None if seq is not None else meta_ref.get(transaction=transaction)
         conv_snap = conv_ref.get(transaction=transaction)
 
         if wire_ref is not None:
@@ -127,12 +166,23 @@ def create_message(
             # `createdAt` lets `sweep()` reclaim the doc independently of its message.
             transaction.create(wire_ref, {"messageId": msg_id, "createdAt": SERVER_TIMESTAMP})
 
+        if seq is not None:
+            new_seq = seq
         else:
+            new_seq = ((meta_snap.get("seqCounter") if meta_snap.exists else 0) or 0) + 1
+            if meta_snap.exists:
+                transaction.update(meta_ref, {"seqCounter": new_seq})
+            else:
+                transaction.set(
+                    meta_ref, {"schemaVersion": 2, "lastSweepAt": None, "seqCounter": new_seq}
+                )
 
         transaction.set(
             msg_ref,
             {
+                "seq": new_seq,
                 "convKey": key,
+                "uids": pair,
                 "senderUid": sender_uid,
                 "recipientUid": recipient_uid,
                 "kind": kind,
@@ -145,18 +195,25 @@ def create_message(
                 "createdAt": SERVER_TIMESTAMP,
                 "deliveries": deliveries or {},
                 "pendingDeviceIds": pending_device_ids or [],
+                "groupMsgId": group_msg_id,
+                "senderAlias": sender_alias,
             },
         )
 
         unread = dict(conv_snap.get("unread") or {}) if conv_snap.exists else {}
         unread[recipient_uid] = unread.get(recipient_uid, 0) + 1
+        conv_data: dict[str, object] = {
             "lastMessageAt": SERVER_TIMESTAMP,
             "lastPreview": preview,
             "unread": unread,
         }
         if conv_snap.exists:
+            # Not "uids": a group conversation's `uids` is the member list set by `create_group`;
+            # writing the pair would drop members.
             transaction.update(conv_ref, conv_data)
         else:
+            # Only DMs create their conversation lazily; a group is created up front.
+            conv_data["uids"] = pair
             transaction.set(conv_ref, conv_data)
 
     try:

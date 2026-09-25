@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import time
 
+from app import devauth, devcfg
 from app.ingest import Ingest
 from app.routing import Routing
 from app.store import allow as allow_store
@@ -244,6 +245,118 @@ def test_v2_republish_on_session_change_resends_still_pending():
 
     broker.fail_publish = False
     ingest.handle_status(status_topic("pgr-v2-7"), online_status_payload("s_00000001"))
+    # This first online /status also bootstraps bookVersion 0 -> 1 and publishes a book
+    # (PROTOCOL.md §5.3); filter to the resent message's id.
+    matches = [p for p in broker.published if json.loads(p.payload).get("id") == msg.id]
+    assert len(matches) == 1
+
+
+def test_v2_republish_on_link_change_same_session_resends_still_pending():
+    """A modem MQTT session resume bumps `link` but not `session` and still republishes."""
+    _make_user("mom", "mom")
+    _make_user("student", "student")
+    allow_store.set_edge("mom", "student", message=True, locate=True)
+    _make_pager_device("pgr-v2-link-1", "student")
+
+    broker = FakeBrokerClient()
+    routing = Routing(broker)
+    ingest = Ingest(broker, routing)
+
+    # Baseline: session s_00000001, link 1. The first online /status also publishes a bootstrap
+    # book; cleared here.
+    ingest.handle_status(
+        status_topic("pgr-v2-link-1"), online_status_payload("s_00000001", link=1)
+    )
+    assert [json.loads(p.payload)["kind"] for p in broker.published] == ["book"]
+    broker.clear()
+
+    broker.fail_publish = True
+    result = routing.send(
+        sender_uid="mom",
+        recipient_alias="student",
+        kind="text",
+        body="hi",
+        origin_backend_kind="webapp",
+    )
+    msg = result.messages[0]
+    assert broker.published == []  # publish failed -> stayed queued
+
+    broker.fail_publish = False
+    # Same session, `link` bumped 1 -> 2: a resume, not a reboot.
+    ingest.handle_status(
+        status_topic("pgr-v2-link-1"), online_status_payload("s_00000001", link=2)
+    )
+    # The unacked bootstrap book is also republished; filter to the resent message's id.
+    matches = [p for p in broker.published if json.loads(p.payload).get("id") == msg.id]
+    assert len(matches) == 1
+
+
+def test_v2_no_republish_when_link_unchanged():
+    _make_user("mom", "mom")
+    _make_user("student", "student")
+    allow_store.set_edge("mom", "student", message=True, locate=True)
+    _make_pager_device("pgr-v2-link-2", "student")
+
+    broker = FakeBrokerClient()
+    routing = Routing(broker)
+    ingest = Ingest(broker, routing)
+
+    # The first online /status publishes a bootstrap book (PROTOCOL.md §5.3); cleared here.
+    ingest.handle_status(
+        status_topic("pgr-v2-link-2"), online_status_payload("s_00000002", link=1)
+    )
+    assert [json.loads(p.payload)["kind"] for p in broker.published] == ["book"]
+    broker.clear()
+
+    broker.fail_publish = True
+    routing.send(
+        sender_uid="mom",
+        recipient_alias="student",
+        kind="text",
+        body="hi",
+        origin_backend_kind="webapp",
+    )
+    broker.fail_publish = False
+
+    # Same session, same link, already online: no edge.
+    ingest.handle_status(
+        status_topic("pgr-v2-link-2"), online_status_payload("s_00000002", link=1)
+    )
+    assert broker.published == []
+
+
+def test_v2_no_republish_when_link_newly_appears_on_unchanged_session():
+    """A device that never reported `link` must not trigger a republish when it first appears."""
+    _make_user("mom", "mom")
+    _make_user("student", "student")
+    allow_store.set_edge("mom", "student", message=True, locate=True)
+    _make_pager_device("pgr-v2-link-3", "student")
+
+    broker = FakeBrokerClient()
+    routing = Routing(broker)
+    ingest = Ingest(broker, routing)
+
+    # Baseline: no `link` field. The first online /status publishes a bootstrap book; cleared here.
+    ingest.handle_status(status_topic("pgr-v2-link-3"), online_status_payload("s_00000003"))
+    assert [json.loads(p.payload)["kind"] for p in broker.published] == ["book"]
+    broker.clear()
+
+    broker.fail_publish = True
+    routing.send(
+        sender_uid="mom",
+        recipient_alias="student",
+        kind="text",
+        body="hi",
+        origin_backend_kind="webapp",
+    )
+    broker.fail_publish = False
+
+    # Same session; `link` now present for the first time.
+    ingest.handle_status(
+        status_topic("pgr-v2-link-3"), online_status_payload("s_00000003", link=1)
+    )
+    assert broker.published == []
+    assert devices_store.get_device("pgr-v2-link-3").status.link == 1
 
 
 def test_republish_reuses_id_but_gets_a_fresh_n_and_both_publishes_verify():
@@ -489,6 +602,157 @@ def test_status_persists_tls_ca_fp_loc_backoff_s_sms_lost():
     assert status.smsLost == 1
 
 
+
+
+    ingest, _broker = _ingest()
+
+    ingest.handle_status(
+        status_topic("pgr-xport-1"), online_status_payload("s_00000001", xport="wifi")
+    )
+
+
+
+def test_status_persists_rst_stage_abn_and_logs_accepted_status(caplog):
+    _make_user("crashuser1", "crashuser1")
+    _make_pager_device("pgr-crash-1", "crashuser1")
+    ingest, _broker = _ingest()
+
+    with caplog.at_level("INFO", logger="relay.ingest"):
+        ingest.handle_status(
+            status_topic("pgr-crash-1"),
+            online_status_payload("s_00000001", rst=4, stage=6, abn=2, link=1),
+        )
+
+    status = devices_store.get_device("pgr-crash-1").status
+    assert status.rst == 4
+    assert status.stage == 6
+    assert status.abn == 2
+
+    # rst=4 is panic, stage=6 is "input/ui" per the firmware's stage table.
+    assert any(
+        "status pgr-crash-1: state=online link=1 rst=4 stage=input/ui abn=2" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_status_without_rst_stage_abn_stores_nothing_for_them(caplog):
+    """Firmware without `rst`/`stage`/`abn` still validates and stores them as `None`; the log line
+    is still emitted (PROTOCOL.md §0)."""
+    _make_user("crashuser2", "crashuser2")
+    _make_pager_device("pgr-crash-2", "crashuser2")
+    ingest, _broker = _ingest()
+
+    with caplog.at_level("INFO", logger="relay.ingest"):
+        ingest.handle_status(
+            status_topic("pgr-crash-2"), online_status_payload("s_00000001")
+        )
+
+    status = devices_store.get_device("pgr-crash-2").status
+    assert status.rst is None
+    assert status.stage is None
+    assert status.abn is None
+    assert status.state == "online"
+    assert any(
+        "status pgr-crash-2: state=online link=None rst=None stage=None abn=None" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_status_logs_unresolved_stage_index_as_raw_int(caplog):
+    """A `stage` index the relay's table predates (future firmware) is
+    logged as the raw int, not raised."""
+    _make_user("crashuser3", "crashuser3")
+    _make_pager_device("pgr-crash-3", "crashuser3")
+    ingest, _broker = _ingest()
+
+    with caplog.at_level("INFO", logger="relay.ingest"):
+        ingest.handle_status(
+            status_topic("pgr-crash-3"), online_status_payload("s_00000001", stage=200)
+        )
+
+    assert devices_store.get_device("pgr-crash-3").status.stage == 200
+    assert any("stage=200" in rec.message for rec in caplog.records)
+
+
+def test_status_rejects_out_of_range_rst_stage_abn_as_malformed():
+    _make_user("crashuser4", "crashuser4")
+    _make_pager_device("pgr-crash-4", "crashuser4")
+    ingest, _broker = _ingest()
+
+    ingest.handle_status(
+        status_topic("pgr-crash-4"), online_status_payload("s_00000001", rst=256)
+    )
+    ingest.handle_status(
+        status_topic("pgr-crash-4"), online_status_payload("s_00000002", stage=-1)
+    )
+    ingest.handle_status(
+        status_topic("pgr-crash-4"), online_status_payload("s_00000003", abn=65536)
+    )
+
+    # No status was stored for this device.
+    assert devices_store.get_device("pgr-crash-4").status.state is None
+
+
+def test_status_persists_stallcmd_and_logs_accepted_status(caplog):
+    _make_user("crashuser5", "crashuser5")
+    _make_pager_device("pgr-crash-5", "crashuser5")
+    ingest, _broker = _ingest()
+
+    with caplog.at_level("INFO", logger="relay.ingest"):
+        ingest.handle_status(
+            status_topic("pgr-crash-5"),
+            online_status_payload("s_00000001", stallcmd="AT+CEREG?"),
+        )
+
+    status = devices_store.get_device("pgr-crash-5").status
+    assert status.stallcmd == "AT+CEREG?"
+    assert any(
+        "status pgr-crash-5: state=online link=None rst=None stage=None abn=None "
+        "stallcmd=AT+CEREG?" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_status_without_stallcmd_stores_nothing_for_it_and_logs_dash(caplog):
+    """Firmware without `stallcmd` still validates and stores it as `None`; the log line prints `-`
+    (PROTOCOL.md §0)."""
+    _make_user("crashuser6", "crashuser6")
+    _make_pager_device("pgr-crash-6", "crashuser6")
+    ingest, _broker = _ingest()
+
+    with caplog.at_level("INFO", logger="relay.ingest"):
+        ingest.handle_status(
+            status_topic("pgr-crash-6"), online_status_payload("s_00000001")
+        )
+
+    status = devices_store.get_device("pgr-crash-6").status
+    assert status.stallcmd is None
+    assert status.state == "online"
+    assert any(
+        "status pgr-crash-6: state=online link=None rst=None stage=None abn=None "
+        "stallcmd=-" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_status_rejects_bad_stallcmd_as_malformed():
+    _make_user("crashuser7", "crashuser7")
+    _make_pager_device("pgr-crash-7", "crashuser7")
+    ingest, _broker = _ingest()
+
+    ingest.handle_status(
+        status_topic("pgr-crash-7"),
+        online_status_payload("s_00000001", stallcmd="A" * 25),
+    )
+    ingest.handle_status(
+        status_topic("pgr-crash-7"),
+        online_status_payload("s_00000002", stallcmd="AT+\x00BAD"),
+    )
+
+    # No status was stored for this device.
+    assert devices_store.get_device("pgr-crash-7").status.state is None
+
+
 def test_status_logs_security_event_on_transition_into_broken(caplog):
     _make_user("catrustuser2", "catrustuser2")
     _make_pager_device("pgr-catrust-2", "catrustuser2")
@@ -549,3 +813,145 @@ def test_status_accepts_n_well_above_the_old_32_bit_ceiling():
     ingest.handle_status(status_t, payload)
     assert devices_store.get_device("pgr-bign").status.state == "online"
     assert device_secrets_store.get("pgr-bign").upN == n_big
+
+
+def test_status_bootstrap_bumps_zero_to_one_and_pushes():
+    key = _make_hmac_pager_device("pgr-boot-1", "student-boot1")
+    _make_user("student-boot1", "student-boot1")
+    ingest, broker = _ingest()
+    status_t = status_topic("pgr-boot-1")
+
+    online = devauth.sign_json(
+        key,
+        status_t,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": 1_700_000_000,
+            "n": 1,
+        },
+    )
+    ingest.handle_status(status_t, online)
+
+    assert devcfg.get_book_version("pgr-boot-1") == 1
+    books = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert len(books) == 1
+    assert books[0]["bv"] == 1
+
+
+def test_status_bootstrap_is_once():
+    key = _make_hmac_pager_device("pgr-boot-2", "student-boot2")
+    _make_user("student-boot2", "student-boot2")
+    ingest, broker = _ingest()
+    status_t = status_topic("pgr-boot-2")
+
+    online1 = devauth.sign_json(
+        key,
+        status_t,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": 1_700_000_000,
+            "n": 1,
+        },
+    )
+    ingest.handle_status(status_t, online1)
+    assert devcfg.get_book_version("pgr-boot-2") == 1
+    broker.clear()
+
+    # Second status, same session: no edge, so `bootstrap_book_version` is a no-op
+    # (bookVersion is already 1).
+    online2 = devauth.sign_json(
+        key,
+        status_t,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": 1_700_000_001,
+            "n": 2,
+        },
+    )
+    ingest.handle_status(status_t, online2)
+
+    assert devcfg.get_book_version("pgr-boot-2") == 1
+    books = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert books == []
+
+
+def test_status_bv_behind_renudges_same_id(monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://relay.example.com")
+    key = _make_hmac_pager_device("pgr-renudge-1", "student-renudge1")
+    _make_user("student-renudge1", "student-renudge1")
+    ingest, broker = _ingest()
+    status_t = status_topic("pgr-renudge-1")
+
+    # First online status bootstraps bookVersion 0 -> 1 and publishes a nudge (bpull=1, hmac,
+    # PUBLIC_BASE_URL set; PROTOCOL.md §3.7).
+    online1 = devauth.sign_json(
+        key,
+        status_t,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": 1_700_000_000,
+            "bpull": 1,
+            "n": 1,
+        },
+    )
+    ingest.handle_status(status_t, online1)
+
+    books = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert len(books) == 1
+    first_nudge = books[0]
+    assert "url" in first_nudge
+    assert first_nudge["bv"] == 1
+    broker.clear()
+
+    # Second status: `bv` is behind bookVersion; the pending nudge already carries bv 1, so
+    # `renudge_if_behind` re-publishes it under the same `id`.
+    online2 = devauth.sign_json(
+        key,
+        status_t,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": 1_700_000_001,
+            "bpull": 1,
+            "bv": 0,
+            "n": 2,
+        },
+    )
+    ingest.handle_status(status_t, online2)
+
+    books2 = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert len(books2) == 1
+    assert books2[0]["id"] == first_nudge["id"]
+    assert "url" in books2[0]

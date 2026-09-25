@@ -7,6 +7,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from app import devauth, wirecbor
 from app.wire import (
     CellInfo,
     DownEnvelope,
@@ -189,6 +190,129 @@ def test_status_rejects_negative_sms_lost():
     with pytest.raises(ValidationError):
         StatusEnvelope.model_validate(_online_status(sms_lost=-1))
 # /status `loc_move_s`: the GNSS-while-moving interval.
+
+
+def test_status_accepts_link():
+    env = StatusEnvelope.model_validate(_online_status(link=3))
+    assert env.link == 3
+
+
+def test_status_link_is_optional():
+    """Absent `link` validates and reports `env.link` as `None`, not `0`."""
+    env = StatusEnvelope.model_validate(_online_status())
+    assert env.link is None
+
+
+def test_status_rejects_negative_link():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(link=-1))
+
+
+def test_status_accepts_link_zero():
+    env = StatusEnvelope.model_validate(_online_status(link=0))
+    assert env.link == 0
+# /status key 52 `xport` is retired: old firmware may still send it; it is ignored, not rejected.
+
+
+# Crash diagnostics: /status `rst`/`stage`/`abn` (PROTOCOL.md §5.1).
+
+
+def test_status_accepts_rst_stage_abn():
+    env = StatusEnvelope.model_validate(_online_status(rst=4, stage=6, abn=2))
+    assert env.rst == 4
+    assert env.stage == 6
+    assert env.abn == 2
+
+
+def test_status_rst_stage_abn_are_optional():
+    env = StatusEnvelope.model_validate(_online_status())
+    assert env.rst is None
+    assert env.stage is None
+    assert env.abn is None
+
+
+@pytest.mark.parametrize("field", ["rst", "stage"])
+def test_status_rejects_rst_stage_out_of_range(field):
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(**{field: -1}))
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(**{field: 256}))
+
+
+def test_status_accepts_rst_stage_boundary_values():
+    assert StatusEnvelope.model_validate(_online_status(rst=0)).rst == 0
+    assert StatusEnvelope.model_validate(_online_status(rst=255)).rst == 255
+    assert StatusEnvelope.model_validate(_online_status(stage=0)).stage == 0
+    assert StatusEnvelope.model_validate(_online_status(stage=255)).stage == 255
+
+
+def test_status_rejects_abn_out_of_range():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(abn=-1))
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(abn=65536))
+
+
+def test_status_accepts_abn_boundary_values():
+    assert StatusEnvelope.model_validate(_online_status(abn=0)).abn == 0
+    assert StatusEnvelope.model_validate(_online_status(abn=65535)).abn == 65535
+
+
+def test_status_rst_stage_abn_round_trip_cbor():
+    """PROTOCOL.md §10: keys 53/54/55."""
+    obj = _online_status(rst=4, stage=6, abn=2)
+    assert wirecbor.KEYMAP["rst"] == 53
+    assert wirecbor.KEYMAP["stage"] == 54
+    assert wirecbor.KEYMAP["abn"] == 55
+    cbor_bytes = wirecbor.encode(obj)
+    decoded = wirecbor.decode(cbor_bytes)
+    assert decoded["rst"] == 4
+    assert decoded["stage"] == 6
+    assert decoded["abn"] == 2
+    env = StatusEnvelope.model_validate(decoded)
+    assert (env.rst, env.stage, env.abn) == (4, 6, 2)
+# Crash diagnostics: /status `stallcmd` (PROTOCOL.md §5.1).
+
+
+def test_status_accepts_stallcmd():
+    env = StatusEnvelope.model_validate(_online_status(stallcmd="AT+CEREG?"))
+    assert env.stallcmd == "AT+CEREG?"
+
+
+def test_status_stallcmd_is_optional():
+    env = StatusEnvelope.model_validate(_online_status())
+    assert env.stallcmd is None
+
+
+def test_status_accepts_stallcmd_boundary_length():
+    assert StatusEnvelope.model_validate(_online_status(stallcmd="")).stallcmd == ""
+    twenty_four = "A" * 24
+    assert StatusEnvelope.model_validate(_online_status(stallcmd=twenty_four)).stallcmd == twenty_four
+
+
+def test_status_rejects_stallcmd_over_length():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(stallcmd="A" * 25))
+
+
+def test_status_rejects_stallcmd_non_printable():
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(stallcmd="AT+CEREG\x00"))
+    with pytest.raises(ValidationError):
+        StatusEnvelope.model_validate(_online_status(stallcmd="AT+é"))
+
+
+def test_status_stallcmd_round_trip_cbor():
+    """PROTOCOL.md §10: key 59."""
+    obj = _online_status(stallcmd="AT+CEREG?")
+    assert wirecbor.KEYMAP["stallcmd"] == 59
+    cbor_bytes = wirecbor.encode(obj)
+    decoded = wirecbor.decode(cbor_bytes)
+    assert decoded["stallcmd"] == "AT+CEREG?"
+    env = StatusEnvelope.model_validate(decoded)
+    assert env.stallcmd == "AT+CEREG?"
+
+
 def test_status_still_ignores_a_genuinely_unknown_field():
     env = StatusEnvelope.model_validate(_online_status(some_future_field="whatever"))
     assert env.state == "online"
@@ -442,6 +566,127 @@ def test_build_down_payload_msg_no_body_raises_before_producing_bad_json():
         build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, kind="msg")
 
 
+def test_down_envelope_sndr_absent_is_valid_and_none():
+    env = DownEnvelope.model_validate(
+        {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "mom", "body": "hi", "ack": None}
+    )
+    assert env.sndr is None
+
+
+def test_down_envelope_sndr_present_on_group_msg():
+    env = DownEnvelope.model_validate(
+        {
+            "v": 1,
+            "id": "m_aaaaaaaa",
+            "ts": 1_700_000_000,
+            "from": "family",
+            "sndr": "mom",
+            "body": "hi",
+            "ack": None,
+        }
+    )
+    assert env.sndr == "mom"
+    assert env.from_ == "family"
+
+
+def test_down_envelope_invalid_sndr_alias_is_malformed():
+    with pytest.raises(ValidationError):
+        DownEnvelope.model_validate(
+            {
+                "v": 1,
+                "id": "m_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "family",
+                "sndr": "Bad Alias!",
+                "body": "hi",
+                "ack": None,
+            }
+        )
+
+
+def test_down_envelope_sndr_on_loc_req_is_malformed():
+    """PROTOCOL.md §4: `sndr` only appears on a `msg`; a `loc_req` carrying it is malformed."""
+    with pytest.raises(ValidationError):
+        DownEnvelope.model_validate(
+            {
+                "v": 1,
+                "id": "m_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "kind": "loc_req",
+                "from": "mom",
+                "sndr": "mom",
+                "ack": None,
+            }
+        )
+
+
+def test_build_down_payload_omits_sndr_by_default():
+    raw = build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi", from_="mom")
+    assert "sndr" not in json.loads(raw)
+
+
+def test_build_down_payload_dm_bytes_byte_identical_regardless_of_sndr_support():
+    raw = build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi", from_="mom")
+    assert raw == b'{"v":1,"id":"m_aaaaaaaa","ts":1700000000,"from":"mom","body":"hi","ack":null}'
+
+
+def test_build_down_payload_with_sndr_round_trips_and_orders_after_from():
+    raw = build_down_payload(
+        msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi", from_="family", sndr="mom"
+    )
+    obj = json.loads(raw)
+    assert obj["sndr"] == "mom"
+    # Field order: from, sndr, body (sndr takes the slot `to` would occupy).
+    keys = list(obj.keys())
+    assert keys.index("from") < keys.index("sndr") < keys.index("body")
+    DownEnvelope.model_validate(obj)
+
+
+def test_build_down_payload_sndr_on_loc_req_raises():
+    with pytest.raises(ValueError):
+        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, kind="loc_req", sndr="mom")
+
+
+def test_group_down_page_carries_sndr_in_both_encodings():
+    raw = build_down_payload(
+        msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi", from_="family", sndr="mom"
+    )
+    obj = json.loads(raw)
+    assert obj["sndr"] == "mom"
+
+    cbor_bytes = wirecbor.encode(obj)
+    assert wirecbor.KEYMAP["sndr"] == 51
+    decoded = wirecbor.decode(cbor_bytes)
+    assert decoded["sndr"] == "mom"
+    assert decoded["from"] == "family"
+
+
+def test_down_worst_case_group_message_signed_fits_640_bytes_both_encodings():
+    """Worst-case signed group `/down msg` (16-char id, `from` and `sndr`, 160-code-point body) is
+    under the 640-byte hard limit in both encodings, signed with the real `app.devauth` signer."""
+    body = "ñ" * 160  # 160 code points, 320 UTF-8 bytes
+    obj = {
+        "v": 1,
+        "id": "m" * 16,
+        "ts": 1_700_000_000,
+        "from": "g" * 16,
+        "sndr": "s" * 16,
+        "body": body,
+        "n": 2**53 - 1,  # worst-case 52-bit replay counter (§14.2)
+        "ack": None,
+    }
+    key = b"k" * 32
+    topic = "pager/pgr-0001/down"
+
+    json_signed = devauth.sign_json(key, topic, obj)
+    assert len(json_signed) <= 640
+    assert len(json_signed) > 400  # sanity: a near-worst-case payload
+
+    cbor_signed = devauth.sign_cbor(key, topic, obj)
+    assert len(cbor_signed) <= 640
+
+    # The unsigned shape (without `n`, which DownEnvelope does not model) is a valid group `msg`.
+    DownEnvelope.model_validate({k: v for k, v in obj.items() if k != "n"})
 
 
 def _base_loc(**overrides):

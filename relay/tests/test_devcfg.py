@@ -20,6 +20,8 @@ from app.main import create_app
 from app.store import allow as allow_store
 from app.store import backends as backends_store
 from app.store import contacts as contacts_store
+from app.store import conversations as conversations_store
+from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
 from app.store import users as users_store
 from tests.conftest import (
@@ -51,6 +53,28 @@ def _make_pager_device(
     backends_store.create_backend(
         owner_uid, kind="pager", config={"deviceId": device_id}, enabled=True
     )
+
+
+_HMAC_KEY = b"k" * 32
+
+
+def _make_hmac_pager_device(
+    device_id: str, owner_uid: str, *, key: bytes = _HMAC_KEY, default_to_uid: str | None = None
+) -> None:
+    """Device with `authMode == 'hmac'` (PROTOCOL.md §3.7 gate)."""
+    devices_store.create_device(
+        device_id=device_id,
+        owner_uid=owner_uid,
+        label="d",
+        mqtt_username=device_id,
+        mqtt_password_hash="x",
+        default_to_uid=default_to_uid,
+        auth_mode="hmac",
+    )
+    backends_store.create_backend(
+        owner_uid, kind="pager", config={"deviceId": device_id}, enabled=True
+    )
+    device_secrets_store.create(device_id, hmac_key=key, mqtt_password_hash="y")
 
 
 def _approve(owner_uid: str, contact_uid: str) -> None:
@@ -121,6 +145,56 @@ def test_build_book_caps_approved_contacts_at_ten():
     _make_user("student5", "student5")
     _make_pager_device("pgr-b-5", "student5")
 
+
+
+def test_build_book_lists_owners_group_as_grp_contact():
+    _make_user("student8g", "student8g")
+    _make_pager_device("pgr-b-8g", "student8g")
+    _make_user("groupmate8g", "groupmate8g")
+    conversations_store.create_group(
+        name="Family", alias="fam-book", member_uids=["student8g", "groupmate8g"], created_by="student8g"
+    )
+
+    obj = devcfg.build_book("pgr-b-8g")
+
+    assert {"a": "fam-book", "n": "Family", "t": "grp"} in obj["c"]
+
+
+def test_build_book_group_contact_not_listed_for_non_member():
+    _make_user("student9g", "student9g")
+    _make_pager_device("pgr-b-9g", "student9g")
+    _make_user("m1-9g", "m1-9g")
+    _make_user("m2-9g", "m2-9g")
+    conversations_store.create_group(
+        name="Others", alias="fam-not-mine", member_uids=["m1-9g", "m2-9g"], created_by="m1-9g"
+    )
+
+    obj = devcfg.build_book("pgr-b-9g")
+
+    assert obj["c"] == []
+
+
+def test_build_book_caps_approved_contacts_at_ten_including_groups():
+    _make_user("student10g", "student10g")
+    _make_pager_device("pgr-b-10g", "student10g")
+    for i in range(8):
+        uid = f"contact10g_{i}"
+        _make_user(uid, f"c10g{i:02d}")
+        _approve("student10g", uid)
+    for i in range(4):
+        mate = f"groupmate10g_{i}"
+        _make_user(mate, mate)
+        conversations_store.create_group(
+            name=f"Group{i}",
+            alias=f"grp10g{i}",
+            member_uids=["student10g", mate],
+            created_by="student10g",
+        )
+
+    obj = devcfg.build_book("pgr-b-10g")
+
+    assert len(obj["c"]) == 10
+    assert any(c["t"] == "grp" for c in obj["c"])
 
 
 def test_push_book_publishes_and_stores_pending():
@@ -402,6 +476,8 @@ def test_online_edge_republishes_unacked_book():
     _make_user("student18", "student18")
     _make_pager_device("pgr-b-18", "student18")
     broker = FakeBrokerClient()
+    # bookVersion starts at 0; any online /status bumps it to 1 (PROTOCOL.md §5.3).
+    _bump_book_version("pgr-b-18")
     devcfg.push_book("pgr-b-18", broker)
     book_id = _raw_device("pgr-b-18")["pendingBook"]["id"]
     ingest = Ingest(broker)
@@ -605,3 +681,157 @@ def test_approve_contact_publishes_book(
         json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
     ]
     assert len(books) == 1
+
+
+def test_push_book_gate_bpull_absent_sends_full_book():
+    _make_user("student-gate1", "student-gate1")
+    _make_hmac_pager_device("pgr-gate-1", "student-gate1")
+    broker = FakeBrokerClient()
+
+    ok = devcfg.push_book("pgr-gate-1", broker, settings=_settings_with_public_base_url())
+
+    assert ok is True
+    sent = json.loads(broker.published[0].payload)
+    assert sent["kind"] == "book"
+    assert "c" in sent
+    assert "url" not in sent
+
+
+def test_push_book_gate_bpull_and_hmac_and_base_url_sends_nudge():
+    _make_user("student-gate2", "student-gate2")
+    _make_hmac_pager_device("pgr-gate-2", "student-gate2")
+    devices_store.update_status("pgr-gate-2", bpull=1)
+    broker = FakeBrokerClient()
+
+    ok = devcfg.push_book("pgr-gate-2", broker, settings=_settings_with_public_base_url())
+
+    assert ok is True
+    sent = json.loads(broker.published[0].payload)
+    assert sent["kind"] == "book"
+    assert sent["url"] == "https://relay.example.com/api/device/book"
+    assert "c" not in sent
+    assert "p" not in sent
+    assert "d" not in sent
+    assert "more" not in sent
+
+
+def test_push_book_gate_bpull_without_base_url_falls_back_to_full_book(caplog):
+    _make_user("student-gate3", "student-gate3")
+    _make_hmac_pager_device("pgr-gate-3", "student-gate3")
+    devices_store.update_status("pgr-gate-3", bpull=1)
+    broker = FakeBrokerClient()
+
+    no_base_url_settings = Settings(
+        broker_api_url="http://emqx.test/api/v5",
+        broker_api_key="k",
+        broker_api_secret="s",
+        webhook_key="wk",
+        dev_mode=False,
+        google_cloud_project=None,
+        firestore_emulator_host=None,
+        firebase_auth_emulator_host=None,
+        public_base_url=None,
+    )
+
+    ok = devcfg.push_book("pgr-gate-3", broker, settings=no_base_url_settings)
+
+    assert ok is True
+    sent = json.loads(broker.published[0].payload)
+    assert sent["kind"] == "book"
+    assert "c" in sent
+    assert "url" not in sent
+
+
+def test_push_book_gate_bpull_but_not_hmac_sends_full_book():
+    _make_user("student-gate4", "student-gate4")
+    _make_pager_device("pgr-gate-4", "student-gate4")
+    devices_store.update_status("pgr-gate-4", bpull=1)
+    broker = FakeBrokerClient()
+
+    ok = devcfg.push_book("pgr-gate-4", broker, settings=_settings_with_public_base_url())
+
+    assert ok is True
+    sent = json.loads(broker.published[0].payload)
+    assert "c" in sent
+    assert "url" not in sent
+
+
+def test_nudge_size_under_640():
+    _make_user("student-nudge1", "student-nudge1")
+    _make_hmac_pager_device("pgr-nudge-1", "student-nudge1")
+    # bv at its max (2**32-1) per PROTOCOL.md §3.3; set directly because bump counts by one.
+    get_db().collection("devices").document("pgr-nudge-1").set(
+        {"bookVersion": 2**32 - 1}, merge=True
+    )
+    prefix = "https://"
+    suffix = ".example.com/api/device/book"
+    url = prefix + "x" * (200 - len(prefix) - len(suffix)) + suffix
+    assert len(url) == 200
+
+    obj = devcfg.build_nudge("pgr-nudge-1", url)
+
+    assert obj["kind"] == "book"
+    assert obj["url"] == url
+    assert obj["bv"] == 2**32 - 1
+
+
+def test_build_book_body_has_no_id_or_ack():
+    _make_user("student-body1", "student-body1")
+    _make_pager_device("pgr-body-1", "student-body1")
+
+    body = devcfg.build_book_body("pgr-body-1")
+
+    assert "id" not in body
+    assert "ack" not in body
+    assert body["kind"] == "book"
+
+
+def test_build_book_body_serves_20_contacts_no_more():
+    _make_user("student-body2", "student-body2")
+    _make_pager_device("pgr-body-2", "student-body2")
+    for i in range(20):
+        uid = f"bodycontact_{i}"
+        _make_user(uid, f"bc{i:02d}")
+        _approve("student-body2", uid)
+
+    body = devcfg.build_book_body("pgr-body-2")
+
+    assert len(body["c"]) == 20
+    assert "more" not in body
+
+
+def test_build_book_body_truncates_at_32_sets_more():
+    _make_user("student-body3", "student-body3")
+    _make_pager_device("pgr-body-3", "student-body3")
+    for i in range(40):
+        uid = f"bodycontact40_{i}"
+        _make_user(uid, f"bc40{i:03d}")
+        _approve("student-body3", uid)
+
+    body = devcfg.build_book_body("pgr-body-3")
+
+    assert len(body["c"]) == 32
+    assert body["more"] is True
+
+
+def test_build_book_body_default_first_then_groups_then_people():
+    _make_user("student-body4", "student-body4")
+    _make_user("zzz-mom", "zzz-mom", "Zzz Mom")
+    _make_pager_device("pgr-body-4", "student-body4", default_to_uid="zzz-mom")
+    _approve("student-body4", "zzz-mom")
+    _make_user("aaa-friend", "aaa-friend", "Aaa Friend")
+    _approve("student-body4", "aaa-friend")
+    conversations_store.create_group(
+        name="Bbb Group",
+        alias="bbb-grp-body4",
+        member_uids=["student-body4", "aaa-friend"],
+        created_by="student-body4",
+    )
+
+    body = devcfg.build_book_body("pgr-body-4")
+
+    assert body["d"] == "zzz-mom"
+    aliases_in_order = [c["a"] for c in body["c"]]
+    assert aliases_in_order[0] == "zzz-mom"
+    assert aliases_in_order[1] == "bbb-grp-body4"  # the group, despite sorting after "aaa-friend"
+    assert aliases_in_order[2] == "aaa-friend"

@@ -9,12 +9,15 @@ from dataclasses import dataclass, field
 from app.backends.base import Backend, DeliverResult
 from app.backends.registry import build_registry
 from app.broker import BrokerClient
+from app.ids import new_id
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.store import users as users_store
 from app.store.backends import Backend as BackendRow
+from app.store.conversations import Conversation
 from app.store.messages import Delivery, Message, MessageKind
 
 logger = logging.getLogger("relay.routing")
@@ -58,6 +61,22 @@ class Routing:
         ts: int | None = None,
     ) -> SendResult:
         ts = ts if ts is not None else int(time.time())
+
+        if recipient_alias is not None:
+            group = conversations_store.get_by_alias(recipient_alias)
+            if group is not None:
+                return self._send_group(
+                    sender_uid=sender_uid,
+                    group=group,
+                    kind=kind,
+                    body=body,
+                    loc=loc,
+                    origin_backend_kind=origin_backend_kind,
+                    origin_backend_id=origin_backend_id,
+                    wire_id=wire_id,
+                    ts=ts,
+                )
+
         candidates, rejected = self._candidate_recipients(sender_uid, recipient_alias, device_id)
 
         for recipient_uid in candidates:
@@ -94,6 +113,53 @@ class Routing:
         if default_uid is not None:
             return [default_uid], []
 
+
+    def _send_group(
+        self,
+        *,
+        sender_uid: str,
+        group: Conversation,
+        kind: MessageKind,
+        body: str | None,
+        loc: dict | None,
+        origin_backend_kind: str,
+        origin_backend_id: str | None,
+        wire_id: str | None,
+        ts: int,
+    ) -> SendResult:
+        if sender_uid not in group.uids:
+            logger.warning(
+                "SECURITY sender %s is not a member of group %s (alias=%r)",
+                sender_uid,
+                group.convKey,
+                group.alias,
+            )
+            return SendResult(
+                messages=[],
+                rejected=[
+                    RejectedRecipient(alias=group.alias, uid=sender_uid, reason="not_member")
+                ],
+            )
+
+
+        seq = messages_store.allocate_seq()
+        # A device-originated send reuses its wire_id as groupMsgId so a redelivery repairs the
+        # same copies.
+        group_msg_id = wire_id if wire_id is not None else new_id("gm_")
+
+        created: list[Message] = []
+        rejected: list[RejectedRecipient] = []
+        for recipient_uid in sorted(uid for uid in group.uids if uid != sender_uid):
+                logger.warning(
+                    sender_uid,
+                    recipient_uid,
+                    group.convKey,
+                )
+                rejected.append(
+                )
+                continue
+        return SendResult(messages=created, rejected=rejected)
+
     def redeliver_pager(self, msg: Message, device_id: str) -> bool:
         """Re-runs the pager delivery of `msg` for `device_id`; False if there is none."""
         bid = messages_store.find_pager_delivery(msg, device_id)
@@ -122,6 +188,10 @@ class Routing:
         origin_backend_id: str | None,
         wire_id: str | None,
         ts: int,
+        conv_key: str | None = None,
+        seq: int | None = None,
+        group_msg_id: str | None = None,
+        sender_alias: str | None = None,
     ) -> Message | None:
         # Self-loop guard: excludes the origin backend (by id if given, else by kind) only when
         # the recipient is the sender.
@@ -165,6 +235,10 @@ class Routing:
             origin_backend_id=origin_backend_id,
             deliveries=deliveries,
             pending_device_ids=pending_device_ids,
+            conv_key=conv_key,
+            seq=seq,
+            group_msg_id=group_msg_id,
+            sender_alias=sender_alias,
         )
         if msg is None:
             # Already created by an earlier webhook redelivery.

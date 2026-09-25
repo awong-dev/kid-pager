@@ -131,6 +131,29 @@ def accept_up_n(device_id: str, n: int) -> bool:
     return run_transaction(_txn)
 
 
+def accept_request_n(device_id: str, n: int) -> bool:
+    """Book-pull check (docs/PROTOCOL.md §14.7): only `n > upN`, no gap window; else no write."""
+    ref = _secrets().document(device_id)
+
+    def _txn(transaction: Transaction) -> bool:
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            raise KeyError(f"no such device secret: {device_id!r}")
+        data = snap.to_dict() or {}
+        up_n = data.get("upN", 0)
+        up_bits = _from_signed64(data.get("upBits", 0))
+
+        if n > up_n:
+            shift = n - up_n
+            new_bits = ((up_bits << shift) | (1 << (shift - 1))) & _WINDOW_MASK
+            transaction.update(ref, {"upN": n, "upBits": _to_signed64(new_bits)})
+            return True
+
+        return False
+
+    return run_transaction(_txn)
+
+
 def next_down_n(device_id: str) -> int:
     """Issues the next `n` for a `/down` envelope."""
     ref = _secrets().document(device_id)

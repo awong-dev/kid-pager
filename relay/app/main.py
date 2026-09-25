@@ -15,6 +15,17 @@ from app.db.firestore import get_db
 from app.ingest import Ingest
 from app.location import Location
 from app.logging_config import configure_logging, request_id_var
+from app.routers import (
+    admin,
+    ca,
+    conversations,
+    dev,
+    device_book,
+    devices,
+    internal,
+    me,
+    webhooks,
+)
 from app.routing import Routing
 
 configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -35,6 +46,12 @@ def create_app(
     async def lifespan(app: FastAPI):
         app.state.settings = settings
         # One backend registry per app; /api/me/backends calls `start_link()` on a new backend.
+        fcm_client = None
+        if settings.push_backend == "fcm":
+            from app.backends.fcm import FirebaseFCMClient
+
+            fcm_client = FirebaseFCMClient()
+        app.state.backend_registry = build_registry(app.state.broker, fcm_client=fcm_client)
         # One Routing instance shared by the webhook path and every API router.
         app.state.routing = Routing(app.state.broker, registry=app.state.backend_registry)
         app.state.ingest = Ingest(app.state.broker, app.state.routing)
@@ -62,6 +79,7 @@ def create_app(
     app.include_router(admin.router)
     app.include_router(dev.router)
     app.include_router(devices.router)
+    app.include_router(device_book.router)
     app.include_router(conversations.router)
     app.include_router(me.router)
     app.include_router(internal.router)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -9,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from firebase_admin import auth as fb_auth
 
+from app import devcfg
 from app.config import Settings
 from app.main import create_app
 from app.store import device_secrets as device_secrets_store
@@ -60,6 +62,14 @@ def fake_emqx() -> FakeEmqxAdmin:
 
 
 @pytest.fixture
+def broker() -> FakeBrokerClient:
+    """The broker fake, exposed so tests can inspect `broker.published`."""
+    return FakeBrokerClient()
+
+
+@pytest.fixture
+def client(fake_emqx: FakeEmqxAdmin, broker: FakeBrokerClient) -> Iterator[TestClient]:
+    app = create_app(settings=make_settings(), broker_client=broker)
     app.state.emqx_admin = fake_emqx
     with TestClient(app) as c:
         yield c
@@ -426,6 +436,136 @@ def test_allowlist_unknown_alias_is_400(client: TestClient, admin_headers: dict[
         headers=admin_headers,
     )
     assert resp.status_code == 400
+def test_allowlist_put_nudges_changed_owners_only(
+    client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    for alias in ("ownera", "ownerb", "contacta", "contactb"):
+        client.post(
+            "/api/admin/users",
+            json={"alias": alias, "displayName": alias, "email": f"{alias}@example.com"},
+            headers=admin_headers,
+        )
+    client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-nudge-a", "ownerAlias": "ownera", "label": "a"},
+        headers=admin_headers,
+    )
+    client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-nudge-b", "ownerAlias": "ownerb", "label": "b"},
+        headers=admin_headers,
+    )
+    resp0 = client.put(
+        "/api/admin/allowlist",
+        json={
+            "entries": [
+                {"fromAlias": "ownerb", "toAlias": "contactb", "message": True, "locate": False},
+            ]
+        },
+        headers=admin_headers,
+    )
+    assert resp0.status_code == 200, resp0.text
+    bv_a_before = devcfg.get_book_version("pgr-nudge-a")
+    bv_b_before = devcfg.get_book_version("pgr-nudge-b")
+    broker.clear()
+
+    resp = client.put(
+        "/api/admin/allowlist",
+        json={
+            "entries": [
+                {"fromAlias": "ownerb", "toAlias": "contactb", "message": True, "locate": False},
+                {"fromAlias": "ownera", "toAlias": "contacta", "message": True, "locate": False},
+            ]
+        },
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert devcfg.get_book_version("pgr-nudge-a") == bv_a_before + 1
+    assert devcfg.get_book_version("pgr-nudge-b") == bv_b_before
+
+    books = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert len(books) == 1
+
+
+def test_display_name_change_bumps_listing_owners(
+    client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    for alias in ("owner-dn", "contact-dn"):
+        client.post(
+            "/api/admin/users",
+            json={"alias": alias, "displayName": alias, "email": f"{alias}@example.com"},
+            headers=admin_headers,
+        )
+    client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-dn-1", "ownerAlias": "owner-dn", "label": "d"},
+        headers=admin_headers,
+    )
+    contact_uid = users_store.get_uid_for_alias("contact-dn")
+    client.put(
+        "/api/admin/allowlist",
+        json={
+            "entries": [
+            ]
+        },
+        headers=admin_headers,
+    )
+    bv_before = devcfg.get_book_version("pgr-dn-1")
+    broker.clear()
+
+    resp = client.patch(
+        f"/api/admin/users/{contact_uid}",
+        json={"displayName": "New Name"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert devcfg.get_book_version("pgr-dn-1") == bv_before + 1
+    books = [
+        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
+    ]
+    assert len(books) == 1
+    assert any(c["a"] == "contact-dn" and c["n"] == "New Name" for c in books[0]["c"])
+
+
+def test_display_name_unchanged_does_not_bump_book(
+    client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    for alias in ("owner-dn2", "contact-dn2"):
+        client.post(
+            "/api/admin/users",
+            json={"alias": alias, "displayName": alias, "email": f"{alias}@example.com"},
+            headers=admin_headers,
+        )
+    client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-dn-2", "ownerAlias": "owner-dn2", "label": "d"},
+        headers=admin_headers,
+    )
+    contact_uid = users_store.get_uid_for_alias("contact-dn2")
+    client.put(
+        "/api/admin/allowlist",
+        json={
+            "entries": [
+                {"fromAlias": "owner-dn2", "toAlias": "contact-dn2", "message": True, "locate": False}
+            ]
+        },
+        headers=admin_headers,
+    )
+    bv_before = devcfg.get_book_version("pgr-dn-2")
+    broker.clear()
+
+    resp = client.patch(
+        f"/api/admin/users/{contact_uid}",
+        json={"displayName": "contact-dn2"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert devcfg.get_book_version("pgr-dn-2") == bv_before
+    assert broker.published == []
 
 
 def test_put_and_get_settings(client: TestClient, admin_headers: dict[str, str]):

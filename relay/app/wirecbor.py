@@ -9,6 +9,7 @@ from typing import Any
 import cbor2
 
 # docs/PROTOCOL.md §10: one flat integer namespace; new fields take the next free integer.
+# 52 (`xport`) is retired; do not reuse.
 KEYMAP: dict[str, int] = {
     "v": 0,
     "id": 1,
@@ -62,6 +63,23 @@ KEYMAP: dict[str, int] = {
     "sms_lost": 48,
     # `/loc` optional `cell` sub-map (docs/PROTOCOL.md §13.2).
     "cell": 49,
+    # `/status` MQTT-session generation counter within a boot.
+    "link": 50,
+    # `/down msg` group-author alias, absent on one-to-one pages.
+    "sndr": 51,
+    # Crash diagnostics (optional): `rst` = esp_reset_reason_t of the last reset, `stage` =
+    # main-loop stage index, `abn` = abnormal resets since power-on.
+    "rst": 53,
+    "stage": 54,
+    "abn": 55,
+    # docs/PROTOCOL.md §3.8: `/up grp_req`'s requested member aliases.
+    "m": 56,
+    # docs/PROTOCOL.md §3.7: the `/down book` nudge's fetch endpoint.
+    "url": 57,
+    # docs/PROTOCOL.md §3.7/§5.1: `/status`'s book-pull capability gate.
+    "bpull": 58,
+    # Crash diagnostics (optional): the AT command name the main loop was stuck on.
+    "stallcmd": 59,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 

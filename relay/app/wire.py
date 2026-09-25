@@ -28,6 +28,35 @@ ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")
 SYSTEM_ALIAS = "system"
 ACK_VALUES = {"shown", "read"}
 
+# Firmware main-loop stage table that `/status`'s `stage` indexes into; used only for logging.
+STAGE_NAMES: tuple[str, ...] = (
+    "?",
+    "boot",
+    "network init",
+    "loop top",
+    "entering light sleep",
+    "just woke from light sleep",
+    "input/ui",
+    "render",
+    "mqtt status/retry",
+    "message pump",
+    "modem health check",
+    "location",
+    "sms",
+    "ca trust",
+    "saving state",
+    "deliberate restart",
+)
+
+
+def stage_name(stage: int | None) -> str | None:
+    """`STAGE_NAMES[stage]`, or the raw int as a string when out of range (never raises)."""
+    if stage is None:
+        return None
+    if 0 <= stage < len(STAGE_NAMES):
+        return STAGE_NAMES[stage]
+    return str(stage)
+
 
 def is_valid_alias(value: str) -> bool:
     """docs/PROTOCOL.md §3.1: the alias regex, or the literal `system`."""
@@ -166,6 +195,19 @@ class StatusEnvelope(BaseModel):
     loc_backoff_s: int | None = None
     # Count of sms_log audit entries dropped for lack of NVS queue space, normally 0 (optional).
     sms_lost: int | None = None
+    # MQTT-session generation within a boot, bumped on each silent modem session resume; a change
+    # triggers the online-edge republish, since a resume drops QoS 1 `/down` in the <=10 s gap.
+    link: int | None = None
+    # Crash diagnostics (optional, display only): `rst` is the last esp_reset_reason_t, `stage`
+    # indexes `STAGE_NAMES`, `abn` counts abnormal resets since power-on.
+    rst: int | None = None
+    stage: int | None = None
+    abn: int | None = None
+    # Crash diagnostics (optional, display only): the AT command name the main loop was stuck on.
+    stallcmd: str | None = None
+    # Book-pull capability gate: only `1` is legal; anything else is dropped to `None`, not
+    # rejected (§3.4 "unknown values").
+    bpull: int | None = None
     # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
     n: int | None = None
 
@@ -186,6 +228,39 @@ class StatusEnvelope(BaseModel):
     def _check_sms_lost(cls, value: int | None) -> int | None:
         if value is not None and value < 0:
             raise ValueError("sms_lost must be >= 0")
+        return value
+
+    @field_validator("link")
+    @classmethod
+    def _check_link(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("link must be >= 0")
+        return value
+
+    @field_validator("rst", "stage")
+    @classmethod
+    def _check_rst_stage(cls, value: int | None) -> int | None:
+        if value is not None and not (0 <= value <= 255):
+            raise ValueError("rst/stage out of range")
+        return value
+
+    @field_validator("abn")
+    @classmethod
+    def _check_abn(cls, value: int | None) -> int | None:
+        if value is not None and not (0 <= value <= 65535):
+            raise ValueError("abn out of range")
+        return value
+
+    @field_validator("bpull")
+    @classmethod
+    def _check_bpull(cls, value: int | None) -> int | None:
+        return value if value == 1 else None
+
+    @field_validator("stallcmd")
+    @classmethod
+    def _check_stallcmd(cls, value: str | None) -> str | None:
+        if value is not None and (len(value) > 24 or not value.isprintable() or not value.isascii()):
+            raise ValueError("stallcmd must be <= 24 printable ASCII chars")
         return value
 
     @field_validator("n")
@@ -239,6 +314,9 @@ class DownEnvelope(BaseModel):
     kind: Literal["msg", "loc_req"] = "msg"
     from_: str | None = Field(default=None, alias="from")
     body: str | None = None
+    # The author's alias on a group `msg`, where `from` names the group; absent on one-to-one
+    # pages and on `loc_req` (docs/PROTOCOL.md §3.1).
+    sndr: str | None = None
     ack: str | None = None
 
     @field_validator("id")
@@ -261,6 +339,13 @@ class DownEnvelope(BaseModel):
             raise ValueError("invalid 'from' alias format")
         return value
 
+    @field_validator("sndr")
+    @classmethod
+    def _check_sndr(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_alias(value):
+            raise ValueError("invalid 'sndr' alias format")
+        return value
+
     @model_validator(mode="after")
     def _check_shape(self) -> DownEnvelope:
         if self.ack is not None:
@@ -273,6 +358,9 @@ class DownEnvelope(BaseModel):
             if self.body:
                 # §3.2: a loc_req has no body.
                 raise ValueError("loc_req down envelope must not carry a body")
+            if self.sndr is not None:
+                # `sndr` is only ever on a `msg`.
+                raise ValueError("loc_req down envelope must not carry 'sndr'")
         else:
             if not self.body:
                 raise ValueError("msg down envelope requires a non-empty body")
@@ -354,13 +442,19 @@ def build_down_payload(
     v: int = 1,
     kind: Literal["msg", "loc_req"] = "msg",
     from_: str = "parent",
+    sndr: str | None = None,
 ) -> bytes:
+    """Minified UTF-8 JSON in §3.1 field order; `kind` is omitted for `msg`, `sndr` when absent."""
     if kind != "loc_req" and not body:
         raise ValueError("msg down payload requires a non-empty body")
+    if kind == "loc_req" and sndr is not None:
+        raise ValueError("loc_req down payload must not carry 'sndr'")
     obj: dict[str, Any] = {"v": v, "id": msg_id, "ts": ts}
     if kind != "msg":
         obj["kind"] = kind
     obj["from"] = from_
+    if sndr is not None:
+        obj["sndr"] = sndr
     if kind != "loc_req":
         obj["body"] = body
     obj["ack"] = None

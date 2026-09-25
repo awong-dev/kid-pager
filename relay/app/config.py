@@ -34,6 +34,9 @@ class Settings:
     # The relay's public base URL, for `GET /ca/{sha256hex}.pem` pointers. Empty with a CA
     # configured makes `app/devsetup.py` and the CA-push route refuse.
     public_base_url: str | None = None
+    # "fcm" injects `app.backends.fcm.FirebaseFCMClient` into the `webapp` backend; "null"
+    # (default) keeps the no-op `NullFCMClient`. Any other value is treated as "null".
+    push_backend: str = "null"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -52,4 +55,5 @@ class Settings:
             firebase_auth_emulator_host=os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or None,
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
+            push_backend=os.environ.get("PUSH_BACKEND", "null").strip().lower(),
         )

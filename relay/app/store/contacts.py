@@ -121,3 +121,20 @@ def bump_book_version(device_id: str) -> int:
     return run_transaction(_txn)
 
 
+def bootstrap_book_version(device_id: str) -> bool:
+    """Bumps `bookVersion` 0 -> 1 in a transaction (docs/PROTOCOL.md §5.3); True only if bumped."""
+    ref = get_db().collection("devices").document(device_id)
+
+    def _txn(transaction: Transaction) -> bool:
+        snap = ref.get(transaction=transaction)
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        bv = int(data.get("bookVersion", 0) or 0)
+        if bv != 0:
+            return False
+        if snap.exists:
+            transaction.update(ref, {"bookVersion": 1})
+        else:
+            transaction.set(ref, {"bookVersion": 1}, merge=True)
+        return True
+
+    return run_transaction(_txn)

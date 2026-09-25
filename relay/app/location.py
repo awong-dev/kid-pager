@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from google.api_core.exceptions import Aborted, AlreadyExists
 from google.cloud.firestore import (
     SERVER_TIMESTAMP,
     ArrayRemove,
@@ -37,6 +39,11 @@ logger = logging.getLogger("relay.location")
 DEFAULT_LOC_REQ_TTL_S = 15 * 60
 # docs/PROTOCOL.md §13.3 rule 6: a fix younger than this answers a `/locate` without wire traffic.
 CACHED_ANSWER_WINDOW_S = 60
+
+# On heavy contention for one device's `locReqs` doc the client's transactional retries can be
+# exhausted (`ValueError`); the loser then joins the winner's request: `_join_after_contention`
+# re-reads `req_ref` up to 10 times with full-jitter delays (0.05..1.0 s).
+CONTENTION_REREAD_BASE_DELAY_S = 0.05
 
 
 def loc_req_ttl_s() -> int:
@@ -357,6 +364,32 @@ def _find_pager_backend(device: devices_store.Device) -> BackendRow | None:
     return None
 
 
+def _join_after_contention(
+    *,
+    requester_uid: str,
+    req_ref: DocumentReference,
+    ttl: int,
+    original_exc: ValueError,
+) -> LocateOutcome:
+    """After the claim transaction exhausted its retries (see `CONTENTION_REREAD_ATTEMPTS`): re-read
+    `req_ref` plainly with full-jitter backoff and, once the winner's request is visible, join it via
+    `ArrayUnion`. Re-raises `original_exc` if no request appears within the budget."""
+    for attempt in range(CONTENTION_REREAD_ATTEMPTS):
+        snap = req_ref.get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            if _age_seconds(data.get("createdAt")) < ttl:
+                req_ref.update({"requesterUids": ArrayUnion([requester_uid])})
+                return LocateOutcome(request_id=data.get("messageId"), cached=False)
+        if attempt < CONTENTION_REREAD_ATTEMPTS - 1:
+            cap = min(
+                CONTENTION_REREAD_MAX_DELAY_S,
+                CONTENTION_REREAD_BASE_DELAY_S * (2**attempt),
+            )
+            time.sleep(random.uniform(0, cap))
+    raise original_exc
+
+
 class Location:
     """Holds a `Routing` so `locate()` can deliver a new `loc_req` inline via `Routing.redeliver_pager`."""
 
@@ -482,6 +515,13 @@ class Location:
                 raise
             return self.locate(
                 requester_uid=requester_uid, device=device, ts=ts, _retry_on_conflict=False
+            )
+        except ValueError as exc:
+            # `run_transaction`'s retry-exhaustion shape; anything else propagates.
+            if not isinstance(exc.__cause__, Aborted):
+                raise
+            return _join_after_contention(
+                requester_uid=requester_uid, req_ref=req_ref, ttl=ttl, original_exc=exc
             )
 
         if kind == "claimed":

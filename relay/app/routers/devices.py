@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -11,6 +12,8 @@ from app.broker import BrokerClient
 from app.store import devices as devices_store
 from app.store import sms as sms_store
 from app.store.devices import Device, DeviceStatus, SmsContact
+
+logger = logging.getLogger("relay.devices")
 
 router = APIRouter(prefix="/api/devices")
 

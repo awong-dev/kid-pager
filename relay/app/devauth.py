@@ -29,6 +29,17 @@ def tag(key: bytes, topic: str, p: bytes) -> bytes:
     return hmac.new(key, topic.encode("utf-8") + b"\x00" + p, "sha256").digest()[:8]
 
 
+# §14.7: the book-pull request MAC uses this literal where §14.3 puts the topic; no MQTT
+# topic contains a space, so a request tag never verifies as an envelope tag.
+_BOOK_REQUEST_TOPIC = "GET /api/device/book"
+
+
+def request_tag(key: bytes, device_id: str, n: int, bv: int) -> bytes:
+    """§14.7: `X-Sig` MAC over `"<device_id>|<n>|<bv>"`; returns the raw 8-byte tag."""
+    m = f"{device_id}|{n}|{bv}".encode("ascii")
+    return tag(key, _BOOK_REQUEST_TOPIC, m)
+
+
 def sign_cbor(key: bytes, topic: str, obj: dict[str, Any]) -> bytes:
     """§14.3 CBOR rule: header count one above the pairs written (`P`), then the `sig` pair."""
     if "sig" in obj:

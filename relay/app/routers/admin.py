@@ -106,6 +106,9 @@ class PatchUserRequest(BaseModel):
 
 
 @router.get("/users")
+) -> User:
+    existing = users_store.get_user(uid)
+    if existing is None:
         raise HTTPException(status_code=404, detail="no such user")
     user = users_store.update_user(
         uid,
@@ -145,7 +148,18 @@ def _resolve_uid(alias: str) -> str:
     return uid
 
 
+def _message_sets_by_owner(edges: list[AllowEdge]) -> dict[str, frozenset[str]]:
+    """Per owner, the `toUid` set with `message=True` (what fixes a book's `c[]`), for diffing."""
+    by_owner: dict[str, set[str]] = {}
+    for e in edges:
+        if e.message:
+            by_owner.setdefault(e.fromUid, set()).add(e.toUid)
+    return {uid: frozenset(to_uids) for uid, to_uids in by_owner.items()}
+
+
 @router.put("/allowlist", dependencies=[Depends(require_admin_write_rate_limit)])
+def put_allowlist(
+) -> list[AllowEdge]:
     edges = [
         EdgeInput(
             from_uid=_resolve_uid(e.fromAlias),
@@ -155,6 +169,19 @@ def _resolve_uid(alias: str) -> str:
         )
         for e in req.entries
     ]
+    # snapshot before `replace_all` so the diff is against the pre-request state (PROTOCOL.md §3.7)
+    new_message_sets = _message_sets_by_owner(result)
+    changed_owner_uids = {
+        owner_uid
+        for owner_uid in old_message_sets.keys() | new_message_sets.keys()
+        if old_message_sets.get(owner_uid, frozenset())
+        != new_message_sets.get(owner_uid, frozenset())
+    }
+    for owner_uid in changed_owner_uids:
+        for device in devices_store.list_devices(owner_uid=owner_uid):
+            contacts_store.bump_book_version(device.id)
+            devcfg.push_book(device.id, broker)
+    return result
 
 
 @router.get("/allowlist")
@@ -246,6 +273,8 @@ def _broker_push_outcome(
     )
     # pick up incoming `locate` edges that predate this device
     allow_store.recompute_locatable_by_for_owner(owner_uid)
+
+    # PROTOCOL.md §3.7: device creation bumps and pushes the new device's book. Best-effort.
 
     # push the broker credential and ACL before handing out a setup code
     host, ca = _bootstrap_host_and_ca(settings)

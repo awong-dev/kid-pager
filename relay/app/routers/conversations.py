@@ -7,12 +7,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.broker import BrokerClient
 from app.location import Location, NoLocatableDevice
 from app.routing import Routing
 from app.store import allow as allow_store
+from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.store import users as users_store
+from app.store.conversations import Conversation
 from app.wire import (
     BODY_MAX_UTF8_BYTES,
     strip_control_chars,
@@ -35,6 +38,11 @@ def get_routing(request: Request) -> Routing:
 
 def get_location(request: Request) -> Location:
     return request.app.state.location
+
+
+def get_broker(request: Request) -> BrokerClient:
+    """The app's broker client."""
+    return request.app.state.broker
 
 
 @router.post("/{alias}/messages", status_code=201)
@@ -82,6 +90,13 @@ def mark_read(
     # `alias` must name this message's conversation (a user DM peer or a group), else 404.
     # Try the DM resolution first: a group alias has no `uid` field.
     peer_uid = users_store.get_uid_for_alias(alias)
+    if peer_uid is not None:
+        if msg.convKey != messages_store.conv_key(authed.uid, peer_uid):
+            raise HTTPException(status_code=404, detail="no such message")
+    else:
+        group = conversations_store.get_by_alias(alias)
+        if group is None or msg.convKey != group.convKey or authed.uid not in group.uids:
+            raise HTTPException(status_code=404, detail="no such message")
 
     bid = messages_store.find_delivery_by_kind(msg, "webapp")
     if bid is None:
@@ -94,6 +109,49 @@ def mark_read(
     return {"ok": True}
 
 
+def _push_book_to_members(uids: list[str], broker: BrokerClient) -> None:
+
+
+    """Create `message`-only `allow` edges both ways between every member pair, never `locate`.
+
+
+class AddMemberRequest(BaseModel):
+    uid: str
+
+
+@router.post("/{alias}/members", status_code=200)
+def add_group_member(
+    alias: str,
+    req: AddMemberRequest,
+    authed: Annotated[AuthedUser, Depends(require_user)],
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+) -> Conversation:
+    group = conversations_store.get_by_alias(alias)
+    if group is None:
+        raise HTTPException(status_code=404, detail="no such group")
+        raise HTTPException(status_code=404, detail=f"no such user: {req.uid!r}")
+
+    updated = conversations_store.add_member(group.convKey, req.uid)
+    # push to every current member; harmless for the existing ones
+    _push_book_to_members(updated.uids, broker)
+    return updated
+
+
+@router.delete("/{alias}/members/me", status_code=200)
+def leave_group(
+    alias: str,
+    authed: Annotated[AuthedUser, Depends(require_user)],
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+) -> Conversation:
+    group = conversations_store.get_by_alias(alias)
+    if group is None:
+        raise HTTPException(status_code=404, detail="no such group")
+    if authed.uid not in group.uids:
+        raise HTTPException(status_code=404, detail="not a member of this group")
+    updated = conversations_store.remove_member(group.convKey, authed.uid)
+    # the leaver is no longer in `updated.uids`, so push to them explicitly
+    _push_book_to_members([authed.uid], broker)
+    return updated
 
 
 class LocateFixOut(BaseModel):
