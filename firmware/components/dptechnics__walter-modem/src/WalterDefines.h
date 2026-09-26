@@ -57,6 +57,31 @@
 // runs long (up to 90 s) so the task watchdog stays fed. WalterModem.cpp has a weak default.
 extern "C" void walter_modem_block_tick(void);
 
+typedef struct {
+  // PAGER PATCH: 1.12 -- free-running, never-reset diagnostic counters (increments only).
+  uint32_t datatx_retx;     // DATA_TX_WAIT timeouts that sent the payload bytes
+  uint32_t prompt_orphan;   // bare "> " prompts recognised in _parseRxData()
+  uint32_t buf_drop_queue;  // parsed buffers dropped because the 8-slot task queue was full
+  uint32_t buf_drop_pool;   // allocation failures with the 8-buffer pool exhausted
+  // PAGER PATCH: 1.13 -- which write path moved bytes, and which command last stalled >= 5 s.
+  uint32_t prompt_handled;        // payload writes run by the "> " prompt handler
+  uint32_t payload_bytes_written; // bytes written by the prompt handler and by patch 1.12
+  uint32_t txdone_timeouts;       // uart_wait_tx_done() 10 ms waits that did not return ESP_OK
+  char stall_cmd[25];             // first 24 chars of the most recent slow command line
+  uint32_t stall_elapsed_ms;
+  int32_t stall_cts_level;        // CTS pin level at that moment, -1 if unavailable
+  uint32_t stall_tx_ring_bytes;   // free TX ring bytes; reads 0 because the TX ring is 0 bytes
+  // PAGER PATCH: 1.15 -- discriminators for the 30 s command stalls, counters not a trace.
+  uint32_t rsp_no_cmd;            // buffers that reached the completion test with no command
+  uint32_t payload_stuck_ms;      // how long _receivingPayload was true at the last timeout
+  // PAGER PATCH: 1.18 -- the modem UART delivers a stray 0xFF at the start of a light-sleep wake.
+  uint32_t glitch_dropped;
+  // PAGER PATCH: 1.19 -- responses paired with NULL because _curCmd had already finished.
+  uint32_t rsp_stale_cmd;
+} walter_modem_pager_counters_t;
+
+extern "C" walter_modem_pager_counters_t walter_modem_pager_counters(void);
+
 // NOLINT(readability-identifier-naming.PrivateFunctionPrefix)
 /**
  * @brief Convert a digit to a string literal.
@@ -444,6 +469,12 @@ static bool endOfLine DISABLE_USED_WARNING;
     for(int i = 0; i < WALTER_MODEM_COMMAND_MAX_ELEMS; ++i) {                                      \
       if(atCmd[i] == NULL) {                                                                       \
         break;                                                                                     \
+      }                                                                                            \
+      /* PAGER PATCH: 1.17 -- trace the AT command element about to be written (instrumentation  */ \
+      /* only; the trailing line terminator is not traced separately).                           */ \
+                                                                                                   \
+      if(s_pagerTraceHook) {                                                                       \
+        s_pagerTraceHook('T', (const uint8_t*) atCmd[i], strlen(atCmd[i]));                        \
       }                                                                                            \
       uart_write_bytes(_uartNo, atCmd[i], strlen(atCmd[i]));                                       \
     }                                                                                              \

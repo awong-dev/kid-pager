@@ -42,6 +42,7 @@ typedef enum {
     GFX_ICON_CHAT,
     GFX_ICON_TLS_PINNED,  /* closed padlock: CA pinned, last connect validated */
     GFX_ICON_TLS_BROKEN,  /* broken padlock: CA pinned, running unvalidated */
+    GFX_ICON_CRASH,
     GFX_ICON_COUNT,
 } gfx_icon_t;
 #define GFX_ICON_W 12
@@ -75,6 +76,9 @@ int gfx_text(int x, int y, gfx_font_t size, const char *utf8);
 
 /* Pixel width gfx_text() would use, without drawing. */
 int gfx_text_width(gfx_font_t size, const char *utf8);
+
+/* Advance width of one decoded codepoint (tofu width if missing). */
+int gfx_glyph_advance(gfx_font_t size, uint32_t cp);
 
 /* Wraps utf8 into out_lines (spaces; per char for CJK); returns line count, or -1 if > max_lines. */
 int gfx_text_wrap(gfx_font_t size, const char *utf8, int max_width_px, char out_lines[][64],

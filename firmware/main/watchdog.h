@@ -3,6 +3,7 @@
 #ifndef WATCHDOG_H
 #define WATCHDOG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -30,6 +31,25 @@ typedef enum {
 /* Logs why the chip last reset and where the main loop was, then arms the RTC watchdog. Call early
  * in app_main(). */
 void watchdog_boot(void);
+
+/* True if the last reset was a panic, task/RTC watchdog or brownout; deliberate restarts are not
+ * crashes. Valid after watchdog_boot(). */
+bool watchdog_last_reset_was_crash(void);
+
+/* Human-readable reason for the last reset. */
+const char *watchdog_last_reset_reason_str(void);
+
+/* Raw esp_reset_reason_t of this boot, for /status. */
+int watchdog_last_reset_reason(void);
+/* Stage the main loop reached in the previous boot; 0 if none. For /status. */
+int watchdog_last_reset_stage(void);
+/* Abnormal reset count since power-on. For /status. */
+unsigned watchdog_abnormal_reset_count(void);
+
+/* Command name the previous boot's stage was stalled on; "" if none or the reset was not abnormal.
+ * For /status. */
+const char *watchdog_last_stall_cmd(void);
+
 /* Subscribes the calling (main loop) task to the task watchdog. */
 void watchdog_loop_begin(void);
 /* Feeds both watchdogs and records the stage. */
@@ -41,6 +61,7 @@ void watchdog_feed(void);
 void watchdog_hard_reset(void);
 
 /* Overrides the walter-modem weak hook, called once a second from its command wait. One stalled
+ * command (90 s) fits the 95 s per-stage feed budget, two do not. Logs the stalled command at 5 s. */
 void walter_modem_block_tick(void);
 
 #ifdef __cplusplus

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#define PICK_VISIBLE_ROWS 5
 
 static int s_sel = 0; /* index into book contacts followed by sms contacts */
 
@@ -42,10 +43,24 @@ static void pick_on_key(input_key_t key)
             s_sel++;
         }
         break;
+    case INPUT_KEY_ENTER: {
         if (n == 0) {
             break;
         }
+        size_t n_book = book_contact_count();
+        if ((size_t) s_sel < n_book) {
+            book_contact_t c;
+            if (book_contact_at((size_t) s_sel, &c)) {
+                scr_chat_open_peer(c.alias);
+            }
+        } else {
+            sms_contact_t sc;
+            if (sms_contact_at((size_t) s_sel - n_book, &sc)) {
+                scr_chat_open_peer(sc.name);
+            }
+        }
         break;
+    }
     case INPUT_KEY_ESC:
         ui_pop();
         break;
@@ -114,6 +129,7 @@ static void pick_render(void)
             int tw = gfx_text_width(GFX_FONT_NORMAL, "sms");
             gfx_text(GFX_SCREEN_W - tw, y, GFX_FONT_NORMAL, "sms");
         }
+        y = ui_row_advance(y, false);
     }
 
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter choose   esc back");

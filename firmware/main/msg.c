@@ -251,6 +251,8 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
         !w_i64(out, out_cap, &off, m->ts) || !w_u8(out, out_cap, &off, m->dir) ||
         !w_u8(out, out_cap, &off, m->ack_state) || !w_u8(out, out_cap, &off, m->flags) ||
         !w_str_field(out, out_cap, &off, m->id) || !w_str_field(out, out_cap, &off, m->from) ||
+        !w_str_field(out, out_cap, &off, m->to) || !w_str_field(out, out_cap, &off, m->sndr) ||
+        !w_u16(out, out_cap, &off, m->body_len) ||
         return 0;
     }
     uint32_t crc = msghist_crc32(out, off);
@@ -271,12 +273,22 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     uint8_t dir, ack_state, flags;
     uint16_t body_len;
 
+    // Accepts versions 1 (pre-`sndr`) through MSGHIST_REC_VERSION so older persisted messages
+    // survive an upgrade.
+    if (!r_u8(buf, len, &off, &version) || version < 1 || version > MSGHIST_REC_VERSION) {
         return false;
     }
     if (!r_u32(buf, len, &off, &seq) || !r_i64(buf, len, &off, &ts) ||
         !r_u8(buf, len, &off, &dir) || dir > 1 || !r_u8(buf, len, &off, &ack_state) ||
         !r_u8(buf, len, &off, &flags) || !r_str_field(buf, len, &off, id, sizeof(id)) ||
         !r_str_field(buf, len, &off, from, sizeof(from)) ||
+        !r_str_field(buf, len, &off, to, sizeof(to))) {
+        return false;
+    }
+    sndr[0] = '\0';
+    if (version >= 2 && !r_str_field(buf, len, &off, sndr, sizeof(sndr))) {
+        return false;
+    }
         return false;
     }
     const uint8_t *body_ptr = buf + off;
@@ -295,6 +307,7 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     memcpy(out->id, id, sizeof(id));
     memcpy(out->from, from, sizeof(from));
     memcpy(out->to, to, sizeof(to));
+    memcpy(out->sndr, sndr, sizeof(sndr));
     out->body_len = body_len;
     out->dir = dir;
     out->ack_state = ack_state;
@@ -343,6 +356,28 @@ int msghist_restore_order(const uint32_t *seqs, int n, int *order_out, int max_o
     return n;
 }
 
+/* The peer a message belongs to: `from` for a down message (`sndr` is only the author label), `to`
+ * for an up message, else `default_alias` when `have_default`, else "(default)". */
+void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, char *out,
+                 size_t out_cap)
+{
+    if (out_cap == 0) {
+        return;
+    }
+    const char *alias;
+    if (m->dir == (uint8_t) MSG_DIR_DOWN) {
+        alias = m->from;
+    } else if (m->to[0] != '\0') {
+        alias = m->to;
+    } else if (have_default && default_alias) {
+        alias = default_alias;
+    } else {
+        alias = "(default)";
+    }
+    strncpy(out, alias, out_cap - 1);
+    out[out_cap - 1] = '\0';
+}
+
 #ifdef ESP_PLATFORM
 
 #include <ctype.h>
@@ -376,6 +411,7 @@ static const char *TAG = "msg";
 #define MK_KIND 6
 #define MK_TO 7
 #define MK_N 12
+#define MK_SNDR 51 // group-message author alias, down-only
 
 // setup_run() calls ui_init() before msg_bind_rtc() runs, so accessors must be safe pre-bind (a NULL
 // lock would jump to address 0): the default is a no-op.
@@ -551,6 +587,13 @@ static void history_restore(void)
         return; // namespace not created yet: msghist mounted fine but nothing was ever written
     }
 
+    msg_t *decoded = heap_caps_malloc(sizeof(msg_t) * MSG_THREAD_DEPTH, MALLOC_CAP_8BIT);
+    if (decoded == NULL) {
+        nvs_close(h);
+        ESP_LOGI(TAG, "msghist: restore skipped, no heap for %u bytes",
+                 (unsigned) (sizeof(msg_t) * MSG_THREAD_DEPTH));
+        return;
+    }
     uint32_t seqs[MSG_THREAD_DEPTH];
     int n = 0;
     uint32_t max_seq = 0;
@@ -574,6 +617,7 @@ static void history_restore(void)
     nvs_close(h);
 
     if (n == 0) {
+        heap_caps_free(decoded);
         return;
     }
 
@@ -585,6 +629,8 @@ static void history_restore(void)
     }
     s_hist_next_seq = max_seq + 1;
     s_unlock();
+
+    heap_caps_free(decoded);
 
     ESP_LOGI(TAG, "msghist: restored %d of %d decoded record(s), newest seq=%u", fill, n,
              (unsigned) max_seq);
@@ -830,6 +876,8 @@ static bool warm_recover_unread(void)
     entry.ack_state = MSG_ACK_SHOWN; // unread[0] only holds shown-not-read messages
     entry.flags = MSG_F_RECOVERED;
     entry.in_use = true;
+    // entry.sndr stays "": msg_unread_t has no sndr, so a warm-recovered group page loses its author
+    // line (only runs when msghist is unavailable).
     s_lock();
     s_unlock();
     return true;
@@ -900,6 +948,7 @@ static bool cold_recover_unread(void)
         entry.ack_state = MSG_ACK_SHOWN;
         entry.flags = MSG_F_RECOVERED;
         entry.in_use = true;
+        // entry.sndr stays "" (msg_unread_t has no sndr), as in warm_recover_unread().
     }
     s_unlock();
 
@@ -979,6 +1028,8 @@ static bool body_rules_ok(const char *body, size_t body_len)
 
 // Shared tail of msg_ingest_down_cbor(): dedup (docs/PROTOCOL.md §4.1 rule 7), thread insert, NVS/RTC
 static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *from_str,
+                                   const char *sndr_str, const char *body_str, size_t body_len,
+                                   const msg_t **out)
 {
     uint32_t digest = id_digest(id_str);
     char id_copy[MSG_ID_MAX];
@@ -989,6 +1040,9 @@ static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *fr
     char from_copy[MSG_FROM_MAX];
     strncpy(from_copy, from_str, MSG_FROM_MAX - 1);
     from_copy[MSG_FROM_MAX - 1] = '\0';
+    char sndr_copy[MSG_FROM_MAX];
+    strncpy(sndr_copy, sndr_str, MSG_FROM_MAX - 1);
+    sndr_copy[MSG_FROM_MAX - 1] = '\0';
     bool is_dup;
     s_lock();
     is_dup = seen_contains_locked(digest);
@@ -1021,6 +1075,7 @@ static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *fr
     strncpy(entry.id, id_copy, MSG_ID_MAX - 1);
     strncpy(entry.from, from_copy, MSG_FROM_MAX - 1);
     entry.to[0] = '\0'; // down messages have no outbound `to`
+    strncpy(entry.sndr, sndr_copy, MSG_FROM_MAX - 1); // "" unless a group page
     entry.body_len = (uint16_t) body_len;
     entry.dir = (uint8_t) MSG_DIR_DOWN;
     entry.ack_state = MSG_ACK_UNSHOWN;
@@ -1078,6 +1133,7 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
 
     char id_local[MSG_ID_MAX] = "";
     char from_local[MSG_FROM_MAX] = "";
+    char sndr_local[MSG_FROM_MAX] = ""; // absent or bad: stays "" (author line falls back to `from`)
     int64_t ts = 0;
     size_t body_len = 0;
     uint32_t n = 0;
@@ -1149,6 +1205,24 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
             from_local[slen] = '\0';
             have_from = true;
             break;
+        }
+        case MK_SNDR: {
+            // Absent is normal (DMs); a bad value is ignored, never malformed (length-only, like MK_FROM).
+            // Only an unreadable CBOR head is malformed.
+            const char *s;
+            size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen)) { // wrong CBOR type (e.g. a uint): ignore it
+                if (!cbor_r_skip(&r)) {
+                    msg_count_malformed();
+                    return MSG_INGEST_MALFORMED;
+                }
+                break;
+            }
+            if (slen > 0 && slen < sizeof(sndr_local)) {
+                memcpy(sndr_local, s, slen);
+                sndr_local[slen] = '\0';
+            }
+            break; // empty or >16 chars: stays ""
         }
         case MK_BODY: {
             const char *s;
@@ -1234,6 +1308,7 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
         }
     }
 
+    return ingest_common(id_local, ts, from_local, sndr_local, body_local, body_len, out);
 }
 
 // Upserts a pending_ack entry for `id` at `state`. Caller holds the lock.
@@ -1406,6 +1481,8 @@ static void gen_local_id(char *out, size_t cap)
     snprintf(out, cap, "x_%08x", (unsigned) esp_random());
 }
 
+bool msg_insert_sms_in(const char *from, const char *body, uint16_t body_len, int64_t ts,
+                       char *out_id, size_t out_id_cap)
 {
     if (!body || !body_rules_ok(body, body_len)) {
         return false;
@@ -1414,6 +1491,7 @@ static void gen_local_id(char *out, size_t cap)
     gen_local_id(id, sizeof(id));
 
     msg_t entry = { 0 };
+    entry.ts = ts; // caller's net_get_clock() result; 0 = no clock yet (docs/PROTOCOL.md §3.5)
     strncpy(entry.id, id, MSG_ID_MAX - 1);
     strncpy(entry.from, from ? from : "", MSG_FROM_MAX - 1);
     entry.to[0] = '\0';
@@ -1760,9 +1838,18 @@ const msg_t *msg_newest_unread(void)
     return found ? &s_unread_snapshot : NULL;
 }
 
+// Uses msg_peer_of(), so an up message with an empty `to` is attributed to `default_alias` or
+// "(default)".
+static bool entry_belongs_to_peer_locked(const msg_t *m, const char *alias, bool have_default,
+                                         const char *default_alias)
 {
+    char peer[MSG_FROM_MAX > MSG_TO_MAX ? MSG_FROM_MAX : MSG_TO_MAX];
+    msg_peer_of(m, have_default, default_alias, peer, sizeof(peer));
+    return strcmp(peer, alias) == 0;
 }
 
+void msg_iter_peer(const char *alias, bool have_default, const char *default_alias, bool from_newest,
+                   msg_iter_peer_cb cb, void *ctx)
 {
     if (!alias || !cb) {
         return;
@@ -1773,6 +1860,7 @@ const msg_t *msg_newest_unread(void)
             if (!s_thread[i].in_use) {
                 break;
             }
+            if (entry_belongs_to_peer_locked(&s_thread[i], alias, have_default, default_alias)) {
                 msg_t copy = s_thread[i];
                 cb(&copy, ctx);
             }
@@ -1786,6 +1874,7 @@ const msg_t *msg_newest_unread(void)
             last = i;
         }
         for (int i = last; i >= 0; i--) {
+            if (entry_belongs_to_peer_locked(&s_thread[i], alias, have_default, default_alias)) {
                 msg_t copy = s_thread[i];
                 cb(&copy, ctx);
             }

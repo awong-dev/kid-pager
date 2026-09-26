@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "gfx.h"
 #include "input.h"
@@ -36,6 +37,8 @@ extern const ui_screen_t g_scr_chat;
 extern const ui_screen_t g_scr_device;
 extern const ui_screen_t g_scr_setup;
 extern const ui_screen_t g_scr_lock;
+/* Locked screen idle -> entering; no-op if already entering. */
+void scr_lock_start_entry(void);
 extern const ui_screen_t g_scr_pick;
 extern const ui_screen_t g_scr_book;
 
@@ -44,12 +47,21 @@ typedef enum {
 } scr_greeting_mode_t;
 void scr_greeting_set_mode(scr_greeting_mode_t mode);
 
+/* Status text drawn on the greeting screen; NULL or "" falls back to "booting". */
 void scr_greeting_set_status(const char *status);
 extern const ui_screen_t g_scr_greeting;
 
 /* Marks every visible down message in the open chat read. Not called from the incoming-message
  * path, which acks `shown` only. */
 void scr_chat_mark_visible_read(void);
+
+/* Opens `alias`'s chat (NULL or "" = the default peer): pushes Chat, sets the peer and marks the
+ * visible rows read. */
+void scr_chat_open_peer(const char *alias);
+
+/* Sets the chat peer without touching the stack or marking anything read; the composer and scroll
+ * reset only when the peer changes. */
+void scr_chat_set_peer(const char *alias);
 
 /* Brings up the panel and the CardKB I2C bus and sets the stack to [Home]. Returns false if the
  * panel is dead; every ui_* call then degrades to a no-op. */
@@ -73,7 +85,27 @@ const ui_screen_t *ui_top(void);
 #define UI_STATUS_H 14
 #define UI_BODY_TOP (UI_STATUS_H + 1)
 
+/* List row box: baseline (13) + descent (3) of the 12 px font. */
+#define UI_ROW_H 16
+#define UI_SEP_H 8 /* row-to-separator clearance: hlines at +3/+5, then advance 8 */
+
+static inline int ui_row_advance(int row_top, bool is_separator)
+{
+    return row_top + (is_separator ? UI_SEP_H : UI_ROW_H);
+}
+
+/* Double underline at y+3 and y+5, with `y` the top of the row after the last one. */
+void ui_draw_row_separator(int y);
+
 /* Footer row; 18 px up keeps the 12 px font's descenders (row 16 from the line top) on screen. */
+#define UI_FOOTER_Y (GFX_SCREEN_H - 18)
+
+/* Brings the 3V3 rail up if it was off and notes the panel RAM loss. Called at the top of every
+ * render. Power effect: powers the display and CardKB iff they were off. */
+void ui_ensure_powered(void);
+
+/* Count of rail off->on edges that ui_ensure_powered() drove; never reset. */
+uint32_t ui_rail_lazy_on_count(void);
 
 /* Draws the status bar and top screen, then a partial refresh (a due full refresh waits for
  * ui_on_awake_lapse()). Power effect: ~0.3-0.8 s; a cheap no-op if the display is dead. */
@@ -89,15 +121,37 @@ void ui_on_awake_lapse(void);
 /* Routes one key to the top screen and clears the boot crash indicator. Does not render. */
 void ui_dispatch_key(input_key_t key);
 
+/* Shows the crash icon in the status bar until the first key press. */
+void ui_set_crash_indicator(bool show);
+
 /* Button short press: opens the newest unread message's chat and marks it read, else nothing.
+ * Long press: Home. Neither renders. */
 void ui_on_button_short(void);
 void ui_on_button_long(void);
 
+/* Asleep, on Home or in Chat: shows Chat on `from`, renders, returns true; only then may the caller
  * call msg_mark_shown(). Otherwise toasts and returns false (PROTOCOL.md §4.1 rule 2). */
 bool ui_incoming(const char *from, bool was_asleep);
 
 /* Transient one-row toast (partial refresh of rows 96..110, above the footer); the next
+ * ui_render() overwrites it. Power effect: ~0.3-0.8 s, a no-op if the display is dead. */
 void ui_show_toast(const char *text);
+
+void ui_debug_pause_kb_poll(bool paused);
+
+uint32_t ui_kb_skipped_read_count(void);
+
+/* Called before the rail drops: deletes the I2C driver and holds CardKB SDA/SCL low, since the
+ * always-on pull-ups would back-power the CardKB through its protection diodes. */
+void ui_kb_bus_release(void);
+
+/* Called by rail_on() after the rail is up: restores the I2C driver on the CardKB pins. */
+void ui_kb_bus_restore(void);
+
+/* Count of ui_kb_bus_release() calls since boot; never reset. */
+uint32_t ui_kb_bus_release_count(void);
+
+void ui_kb_i2c_reinit(void);
 
 /* Body text size, stored in NVS ns "ui" key "textsz"; the status bar and footer are always
  * GFX_FONT_NORMAL. */
@@ -106,6 +160,13 @@ void ui_toggle_text_size(void); /* power effect: one NVS write */
 
 /* Writes local-time "HH:MM", or "--:--" when epoch_s == 0. `out` needs >= 6 bytes. */
 void ui_format_hhmm(int64_t epoch_s, char *out, size_t out_size);
+
+/* Status bar clock text: "--:--" unless `in_use` and `seeded`, else "HH:MM" from hh/mm. `out`
+ * needs >= 6 bytes. */
+void ui_status_clock_text(bool in_use, bool seeded, int hh, int mm, char *out, size_t out_size);
+
+/* True if the status bar HH:MM changed since it was last drawn; always false while not in use. */
+bool ui_clock_due(void);
 
 #ifdef __cplusplus
 }

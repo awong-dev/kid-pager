@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Row layout: messages (index 0 = newest) stack as one flat line sequence, newest at the bottom.
 // `scroll` is a line offset, 0 = pinned to the newest message's last row.
@@ -73,6 +74,49 @@ bool chat_layout_is_last_row_visible(const int *msg_rows, int count, int rows, i
     return cum >= scroll && cum <= scroll + rows - 1;
 }
 
+// Index of the first codepoint to draw (the longest suffix that fits) and whether the "…" marker
+// is needed. Returns n with marker true if the marker alone does not fit.
+int chat_composer_viewport(const uint8_t *adv, int n, int avail_px, int marker_px, bool *marker)
+{
+    if (n <= 0) {
+        if (marker) {
+            *marker = false;
+        }
+        return 0;
+    }
+
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        total += adv[i];
+    }
+    if (total <= avail_px) {
+        if (marker) {
+            *marker = false;
+        }
+        return 0;
+    }
+
+    if (marker) {
+        *marker = true;
+    }
+    int budget = avail_px - marker_px;
+    if (budget <= 0) {
+        return n; // marker alone does not fit either -- draw only it
+    }
+
+    int sum = 0;
+    int start = n;
+    for (int i = n - 1; i >= 0; i--) {
+        int next_sum = sum + adv[i];
+        if (next_sum > budget) {
+            break;
+        }
+        sum = next_sum;
+        start = i;
+    }
+    return start;
+}
+
 #ifdef ESP_PLATFORM
 
 #include "ui.h"
@@ -97,9 +141,30 @@ bool chat_layout_is_last_row_visible(const int *msg_rows, int count, int rows, i
 
 static int s_scroll = 0; // 0 = pinned to the newest messages
 
+// Alias of the open peer; "" = the book's default peer.
+static char s_peer[BOOK_ALIAS_MAX] = "";
+
+// s_peer if set, else the book's default alias, else "(default)" (same rule as msg_peer_of()).
+static void resolve_effective_peer(char *out, size_t cap)
+{
+    if (s_peer[0] != '\0') {
+        strncpy(out, s_peer, cap - 1);
+        out[cap - 1] = '\0';
+        return;
+    }
+    char default_alias[BOOK_ALIAS_MAX] = "";
+    if (book_get_default_alias(default_alias, sizeof(default_alias))) {
+        strncpy(out, default_alias, cap - 1);
+    } else {
+        strncpy(out, "(default)", cap - 1);
+    }
+    out[cap - 1] = '\0';
+}
+
 static int visible_rows(void)
 {
     // body rows minus the composer row and the "[peer]" header row
+    return (ui_text_size() == GFX_FONT_LARGE) ? 3 : 5;
 }
 
 // Per-message header strings and wrapped row counts for the open peer, newest first. Bodies are
@@ -110,6 +175,7 @@ typedef struct {
 } chat_row_src_t;
 
 static int s_rows[MSG_THREAD_DEPTH];
+// Copies of the open peer's messages, parallel to s_src[]/s_rows[].
 
 // Wrapped lines of one message at a time.
 static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch currently holds lines for
@@ -123,6 +189,7 @@ static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch current
     if (dir == (uint8_t) MSG_DIR_UP) {
         strncpy(out->who, "you", sizeof(out->who) - 1);
     } else {
+        // a group page's per-message author replaces `from`; `sndr` is "" on a DM
     }
     out->who[sizeof(out->who) - 1] = '\0';
 
@@ -161,8 +228,21 @@ static int wrap_width_conservative(gfx_font_t sz, const chat_row_src_t *src)
     return (n < 1) ? 1 : n;
 }
 
+// msg_iter_peer() callback; the iteration holds msg.c's lock, so excess entries are dropped.
+
+static void collect_peer_entry(const msg_t *m, void *ctx)
 {
     }
+}
+
+// Fills s_entries[]/s_src[]/s_rows[] for the open peer, newest first; returns the count.
+static size_t chat_build_rows(gfx_font_t sz)
+{
+    char peer[BOOK_ALIAS_MAX];
+    resolve_effective_peer(peer, sizeof(peer));
+    char default_alias[BOOK_ALIAS_MAX] = "";
+    bool have_default = book_get_default_alias(default_alias, sizeof(default_alias));
+
 
     const msg_t *nu = msg_newest_unread();
     char newest_unread_id[MSG_ID_MAX] = "";
@@ -206,6 +286,7 @@ static void mark_visible_read(void)
     }
 
     for (size_t i = 0; i < count; i++) {
+        const msg_t *m = &s_entries[i];
         if (m->dir == (uint8_t) MSG_DIR_DOWN && m->ack_state != MSG_ACK_READ &&
             chat_layout_is_last_row_visible(s_rows, (int) count, rows, scroll, (int) i)) {
             char id[MSG_ID_MAX];
@@ -218,6 +299,33 @@ static void mark_visible_read(void)
 }
 
 void scr_chat_mark_visible_read(void) { mark_visible_read(); }
+
+// Resets the composer and scroll only when the peer changes.
+void scr_chat_set_peer(const char *alias)
+{
+    char resolved[BOOK_ALIAS_MAX];
+    if (alias && alias[0] != '\0') {
+        strncpy(resolved, alias, sizeof(resolved) - 1);
+        resolved[sizeof(resolved) - 1] = '\0';
+    } else {
+        resolved[0] = '\0';
+    }
+    if (strcmp(resolved, s_peer) != 0) {
+        strncpy(s_peer, resolved, sizeof(s_peer) - 1);
+        s_peer[sizeof(s_peer) - 1] = '\0';
+        s_scroll = 0;
+        msg_composer_reset();
+    }
+}
+
+// ui_push() fires on_event(UI_EVT_ENTER), which resets the composer; the peer is set after so
+// mark_visible_read() sees it.
+void scr_chat_open_peer(const char *alias)
+{
+    ui_push(&g_scr_chat);
+    scr_chat_set_peer(alias);
+    scr_chat_mark_visible_read();
+}
 
 static void chat_on_event(ui_evt_t evt)
 {
@@ -383,6 +491,34 @@ static void try_send(void)
         if (!(have_default && strcmp(default_alias, resolved_alias) == 0)) {
             strncpy(to, resolved_alias, sizeof(to) - 1);
         }
+    } else {
+        // no `@word`: send to the open peer; an SMS peer goes through sms.c, never `/up`
+        sms_contact_t peer_sms;
+        if (s_peer[0] != '\0' && sms_find_by_name(s_peer, strlen(s_peer), &peer_sms) >= 0) {
+            sms_measure_t m;
+            sms_measure(body, body_len, sms_get_charset_mode(), &m);
+            if (sms_decide_encoding(&m) == SMS_ENC_TOO_LONG) {
+                ui_show_toast("message too long for SMS");
+                return;
+            }
+            if (sms_queue_send(&peer_sms, body, body_len)) {
+                msg_composer_reset();
+                s_scroll = 0;
+            } else {
+                ui_show_toast("SMS unavailable or send queue full");
+            }
+            return;
+        }
+
+        // `to` stays empty for the default peer, including the "(default)" no-book placeholder
+        char default_alias[BOOK_ALIAS_MAX] = "";
+        bool have_default = book_get_default_alias(default_alias, sizeof(default_alias));
+        bool is_default_peer = (s_peer[0] == '\0') ||
+                                (have_default && strcmp(default_alias, s_peer) == 0) ||
+                                (!have_default && strcmp(s_peer, "(default)") == 0);
+        if (!is_default_peer) {
+            strncpy(to, s_peer, sizeof(to) - 1);
+        }
     }
 
     if (msg_queue_reply(to, body, body_len)) {
@@ -441,12 +577,68 @@ static void chat_on_key(input_key_t key)
     }
 }
 
+// Decodes one UTF-8 codepoint at `p` (invalid bytes give U+FFFD) and returns the next start.
+static const char *composer_utf8_next(const char *p, uint32_t *cp)
+{
+    const uint8_t *u = (const uint8_t *) p;
+    uint8_t b0 = u[0];
+    int extra;
+    uint32_t v;
+    if (b0 < 0x80) {
+        *cp = b0;
+        return p + 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+        extra = 1;
+        v = b0 & 0x1F;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        extra = 2;
+        v = b0 & 0x0F;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        extra = 3;
+        v = b0 & 0x07;
+    } else {
+        *cp = 0xFFFD;
+        return p + 1;
+    }
+    for (int i = 1; i <= extra; i++) {
+        uint8_t bi = u[i];
+        if (bi == 0 || (bi & 0xC0) != 0x80) {
+            *cp = 0xFFFD;
+            return p + 1;
+        }
+        v = (v << 6) | (bi & 0x3F);
+    }
+    *cp = v;
+    return p + 1 + extra;
+}
+
 static void chat_render(void)
 {
     gfx_font_t sz = ui_text_size();
     // glyph height plus 2 px leading
     int pitch = ((sz == GFX_FONT_LARGE) ? 16 : 12) + 2;
     int rows = visible_rows();
+
+    {
+        char peer[BOOK_ALIAS_MAX];
+        resolve_effective_peer(peer, sizeof(peer));
+        char nick[BOOK_NICK_MAX] = "";
+        bool is_group = false;
+        size_t nbook = book_contact_count();
+        for (size_t i = 0; i < nbook; i++) {
+            book_contact_t c;
+            if (!book_contact_at(i, &c)) {
+                continue;
+            }
+            if (strcmp(c.alias, peer) == 0) {
+                is_group = (strcmp(c.type, "grp") == 0);
+                break;
+            }
+        }
+        char header[BOOK_NICK_MAX + BOOK_ALIAS_MAX + 12];
+        snprintf(header, sizeof(header), is_group ? "[%s] \xC2\xB7 group" : "[%s]", disp);
+        gfx_text(0, UI_BODY_TOP + 2, sz, header);
+    }
 
     size_t count = chat_build_rows(sz);
     clamp_scroll();
@@ -455,6 +647,7 @@ static void chat_render(void)
     chat_layout(s_rows, (int) count, rows, s_scroll, cells);
     s_wrap_cached_msg = -1;
 
+    int y = UI_BODY_TOP + 2 + pitch; // one pitch below the header
     for (int r = 0; r < rows; r++) {
         chat_layout_cell_t cell = cells[r];
         if (cell.msg_index >= 0) {
@@ -482,6 +675,7 @@ static void chat_render(void)
     y += 2;
 
     // Composer row: one line; a longer draft shows its tail after a leading "…". The counter shows
+    // the tighter SMS limit while the leading `@word` resolves to an SMS contact.
     char counter[24];
     sms_contact_t sms_peek;
     size_t sms_skip = 0;
@@ -498,6 +692,44 @@ static void chat_render(void)
         size_t used = (enc == SMS_ENC_UCS2) ? m.ucs2_units : m.gsm7_septets;
         snprintf(counter, sizeof(counter), "%u/%u sms", (unsigned) used, (unsigned) limit);
     } else {
+    }
+    int cw = show_counter ? gfx_text_width(GFX_FONT_NORMAL, counter) : 0;
+
+    int pen = gfx_text(0, y, GFX_FONT_NORMAL, "> ");
+
+    // per-codepoint advance and start offset; static: too big for the stack
+    int n = 0;
+    const char *cur = msg_composer_text();
+        cp_start[n] = cur;
+        uint32_t cp;
+        cur = composer_utf8_next(cur, &cp);
+        adv[n] = (uint8_t) gfx_glyph_advance(GFX_FONT_NORMAL, cp);
+        n++;
+    }
+
+    static const char MARKER[] = "…";
+    int marker_w = gfx_text_width(GFX_FONT_NORMAL, MARKER);
+    const int caret_w = 2;
+    const int caret_h = 12; // GFX_FONT_NORMAL height
+    int avail = GFX_SCREEN_W - pen - (show_counter ? cw + 6 : 0) - caret_w;
+
+    bool marker;
+    int start = chat_composer_viewport(adv, n, avail, marker_w, &marker);
+
+    if (marker) {
+        pen = gfx_text(pen, y, GFX_FONT_NORMAL, MARKER);
+    }
+    if (start < n) {
+        pen = gfx_text(pen, y, GFX_FONT_NORMAL, cp_start[start]);
+    }
+
+    // caret: filled bar after the text (gfx has no filled-rectangle primitive)
+    for (int cy = y; cy < y + caret_h; cy++) {
+        gfx_hline(pen, pen + caret_w - 1, cy);
+    }
+
+    if (show_counter) {
+        gfx_text(GFX_SCREEN_W - cw, y, GFX_FONT_NORMAL, counter);
     }
 }
 

@@ -290,6 +290,7 @@ static void nick_render(void)
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter save   esc cancel");
 }
 
+#define BOOK_VISIBLE_ROWS 5
 
 static int selectable_count(void)
 {
@@ -382,6 +383,7 @@ static void list_render(void)
             }
             gfx_text(10, y, GFX_FONT_NORMAL, "Add");
         }
+        y = ui_row_advance(y, false);
     }
 
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "up/down move   enter select   esc back");

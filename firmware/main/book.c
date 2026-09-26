@@ -1,8 +1,10 @@
 
 #include "book.h"
 
+#include <assert.h>
 #include <string.h>
 
+#include "cafetch.h"
 #include "cbor.h"
 
 static bool is_cont_byte(uint8_t b) { return (b & 0xC0) == 0x80; }
@@ -44,6 +46,8 @@ bool book_name_valid(const char *name, size_t len)
 #define BK_D 17
 #define BK_C 18
 #define BK_P 19
+#define BK_MORE 20 /* fetch response only */
+#define BK_URL 57  /* nudge only */
 
 #define CONTACT_KEY_A 0
 #define CONTACT_KEY_N 1
@@ -149,6 +153,7 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
     return out->name[0] != '\0'; // required, §3.1
 }
 
+bool book_parse(const uint8_t *buf, uint16_t len, bool sig_pair_present, book_parsed_t *out)
 {
     memset(out, 0, sizeof(*out));
 
@@ -164,6 +169,8 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
     }
 
     bool is_book = false;
+    bool have_c = false; // key presence, not array length, decides nudge vs full book
+    bool have_p = false;
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t key;
@@ -212,6 +219,7 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
             break;
         }
         case BK_C: {
+            have_c = true;
             uint32_t n;
             if (!cbor_r_array(&r, &n)) {
                 return false;
@@ -223,10 +231,12 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
                 }
                 if (out->n_contacts < BOOK_MAX_CONTACTS) {
                     out->contacts[out->n_contacts++] = c;
+                } // over cap: parsed but dropped (keep first 32, §3.7)
             }
             break;
         }
         case BK_P: {
+            have_p = true;
             uint32_t n;
             if (!cbor_r_array(&r, &n)) {
                 return false;
@@ -242,6 +252,32 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
             }
             break;
         }
+        case BK_N: { // fetch response only
+            uint64_t v;
+            if (!cbor_r_uint(&r, &v)) {
+                return false;
+            }
+            out->n = v;
+            break;
+        }
+        case BK_MORE: { // fetch response only; log-only
+            bool v;
+            if (!cbor_r_bool(&r, &v)) {
+                return false;
+            }
+            out->more = v;
+            break;
+        }
+        case BK_URL: { // nudge only
+            const char *s;
+            size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen) || slen == 0 || slen >= sizeof(out->nudge_url)) {
+                return false;
+            }
+            memcpy(out->nudge_url, s, slen);
+            out->nudge_url[slen] = '\0';
+            break;
+        }
         default:
             if (!cbor_r_skip(&r)) {
                 return false;
@@ -250,12 +286,45 @@ static bool parse_request(cbor_r_t *r, book_request_t *out)
         }
     }
 
+    if (is_book) {
+        // neither `c` nor `p` present: a nudge (§3.7)
+        out->is_nudge = !have_c && !have_p;
+        if (out->is_nudge) {
+            if (out->nudge_url[0] == '\0') {
+                return false; // missing url: malformed nudge
+            }
+            // the nudge url must pass cafetch_parse_url() (§3.7)
+            char scratch_host[CAFETCH_HOST_MAX];
+            uint16_t scratch_port;
+            char scratch_path[CAFETCH_PATH_MAX];
+            if (!cafetch_parse_url(out->nudge_url, scratch_host, sizeof(scratch_host), &scratch_port,
+                                   scratch_path, sizeof(scratch_path))) {
+                return false; // bad url: malformed nudge
+            }
+        }
+    }
+
     return is_book;
+}
+
+void book_carry_nicknames(book_contact_t *new_contacts, uint8_t new_n, const book_contact_t *old_contacts,
+                          uint8_t old_n)
+{
+    for (uint8_t i = 0; i < new_n; i++) {
+        for (uint8_t j = 0; j < old_n; j++) {
+            if (strncmp(old_contacts[j].alias, new_contacts[i].alias, BOOK_ALIAS_MAX) == 0) {
+                strncpy(new_contacts[i].nickname, old_contacts[j].nickname, sizeof(new_contacts[i].nickname) - 1);
+                new_contacts[i].nickname[sizeof(new_contacts[i].nickname) - 1] = '\0';
+                break;
+            }
+        }
+    }
 }
 
 #ifdef ESP_PLATFORM
 
 #include "auth.h"
+#include "bookpull.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "ident.h"
@@ -304,9 +373,24 @@ static uint64_t next_up_n_locked(bool *wrapped)
     return n;
 }
 
+uint64_t book_next_up_n(bool *wrapped)
+{
+    bool wrapped_local = false;
+    uint64_t n = next_up_n_locked(&wrapped_local);
+    if (wrapped_local && s_on_wrap) {
+        s_on_wrap(); // caller must bump n_epoch before the next draw
+    }
+    if (wrapped) {
+        *wrapped = wrapped_local;
+    }
+    return n;
+}
+
 // NVS "book": one blob replaced as a unit; `layout` is its version tag.
 
 #define BOOK_NS "book"
+// an older layout reads back as no book (bv == 0), which the relay re-nudges
+#define BOOK_BLOB_VERSION 2u
 
 typedef struct {
     uint32_t layout;
@@ -318,6 +402,9 @@ typedef struct {
     book_contact_t contacts[BOOK_MAX_CONTACTS];
     book_request_t requests[BOOK_MAX_REQUESTS];
 } book_blob_t;
+
+// one NVS blob; also the fetch response's 4096-byte cap
+_Static_assert(sizeof(book_blob_t) <= 4096, "book NVS blob exceeds the 4 KB budget");
 
 // RAM cache, guarded by s_lock/s_unlock
 static book_blob_t s_book;
@@ -461,16 +548,81 @@ bool book_set_nickname(const char *alias, const char *nickname, size_t nickname_
     return persist_snapshot();
 }
 
+// ~3.7 kB, off the task stacks; touched only with s_lock held
+static book_blob_t s_apply_scratch;
+
+static void apply_parsed_book(const book_parsed_t *parsed)
 {
     s_lock();
+    book_defaults(&s_apply_scratch);
+    s_apply_scratch.bv = parsed->bv;
+    s_apply_scratch.have_default = parsed->have_default;
+    strncpy(s_apply_scratch.default_alias, parsed->default_alias, sizeof(s_apply_scratch.default_alias) - 1);
+    s_apply_scratch.n_contacts = parsed->n_contacts;
+    memcpy(s_apply_scratch.contacts, parsed->contacts, sizeof(parsed->contacts[0]) * parsed->n_contacts);
+    // carry nicknames over from the old book (s_book)
+    book_carry_nicknames(s_apply_scratch.contacts, s_apply_scratch.n_contacts, s_book.contacts,
+                         s_book.n_contacts);
+    s_apply_scratch.n_requests = parsed->n_requests;
+    for (uint8_t i = 0; i < parsed->n_requests; i++) {
+        s_apply_scratch.requests[i] = parsed->requests[i];
     }
+    s_book = s_apply_scratch;
     s_unlock();
 
     persist_snapshot(); // unlocked flash write
 
+    ESP_LOGI(TAG, "book applied: bv=%u contacts=%u requests=%u", (unsigned) parsed->bv,
+             (unsigned) parsed->n_contacts, (unsigned) parsed->n_requests);
+}
 
-        // acked `shown` once applied
+bool book_ingest_cbor(const uint8_t *buf, uint16_t len)
+{
+    bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
+    static book_parsed_t s_ingest_parsed; // MQTT event task only
+    if (!book_parse(buf, len, sig_present, &s_ingest_parsed)) {
+        return false; // not book, or malformed: caller falls through to msg.c
     }
+
+    if (s_ingest_parsed.is_nudge) {
+        // a nudge never touches s_book/NVS
+        bookpull_on_nudge(s_ingest_parsed.id, s_ingest_parsed.bv, s_ingest_parsed.nudge_url);
+        return true;
+    }
+
+    apply_parsed_book(&s_ingest_parsed);
+
+    if (s_ingest_parsed.id[0] != '\0') {
+        // acked `shown` once applied
+        msg_mark_shown(s_ingest_parsed.id);
+    }
+    return true;
+}
+
+bool book_apply_fetched(const uint8_t *body, size_t len, uint64_t expect_n, uint32_t min_bv)
+{
+    static book_parsed_t s_fetch_parsed; // modes_run() task only
+    // the §14.7 response is always signed (hmac devices only)
+    if (!book_parse(body, (uint16_t) len, true, &s_fetch_parsed)) {
+        ESP_LOGI(TAG, "book fetch response: malformed CBOR (or not kind:\"book\") - rejected");
+        return false;
+    }
+    if (s_fetch_parsed.n != expect_n) {
+        ESP_LOGI(TAG, "book fetch response: n=%llu != request X-N=%llu - rejected",
+                 (unsigned long long) s_fetch_parsed.n, (unsigned long long) expect_n);
+        return false;
+    }
+    if (s_fetch_parsed.bv < min_bv) {
+        ESP_LOGI(TAG, "book fetch response: bv=%u < nudge bv=%u - rejected", (unsigned) s_fetch_parsed.bv,
+                 (unsigned) min_bv);
+        return false;
+    }
+    if (s_fetch_parsed.more) {
+        ESP_LOGI(TAG, "book fetch response: more=true - c[] truncated at %u contacts server-side",
+                 (unsigned) BOOK_MAX_CONTACTS);
+    }
+
+    apply_parsed_book(&s_fetch_parsed);
     return true;
 }
 

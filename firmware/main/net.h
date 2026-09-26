@@ -77,11 +77,86 @@ bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos);
 
 /* Binary publish; `mid` (nullable) gets the message id. True means accepted, not PUBACKed. */
 
+/* Blocks up to `max_wait_ms` while a publish is outstanding or just done; returns ms waited. */
+uint32_t net_publish_quiet_wait_ms(uint32_t max_wait_ms);
+
+/* Read-only counters from the vendored walter-modem component. */
+typedef struct {
+    uint32_t datatx_retx;    /* DATA_TX_WAIT timeouts answered with the payload */
+    uint32_t prompt_orphan;  /* bare "> " prompt case matched */
+    uint32_t buf_drop_queue; /* parsed RX buffer dropped, queue full */
+    uint32_t buf_drop_pool;  /* RX buffer allocation failed */
+    uint32_t prompt_handled;        /* "> " prompt handler wrote a payload */
+    uint32_t payload_bytes_written; /* bytes written by that handler */
+    uint32_t txdone_timeouts;       /* uart_wait_tx_done() did not return ESP_OK */
+    char stall_cmd[25];             /* first 24 chars of the last command that took >= 5s */
+    uint32_t stall_elapsed_ms;      /* run time of that attempt at last sample */
+    int32_t stall_cts_level;        /* CTS level at that sample, -1 if unavailable */
+    uint32_t stall_tx_ring_bytes;   /* UART TX ring free bytes at that sample */
+    uint32_t rsp_no_cmd;       /* buffer completed nothing (cmd NULL, result OK) and was freed */
+    uint32_t payload_stuck_ms; /* _receivingPayload age when a command last timed out */
+    uint32_t glitch_dropped;   /* stray leading 0xFF dropped */
+    uint32_t rsp_stale_cmd;    /* response for a finished _curCmd paired with NULL */
+} net_pager_counters_t;
+net_pager_counters_t net_get_pager_counters(void);
+
+typedef enum {
+    NET_PUBLISH_RING_OK = 0,
+    NET_PUBLISH_RING_TIMEOUT,
+    NET_PUBLISH_RING_ERROR,
+} net_publish_outcome_t;
+
+typedef struct {
+    int64_t issued_us;               /* esp_timer_get_time() at issue */
+    char topic_tail[8];              /* last up to 7 chars of the topic + NUL */
+    uint16_t len;
+    net_publish_outcome_t outcome;
+    uint32_t elapsed_ms;             /* wall time the blocking mqttPublish() call took */
+} net_publish_ring_entry_t;
+#define NET_PUBLISH_RING_MAX 12
+/* Copies the most recent LTE publishes, oldest first, up to `cap`; returns the count. */
+uint32_t net_get_publish_ring(net_publish_ring_entry_t *out, uint32_t cap);
+
+/* Liveness pings whose first re-SUBSCRIBE went unanswered for 30s. */
+uint32_t net_get_resub_swallowed_count(void);
+
+/* True until a liveness re-SUBSCRIBE's SUBACK arrives or 3s pass; the SUBACK needs RTS asserted. */
+bool net_resub_hold(void);
+
+/* Hold counters: engagements, longest hold, SUBACKs seen in a hold; out-pointers may be NULL. */
+void net_get_resub_hold_stats(uint32_t *holds, uint32_t *max_hold_ms, uint32_t *suback_in_hold);
+
 /* Callback per inbound MQTT message, on the modem event task (keep it short); `body` has no NUL.
  * Oversize cap is topic-aware (PROTOCOL.md §2): `pager/boot/...` 4 kB, otherwise 1280 bytes. */
 void net_set_msg_cb(void (*cb)(const char *topic, const char *body, uint16_t len));
 
 /* Light-sleeps up to `ms` (ext1 wake from the LIS3DH); false if a key is queued. Power: ~1 mA. */
+
+/* Per-wake URC drain probe: one async bare "AT"; false if one is outstanding or modem busy. */
+bool net_urc_probe(void);
+
+/* Probe counters: stuck = unanswered after 3 wakes; timedout = 2 s budget expired; skip_busy =
+ * command slot occupied; skip_down = modem not begun; answer_ms_* count answered probes only. */
+typedef struct {
+    uint32_t issued;
+    uint32_t answered;
+    uint32_t stuck;
+    uint32_t noqueue;
+    uint32_t timedout;
+    uint32_t skip_busy;
+    uint32_t skip_down;
+    uint32_t first_attempt_ms;
+    uint32_t answer_ms_last;
+    uint32_t answer_ms_max;
+    uint32_t answer_n;
+} net_probe_counters_t;
+net_probe_counters_t net_get_probe_counters(void);
+
+/* True until the drain probe's callback has run; the caller keeps the wake window open. */
+bool net_urc_probe_in_flight(void);
+
+/* Bytes in the modem UART RX ring; 0 on a driver error. */
+uint32_t net_uart_rx_buffered_bytes(void);
 
 /* checkComm() + getNetworkRegState(); false if the modem is silent or unregistered. */
 bool net_check(void);
@@ -107,11 +182,22 @@ void net_ack_disconnect_edge(void);
 /* Liveness ping and silent-resume repair; no SUBACK in 30s or a stuck connect marks it dead. */
 void net_service_session(void);
 
+void net_set_lte_suppressed(bool suppressed);
+
 /* Clears the session_restart_edge. */
 void net_ack_session_restart_edge(void);
 
 /* True while the event handler is inside an AT transaction; do not light-sleep meanwhile. */
 bool net_modem_busy(void);
+
+/* True from queuing mqttConnect() until CONNECTED/SUBSCRIBED, session_down or the 30s timeout. */
+bool net_connect_in_flight(void);
+
+/* True while a publish is outstanding, bounded by PUBLISH_SLEEP_HOLD_MAX_US. */
+bool net_publish_in_flight(void);
+
+/* True after NET_SESSION_UP_FAIL_ESCALATE consecutive net_session_up() failures. */
+bool net_connect_fail_streak_maxed(void);
 
 /* Drain-and-reset deltas, folded into RTC totals once per wake cycle. */
 uint32_t net_take_memfull_delta(void);
@@ -123,10 +209,19 @@ const char *net_get_device_id(void);
 /* SIM presence check for the pre-provisioning screen; brings the modem up itself, no attach. */
 bool net_check_sim(void);
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+/* Attaches, dials a plain socket (UDP if `udp`) and polls up to 10s for SOCKET_STATE_OPENED. */
 bool net_check_tcp(const char *host, uint16_t port, bool udp, bool tls);
 
 /* Plain TCP with an HTTP/1.0 GET padded to `bytes`, then waits 12 s for a +SQNSRING. */
 bool net_check_tcp_sized(const char *host, uint16_t port, size_t bytes);
+
+/* Installs the library's UART/response trace hook; NULL clears it. */
+void net_debug_install_trace_hook(void (*fn)(char kind, const uint8_t *data, size_t len));
+
+/* mode 0/1: flow control off, RTS a plain output at that level; 2: hardware CTS/RTS restored. */
+void net_debug_rts(int mode);
+#endif /* PAGER_DEBUG_NO_LIGHT_SLEEP */
 
 /* Debug build only: send one raw AT command; the reply shows in the AT trace. */
 bool net_debug_at(const char *cmd);
@@ -136,7 +231,10 @@ bool net_take_registered_edge(void);
 /* Seconds without a network; 0 when registered. */
 uint32_t net_unregistered_for_s(void);
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+/* Real AT+SQNSMQTTCONNECT with dummy credentials; waits up to 30 s for an MQTT event. */
 bool net_check_mqtt(const char *host, uint16_t port, int tls_mode);
+#endif /* PAGER_DEBUG_NO_LIGHT_SLEEP */
 
 /* GNSS. loc.c is the only caller. */
 
@@ -198,7 +296,14 @@ typedef struct {
 /* Cached cell snapshot, refreshed by one AT+SQNMONI only when stale; returns out->valid. */
 bool net_get_cell_info(net_cell_info_t *out);
 
+/* Arms or disarms LIS3DH INT1 as a light-sleep wake source; arm only after a good WHO_AM_I. */
+void net_set_accel_wake(bool on);
+
+/* Same as net_set_accel_wake(true). */
 void net_enable_accel_wake(void);
+
+/* net_sleep() returns woken by the LIS3DH pin (ext1) since boot. */
+uint32_t net_get_ext1_wakes(void);
 
 /* SMS. main/sms.c is the only caller. */
 

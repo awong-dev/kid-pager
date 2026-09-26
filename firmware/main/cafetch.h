@@ -21,6 +21,10 @@ extern "C" {
 bool cafetch_parse_url(const char *url, char *host_out, size_t host_cap, uint16_t *port_out,
                        char *path_out, size_t path_cap);
 
+// Builds the GET request; `extra_hdrs` is inserted verbatim and each header must end in "\r\n".
+bool cafetch_build_request_hdrs(const char *host, const char *path, const char *extra_hdrs, char *out,
+                                size_t cap, size_t *out_len);
+
 bool cafetch_build_request(const char *host, const char *path, char *out, size_t cap,
                            size_t *out_len);
 
@@ -74,6 +78,9 @@ bool cafetch_validate_body(const uint8_t *body, size_t body_len, const uint8_t e
 
 #ifdef ESP_PLATFORM
 
+// Opens the socket and sends the GET (`extra_hdrs` NULL for none). False if it cannot start or busy.
+bool cafetch_begin_ex(const char *url, const char *extra_hdrs);
+
 bool cafetch_begin(const char *url);
 
 typedef enum {
@@ -88,6 +95,9 @@ cafetch_status_t cafetch_poll(int64_t now_us);
 // After CAFETCH_OK: validates the body; the out-params are filled regardless.
 bool cafetch_result(const uint8_t expected_sha[CAFETCH_SHA_LEN], char *pem_out, size_t pem_cap,
                     size_t *pem_len, int *out_http_status, size_t *out_bytes);
+
+// Raw body so far (valid until cafetch_end()); true iff complete. Outputs filled even on failure.
+bool cafetch_body(const uint8_t **body, size_t *len, int *status);
 
 // Tears down the socket; call after CAFETCH_OK/FAILED before the next begin.
 void cafetch_end(void);

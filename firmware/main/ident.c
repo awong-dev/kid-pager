@@ -1,6 +1,7 @@
 /* Device identity, NVS namespace "ident". */
 #include "ident.h"
 
+#include <assert.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -10,6 +11,22 @@ static const char *TAG = "ident";
 static const char *NVS_NS = "ident";
 
 static ident_t s_ident;
+
+static ident_t s_scratch;
+static bool s_scratch_busy;
+
+ident_t *ident_scratch(void)
+{
+    assert(!s_scratch_busy);
+    s_scratch_busy = true;
+    memset(&s_scratch, 0, sizeof(s_scratch));
+    return &s_scratch;
+}
+
+void ident_scratch_release(void)
+{
+    s_scratch_busy = false;
+}
 
 /* docs/PROTOCOL.md §1: `^[a-z0-9][a-z0-9-]{2,23}$`, 3..24 chars. */
 static bool valid_dev_id(const char *s, size_t len)
@@ -120,43 +137,64 @@ bool ident_load(void)
         return false;
     }
 
+     * task stack. Boot is single-threaded; released on every exit path. */
+    ident_t *tmp = ident_scratch();
 
     /* Required: no identity without these (`ca` below is the exception). */
     bool ok = true;
+    ok = ok && read_str(h, "dev_id", tmp->dev_id, sizeof(tmp->dev_id)) == FIELD_OK;
+    ok = ok && read_str(h, "mqtt_pw", tmp->mqtt_pw, sizeof(tmp->mqtt_pw)) == FIELD_OK;
+    ok = ok && read_blob(h, "kdev", tmp->kdev, sizeof(tmp->kdev)) == FIELD_OK;
+    ok = ok && read_str(h, "host", tmp->host, sizeof(tmp->host)) == FIELD_OK;
+    ok = ok && read_u16(h, "port", &tmp->port) == FIELD_OK;
     /* `ca` is optional: empty means no CA is pinned. Only a read error fails. */
+    ok = ok && read_str(h, "ca", tmp->ca, sizeof(tmp->ca)) != FIELD_ERROR;
 
+    if (ok && !valid_dev_id(tmp->dev_id, strlen(tmp->dev_id))) {
+        ESP_LOGD(TAG, "dev_id '%s' fails PROTOCOL.md %%1 regex", tmp->dev_id);
         ok = false;
     }
 
     /* Optional fields default to zero/empty; a read error other than not-found fails the load. */
     field_status_t st;
 
+    st = read_str(h, "apn", tmp->apn, sizeof(tmp->apn));
     ok = ok && st != FIELD_ERROR;
 
+    st = read_str(h, "label", tmp->label, sizeof(tmp->label));
     ok = ok && st != FIELD_ERROR;
 
+    st = read_u32(h, "flags", &tmp->flags);
     ok = ok && st != FIELD_ERROR;
 
+    st = read_blob(h, "ca_hash", tmp->ca_hash, sizeof(tmp->ca_hash));
     ok = ok && st != FIELD_ERROR;
 
     /* "n_epoch32" (u32) is the current key; an older device wrote "n_epoch" (u16). Read that once so
      * the replay counter continues rather than resetting; ident_store() writes only "n_epoch32". */
+    st = read_u32(h, "n_epoch32", &tmp->n_epoch);
     if (st == FIELD_MISSING) {
         uint16_t legacy_epoch = 0;
         field_status_t legacy_st = read_u16(h, "n_epoch", &legacy_epoch);
         ok = ok && legacy_st != FIELD_ERROR;
+        tmp->n_epoch = legacy_epoch; /* 0 if legacy_st == FIELD_MISSING too */
     } else {
         ok = ok && st != FIELD_ERROR;
     }
 
+    st = read_u8(h, "claimed", &tmp->claimed);
     ok = ok && st != FIELD_ERROR;
 
     nvs_close(h);
 
     if (!ok) {
+        ident_scratch_release();
         return false;
     }
 
+    tmp->ca_len = strlen(tmp->ca);
+    s_ident = *tmp;
+    ident_scratch_release();
     return true;
 }
 

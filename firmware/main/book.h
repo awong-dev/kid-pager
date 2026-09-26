@@ -24,6 +24,7 @@ extern "C" {
 #define BOOK_MAX_CONTACTS 32 /* §14.7 fetch response cap */
 #define BOOK_MAX_REQUESTS 4  /* §4.3 */
 
+// Applied-book entry; `nickname` is device-local and never on the wire.
 typedef struct {
     char alias[BOOK_ALIAS_MAX];
     char name[BOOK_NAME_MAX];
@@ -38,6 +39,7 @@ typedef struct {
 // 1-16 code points, <= 48 bytes, no control characters.
 bool book_name_valid(const char *name, size_t len);
 
+// One decoded `kind:"book"` envelope: a /down message or a §14.7 fetch response.
 typedef struct {
     char id[BOOK_ID_MAX];
     uint32_t bv;
@@ -47,7 +49,18 @@ typedef struct {
     book_contact_t contacts[BOOK_MAX_CONTACTS]; /* nickname always empty */
     uint8_t n_requests;
     book_request_t requests[BOOK_MAX_REQUESTS];
+    uint64_t n;   /* key 12; fetch response only */
+    bool more;    /* key 20; fetch response only */
+    bool is_nudge; /* neither key 18 nor key 19 present */
+    char nudge_url[BOOK_URL_MAX]; /* key 57; validated, only when is_nudge */
 } book_parsed_t;
+
+// `buf` must already be signature-verified. False if it is not a well-formed book.
+bool book_parse(const uint8_t *buf, uint16_t len, bool sig_pair_present, book_parsed_t *out);
+
+// Copies nicknames from old to new contacts by alias.
+void book_carry_nicknames(book_contact_t *new_contacts, uint8_t new_n, const book_contact_t *old_contacts,
+                          uint8_t old_n);
 
 #ifdef ESP_PLATFORM
 typedef void (*book_lock_fn)(void);
@@ -77,7 +90,15 @@ bool book_request_at(size_t index, book_request_t *out);
 // Sets or clears (empty) a nickname; false if not a contact. Power effect: one NVS write.
 bool book_set_nickname(const char *alias, const char *nickname, size_t nickname_len);
 
+// Handles a `kind:"book"` /down (§3.2/§3.7); true if consumed. Power effect: one NVS write.
 bool book_ingest_cbor(const uint8_t *buf, uint16_t len);
+
+// Applies a verified §14.7 fetch response if `n` == expect_n and `bv` >= min_bv.
+// Power effect: one NVS write.
+bool book_apply_fetched(const uint8_t *body, size_t len, uint64_t expect_n, uint32_t min_bv);
+
+// Next shared /up counter for the fetch request `X-N`; 0 if unbound.
+uint64_t book_next_up_n(bool *wrapped);
 
 // Publishes a signed `contact_req` (§3.2); false on a bad name. Power effect: one MQTT publish.
 bool book_request(const char *name, const char *ph_or_alias);

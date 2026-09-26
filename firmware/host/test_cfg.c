@@ -134,6 +134,21 @@ static void test_sms_only(void)
     CHECK(cbor_r_array(&r, &count) && count == 2, "captured sms span must decode as a 2-item array");
 }
 
+{
+    uint8_t buf[192];
+    cbor_w_t w;
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 1, "m_77777777", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_map_key(&w, 38, 1);
+    cbor_w_bool(&w, 0, true);
+
+    cfg_dispatch_t d;
+    bool ok = cfg_parse(buf, (uint16_t) w.len, false, &d);
+    CHECK(strcmp(d.id, "m_77777777") == 0, "id mismatch: %s", d.id);
+}
+
 /* An empty `sms` array (clearing the allow-list) is a recognised, well-formed push. */
 static void test_sms_empty_array(void)
 {

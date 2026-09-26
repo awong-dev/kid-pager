@@ -332,6 +332,11 @@ int gfx_text(int x, int y, gfx_font_t size, const char *utf8)
     return pen;
 }
 
+int gfx_glyph_advance(gfx_font_t size, uint32_t cp)
+{
+    return glyph_adv(size, cp);
+}
+
 int gfx_text_width(gfx_font_t size, const char *utf8)
 {
     int w = 0;
@@ -479,6 +484,27 @@ static void icon_padlock(int x, int y, bool broken)
     gfx_set_pixel(x + 6, y + 8, true);
 }
 
+// Starburst glyph: 2x2 centre with 8 rays (N/S/E/W and diagonals).
+static void icon_crash(int x, int y)
+{
+    int cx = x + 5, cy = y + 5; // 2x2 filled centre: (cx,cy)-(cx+1,cy+1)
+    gfx_set_pixel(cx, cy, true);
+    gfx_set_pixel(cx + 1, cy, true);
+    gfx_set_pixel(cx, cy + 1, true);
+    gfx_set_pixel(cx + 1, cy + 1, true);
+
+    for (int i = 1; i <= 3; i++) {
+        gfx_set_pixel(cx, y + 5 - i, true);        // N
+        gfx_set_pixel(cx, y + 6 + i, true);        // S
+        gfx_set_pixel(x + 5 - i, cy, true);        // W
+        gfx_set_pixel(x + 6 + i, cy, true);        // E
+        gfx_set_pixel(x + 6 + i, y + 5 - i, true); // NE
+        gfx_set_pixel(x + 5 - i, y + 5 - i, true); // NW
+        gfx_set_pixel(x + 6 + i, y + 6 + i, true); // SE
+        gfx_set_pixel(x + 5 - i, y + 6 + i, true); // SW
+    }
+}
+
 void gfx_icon(int x, int y, gfx_icon_t id)
 {
     switch (id) {
@@ -567,6 +593,9 @@ void gfx_icon(int x, int y, gfx_icon_t id)
         break;
     case GFX_ICON_TLS_BROKEN:
         icon_padlock(x, y, true);
+        break;
+    case GFX_ICON_CRASH:
+        icon_crash(x, y);
         break;
     default:
         gfx_rect(x, y, GFX_ICON_W, GFX_ICON_H);

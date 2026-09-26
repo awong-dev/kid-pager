@@ -50,6 +50,13 @@
 
 #if CONFIG_WALTER_MODEM_ENABLE_MQTT
 #pragma region PUBLIC_METHODS
+
+// PAGER PATCH: 1.13 -- MQTT publish/subscribe/disconnect/config commands use 10 s x 2 attempts
+// instead of the library's 30 s x 3, so a stalled command does not hold the command slot for 90 s.
+// (or an ordinary command-line retry) fires.
+static constexpr TickType_t PAGER_MQTT_CMD_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
+static constexpr uint8_t PAGER_MQTT_CMD_ATTEMPTS = 2;
+
 bool WalterModem::mqttConfig(const char* client_id, const char* username, const char* password,
                              uint8_t tls_profile_id, WalterModemRsp* rsp, walterModemCb cb,
                              void* args)
@@ -69,12 +76,19 @@ bool WalterModem::mqttConfig(const char* client_id, const char* username, const 
     buf->size += sprintf((char*) buf->data + buf->size, ",%u", tls_profile_id);
   }
 
+  // PAGER PATCH: 1.13 -- 10s x 2 attempts instead of the 30s x 3 default.
   _runCmd(arr((const char*) buf->data), "OK", rsp, cb, args, NULL, NULL,
+          WALTER_MODEM_CMD_TYPE_TX_WAIT, NULL, 0, buf, PAGER_MQTT_CMD_ATTEMPTS,
+          PAGER_MQTT_CMD_TIMEOUT_TICKS);
   _returnAfterReply();
 }
 
 bool WalterModem::mqttDisconnect(WalterModemRsp* rsp, walterModemCb cb, void* args)
 {
+  // PAGER PATCH: 1.13 -- 10s x 2 attempts instead of the 30s x 3 default.
+  _runCmd(arr("AT+SQNSMQTTDISCONNECT=0"), "OK", rsp, cb, args, NULL, NULL,
+          WALTER_MODEM_CMD_TYPE_TX_WAIT, NULL, 0, NULL, PAGER_MQTT_CMD_ATTEMPTS,
+          PAGER_MQTT_CMD_TIMEOUT_TICKS);
   _returnAfterReply();
 }
 
@@ -95,7 +109,14 @@ bool WalterModem::mqttConnect(const char* hostname, uint16_t port, uint16_t keep
 bool WalterModem::mqttPublish(const char* topic, uint8_t* buf, uint16_t buf_size, uint8_t qos,
                               WalterModemRsp* rsp, walterModemCb cb, void* args)
 {
+  // PAGER PATCH: 1.13 -- 10s x 2 attempts instead of the 30s x 3 default.
+  // Patch 1.12's DATA_TX_WAIT payload-write-on-timeout still fires on this
+  // command's first timeout exactly as before; this only shortens the wait
+  // before that first timeout (and the ordinary command-line retry a
+  // non-DATA_TX_WAIT command would get) from 30s to 10s.
   _runCmd(arr("AT+SQNSMQTTPUBLISH=0,", _atStr(topic), ",", _atNum(qos), ",", _atNum(buf_size)),
+          "OK", rsp, cb, args, NULL, NULL, WALTER_MODEM_CMD_TYPE_DATA_TX_WAIT, buf, buf_size, NULL,
+          PAGER_MQTT_CMD_ATTEMPTS, PAGER_MQTT_CMD_TIMEOUT_TICKS);
   _returnAfterReply();
 }
 
@@ -136,11 +157,18 @@ bool WalterModem::mqttSubscribe(const char* topic, uint8_t qos, WalterModemRsp* 
     }
   };
 
+  // PAGER PATCH: 1.13 -- 10s x 2 attempts instead of the 30s x 3 default.
   _runCmd(arr("AT+SQNSMQTTSUBSCRIBE=0,", _atStr(topic), ",", _atNum(qos)), "OK", rsp, cb, args,
+          completeHandler, NULL, WALTER_MODEM_CMD_TYPE_TX_WAIT, NULL, 0, NULL,
+          PAGER_MQTT_CMD_ATTEMPTS, PAGER_MQTT_CMD_TIMEOUT_TICKS);
   _returnAfterReply();
 }
 
+// PAGER PATCH: 1.20 -- optional per-call attempt/timeout budget; the defaults keep the
+// library's 3 x 30 s.
 bool WalterModem::mqttReceive(const char* topic, int message_id, uint8_t* buf, size_t buf_size,
+                              WalterModemRsp* rsp, walterModemCb cb, void* args,
+                              uint8_t maxAttempts, TickType_t cmdTimeoutTicks)
 {
 
   size_t readable_size = (buf_size > 4096) ? 4096 : buf_size;
@@ -148,10 +176,13 @@ bool WalterModem::mqttReceive(const char* topic, int message_id, uint8_t* buf, s
   if(message_id == 0) {
     /* no msg id means qos 0 message */
     _runCmd(arr("AT+SQNSMQTTRCVMESSAGE=0,", _atStr(topic)), "OK", rsp, cb, args, NULL, NULL,
+            WALTER_MODEM_CMD_TYPE_TX_WAIT, buf, readable_size, NULL, maxAttempts, cmdTimeoutTicks);
     _returnAfterReply();
   } else {
     _runCmd(arr("AT+SQNSMQTTRCVMESSAGE=0,", _atStr(topic), ",", _atNum(message_id), ",",
                 _atNum(readable_size)),
+            "OK", rsp, cb, args, NULL, NULL, WALTER_MODEM_CMD_TYPE_TX_WAIT, buf, readable_size,
+            NULL, maxAttempts, cmdTimeoutTicks);
     _returnAfterReply();
   }
 }

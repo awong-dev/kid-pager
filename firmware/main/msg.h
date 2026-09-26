@@ -47,6 +47,8 @@ typedef struct {
     char id[MSG_ID_MAX];
     char from[MSG_FROM_MAX];
     char to[MSG_TO_MAX]; /* peer alias for up messages; empty = default, §5.6 */
+    /* Author alias of a group message (CBOR key 51); "" otherwise. Never sent on `/up`. */
+    char sndr[MSG_FROM_MAX];
     uint16_t body_len; /* UTF-8 bytes */
     uint8_t dir;       /* msg_dir_t */
     uint8_t ack_state; /* depends on dir */
@@ -65,6 +67,7 @@ typedef struct {
 /* `body` is the UTF-8 text (m->body_len bytes; may be NULL only when body_len == 0). Returns the
 
 /* False, leaving `out` untouched, for an unknown version, truncation, bad CRC or oversize body. `body_out`
+ * (>= body_len + 1) gets the NUL-terminated text; NULL decodes the header only. */
 
 /* True once `ack_state` is the last state this direction reaches. */
 bool msghist_is_terminal_ack(uint8_t dir, uint8_t ack_state);
@@ -156,6 +159,9 @@ void msg_mark_all_unshown(void);
 bool msg_queue_reply(const char *to, const char *body, uint16_t len);
 
 /* Inserts a DOWN entry for an inbound SMS, already READ so it is never acked (PROTOCOL.md §3.6);
+ * `ts` is 0 with no network clock; `out_id` receives the generated "x_" id. */
+bool msg_insert_sms_in(const char *from, const char *body, uint16_t body_len, int64_t ts,
+                       char *out_id, size_t out_id_cap);
 
 /* Inserts a PENDING UP entry for a direct SMS send. It is never retried by msg_pump() and never
  * published over MQTT (PROTOCOL.md §3.6). `out_id` receives a fresh "x_" id. */
@@ -177,7 +183,15 @@ size_t msg_thread_count(void);
 const msg_t *msg_thread_at(size_t index); /* 0 = newest; NULL if index >= msg_thread_count() */
 const msg_t *msg_newest_unread(void);     /* NULL if none */
 
+/* Writes the peer alias for message `m` into `out` (always NUL-terminated). */
+void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, char *out,
+                 size_t out_cap);
+
+/* Calls `cb` with a stack copy of every thread entry whose msg_peer_of() equals `alias`. The lock is
+ * held throughout, so `cb` must not block, allocate or call back into msg.c. */
 typedef void (*msg_iter_peer_cb)(const msg_t *m, void *ctx);
+void msg_iter_peer(const char *alias, bool have_default, const char *default_alias, bool from_newest,
+                   msg_iter_peer_cb cb, void *ctx);
 
 /* Erases the `msghist` partition contents and the `msgq` pending-reply/unread bodies. */
 void msg_history_erase(void);

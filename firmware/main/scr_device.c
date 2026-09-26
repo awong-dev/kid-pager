@@ -7,6 +7,7 @@
 #include "carrier.h"
 #include "lock.h"
 #include "msg.h"
+#include "book.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -122,6 +123,7 @@ static void device_on_key_pw(input_key_t key)
                 s_pw_modal = PW_MODAL_NEW;
                 s_pw_allow_off = true;
             } else {
+                ui_show_toast("wrong passcode");
                 s_pw_modal = PW_MODAL_NONE;
             }
         } else if (s_pw_modal == PW_MODAL_NEW) {
@@ -274,6 +276,7 @@ static void device_render_pw(void)
 // device_row_t order), built each render into a static buffer.
 #define DEVICE_MAX_LINES 21
 #define DEVICE_LINE_LEN 72
+#define DEVICE_VISIBLE_LINES 5
 
 static void device_render_normal(void)
 {
@@ -289,6 +292,8 @@ static void device_render_normal(void)
     snprintf(lines[n], DEVICE_LINE_LEN, "broker %s:%u  sig %s", ident_get_host(),
              (unsigned) ident_get_port(), (ident_get_flags() & IDENT_FLAG_REQ_SIG) ? "on" : "off");
     selectable[n++] = false;
+    snprintf(lines[n], DEVICE_LINE_LEN, "session %s  book v%u", modes_get_session_id(),
+             (unsigned) book_get_bv());
     selectable[n++] = false;
     snprintf(lines[n], DEVICE_LINE_LEN, "counters memfull %u  drops %u  resets %u",
              (unsigned) modes_get_memfull_count(), (unsigned) modes_get_oversize_drop_count(),
@@ -338,6 +343,7 @@ static void device_render_normal(void)
             gfx_text(0, y, GFX_FONT_NORMAL, ">");
         }
         gfx_text(10, y, GFX_FONT_NORMAL, lines[i]);
+        y = ui_row_advance(y, false);
     }
 
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter select  esc back");

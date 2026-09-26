@@ -1,11 +1,15 @@
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_console.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_system.h"
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -14,7 +18,9 @@
 
 #include <stdio.h>
 
+#include "accel.h"
 #include "catrust.h"
+#include "flightrec.h"
 #include "ident.h"
 #include "watchdog.h"
 #include "carrier.h"
@@ -22,9 +28,11 @@
 #include "gfx.h"
 #include "input.h"
 #include "loc.h"
+#include "lock.h"
 #include "modes.h"
 #include "net.h"
 #include "pins.h"
+#include "rail.h"
 #include "setup.h"
 #include "sms.h"
 #include "ui.h"
@@ -69,6 +77,7 @@ static int cmd_setup(int argc, char **argv)
     return 0; // unreachable
 }
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
 // Debug build only: `nettest <host> <port>` dials a plain TCP socket (no TLS).
 static int cmd_nettest(int argc, char **argv)
 {
@@ -92,6 +101,7 @@ static int cmd_nettest(int argc, char **argv)
 }
 
 // Debug build only: `mqtttest <host> <port>` issues a real AT+SQNSMQTTCONNECT (TLS, no validation,
+// dummy credentials).
 static int cmd_mqtttest(int argc, char **argv)
 {
     esp_log_level_set("WalterModem", ESP_LOG_DEBUG); // raw AT TX:/RX: trace
@@ -109,32 +119,72 @@ static int cmd_mqtttest(int argc, char **argv)
     if (argc == 4 && strcmp(argv[3], "emptyca") == 0) tls_mode = 3;
     bool ok = net_check_mqtt(argv[1], (uint16_t) port, tls_mode);
     printf("mqtttest: %s\n", ok ? "CONNECTED" : "NOT CONNECTED (see log above)");
+    net_pager_counters_t pc = net_get_pager_counters();
+    printf("modem counters: datatx_retx=%u prompt_orphan=%u buf_drop_queue=%u buf_drop_pool=%u\n",
+           (unsigned) pc.datatx_retx, (unsigned) pc.prompt_orphan, (unsigned) pc.buf_drop_queue,
+           (unsigned) pc.buf_drop_pool);
     return ok ? 0 : 1;
 }
 
 // Debug build only: `sleeptest <minutes> [yield_ms] [interval_ms]` opens a window of real light
+// sleep; alone it prints the report. A 0 override means the build default.
 static int cmd_sleeptest(int argc, char **argv)
 {
     if (argc == 1) {
         modes_debug_sleeptest_report();
+        uint32_t n = flightrec_count();
+        if (n > 0) {
+            printf("flightrec: %u records held, run `flightrec` to dump\n", (unsigned) n);
+        }
         return 0;
     }
     long m = strtol(argv[1], NULL, 10);
     if (m < 1 || m > 120) {
+        printf("usage: sleeptest [<minutes 1..120> [yield_ms 0|30..10000] "
+               "[interval_ms 0|200..60000] [probe_wait_ms 0|100..15000] "
+               "[wake0_ms 0|0..2000]]   (0 = build default)\n");
         return 1;
     }
     long yield_ms = 0;    // 0 = use PAGER_POST_WAKE_YIELD_MS
     long interval_ms = 0; // 0 = use the normal active/sleep interval
+    // 0 keeps the build default for both overrides.
     if (argc >= 3) {
         yield_ms = strtol(argv[2], NULL, 10);
+        if (yield_ms != 0 && (yield_ms < 30 || yield_ms > 10000)) {
+            printf("usage: sleeptest <minutes> [yield_ms 0|30..10000] [interval_ms 0|200..60000]\n");
             return 1;
         }
     }
     if (argc >= 4) {
         interval_ms = strtol(argv[3], NULL, 10);
+        if (interval_ms != 0 && (interval_ms < 200 || interval_ms > 60000)) {
+            printf("usage: sleeptest <minutes> [yield_ms 0|30..10000] [interval_ms 0|200..60000]\n");
             return 1;
         }
     }
+    // Bound on how long each wake holds RTS asserted for the drain probe's answer; only matters
+    // with a long interval_ms.
+    long probe_wait_ms = 0; // 0 = use PAGER_PROBE_WAIT_MS
+    if (argc >= 5) {
+        probe_wait_ms = strtol(argv[4], NULL, 10);
+        if (probe_wait_ms != 0 && (probe_wait_ms < 100 || probe_wait_ms > 15000)) {
+            printf("usage: sleeptest <minutes> [yield_ms 0|30..10000] [interval_ms 0|200..60000] "
+                   "[probe_wait_ms 0|100..15000] [wake0_ms 0..2000]\n");
+            return 1;
+        }
+    }
+    // 0 leaves IO46 untouched.
+    long wake0_ms = 0;
+    if (argc >= 6) {
+        wake0_ms = strtol(argv[5], NULL, 10);
+        if (wake0_ms < 0 || wake0_ms > 2000) {
+            printf("usage: sleeptest <minutes> [yield_ms 0|30..10000] [interval_ms 0|200..60000] "
+                   "[probe_wait_ms 0|100..15000] [wake0_ms 0..2000]\n");
+            return 1;
+        }
+    }
+    modes_debug_sleeptest_start((uint32_t) m, (uint32_t) yield_ms, (uint32_t) interval_ms,
+                                (uint32_t) probe_wait_ms, (uint32_t) wake0_ms);
     return 0;
 }
 
@@ -154,6 +204,273 @@ static int cmd_at(int argc, char **argv)
     bool ok = net_debug_at(line);
     printf("at: %s\n", ok ? "OK" : "ERROR/timeout");
     return ok ? 0 : 1;
+}
+
+// Debug build only: `flightrec` dumps the flight recorder ring; `flightrec clear` resets it.
+static int cmd_flightrec(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "clear") == 0) {
+        flightrec_clear();
+        printf("flightrec: cleared\n");
+        return 0;
+    }
+    if (argc != 1) {
+        printf("usage: flightrec [clear]\n");
+        return 1;
+    }
+    flightrec_dump();
+    return 0;
+}
+
+// Debug build only: `rts 0|1` drives RTS as a plain GPIO with flow control off; `rts fc` restores
+// flow control and prints CTS transitions over 300 ms.
+static int cmd_rts(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("usage: rts <0|1|fc>\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "0") == 0) {
+        net_debug_rts(0);
+        printf("rts: flow control off, RTS=0\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "1") == 0) {
+        net_debug_rts(1);
+        printf("rts: flow control off, RTS=1\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "fc") == 0) {
+        net_debug_rts(2);
+        int last = flightrec_cts_level();
+        printf("rts: flow control restored; cts@0ms=%d\n", last);
+        for (int ms = 1; ms <= 300; ms++) {
+            esp_rom_delay_us(1000);
+            int lvl = flightrec_cts_level();
+            if (lvl != last) {
+                printf("rts: cts@%dms=%d\n", ms, lvl);
+                last = lvl;
+            }
+        }
+        return 0;
+    }
+    printf("usage: rts <0|1|fc>\n");
+    return 1;
+}
+
+// Debug build only: `wake0 0|1|z` drives IO46 (PAGER_PIN_WAKE0) low or high, or floats it.
+static int cmd_wake0(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("usage: wake0 <0|1|z>\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "z") == 0) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = 1ULL << PAGER_PIN_WAKE0,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&cfg);
+        printf("wake0: input, no pull\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "0") == 0 || strcmp(argv[1], "1") == 0) {
+        gpio_set_direction((gpio_num_t) PAGER_PIN_WAKE0, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t) PAGER_PIN_WAKE0, argv[1][0] - '0');
+        printf("wake0: output %c\n", argv[1][0]);
+        return 0;
+    }
+    printf("usage: wake0 <0|1|z>\n");
+    return 1;
+}
+
+// Debug build only: prints the current CTS level (IO47).
+static int cmd_cts(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    printf("cts: %d\n", flightrec_cts_level());
+    return 0;
+}
+
+// Debug build only: prints the attentive-window and lock state.
+static int cmd_attn(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    int64_t age_us = modes_debug_last_input_age_us();
+    bool in_use = modes_in_use();
+    printf("attn: last_input_age=%lld.%03llds attentive=%d in_use=%d locked=%d (lock_set=%d)\n",
+           (long long) (age_us / 1000000), (long long) ((age_us / 1000) % 1000), (int) in_use,
+           (int) in_use, (int) lock_is_locked(), (int) lock_is_set());
+    return 0;
+}
+
+// Debug build only: `railcycle [seconds]` powers the display/CardKB rails off as sleep entry does,
+// then on as the EXT0 wake does, and times ui_render().
+static int cmd_railcycle(int argc, char **argv)
+{
+    // Default 2 s; a longer time only changes how long the SSD1680 has been unpowered.
+    long secs = 2;
+    if (argc >= 2) {
+        secs = strtol(argv[1], NULL, 10);
+        if (secs < 0) {
+            printf("usage: railcycle [seconds]\n");
+            return 1;
+        }
+    }
+    printf("railcycle: rail_off() for %lds\n", secs);
+    rail_off();
+    vTaskDelay(pdMS_TO_TICKS((uint32_t) secs * 1000));
+    printf("railcycle: rail_on() + ui_render()\n");
+    int64_t t0 = esp_timer_get_time();
+    ui_ensure_powered();
+    ui_render();
+    int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+    printf("railcycle: elapsed=%lld ms (rail_on + ui_render) busy_timeout_count=%u\n",
+           (long long) elapsed_ms, (unsigned) disp_busy_timeout_count());
+    return 0;
+}
+
+// Debug build only: dumps IO MUX, RTC IO, pad hold and GPIO_IN state for IO8.
+// Debug build only: `btn [long]` simulates a button press through input.c's queue.
+static int cmd_btn(int argc, char **argv)
+{
+    bool is_long = (argc >= 2) && (strcmp(argv[1], "long") == 0);
+    if (is_long) {
+        input_feed_button_long();
+        printf("btn: long press simulated (BTN_DOWN, BTN_LONG)\n");
+    } else {
+        input_feed_button_short();
+        printf("btn: short press simulated (BTN_DOWN, BTN_SHORT)\n");
+    }
+    return 0;
+}
+
+// Debug build only: `lockclear` drops the passcode, `lockset <passcode>` restores it.
+static int cmd_lockclear(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    lock_clear_passcode();
+    printf("lockclear: passcode cleared, device unlocked\n");
+    return 0;
+}
+
+static int cmd_lockset(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("usage: lockset <passcode>\n");
+        return 1;
+    }
+    bool ok = lock_set_passcode(argv[1], strlen(argv[1]));
+    printf("lockset: %s\n", ok ? "passcode set" : "failed (4-16 printable chars required)");
+    return ok ? 0 : 1;
+}
+
+// Debug build only: `railsettle [ms]` reads or sets rail.c's post-rail-on settle.
+static int cmd_railsettle(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("railsettle: current = %u ms\n", (unsigned) rail_debug_get_settle_ms());
+        return 0;
+    }
+    long ms = strtol(argv[1], NULL, 10);
+    if (ms < 0) {
+        printf("usage: railsettle <ms>\n");
+        return 1;
+    }
+    rail_debug_set_settle_ms((uint32_t) ms);
+    printf("railsettle: set to %ld ms\n", ms);
+    return 0;
+}
+
+// Debug build only: `dispbusytrace` arms a one-shot BUSY transition trace for the next power-loss
+// recovery.
+static int cmd_dispbusytrace(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    disp_debug_arm_busy_trace();
+    printf("dispbusytrace: armed for the next power-loss recovery\n");
+    return 0;
+}
+
+// Debug build only: `kbtime [cycles]` times how long after rail_on() (settle forced to 0) the
+// CardKB first ACKs.
+static int cmd_kbtime(int argc, char **argv)
+{
+    int cycles = 10;
+    if (argc >= 2) {
+        cycles = (int) strtol(argv[1], NULL, 10);
+        if (cycles < 1) {
+            cycles = 1;
+        }
+    }
+    int64_t sum_ms = 0;
+    long long min_ms = -1, max_ms = -1;
+    int got = 0;
+    // The kbd task is paused so it does not use I2C_NUM_0 concurrently; settle 0 makes t0 the raw
+    // rail_on().
+    uint32_t saved_settle = rail_debug_get_settle_ms();
+    rail_debug_set_settle_ms(0);
+    ui_debug_pause_kb_poll(true);
+    for (int i = 0; i < cycles; i++) {
+        rail_off();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        int64_t t0 = esp_timer_get_time();
+        rail_on();
+        int64_t ack_us = -1;
+        bool reinit_done = false;
+        while (esp_timer_get_time() - t0 < 8000000) { // 8s: wide enough to find the real ceiling
+            i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+            i2c_master_start(cmd);
+            i2c_master_write_byte(cmd, (uint8_t) ((PAGER_I2C_ADDR_CARDKB << 1) | I2C_MASTER_WRITE),
+                                   true);
+            i2c_master_stop(cmd);
+            esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(2));
+            i2c_cmd_link_delete(cmd);
+            if (err == ESP_OK) {
+                ack_us = esp_timer_get_time() - t0;
+                break;
+            }
+            // The bus may NACK until the driver is re-initialised: repeat the kbd task's one-shot
+            // recovery at ~50 ms.
+            if (!reinit_done && esp_timer_get_time() - t0 >= 50000) {
+                reinit_done = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (ack_us < 0) {
+            printf("kbtime: cycle %d: CardKB never acked within 8000ms (reinit_done=%d)\n", i + 1,
+                   (int) reinit_done);
+        } else {
+            if (reinit_done) {
+                printf("kbtime: cycle %d: needed the bus re-init\n", i + 1);
+            }
+            long long ack_ms = ack_us / 1000;
+            printf("kbtime: cycle %d: CardKB first ACK at +%lld ms\n", i + 1, ack_ms);
+            sum_ms += ack_ms;
+            got++;
+            if (min_ms < 0 || ack_ms < min_ms) {
+                min_ms = ack_ms;
+            }
+            if (ack_ms > max_ms) {
+                max_ms = ack_ms;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(500)); // let this cycle settle before the next rail_off()
+    }
+    ui_debug_pause_kb_poll(false);
+    rail_debug_set_settle_ms(saved_settle);
+    if (got > 0) {
+        printf("kbtime: min=%lld ms max=%lld ms avg=%lld ms over %d/%d cycle(s) acked\n", min_ms,
+               max_ms, (long long) (sum_ms / got), got, cycles);
+    }
+    return 0;
 }
 
 #endif
@@ -344,6 +661,8 @@ static void start_setup_console(void)
     register_carrier_cmd();
     register_input_cmds();
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    // Debug build only.
     const esp_console_cmd_t nettest_cmd = {
         .command = "nettest",
         .help = "nettest <host> <port> -- TEMPORARY: plain TCP (no TLS) connectivity probe",
@@ -359,6 +678,7 @@ static void start_setup_console(void)
         .func = &cmd_mqtttest,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&mqtttest_cmd));
+#endif
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }
@@ -431,6 +751,126 @@ static int cmd_smslist(int argc, char **argv)
     return 0;
 }
 
+// `acceltest`: LIS3DH register dump and tuning via accel_debug_*(); every form re-probes WHO_AM_I.
+// `acceltest samples 600` blocks this console task for ~60 s (one sample per ODR period).
+static const char *ACCELTEST_USAGE =
+    "acceltest ths <0-127>     -- write INT1_THS, echo the read-back\n"
+    "acceltest dur <0-127>     -- write INT1_DURATION, echo the read-back\n"
+
+static int cmd_acceltest(int argc, char **argv)
+{
+    accel_debug_status_t st;
+    bool newly_configured = false;
+    bool present = accel_debug_status(&st, &newly_configured);
+    if (newly_configured) {
+        printf("acceltest: LIS3DH now answers WHO_AM_I -- configured\n");
+    }
+
+    if (argc == 1) {
+        if (!present) {
+            return 1;
+        }
+        printf("acceltest: present=1 WHO_AM_I=0x%02x\n", (unsigned) st.who_am_i);
+        printf("acceltest: CTRL_REG1=0x%02x CTRL_REG2=0x%02x CTRL_REG3=0x%02x CTRL_REG4=0x%02x "
+               "CTRL_REG5=0x%02x\n",
+               (unsigned) st.ctrl_reg1, (unsigned) st.ctrl_reg2, (unsigned) st.ctrl_reg3,
+               (unsigned) st.ctrl_reg4, (unsigned) st.ctrl_reg5);
+        printf("acceltest: INT1_CFG=0x%02x INT1_THS=0x%02x (%u mg) INT1_DURATION=0x%02x "
+               "INT1_SRC=0x%02x\n",
+               (unsigned) st.int1_cfg, (unsigned) st.int1_ths, (unsigned) st.ths_mg,
+               (unsigned) st.int1_duration, (unsigned) st.int1_src);
+        printf("acceltest: refractory=%llds edges_reported=%u ext1_wakes=%u\n",
+               (long long) (st.refractory_us / 1000000), (unsigned) st.edges_reported,
+               (unsigned) st.ext1_wakes);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "samples") == 0) {
+        if (argc != 3) {
+            printf("usage: acceltest samples <n>\n");
+            return 1;
+        }
+        char *end = NULL;
+        long n = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || n < 1 || n > 600) {
+            printf("acceltest: n must be 1..600\n");
+            return 1;
+        }
+        if (!present) {
+            return 1;
+        }
+        for (long i = 0; i < n; i++) {
+            int16_t x_mg = 0, y_mg = 0, z_mg = 0;
+                printf("acceltest: sample %ld: I2C read failed\n", i);
+            } else {
+                printf("acceltest: x=%d y=%d z=%d mg\n", (int) x_mg, (int) y_mg, (int) z_mg);
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "ths") == 0) {
+        if (argc != 3) {
+            printf("usage: acceltest ths <0-127>\n");
+            return 1;
+        }
+        char *end = NULL;
+        long v = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || v < 0 || v > 127) {
+            printf("acceltest: ths must be 0..127\n");
+            return 1;
+        }
+        uint8_t readback = 0;
+        if (!accel_debug_set_ths((uint8_t) v, &readback)) {
+            printf("acceltest: not present, or the write failed\n");
+            return 1;
+        }
+        printf("acceltest: INT1_THS=0x%02x (%u mg)\n", (unsigned) readback,
+               (unsigned) readback * 16);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "dur") == 0) {
+        if (argc != 3) {
+            printf("usage: acceltest dur <0-127>\n");
+            return 1;
+        }
+        char *end = NULL;
+        long v = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || v < 0 || v > 127) {
+            printf("acceltest: dur must be 0..127\n");
+            return 1;
+        }
+        uint8_t readback = 0;
+        if (!accel_debug_set_dur((uint8_t) v, &readback)) {
+            printf("acceltest: not present, or the write failed\n");
+            return 1;
+        }
+        printf("acceltest: INT1_DURATION=0x%02x\n", (unsigned) readback);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "refr") == 0) {
+        if (argc != 3) {
+            printf("usage: acceltest refr <seconds>\n");
+            return 1;
+        }
+        char *end = NULL;
+        long v = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || v < 0) {
+            printf("acceltest: seconds must be >= 0 (0 disables the refractory guard)\n");
+            return 1;
+        }
+        accel_debug_set_refractory_s((uint32_t) v);
+        printf("acceltest: refractory=%lds\n", v);
+        return 0;
+    }
+
+    printf("%s", ACCELTEST_USAGE);
+    return 1;
+}
+
 // Debug build: paints a known pattern and drives partial/full refreshes directly, to correlate a
 // screen-x range with disp.c's "partial: native rows" log line.
 #define DISPTEST_COL_PX 8
@@ -449,6 +889,9 @@ static const char *DISPTEST_USAGE =
     "disptest seq [n0] [n1] [ms]  -- `step` for n = n0..n1, ms apart (defaults 2 12 1500; "
     "count clamped to 36, ms clamped to 200..5000)\n"
     "disptest full                -- force one full refresh of whatever is in the framebuffer\n"
+    "disptest black|white         -- paint every pixel one colour and full refresh (wiring check)\n"
+    "disptest swreset             -- fault injector: send SW reset (0x12) alone, wait BUSY, "
+    "nothing else -- leaves the controller on power-on register defaults\n"
     "NOTE: do not use `wake` or `key` while disptest is running -- the UI render task would "
     "repaint over the test pattern.\n";
 
@@ -579,6 +1022,31 @@ static int cmd_disptest(int argc, char **argv)
         printf("disptest: full refresh done\n");
         return 0;
     }
+    if (strcmp(argv[1], "black") == 0 || strcmp(argv[1], "white") == 0) {
+        // Wiring check: a uniform image, then a full refresh; anything else points at the
+        // SPI/DC/RST/BUSY path.
+        if (argc != 2) {
+            printf("usage: disptest black|white\n");
+            return 1;
+        }
+        gfx_clear();
+        if (argv[1][0] == 'b') {
+            gfx_invert_rect(0, 0, GFX_SCREEN_W, GFX_SCREEN_H);
+        }
+        disp_full_refresh();
+        printf("disptest: %s painted, full refresh done\n", argv[1]);
+        return 0;
+    }
+    if (strcmp(argv[1], "swreset") == 0) {
+        if (argc != 2) {
+            printf("usage: disptest swreset\n");
+            return 1;
+        }
+        disp_fault_inject_swreset();
+        printf("disptest: swreset sent (SW reset only, no re-init) -- controller now on "
+               "power-on register defaults\n");
+        return 0;
+    }
     printf("%s", DISPTEST_USAGE);
     return 1;
 }
@@ -614,6 +1082,11 @@ static void start_normal_console(void)
 
     const esp_console_cmd_t sleeptest_cmd = {
         .command = "sleeptest",
+        .help = "sleeptest [<minutes> [yield_ms] [interval_ms] [probe_wait_ms] [wake0_ms]] -- really "
+                 "light-sleep for a while (optionally overriding the post-wake yield, the wake "
+                 "interval, the probe wait, and pulsing IO46/WAKE0 on every wake), then report "
+                 "what arrived; bare `sleeptest` re-prints the last report plus the flightrec "
+                 "summary if one is held",
         .hint = NULL,
         .func = &cmd_sleeptest,
     };
@@ -626,6 +1099,112 @@ static void start_normal_console(void)
         .func = &cmd_at,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&at_cmd));
+
+    const esp_console_cmd_t flightrec_cmd = {
+        .command = "flightrec",
+        .help = "flightrec [clear] -- dump (or reset) the flight recorder's raw UART/wake/probe/"
+                 "sleep ring",
+        .hint = NULL,
+        .func = &cmd_flightrec,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&flightrec_cmd));
+
+    const esp_console_cmd_t rts_cmd = {
+        .command = "rts",
+        .help = "rts <0|1|fc> -- awake RTS/CTS experiment: 0/1 = flow control off, RTS driven low/"
+                 "high; fc = flow control restored, CTS sampled for 300 ms",
+        .hint = NULL,
+        .func = &cmd_rts,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&rts_cmd));
+
+    const esp_console_cmd_t wake0_cmd = {
+        .command = "wake0",
+        .help = "wake0 <0|1|z> -- drive IO46/LTE_WAKE0 low/high, or float it as an input",
+        .hint = NULL,
+        .func = &cmd_wake0,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wake0_cmd));
+
+    const esp_console_cmd_t cts_cmd = {
+        .command = "cts",
+        .help = "cts -- print the current CTS (IO47) level",
+        .hint = NULL,
+        .func = &cmd_cts,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cts_cmd));
+
+    const esp_console_cmd_t attn_cmd = {
+        .command = "attn",
+        .help = "attn -- print the attentive window's raw state (last_input_age, attentive, "
+                 "in_use, locked/lock_set), for bench diagnosis of the attentive edge",
+        .hint = NULL,
+        .func = &cmd_attn,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&attn_cmd));
+
+    const esp_console_cmd_t railcycle_cmd = {
+        .command = "railcycle",
+        .help = "railcycle [seconds] -- rail_off() (sleep-entry style), wait <seconds> (default "
+                 "2), rail_on()+ui_render() (EXT0-wake style), print elapsed ms; use a larger seconds value (e.g. 150) to reproduce a real 2+ minute sleep",
+        .hint = NULL,
+        .func = &cmd_railcycle,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&railcycle_cmd));
+
+    const esp_console_cmd_t btn_cmd = {
+        .command = "btn",
+                 "BTN_LONG with `long`) through input.c's real event queue, same path a "
+                 "physical press takes downstream; needed to reach scr_lock.c's passcode entry "
+                 "from the console",
+        .hint = NULL,
+        .func = &cmd_btn,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&btn_cmd));
+
+    const esp_console_cmd_t lockclear_cmd = {
+        .command = "lockclear",
+        .help = "lockclear -- bench-only: clear the passcode so a real-sleep render test can "
+                 "use an incoming page as the trigger (ui_incoming() never renders while "
+                 "locked); restore with `lockset <passcode>` after",
+        .hint = NULL,
+        .func = &cmd_lockclear,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&lockclear_cmd));
+
+    const esp_console_cmd_t lockset_cmd = {
+        .command = "lockset",
+        .help = "lockset <passcode> -- bench-only: set/restore the passcode",
+        .hint = NULL,
+        .func = &cmd_lockset,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&lockset_cmd));
+
+    const esp_console_cmd_t railsettle_cmd = {
+        .command = "railsettle",
+        .help = "railsettle [ms] -- read or set rail.c's universal post-rail-on settle delay",
+        .hint = NULL,
+        .func = &cmd_railsettle,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&railsettle_cmd));
+
+    const esp_console_cmd_t dispbusytrace_cmd = {
+        .command = "dispbusytrace",
+        .help = "dispbusytrace -- arm a one-shot ~200ms BUSY transition trace for the next "
+                 "power-loss recovery",
+        .hint = NULL,
+        .func = &cmd_dispbusytrace,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&dispbusytrace_cmd));
+
+    const esp_console_cmd_t kbtime_cmd = {
+        .command = "kbtime",
+        .help = "kbtime [cycles] -- measure how long after rail-on the CardKB first ACKs on "
+                 "I2C, averaged over `cycles` (default 5) off/on cycles",
+        .hint = NULL,
+        .func = &cmd_kbtime,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&kbtime_cmd));
 
     register_carrier_cmd();
     register_input_cmds();
@@ -671,6 +1250,15 @@ static void start_normal_console(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&smslist_cmd));
 
+    const esp_console_cmd_t acceltest_cmd = {
+        .command = "acceltest",
+                 "register/sample dump and runtime tuning; run "
+                 "`acceltest` with no args for the full usage",
+        .hint = NULL,
+        .func = &cmd_acceltest,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&acceltest_cmd));
+
     const esp_console_cmd_t disptest_cmd = {
         .command = "disptest",
                  "deterministic e-paper partial-refresh bench harness; "
@@ -683,13 +1271,29 @@ static void start_normal_console(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&disptest_cmd));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    ESP_LOGD(TAG, "debug console REPL started in normal mode (PAGER_DEBUG_NO_LIGHT_SLEEP)");
 }
 #endif
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "school_pager boot");
+
+    // Fixed local timezone for every on-glass HH:MM; the network clock carries no TZ.
+    setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+    tzset();
+
     watchdog_boot(); // logs why we reset and where the loop was; arms the RTC watchdog
+
+    // Installs the library's UART trace hook before anything can reach WalterModem::begin(); inert
+    // until a `sleeptest` window arms recording.
+    flightrec_init();
+
+    // Flags a crash/watchdog/brownout reset in the status bar until the first key press.
+    if (watchdog_last_reset_was_crash()) {
+        ESP_LOGI(TAG, "boot crash indicator: %s", watchdog_last_reset_reason_str());
+        ui_set_crash_indicator(true);
+    }
 
     // board_init() reads the board kind from NVS, so NVS comes up first.
     esp_err_t nvs_err = nvs_flash_init();

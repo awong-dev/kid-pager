@@ -3056,6 +3056,12 @@ typedef struct sWalterModemCmd {
   uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS;
 
   /**
+   * @brief PAGER PATCH: 1.13 -- per-attempt timeout in ticks; 0 selects the library default
+   * (WALTER_MODEM_CMD_TIMEOUT_TICKS, resolved in WalterModem.cpp).
+   */
+  TickType_t timeoutTicks = 0;
+
+  /**
    * @brief The current attempt number.
    */
   uint8_t attempt = 0;
@@ -3064,6 +3070,12 @@ typedef struct sWalterModemCmd {
    * @brief The time on which the current attempt was started.
    */
   TickType_t attemptStart = 0;
+
+  /**
+   * @brief PAGER PATCH: 1.12 -- true once the first DATA_TX_WAIT timeout has sent the payload bytes
+   * instead of the AT line; a second timeout fails the command.
+   */
+  bool dataTxPayloadRetried = false;
 
   /**
    * @brief A lock and condition variable used to implement the blocking API.
@@ -3279,6 +3291,13 @@ struct WalterModemStpResponseTransferBlock {
 #endif
 #pragma endregion
 #pragma endregion // STRUCTS
+
+/**
+ * PAGER PATCH: 1.17 -- optional trace hook: 'R' raw bytes read from the modem UART, 'T' bytes
+ * written, 'U' a response buffer with no command waiting. `data` is valid only during the call.
+ */
+typedef void (*walter_pager_trace_fn)(char kind, const uint8_t *data, size_t len);
+
 #pragma region CLASS
 /**
  * @brief The WalterModem class allows you to use the Sequans Monarch 2 modem and positioning
@@ -3300,9 +3319,20 @@ private:
   static inline bool _hardwareReset = false;
 
   /**
+   * @brief PAGER PATCH: 1.16 -- set when a "+SYSSTART" banner arrives while a hardware reset
+   * discards input; cleared at the start of every reset() and consumed by its wait.
+   */
+  static inline bool _sawSysStartDuringReset = false;
+
+  /**
    * @brief boolean for when we are doing a hardware reset.
    */
   static inline bool _receivingPayload = false;
+
+  /**
+   * @brief PAGER PATCH: 1.15 -- tick count when `_receivingPayload` was last set.
+   */
+  static inline TickType_t _receivingPayloadSetAt = 0;
 
   static inline bool _foundCRLF = false;
 
@@ -3954,6 +3984,7 @@ private:
    * @param dataSize The number of bytes in the data buffer.
    * @param stringsBuffer Optional pool buffer for remembering non-static string parameters.
    * @param maxAttempts The maximum number of retries for this command.
+   * @param cmdTimeoutTicks PAGER PATCH: 1.13. Per-attempt timeout in ticks; 0 = library default.
    *
    * @return Pointer to the command on success, NULL when no memory for the command was
    * available.
@@ -3964,6 +3995,7 @@ private:
       void (*completeHandler)(struct sWalterModemCmd* cmd, WalterModemState result) = NULL,
       void* completeHandlerArg = NULL, WalterModemCmdType type = WALTER_MODEM_CMD_TYPE_TX_WAIT,
       uint8_t* data = NULL, uint16_t dataSize = 0, WalterModemBuffer* stringsBuffer = NULL,
+      uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS, TickType_t cmdTimeoutTicks = 0);
 
   /**
    * @brief Finish a queue command.
@@ -3994,6 +4026,14 @@ private:
    * command to process.
    */
   static TickType_t _processModemCMD(WalterModemCmd* cmd, bool queueError = false);
+
+  /**
+   * @brief PAGER PATCH: 1.13 -- record the command outstanding for >= 5 s (stall_* counters).
+   *
+   * @param cmd The command that has been outstanding.
+   * @param diffTicks How long its current attempt has been outstanding, in ticks.
+   */
+  static void _pagerSnapshotStall(WalterModemCmd* cmd, TickType_t diffTicks);
 
   /**
    * @brief Process an AT response from the queue.
@@ -4320,10 +4360,15 @@ public:
    * @param[out] rsp Pointer to the response structure to save the result in.
    * @param[in] cb Callback function, if not NULL this function will not block.
    * @param[in] args Arguments to pass to the callback.
+   * @param maxAttempts PAGER PATCH: 1.20. Attempts for this command (default 3).
+   * @param cmdTimeoutTicks PAGER PATCH: 1.20. Per-attempt timeout in ticks; 0 = 30 s default.
    *
    * @return True when the expected response is received, false otherwise.
    */
   static bool sendCmd(const char* at_cmd, const char* at_cmd_rsp = "OK", WalterModemRsp* rsp = NULL,
+                      walterModemCb cb = NULL, void* args = NULL,
+                      uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS,
+                      TickType_t cmdTimeoutTicks = 0);
 
   /**
    * @brief Software reset the modem and wait for it to reset, this is required when switching
@@ -4358,9 +4403,23 @@ public:
    * @param[out] rsp Pointer to the response structure to save the result in.
    * @param[in] cb Callback function, if not NULL this function will not block.
    * @param[in] args Arguments to pass to the callback.
+   * @param maxAttempts PAGER PATCH: 1.14. Attempts for this command (default 3).
+   * @param cmdTimeoutTicks PAGER PATCH: 1.14. Per-attempt timeout in ticks; 0 = 30 s default.
    *
    * @return True on "OK" response, false otherwise.
    */
+  static bool checkComm(WalterModemRsp* rsp = NULL, walterModemCb cb = NULL, void* args = NULL,
+                        uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS,
+                        TickType_t cmdTimeoutTicks = 0);
+
+  /**
+   * PAGER PATCH: 1.17 -- install (or clear, with NULL) the UART/response trace hook.
+   *
+   * @param fn The hook to install, or NULL to remove it.
+   *
+   * @return None.
+   */
+  static void setPagerTraceHook(walter_pager_trace_fn fn);
 
   /**
    * @brief Put Walter to deep or light sleep.
@@ -4427,9 +4486,14 @@ public:
    * @param[out] rsp Pointer to the response structure to save the result in.
    * @param[in] cb Callback function, if not NULL this function will not block.
    * @param[in] args Arguments to pass to the callback.
+   * @param maxAttempts PAGER PATCH: 1.20. Attempts for this command (default 3).
+   * @param cmdTimeoutTicks PAGER PATCH: 1.20. Per-attempt timeout in ticks; 0 = 30 s default.
    *
    * @return True on "OK" response, false otherwise.
    */
+  static bool getRSSI(WalterModemRsp* rsp = NULL, walterModemCb cb = NULL, void* args = NULL,
+                      uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS,
+                      TickType_t cmdTimeoutTicks = 0);
 
   /**
    * @brief Get extended RSRQ and RSRP signal quality.
@@ -4642,10 +4706,15 @@ public:
    * @param[out] rsp Pointer to the response structure to save the result in.
    * @param[in] cb Callback function, if not NULL this function will not block.
    * @param[in] args Arguments to pass to the callback.
+   * @param maxAttempts PAGER PATCH: 1.20. Attempts for this command (default 3).
+   * @param cmdTimeoutTicks PAGER PATCH: 1.20. Per-attempt timeout in ticks; 0 = 30 s default.
    *
    * @return True on "OK" response, false otherwise.
    */
   static bool mqttReceive(const char* topic, int message_id, uint8_t* buf, size_t buf_size,
+                          WalterModemRsp* rsp = NULL, walterModemCb cb = NULL, void* args = NULL,
+                          uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS,
+                          TickType_t cmdTimeoutTicks = 0);
 
 #endif
 #pragma endregion
@@ -6001,9 +6070,14 @@ public:
    * @param[out] rsp Pointer to the response structure to save the result in.
    * @param[in] cb Callback function, if not NULL this function will not block.
    * @param[in] args Arguments to pass to the callback.
+   * @param maxAttempts PAGER PATCH: 1.20. Attempts for this "AT+SQNVMON?" (default 3).
+   * @param cmdTimeoutTicks PAGER PATCH: 1.20. Per-attempt timeout in ticks; 0 = 30 s default.
    *
    * @return True on "OK" response, false otherwise.
    */
+  static bool getVoltage(WalterModemRsp* rsp = NULL, walterModemCb cb = NULL, void* args = NULL,
+                         uint8_t maxAttempts = WALTER_MODEM_DEFAULT_CMD_ATTEMPTS,
+                         TickType_t cmdTimeoutTicks = 0);
 
 #pragma endregion // CLASS PUBLIC METHODS VOLTAGE_MONITOR
 #pragma region CLASS PUBLIC METHODS SMS

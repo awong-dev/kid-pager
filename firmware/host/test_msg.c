@@ -231,6 +231,131 @@ static void test_msghist_decode_rejects_corruption(void)
           "a record with an unknown version was accepted");
 }
 
+static void test_msghist_roundtrip_sms_ts(void)
+{
+    msg_t with_ts = make_msg("x_deadbeef", "mom", "", "call me back", MSG_DIR_DOWN, MSG_ACK_READ, 0,
+                             1757700000);
+    uint8_t buf[MSGHIST_REC_MAX];
+    CHECK(len > 0, "encode of an SMS-shaped record with a real ts returned 0");
+    msg_t out;
+    uint32_t seq = 0;
+    CHECK(out.ts == 1757700000, "ts mismatch after round trip: %lld != 1757700000",
+          (long long) out.ts);
+    CHECK(out.dir == MSG_DIR_DOWN, "dir mismatch");
+    CHECK(out.ack_state == MSG_ACK_READ, "ack_state mismatch");
+
+    msg_t no_ts = make_msg("x_cafef00d", "mom", "", "call me back", MSG_DIR_DOWN, MSG_ACK_READ, 0, 0);
+    CHECK(len > 0, "encode of an SMS-shaped record with ts 0 returned 0");
+    CHECK(out.ts == 0, "ts-0 record decoded with ts == %lld, want 0", (long long) out.ts);
+}
+
+static void test_msghist_roundtrip_sndr(void)
+{
+    msg_t m = make_msg("m_7f3a", "family-grp", "", "Pickup at 3:15 by the gym", MSG_DIR_DOWN,
+                       MSG_ACK_SHOWN, 0, 1757700000);
+    strncpy(m.sndr, "alice", sizeof(m.sndr) - 1);
+
+    uint8_t buf[MSGHIST_REC_MAX];
+    CHECK(len > 0, "encode of a record with sndr returned 0");
+
+    msg_t out;
+    uint32_t seq = 0;
+    CHECK(strcmp(out.sndr, "alice") == 0, "sndr mismatch after round trip: '%s' != 'alice'",
+          out.sndr);
+    CHECK(strcmp(out.from, m.from) == 0, "from mismatch after round trip (should stay the group alias)");
+
+    msg_t big = make_msg("m_deadbeefdeadbe", "0123456789abcdef", "0123456789abcdef", "", MSG_DIR_DOWN,
+                         MSG_ACK_UNSHOWN, 0, 1700000000);
+    strncpy(big.sndr, "0123456789abcdef", sizeof(big.sndr) - 1);
+
+    CHECK(len > 0 && len <= MSGHIST_REC_MAX,
+          "worst-case sndr+body record out of range: %u (cap %u)", (unsigned) len,
+          (unsigned) MSGHIST_REC_MAX);
+    CHECK(strcmp(out.sndr, "0123456789abcdef") == 0, "worst-case sndr mismatch: '%s'", out.sndr);
+}
+
+/* Little-endian helpers that hand-build a version-1 record (no `sndr`); CRC-32 as in zlib/PNG. */
+static uint32_t crc32_like_msg_c(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = (uint32_t) (-(int32_t) (crc & 1u));
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+static void put_u8(uint8_t *buf, size_t *off, uint8_t v) { buf[(*off)++] = v; }
+
+static void put_u16(uint8_t *buf, size_t *off, uint16_t v)
+{
+    buf[(*off)++] = (uint8_t) (v & 0xFF);
+    buf[(*off)++] = (uint8_t) (v >> 8);
+}
+
+static void put_u32(uint8_t *buf, size_t *off, uint32_t v)
+{
+    buf[(*off)++] = (uint8_t) (v & 0xFF);
+    buf[(*off)++] = (uint8_t) ((v >> 8) & 0xFF);
+    buf[(*off)++] = (uint8_t) ((v >> 16) & 0xFF);
+    buf[(*off)++] = (uint8_t) ((v >> 24) & 0xFF);
+}
+
+static void put_i64(uint8_t *buf, size_t *off, int64_t v)
+{
+    uint64_t u = (uint64_t) v;
+    put_u32(buf, off, (uint32_t) (u & 0xFFFFFFFFu));
+    put_u32(buf, off, (uint32_t) (u >> 32));
+}
+
+static void put_str_field(uint8_t *buf, size_t *off, const char *s)
+{
+    size_t len = strlen(s);
+    put_u8(buf, off, (uint8_t) len);
+    memcpy(buf + *off, s, len);
+    *off += len;
+}
+
+static size_t encode_v1_record(uint8_t *out, uint32_t seq, int64_t ts, uint8_t dir,
+                               uint8_t ack_state, uint8_t flags, const char *id, const char *from,
+                               const char *to, const char *body, uint16_t body_len)
+{
+    size_t off = 0;
+    put_u8(out, &off, 1); /* version */
+    put_u32(out, &off, seq);
+    put_i64(out, &off, ts);
+    put_u8(out, &off, dir);
+    put_u8(out, &off, ack_state);
+    put_u8(out, &off, flags);
+    put_str_field(out, &off, id);
+    put_str_field(out, &off, from);
+    put_str_field(out, &off, to);
+    put_u16(out, &off, body_len);
+    memcpy(out + off, body, body_len);
+    off += body_len;
+    uint32_t crc = crc32_like_msg_c(out, off);
+    put_u32(out, &off, crc);
+    return off;
+}
+
+static void test_msghist_v1_record_decodes_with_empty_sndr(void)
+{
+    uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = encode_v1_record(buf, 3, 1700000000, MSG_DIR_DOWN, MSG_ACK_READ, 0, "m_old",
+                                  "mom", "", "hi there", 8);
+    CHECK(len > 0 && len <= MSGHIST_REC_MAX, "v1 record encode out of range");
+
+    msg_t out;
+    uint32_t seq = 0;
+    CHECK(seq == 3, "v1 decode: seq == %u, want 3", (unsigned) seq);
+    CHECK(strcmp(out.id, "m_old") == 0, "v1 decode: id mismatch");
+    CHECK(strcmp(out.from, "mom") == 0, "v1 decode: from mismatch");
+    CHECK(out.sndr[0] == '\0', "v1 decode: sndr should be empty, got '%s'", out.sndr);
+}
+
 static void test_msghist_terminal_ack(void)
 {
     CHECK(!msghist_is_terminal_ack(MSG_DIR_DOWN, MSG_ACK_UNSHOWN), "UNSHOWN reported terminal");
@@ -261,6 +386,76 @@ static void test_msghist_restore_order(void)
     CHECK(n2 == 2, "clamped n == %d, want 2", n2);
 }
 
+/* Newest-first filter over a plain array using msg_peer_of(); `msgs` is newest-first. */
+static size_t filter_peer(const msg_t *msgs, size_t n, const char *alias, bool have_default,
+                          const char *default_alias, const msg_t **out, size_t out_cap)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < n; i++) {
+        char peer[MSG_FROM_MAX];
+        msg_peer_of(&msgs[i], have_default, default_alias, peer, sizeof(peer));
+        if (strcmp(peer, alias) == 0 && count < out_cap) {
+            out[count++] = &msgs[i];
+        }
+    }
+    return count;
+}
+
+static void test_msg_peer_of(void)
+{
+    char peer[MSG_FROM_MAX];
+
+    msg_t down = make_msg("m_1", "mom", "", "hi", MSG_DIR_DOWN, MSG_ACK_SHOWN, 0, 100);
+    msg_peer_of(&down, true, "mom", peer, sizeof(peer));
+    CHECK(strcmp(peer, "mom") == 0, "down message peer == '%s', want 'mom'", peer);
+
+    msg_t group_down = make_msg("m_2", "fam", "", "party", MSG_DIR_DOWN, MSG_ACK_SHOWN, 0, 101);
+    strncpy(group_down.sndr, "bob", sizeof(group_down.sndr) - 1);
+    msg_peer_of(&group_down, true, "mom", peer, sizeof(peer));
+    CHECK(strcmp(peer, "fam") == 0, "group down message peer == '%s', want 'fam' (never sndr)", peer);
+
+    msg_t up_explicit = make_msg("u_1", "student", "bob", "ok", MSG_DIR_UP, MSG_ACK_UP_PENDING, 0, 102);
+    msg_peer_of(&up_explicit, true, "mom", peer, sizeof(peer));
+    CHECK(strcmp(peer, "bob") == 0, "up message with to=='bob' peer == '%s', want 'bob'", peer);
+
+    msg_t up_default = make_msg("u_2", "student", "", "ok", MSG_DIR_UP, MSG_ACK_UP_PENDING, 0, 103);
+    msg_peer_of(&up_default, true, "mom", peer, sizeof(peer));
+    CHECK(strcmp(peer, "mom") == 0,
+          "up message with empty to, default 'mom', peer == '%s', want 'mom'", peer);
+
+    msg_peer_of(&up_default, false, "", peer, sizeof(peer));
+    CHECK(strcmp(peer, "(default)") == 0,
+          "up message with empty to, no book, peer == '%s', want '(default)'", peer);
+}
+
+static void test_msg_peer_subsets_newest_first(void)
+{
+    msg_t msgs[5] = {
+        make_msg("m_5", "bob", "", "b5", MSG_DIR_DOWN, MSG_ACK_SHOWN, 0, 500),
+        make_msg("u_4", "student", "mom", "m4", MSG_DIR_UP, MSG_ACK_UP_SENT, 0, 400),
+        make_msg("m_3", "mom", "", "m3", MSG_DIR_DOWN, MSG_ACK_SHOWN, 0, 300),
+        make_msg("u_2", "student", "bob", "b2", MSG_DIR_UP, MSG_ACK_UP_SENT, 0, 200),
+        make_msg("m_1", "mom", "", "m1", MSG_DIR_DOWN, MSG_ACK_READ, 0, 100),
+    };
+
+    const msg_t *mom_out[8];
+    size_t mom_n = filter_peer(msgs, 5, "mom", true, "mom", mom_out, 8);
+    CHECK(mom_n == 3, "mom subset size == %zu, want 3", mom_n);
+    if (mom_n == 3) {
+        CHECK(strcmp(mom_out[0]->id, "u_4") == 0, "mom_out[0] == '%s', want 'u_4'", mom_out[0]->id);
+        CHECK(strcmp(mom_out[1]->id, "m_3") == 0, "mom_out[1] == '%s', want 'm_3'", mom_out[1]->id);
+        CHECK(strcmp(mom_out[2]->id, "m_1") == 0, "mom_out[2] == '%s', want 'm_1'", mom_out[2]->id);
+    }
+
+    const msg_t *bob_out[8];
+    size_t bob_n = filter_peer(msgs, 5, "bob", true, "mom", bob_out, 8);
+    CHECK(bob_n == 2, "bob subset size == %zu, want 2", bob_n);
+    if (bob_n == 2) {
+        CHECK(strcmp(bob_out[0]->id, "m_5") == 0, "bob_out[0] == '%s', want 'm_5'", bob_out[0]->id);
+        CHECK(strcmp(bob_out[1]->id, "u_2") == 0, "bob_out[1] == '%s', want 'u_2'", bob_out[1]->id);
+    }
+}
+
 int main(void)
 {
     test_ascii_byte_cap();
@@ -271,11 +466,19 @@ int main(void)
 
     test_msghist_roundtrip_basic();
     test_msghist_roundtrip_edges();
+    test_msghist_roundtrip_sms_ts();
+    test_msghist_roundtrip_sndr();
+    test_msghist_v1_record_decodes_with_empty_sndr();
     test_msghist_decode_rejects_corruption();
     test_msghist_terminal_ack();
     test_msghist_restore_order();
 
+    test_msg_peer_of();
+    test_msg_peer_subsets_newest_first();
+
     if (g_failures == 0) {
+               "msghist record codec/terminal-ack/restore-order (v1+v2, sndr), and msg_peer_of() "
+               "(shared peer rule), 0 failures\n");
         return 0;
     }
     printf("FAIL: %d failure(s)\n", g_failures);

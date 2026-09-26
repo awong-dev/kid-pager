@@ -289,6 +289,9 @@ void lock_init(bool rtc_was_valid)
     load_from_nvs(); // power effect: a few NVS reads
 
     s_lock();
+    // A set passcode always locks at boot: the clock restarts, so an RTC `unlocked` is stale.
+    (void) rtc_was_valid;
+    s_rtc->locked = s_have_hash ? 1 : 0;
     s_save();
     s_unlock();
 }
@@ -388,7 +391,10 @@ bool lock_try_passcode(const char *passcode, size_t len)
     bool match = computed && memcmp(got, want, LOCK_HASH_LEN) == 0;
 
     if (match) {
+        s_lock();
         s_rtc->locked = 0;
+        s_save();
+        s_unlock();
     }
     return match;
 }

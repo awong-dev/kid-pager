@@ -1,4 +1,5 @@
 // `kind:"cfg"` dispatcher (docs/PROTOCOL.md §3.2/§10); hands each sub-map to its owner.
+// Keys: `lock`=0, `ca`=1, `sms`=2, `ota`=4, `loc`=5, `ast`=6; 3 is retired.
 #ifndef CFG_H
 #define CFG_H
 
@@ -25,6 +26,7 @@ typedef struct {
     // `sms`=2
     bool have_sms;
     size_t sms_off, sms_len;
+
 } cfg_dispatch_t;
 
 // Decodes a verified /down envelope (`sig_pair_present`: trailing sig pair already trimmed).

@@ -354,9 +354,27 @@ static void ack_apply(const char *id, bool shown)
 
 static void begin_unpin(const char *id)
 {
+    ident_t *snap = ident_scratch();
+    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
+    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
+    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
+    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
+    snap->port = ident_get_port();
+    snap->ca[0] = '\0';
+    snap->ca_len = 0;
+    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
+    snap->flags = ident_get_flags();
+    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
+    memset(snap->ca_hash, 0, sizeof(snap->ca_hash));
+    snap->n_epoch = ident_get_n_epoch();
+    snap->claimed = ident_get_claimed();
+
+    if (!ident_store(snap)) {
+        ident_scratch_release();
         ESP_LOGI(TAG, "un-pin: ident_store() failed - CA left pinned, will retry on the next push");
         return;
     }
+    ident_scratch_release();
     net_tls_configure(NET_TLS_CA_SLOT, false);
     set_broken(false);
     clear_pend_fail();
@@ -441,9 +459,26 @@ static void service_fetching(void)
 
 static void commit_apply(void)
 {
+    ident_t *snap = ident_scratch();
+    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
+    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
+    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
+    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
+    snap->port = ident_get_port();
+    strncpy(snap->ca, s_apply_pem, sizeof(snap->ca) - 1);
+    snap->ca_len = strlen(snap->ca);
+    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
+    snap->flags = ident_get_flags();
+    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
+    memcpy(snap->ca_hash, s_apply_sha, sizeof(snap->ca_hash));
+    snap->n_epoch = ident_get_n_epoch();
+    snap->claimed = ident_get_claimed();
 
     // ca_hash is the SHA-256 of the stored PEM, not of the raw HTTP body
+    mbedtls_sha256((const unsigned char *) snap->ca, snap->ca_len, snap->ca_hash, 0);
 
+    bool stored = ident_store(snap);
+    ident_scratch_release();
     net_write_ca_slot(NET_TLS_CA_SLOT, s_apply_pem); // best-effort
     net_tls_configure(NET_TLS_CA_SLOT, true);
     set_broken(false);

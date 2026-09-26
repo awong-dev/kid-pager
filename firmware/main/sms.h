@@ -25,6 +25,11 @@ extern "C" {
 #define SMS_LOG_ID_MAX 11  /* "s_" + 8 hex + NUL, PROTOCOL.md §1/§3.6 */
 #define SMS_PEER_MAX SMS_PHONE_MAX
 
+/* Concurrent in-flight concatenated messages; each slot costs SMS_REASM_MAX_PARTS * SMS_BODY_MAX. */
+#define SMS_REASM_SLOTS 2
+/* A `total` above this is rejected (SMS_REASM_DROPPED). */
+#define SMS_REASM_MAX_PARTS 4
+#define SMS_REASM_WINDOW_US (120LL * 1000000LL) /* from the first part */
 
 typedef struct {
     char name[SMS_CONTACT_NAME_MAX_UTF8];
@@ -124,6 +129,51 @@ bool sms_parse_cmgr_header(const char *raw, size_t len, sms_cmgr_header_t *out);
 bool sms_decode_received(const char *body, size_t body_len, int dcs, char *out, size_t out_cap,
                          size_t *out_len, bool *out_shown, bool *out_used_fallback);
 
+/* Concatenated-SMS UDH (3GPP TS 23.040 §9.2.3.24): UDHL then information elements. Only IEI 0x00
+ * (8-bit reference) and 0x08 (16-bit reference) are recognised; other IEs are skipped. */
+
+/* `tpdu_udh` includes its leading UDHL byte. False for no concatenation IE, a length overrun,
+ * total == 0, part == 0 or part > total. A 16-bit reference is folded to its low byte. */
+bool sms_parse_udh(const uint8_t *tpdu_udh, size_t len, uint8_t *ref, uint8_t *total,
+                   uint8_t *part);
+
+typedef enum {
+    SMS_REASM_COMPLETE = 0, /* every part present; `out`/`*out_len` filled */
+    SMS_REASM_PENDING = 1,  /* stored, waiting for more parts */
+    SMS_REASM_DROPPED = 2,  /* invalid input, or the message would not fit `out_cap` */
+} sms_reasm_result_t;
+
+typedef struct {
+    bool in_use;
+    uint8_t ref;
+    uint8_t total;
+    uint8_t parts_seen_mask; /* bit (part-1) set once that part has arrived */
+    char part_body[SMS_REASM_MAX_PARTS][SMS_BODY_MAX];
+    size_t part_len[SMS_REASM_MAX_PARTS];
+    int64_t first_part_us; /* monotonic esp_timer time, not wall clock */
+} sms_reasm_slot_t;
+
+typedef struct {
+    sms_reasm_slot_t slots[SMS_REASM_SLOTS];
+} sms_reasm_t;
+
+void sms_reasm_init(sms_reasm_t *r);
+
+/* Adds one decoded part (UDH stripped) to the slot keyed by (ref, total); with no free slot the
+ * oldest is evicted. COMPLETE concatenates in part order; DROPPED on bad values or no room. */
+int sms_reasm_add(sms_reasm_t *r, uint8_t ref, uint8_t total, uint8_t part, const char *text,
+                  size_t len, int64_t now_us, char *out, size_t out_cap, size_t *out_len);
+
+typedef struct {
+    uint8_t ref;
+    uint8_t total;
+    char body[SMS_BODY_MAX]; /* parts that arrived, in part order; missing parts are skipped */
+    size_t body_len;
+} sms_reasm_expired_t;
+
+/* Frees and reports every slot older than SMS_REASM_WINDOW_US at `now_us`; a clock that moves
+ * backwards never expires a slot. Returns the number expired, writing up to `out_cap` entries. */
+int sms_reasm_expire(sms_reasm_t *r, int64_t now_us, sms_reasm_expired_t *out, int out_cap);
 
 typedef struct {
     char peer[SMS_PEER_MAX];
@@ -174,6 +224,7 @@ void sms_bind(auth_rtc_t *auth_rtc, sms_rtc_lock_fn lock, sms_rtc_unlock_fn unlo
              sms_rtc_save_fn save, sms_epoch_wrap_fn on_wrap);
 
 /* Loads NVS state, configures the modem and arms the boot-drain scan; if modem setup fails SMS is
+ * disabled for this boot. Call after net_init() and sms_bind(). */
 void sms_init(void);
 
 /* Charset AT+CSCS rests on this boot (SMS_CHARSET_IRA if SMS is unavailable). */

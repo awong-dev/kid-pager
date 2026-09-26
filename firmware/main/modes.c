@@ -6,6 +6,10 @@
 #include "net.h"
 #include "watchdog.h"
 #include "ui.h"
+#include "disp.h"
+#include "flightrec.h"
+#include "pins.h"
+#include "rail.h"
 
 #include "input.h"
 #include "ime.h"
@@ -20,6 +24,7 @@
 #include "catrust.h"
 
 #include "book.h"
+#include "bookpull.h"
 
 #include "accel.h"
 #include "loc.h"
@@ -36,6 +41,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -52,13 +58,34 @@ static const char *TAG = "modes";
 
 // The modem releases a held URC only when it accepts a host command, never within 200 ms of RTS
 // being re-asserted; a 20 s cadence with the probe held open until answered delivers reliably.
+#define PAGER_WAKE_INTERVAL_SLEEP_MS 20000u  // T=20s sleep mode
+#define PAGER_WAKE_INTERVAL_ACTIVE_MS 20000u // T=20s active mode
 // Minimum interval between msg_pump() calls: caps the pump at 5 Hz on the 100 ms UI-awake cadence.
 #define PAGER_PUMP_MIN_INTERVAL_US (200 * 1000)
 // Sleep-mode wake interval while unregistered: there is nothing to receive.
 #define PAGER_WAKE_INTERVAL_UNREGISTERED_MS 30000u
+// Wake interval during the attentive window after input, so the next keypress is picked up
+// promptly. Below PAGER_PROBE_WAIT_MIN_INTERVAL_MS, so the probe does not wait.
+#define PAGER_WAKE_INTERVAL_ATTENTIVE_MS 1000u
+// How long the attentive cadence stays armed after the last input.
 // Awake time with RTS asserted after each timer wake. The modem holds URCs while RTS is deasserted
 // and does not hand them over within 50 ms.
 #define PAGER_POST_WAKE_YIELD_MS 200u
+// skipped.
+#define PAGER_INPUT_WAKE_YIELD_MS 40u
+// Bound on the extra awake time that keeps RTS asserted until the drain probe is answered.
+#define PAGER_PROBE_WAIT_MS 15000u
+// The probe wait is armed only when the wake interval is at least this long.
+#define PAGER_PROBE_WAIT_MIN_INTERVAL_MS 10000u
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+static uint32_t s_probe_wait_ms_override = 0; // sleeptest arg 4, 0 = build default
+// sleeptest arg 5: 0 leaves IO46/PAGER_PIN_WAKE0 untouched; otherwise it is configured as an
+// output once and stays so.
+static uint32_t s_st_wake0_ms = 0;
+static bool s_wake0_configured = false;
+#endif
+static uint32_t s_probe_wait_n = 0, s_probe_wait_giveups = 0;
+static int64_t s_probe_wait_total_us = 0, s_probe_wait_max_us = 0;
 #define PAGER_ACTIVE_IDLE_TIMEOUT_S (10 * 60) // 10 min
 #define PAGER_STATUS_HEARTBEAT_S 3600u         // §5.4(d)
 #define PAGER_CHECKCOMM_EVERY_N_WAKES 60u      // modem health check cadence
@@ -78,6 +105,7 @@ static const uint32_t k_backoff_s[] = { 5, 15, 60, 300 };
 #define PAGER_ID_MAX_LEN 17 // 16 chars + NUL, PROTOCOL.md §1/§3.1
 
 // Validity plus layout version tag; bump on any layout change so a stale CRC-valid struct is rejected.
+#define PAGER_RTC_MAGIC 0x50475237u // "PGR" + layout version 7
 
 typedef enum {
     PAGER_MODE_SLEEP = 0,
@@ -140,6 +168,12 @@ static void rtc_unlock(void) { xSemaphoreGive(s_rtc_mutex); }
 
 static bool s_was_mqtt_connected = false;
 static bool s_ui_awake_prev = false; // edge-detects input_awake()
+
+// esp_timer_get_time() of the last key, button or ext1 event; RAM-only. Starts outside the window so
+// "no input yet" does not read as attentive at boot.
+static int64_t s_last_input_us = -(int64_t) (PAGER_ATTENTIVE_S + 1) * 1000000;
+// Edge-detects the attentive/normal cadence transition.
+static bool s_attentive_prev = false;
 
 static uint32_t s_mqtt_link_counter = 0;
 
@@ -237,10 +271,29 @@ static void on_auth_epoch_wrap(void)
 {
     // Power effect: one NVS (flash) write. ident_t has no per-field setter: snapshot every getter into
     // the shared ident_scratch() buffer, bump n_epoch, rewrite via ident_store().
+    ident_t *snap = ident_scratch();
+    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
+    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
+    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
+    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
+    snap->port = ident_get_port();
+    strncpy(snap->ca, ident_get_ca(), sizeof(snap->ca) - 1);
+    snap->ca_len = ident_get_ca_len();
+    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
+    snap->flags = ident_get_flags();
+    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
+    memcpy(snap->ca_hash, ident_get_ca_hash(), sizeof(snap->ca_hash));
+    snap->n_epoch = (uint16_t) (ident_get_n_epoch() + 1);
+    snap->claimed = ident_get_claimed();
+
+    if (!ident_store(snap)) {
         ESP_LOGI(TAG, "failed to persist n_epoch=%u after up_lo wrap (§2.5) - "
                       "next boot's replay window may see a gap",
+                 (unsigned) snap->n_epoch);
     } else {
+        ESP_LOGI(TAG, "n_epoch bumped to %u after up_lo wrap (§14.2)", (unsigned) snap->n_epoch);
     }
+    ident_scratch_release();
 }
 
 // docs/PROTOCOL.md §10 envelope keys written for /status.
@@ -259,6 +312,14 @@ static void on_auth_epoch_wrap(void)
 #define STK_LOC_BACKOFF_S 43
 #define STK_TLS 39           // "unpinned"/"pinned"/"broken"/"proxy"
 #define STK_CA_FP 42         // absent when unpinned
+#define STK_SMS_LOST 48      // sms_log audit entries dropped for lack of NVS space
+// Key 52 is retired; do not reuse.
+#define STK_RST 53             // esp_reset_reason_t of this boot (watchdog_last_reset_reason())
+#define STK_STAGE 54           // previous boot's stage breadcrumb, 0 if none (watchdog_last_reset_stage())
+#define STK_ABN 55             // abnormal resets since power-on (watchdog_abnormal_reset_count())
+#define STK_BPULL 58           // book-pull capability gate: present (1) when supported
+// Previous boot's stalled-command breadcrumb (watchdog_last_stall_cmd()), omitted when empty.
+#define STK_STALLCMD 59
 
 #define PAGER_RSSI_UNSET (-1000) // outside net_get_rssi()'s valid [-113,-51] range
 
@@ -298,6 +359,25 @@ static void ui_wake_status_refresh(void)
     refresh_rssi_dbm();
 }
 
+// True inside the PAGER_ATTENTIVE_S attentive window.
+static bool attentive_now(void)
+{
+    return (esp_timer_get_time() - s_last_input_us) < (int64_t) PAGER_ATTENTIVE_S * 1000000;
+}
+
+// "In use" for the status-bar clock is the attentive window, wider than input_awake()'s window;
+// the rail stays on for all of it.
+bool modes_in_use(void)
+{
+    return attentive_now();
+}
+
+// Microseconds since the last key/button/ext1 event.
+int64_t modes_debug_last_input_age_us(void)
+{
+    return esp_timer_get_time() - s_last_input_us;
+}
+
 int modes_get_rssi_dbm(void) { return (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : -113; }
 bool modes_batt_mv_known(void) { return s_last_batt_mv != 0; }
 const char *modes_get_session_id(void) { return g_rtc.session_id; }
@@ -324,11 +404,19 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     // bearer TLS ends at Beam ("proxy").
     char ca_fp[17];
 
+    // Previous boot's stalled-command breadcrumb, "" when none.
+    const char *stall_cmd = watchdog_last_stall_cmd();
+    bool have_stall_cmd = stall_cmd[0] != '\0';
+
     uint32_t nfields = 8 + 3 + 1 + 1 + 1 + 1 + 3 + 1; // fixed fields; optional ones are added below
     if (have_ca_fp) {
         nfields += 1;
     }
+    if (have_stall_cmd) {
+        nfields += 1; // key 59, omitted when empty
+    }
     if (signed_env) {
+        nfields += 1; // bpull
         nfields += 2; // n (written below) + sig (appended by auth_sign())
     }
 
@@ -352,6 +440,21 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_uint(&w, STK_SMS_LOST, sms_get_lost_count());
     // Always present: callers build this only while mqtt_connected, after the counter is incremented.
     cbor_w_uint(&w, STK_LINK, s_mqtt_link_counter);
+
+    // Crash diagnostics (docs/PROTOCOL.md §9.5 keys 53/54/55), readable when the USB port is dead
+    // after a reset.
+    cbor_w_uint(&w, STK_RST, (uint64_t) (unsigned) watchdog_last_reset_reason());
+    cbor_w_uint(&w, STK_STAGE, (uint64_t) (unsigned) watchdog_last_reset_stage());
+    cbor_w_uint(&w, STK_ABN, (uint64_t) watchdog_abnormal_reset_count());
+    if (have_stall_cmd) {
+        cbor_w_tstr(&w, STK_STALLCMD, stall_cmd, strlen(stall_cmd));
+    }
+
+
+    // `bpull: 1` only when signing is on (the relay nudges only hmac devices); never sent as 0.
+    if (signed_env) {
+        cbor_w_uint(&w, STK_BPULL, 1);
+    }
 
     if (!signed_env) {
         *out_len = w.len;
@@ -548,10 +651,34 @@ static uint32_t s_st_interval_ms = 0;
 // 0 until the window closes, then close + ST_GRACE_S so late events and their acks are recorded.
 static volatile int64_t s_st_grace_until_us = 0;
 #define ST_GRACE_S 25
+// With flightrec records held, stay awake ST_HOLD_S after the report (a reset would destroy the
+// PSRAM recording), printing a status line every ST_HOLD_PRINT_INTERVAL_S.
+static int64_t s_st_hold_until_us = 0;
+static int64_t s_st_hold_last_print_us = 0;
+#define ST_HOLD_S (15 * 60)
+#define ST_HOLD_PRINT_INTERVAL_S 60
 static uint32_t s_st_sleeps = 0, s_st_wake_timer = 0, s_st_wake_other = 0;
+// Wakes whose net_sleep() interval was the attentive cadence.
+static uint32_t s_st_wake_attentive = 0;
+// Sleeps entered with the 3V3 rail off vs. kept on (attentive window).
+static uint32_t s_st_rail_off_sleeps = 0, s_st_rail_kept_on_sleeps = 0;
+// Wakes that brought the rail up via an EXT1 wake cause.
+static uint32_t s_st_rail_on_wakes = 0;
 // Cumulative microseconds per loop segment, each with its own sample count. Bucket 0 is the
+// post-wake yield (sleeping iterations); bucket 1 is the awake loop (iterations that skipped sleep).
+#define ST_SEG_N 8
+static const char *const k_st_seg_name[ST_SEG_N] = { "post-wake yield", "awake-loop (no sleep)",
+                                                    "input+ui+render", "mqtt status/retry",
+                                                    "msg_pump+health", "accel+loc", "sms",
+                                                    "catrust+heartbeat+rtc_save" };
 static int64_t s_st_seg_us[ST_SEG_N];
 static int64_t s_st_seg_max_us[ST_SEG_N];
+static uint32_t s_st_seg_n[ST_SEG_N];
+// Longest single iteration's awake work (excludes light-sleep time).
+static int64_t s_st_iter_max_us = 0;
+// Bytes buffered in the modem UART RX ring 50 ms after each wake.
+static uint32_t s_st_wake_bytes_max = 0;
+static uint32_t s_st_wake_bytes_nonzero = 0;
 static int64_t s_st_mark_us = 0;
 // Per-cycle timestamps for the first cycles: esp_timer and the RTC clock around net_sleep(), to
 // tell real sleep from entry/exit time.
@@ -566,6 +693,7 @@ static uint32_t s_st_ncyc = 0;
             int64_t _n = esp_timer_get_time();                                                      \
             int64_t _d = _n - s_st_mark_us;                                                         \
             s_st_seg_us[i] += _d;                                                                   \
+            s_st_seg_n[i]++;                                                                        \
             if (_d > s_st_seg_max_us[i]) s_st_seg_max_us[i] = _d;                                   \
             s_st_mark_us = _n;                                                                      \
         }                                                                                           \
@@ -604,28 +732,49 @@ static void sleeptest_note(char kind, int32_t a, const char *id)
     s_st_n_events = s_st_n_events + 1;
 }
 
+void modes_debug_sleeptest_start(uint32_t minutes, uint32_t yield_ms_override,
+                                 uint32_t interval_ms_override, uint32_t probe_wait_ms_override,
+                                 uint32_t wake0_ms)
 {
+    s_st_wake0_ms = wake0_ms;
+    flightrec_clear();
+    flightrec_set_recording(true);
     s_st_n_events = 0;
     s_st_sleeps = s_st_wake_timer = s_st_wake_other = 0;
+    s_st_wake_attentive = 0;
+    s_st_rail_off_sleeps = s_st_rail_kept_on_sleeps = 0;
+    s_st_rail_on_wakes = 0;
     s_st_asleep_us = 0;
     s_st_ncyc = 0;
     s_st_mark_us = esp_timer_get_time();
     memset(s_st_seg_us, 0, sizeof(s_st_seg_us));
     memset(s_st_seg_max_us, 0, sizeof(s_st_seg_max_us));
+    memset(s_st_seg_n, 0, sizeof(s_st_seg_n));
+    s_st_iter_max_us = 0;
+    s_st_wake_bytes_max = 0;
+    s_st_wake_bytes_nonzero = 0;
     s_st_start_us = esp_timer_get_time();
     s_st_until_us = s_st_start_us + (int64_t) minutes * 60 * 1000000;
     s_st_grace_until_us = 0;
     s_st_yield_ms = yield_ms_override;
     s_st_interval_ms = interval_ms_override;
+    s_probe_wait_ms_override = probe_wait_ms_override;
+    disp_reset_refresh_stats(); // so this window's report is only this window's refreshes
+    s_probe_wait_n = s_probe_wait_giveups = 0;
+    s_probe_wait_total_us = s_probe_wait_max_us = 0;
     s_st_report_due = true;
     // The AT trace would stall writes on a USB console with no host and stretch the wake window.
     esp_log_level_set("WalterModem", ESP_LOG_WARN);
     ESP_LOGI(TAG,
              "sleeptest: light sleep ENABLED for %u min (yield=%u ms, interval=%u ms, "
+             "wake0_ms=%u, 0=build default/untouched). The USB log goes quiet now. Send pages; "
+             "a report prints %u s after the window closes.",
              (unsigned) minutes, (unsigned) yield_ms_override, (unsigned) interval_ms_override,
+             (unsigned) wake0_ms, (unsigned) ST_GRACE_S);
 }
 
 // Report text kept in NVS: the USB port often does not re-enumerate after a sleep window until reset.
+static char s_st_text[3450];
 
 static void st_appendf(size_t *n, const char *fmt, ...)
 {
@@ -655,6 +804,7 @@ static void sleeptest_save(void)
     nvs_close(h);
 }
 
+static void modes_debug_sleeptest_print_saved(void)
 {
     nvs_handle_t h;
     if (nvs_open("dbg", NVS_READONLY, &h) != ESP_OK) {
@@ -679,11 +829,29 @@ void modes_debug_sleeptest_report(void)
     int64_t end = (now < s_st_until_us) ? now : s_st_until_us;
     int64_t span_us = end - s_st_start_us;
     st_appendf(&n, "window %lld s%s, yield=%u ms interval=%u ms (0=build default), %u light sleeps, "
+                    "asleep %lld s (%d%%), wakes: %u timer / %u other, attentive wakes: %u\n",
                (long long) (span_us / 1000000), (now < s_st_until_us) ? " (still open)" : "",
                (unsigned) s_st_yield_ms, (unsigned) s_st_interval_ms, (unsigned) s_st_sleeps,
                (long long) (s_st_asleep_us / 1000000),
                span_us > 0 ? (int) (s_st_asleep_us * 100 / span_us) : 0, (unsigned) s_st_wake_timer,
+               (unsigned) s_st_wake_other, (unsigned) s_st_wake_attentive);
+    // avg divides by each bucket's own sample count; buckets with no samples are skipped.
+    int64_t st_awake_total_us = 0;
+    for (int i = 0; i < ST_SEG_N; i++) {
+        st_awake_total_us += s_st_seg_us[i];
+        if (s_st_seg_n[i] == 0) {
+            continue;
+        }
+        st_appendf(&n, "  awake in %-28s avg %5lld ms/wake, max %5lld ms  (n=%u)\n", k_st_seg_name[i],
+                   (long long) (s_st_seg_us[i] / 1000 / s_st_seg_n[i]),
+                   (long long) (s_st_seg_max_us[i] / 1000), (unsigned) s_st_seg_n[i]);
     }
+    // Bucket 2 runs on every iteration, so its count is the iteration total; bucket 1 counts those that
+    // did not sleep.
+    st_appendf(&n, "  awake total %lld s over %u iterations (%u without a sleep); longest single "
+                    "iteration %lld ms\n",
+               (long long) (st_awake_total_us / 1000000), (unsigned) s_st_seg_n[2],
+               (unsigned) s_st_seg_n[1], (long long) (s_st_iter_max_us / 1000));
     for (uint32_t i = 0; i < s_st_ncyc; i++) {
         const st_cycle_t *c = &s_st_cyc[i];
         st_appendf(&n, "  cycle %u: net_sleep %lld ms by esp_timer, %lld ms by the RTC; awake before it %lld ms\n",
@@ -719,6 +887,89 @@ void modes_debug_sleeptest_report(void)
     if (ne == 0) {
         st_appendf(&n, "  no events: nothing was received during the window or the %u s after it closed\n",
                    (unsigned) ST_GRACE_S);
+    }
+    // Appended so the evidence survives the USB-dead sleep window; sleeptest_save() writes this text.
+    net_pager_counters_t pc = net_get_pager_counters();
+    // glitch_dropped counts stray leading 0xFF bytes dropped on wake.
+    st_appendf(&n, "modem counters: datatx_retx=%u prompt_orphan=%u buf_drop_queue=%u buf_drop_pool=%u "
+                    "modem_resets=%u glitch_dropped=%u\n",
+               (unsigned) pc.datatx_retx, (unsigned) pc.prompt_orphan, (unsigned) pc.buf_drop_queue,
+               (unsigned) pc.buf_drop_pool, (unsigned) g_rtc.modem_resets, (unsigned) pc.glitch_dropped);
+    // Which write path moved bytes, whether uart_wait_tx_done() timed out, and the command outstanding
+    // the last time one ran >= 5 s.
+    st_appendf(&n, "tx counters: prompt_handled=%u payload_bytes_written=%u txdone_timeouts=%u\n",
+               (unsigned) pc.prompt_handled, (unsigned) pc.payload_bytes_written,
+               (unsigned) pc.txdone_timeouts);
+    if (pc.stall_cmd[0] != '\0') {
+        st_appendf(&n, "stalled command: \"%.24s\" elapsed=%u ms cts=%d tx_ring_free=%u B\n",
+                   pc.stall_cmd, (unsigned) pc.stall_elapsed_ms, (int) pc.stall_cts_level,
+                   (unsigned) pc.stall_tx_ring_bytes);
+    }
+    // URC drain probe counters.
+    net_probe_counters_t probec = net_get_probe_counters();
+    // skip_busy/skip_down are cumulative since boot; the other probe counters clear on
+    // net_recover_modem().
+    st_appendf(&n, "probe counters: probe_issued=%u probe_answered=%u probe_stuck=%u probe_noqueue=%u "
+                    "probe_timedout=%u probe_skip_busy=%u probe_skip_down=%u\n",
+               (unsigned) probec.issued, (unsigned) probec.answered, (unsigned) probec.stuck,
+               (unsigned) probec.noqueue, (unsigned) probec.timedout, (unsigned) probec.skip_busy,
+               (unsigned) probec.skip_down);
+    // rsp_no_cmd/rsp_stale_cmd/payload_stuck_ms come from the vendored library; probe_first_attempt_ms
+    // from the probe's own timing.
+    st_appendf(&n, "stall discriminator: rsp_no_cmd=%u rsp_stale_cmd=%u payload_stuck_ms=%u "
+                    "probe_first_attempt_ms=%u\n",
+               (unsigned) pc.rsp_no_cmd, (unsigned) pc.rsp_stale_cmd, (unsigned) pc.payload_stuck_ms,
+               (unsigned) probec.first_attempt_ms);
+    // probe_answer_ms is recorded on the ANSWERED branch only; wait_* is the awake time that cost, with
+    // how many waits hit the bound.
+    st_appendf(&n, "probe answer: answer_ms last=%u max=%u n=%u; wait avg=%lld ms max=%lld ms n=%u "
+                    "gaveup=%u\n",
+               (unsigned) probec.answer_ms_last, (unsigned) probec.answer_ms_max,
+               (unsigned) probec.answer_n,
+               (long long) (s_probe_wait_n ? (s_probe_wait_total_us / 1000 / s_probe_wait_n) : 0),
+               (long long) (s_probe_wait_max_us / 1000), (unsigned) s_probe_wait_n,
+               (unsigned) s_probe_wait_giveups);
+    st_appendf(&n, "post-wake UART bytes (50ms sample): max=%u wakes_with_bytes=%u\n",
+               (unsigned) s_st_wake_bytes_max, (unsigned) s_st_wake_bytes_nonzero);
+    // Liveness pings whose first re-SUBSCRIBE was swallowed.
+    st_appendf(&n, "resub_first_swallowed=%u\n", (unsigned) net_get_resub_swallowed_count());
+    // Holds, longest hold, and SUBACKs caught during a hold.
+    uint32_t resub_holds = 0, resub_hold_max_ms = 0, resub_suback_in_hold = 0;
+    net_get_resub_hold_stats(&resub_holds, &resub_hold_max_ms, &resub_suback_in_hold);
+    st_appendf(&n, "resub holds: %u, max hold ms: %u, suback in hold: %u\n", (unsigned) resub_holds,
+               (unsigned) resub_hold_max_ms, (unsigned) resub_suback_in_hold);
+    // Display BUSY timeouts.
+    st_appendf(&n, "disp_busy_timeout_count=%u\n", (unsigned) disp_busy_timeout_count());
+    {
+        uint32_t disp_full = 0, disp_partial = 0, disp_upgraded = 0;
+        disp_get_refresh_stats(&disp_full, &disp_partial, &disp_upgraded);
+        char ring_str[160];
+        disp_refresh_ring_format(ring_str, sizeof(ring_str));
+        st_appendf(&n, "disp refreshes: full=%u partial=%u upgraded=%u; last: %s\n", (unsigned) disp_full,
+                   (unsigned) disp_partial, (unsigned) disp_upgraded, ring_str);
+    }
+    // off_sleeps + kept_on_sleeps equals the light sleep count; kb_bus_releases tracks off_sleeps 1:1;
+    // lazy_on is ui.c's free-running count, not window-scoped.
+    st_appendf(&n, "rail: off_sleeps=%u kept_on_sleeps=%u kb_skipped_reads=%u kb_bus_releases=%u "
+                    "on_wakes=%u lazy_on=%u\n",
+               (unsigned) s_st_rail_off_sleeps, (unsigned) s_st_rail_kept_on_sleeps,
+               (unsigned) ui_kb_skipped_read_count(), (unsigned) ui_kb_bus_release_count(),
+               (unsigned) s_st_rail_on_wakes, (unsigned) ui_rail_lazy_on_count());
+    net_publish_ring_entry_t ring[NET_PUBLISH_RING_MAX];
+    uint32_t nring = net_get_publish_ring(ring, NET_PUBLISH_RING_MAX);
+    if (nring == 0) {
+        st_appendf(&n, "publish ring: empty\n");
+    } else {
+        st_appendf(&n, "publish ring (%u entr%s, oldest first):\n", (unsigned) nring, nring == 1 ? "y" : "ies");
+        for (uint32_t i = 0; i < nring; i++) {
+            const net_publish_ring_entry_t *r = &ring[i];
+            const char *outcome = (r->outcome == NET_PUBLISH_RING_OK)        ? "OK"
+                                  : (r->outcome == NET_PUBLISH_RING_TIMEOUT) ? "TIMEOUT"
+                                                                              : "ERROR";
+            st_appendf(&n, "  +%4d s  ...%-7s %4u B  %-7s %4u ms\n",
+                       (int) ((r->issued_us - s_st_start_us) / 1000000), r->topic_tail, (unsigned) r->len,
+                       outcome, (unsigned) r->elapsed_ms);
+        }
     }
     ESP_LOGI(TAG, "sleeptest report:\n%s", s_st_text);
     if (now >= s_st_until_us) {
@@ -760,6 +1011,7 @@ static void handle_ingest_result(msg_ingest_t r, const msg_t *out, uint16_t len,
                 lat = (int32_t) (now_s - out->ts);
             }
             sleeptest_note('M', lat, id);
+            flightrec_event('M', lat, 0);
         }
 #endif
         modes_alert_incoming(id, from);
@@ -961,6 +1213,79 @@ static void run_modem_health_check(void)
     }
 }
 
+// Resets the modem after 6 consecutive stuck probes (the library had not released the command after
+// 3 wake intervals); an answered probe resets the streak. Called every wake, not gated on mode.
+static void check_probe_stuck_escalation(void)
+{
+    static uint32_t s_last_answered = 0, s_last_stuck = 0, s_consecutive_stuck = 0;
+    net_probe_counters_t pc = net_get_probe_counters();
+    // Counters going backwards means net_recover_modem() zeroed them: resynchronise, or the unsigned
+    // streak underflows.
+    if (pc.answered < s_last_answered || pc.stuck < s_last_stuck) {
+        s_last_answered = pc.answered;
+        s_last_stuck = pc.stuck;
+        s_consecutive_stuck = 0;
+        return;
+    }
+    if (pc.answered != s_last_answered) {
+        s_last_answered = pc.answered;
+        s_consecutive_stuck = 0;
+    }
+    if (pc.stuck != s_last_stuck) {
+        s_consecutive_stuck += (pc.stuck - s_last_stuck);
+        s_last_stuck = pc.stuck;
+        if (s_consecutive_stuck >= 6) {
+            s_consecutive_stuck = 0;
+            if (rate_limited_modem_recover("URC probe stuck 6x in a row")) {
+                note_session_up_attempt(net_session_up());
+            }
+        }
+    }
+}
+
+// Holds the wake window open (RTS asserted) until the drain probe is answered: the modem releases
+// held URCs only once it accepts a command. Bounded by PAGER_PROBE_WAIT_MS; no AT traffic of its own.
+static void wait_for_probe_answer(uint32_t interval_ms)
+{
+    uint32_t bound_ms = PAGER_PROBE_WAIT_MS;
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    if (sleeptest_active() && s_probe_wait_ms_override) {
+        bound_ms = s_probe_wait_ms_override;
+    }
+#endif
+    if (bound_ms == 0 || interval_ms < PAGER_PROBE_WAIT_MIN_INTERVAL_MS) {
+        return;
+    }
+    if (!net_urc_probe_in_flight()) {
+        return; // answered inside the yield already, or no probe was issued
+    }
+    int64_t t0 = esp_timer_get_time();
+    int64_t deadline_us = t0 + (int64_t) bound_ms * 1000;
+    // Samples CTS at entry (baseline) and every 20 ms; flightrec_cts_level() is -1 outside a sleeptest
+    // window.
+    int prev_cts = flightrec_cts_level();
+    while (net_urc_probe_in_flight()) {
+        if (esp_timer_get_time() >= deadline_us) {
+            s_probe_wait_giveups++;
+            flightrec_event('G', (int32_t) ((esp_timer_get_time() - t0) / 1000), 0);
+            break;
+        }
+        // No watchdog_kick() here: the loop is bounded inside watchdog.c's 95 s per-stage budget.
+        vTaskDelay(pdMS_TO_TICKS(20));
+        int cts = flightrec_cts_level();
+        if (cts != prev_cts) {
+            flightrec_event('C', cts, (int32_t) ((esp_timer_get_time() - t0) / 1000));
+            prev_cts = cts;
+        }
+    }
+    int64_t waited_us = esp_timer_get_time() - t0;
+    s_probe_wait_n++;
+    s_probe_wait_total_us += waited_us;
+    if (waited_us > s_probe_wait_max_us) {
+        s_probe_wait_max_us = waited_us;
+    }
+}
+
 // Keeps the screen stack in sync with lock.c's `locked` state. modes_run() task only: the admin
 // `clear` runs on the MQTT event task and must not touch the stack, so this poll picks it up.
 static void lock_screen_sync(void)
@@ -1018,6 +1343,9 @@ void modes_boot(void)
     book_bind(&g_rtc.auth, rtc_lock, rtc_unlock, rtc_save, on_auth_epoch_wrap);
     book_init();
 
+    // Must run before net_set_msg_cb(): a nudge could arrive as soon as MQTT subscribes.
+    bookpull_bind(rtc_lock, rtc_unlock);
+
     input_init(); // power effect: GPIO config + static queue alloc only
 
     if (!ui_init()) {
@@ -1059,6 +1387,28 @@ void modes_boot(void)
     ESP_LOGI(TAG, "boot complete, entering sleep mode");
 }
 
+// The attentive/normal cadence edge; called once per loop iteration, unconditionally, before
+// skip_sleep is computed.
+static bool attentive_service(void)
+{
+    bool attentive = attentive_now();
+    if (attentive != s_attentive_prev) {
+        ESP_LOGI(TAG, "wake cadence: %s",
+                 attentive ? "attentive (1 s, recent input)" : "normal (input idle)");
+        s_attentive_prev = attentive;
+        if (!attentive) {
+            // The attentive window lapsed: render once so the status-bar clock reads "--:--" before 20 s
+            // sleeps resume. The rail was on for the whole window, so painting here is safe.
+            // Auto-lock at this edge bounds an unattended pager (lock.auto may be longer); the screen
+                lock_now();
+                lock_screen_sync();
+            }
+            ui_render(); // calls ui_ensure_powered() first
+        }
+    }
+    return attentive;
+}
+
 void modes_run(void)
 {
     uint32_t backoff_index = 0;
@@ -1073,6 +1423,12 @@ void modes_run(void)
         // Lengthen the sleep-mode wake interval while unregistered; active mode is left alone.
         if (g_rtc.mode != (uint8_t) PAGER_MODE_ACTIVE && net_unregistered_for_s() > 0) {
             interval_ms = PAGER_WAKE_INTERVAL_UNREGISTERED_MS;
+        }
+        // Input shortens the wake interval in either mode (overriding the unregistered interval);
+        // sleeptest's own override below still wins inside a window.
+        bool attentive = attentive_service();
+        if (attentive) {
+            interval_ms = PAGER_WAKE_INTERVAL_ATTENTIVE_MS;
         }
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
         // sleeptest overrides the wake interval for the window only.
@@ -1107,10 +1463,16 @@ void modes_run(void)
 
         // No light sleep while a button is held or stuck (ext1 is a level wake and would return at once),
         // the UI-awake window is open, or an AT transaction is in flight (RTS would drop mid-response).
+        // net_connect_in_flight() is bounded by the 30 s connect timeout, net_publish_in_flight() by
+        // PUBLISH_SLEEP_HOLD_MAX_US (15 s).
         bool btn_busy = input_button_busy();
         bool btn_stuck = input_button_stuck();
         bool ui_awake = input_awake();
+        // A fetch holds the loop awake only while in progress (<= 30 s), not during the cooldown between
+        // attempts; net_resub_hold() (<= 3 s) keeps it awake so a liveness re-SUBSCRIBE's SUBACK is seen.
+        bool skip_sleep = btn_busy || btn_stuck || ui_awake || net_modem_busy() || net_connect_in_flight() ||
         // pump_blocked keys only on net_modem_busy() (the UART/RTS interlock with the MQTT event handler);
+        // UI-awake and connect-in-flight are no reason to withhold a publish. msg_pump() is rate-limited below.
         bool pump_blocked = net_modem_busy();
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
         // Debug builds behave as if the UI were always awake (no light sleep, log alive), except inside a
@@ -1129,6 +1491,35 @@ void modes_run(void)
                 modes_debug_sleeptest_report();
                 // Proof of life that does not depend on USB: the relay logs this webhook.
                 modes_publish_status_now();
+                flightrec_event('E', 0, 0);
+                flightrec_set_recording(false);
+                uint32_t n = flightrec_count();
+                if (n > 0) {
+                    // Dump once and hold instead of resetting (a reset would destroy the recording).
+                    flightrec_dump();
+                    printf("flightrec: %u records held, type 'flightrec' to dump again "
+                           "(reset in %u min)\n",
+                           (unsigned) n, (unsigned) (ST_HOLD_S / 60));
+                    s_st_hold_until_us = esp_timer_get_time() + (int64_t) ST_HOLD_S * 1000000;
+                    s_st_hold_last_print_us = esp_timer_get_time();
+                } else {
+                    // The USB port often does not re-enumerate after light sleep; a restart brings it
+                    // back and the saved report prints at boot.
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    watchdog_hard_reset(); // not esp_restart(): that leaves a dead USB port dead
+                }
+            }
+            if (s_st_hold_until_us != 0) {
+                int64_t now = esp_timer_get_time();
+                if (now >= s_st_hold_until_us) {
+                    watchdog_hard_reset();
+                } else if (now - s_st_hold_last_print_us >= (int64_t) ST_HOLD_PRINT_INTERVAL_S * 1000000) {
+                    s_st_hold_last_print_us = now;
+                    printf("flightrec: %u records held, type 'flightrec' to dump "
+                           "(reset in %u min)\n",
+                           (unsigned) flightrec_count(),
+                           (unsigned) ((s_st_hold_until_us - now) / 1000000 / 60));
+                }
             }
         }
 #endif
@@ -1137,7 +1528,53 @@ void modes_run(void)
             int64_t st_t0 = esp_timer_get_time();
             int64_t st_rtc0 = (int64_t) esp_clk_rtc_time();
 #endif
+            // Rail gate: outside the attentive window the display/CardKB rail drops for sleep; inside it
+            // the rail stays on (cycling it every second would reboot the CardKB). rail_off() cuts their draw.
+            if (attentive) {
+                rail_on();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+                s_st_rail_kept_on_sleeps++;
+#endif
+            } else {
+                rail_off();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+                s_st_rail_off_sleeps++;
+#endif
+            }
             watchdog_kick(WD_SLEEP_ENTER);
+            // Wake path: the rail comes up here only for real input (an ext1 wake), or lazily via
+            // ui_ensure_powered() when a render needs it; a timer wake with nothing to draw leaves it off.
+            // wake_is_ext1: any ext1 wake (button or LIS3DH): short yield, no probe wait. wake_is_button:
+            {
+                esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+                    int64_t wake_now_us = esp_timer_get_time();
+                    s_last_input_us = wake_now_us;
+                    ui_ensure_powered(); // rule (b): this wake IS real input, bring the rail up now
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+                    s_st_rail_on_wakes++;
+#endif
+                }
+            }
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            // Tags every flightrec record of this wake with its cycle number (s_st_sleeps + 1).
+            flightrec_set_cycle((uint16_t) (s_st_sleeps + 1));
+            // wake0_ms: 0 leaves IO46/LTE_WAKE0 untouched; otherwise pulse it after net_sleep() and
+            // before the probe's wake bytes.
+            if (s_st_wake0_ms) {
+                if (!s_wake0_configured) {
+                    gpio_set_direction((gpio_num_t) PAGER_PIN_WAKE0, GPIO_MODE_OUTPUT);
+                    s_wake0_configured = true;
+                }
+                gpio_set_level((gpio_num_t) PAGER_PIN_WAKE0, 1);
+                vTaskDelay(pdMS_TO_TICKS(s_st_wake0_ms));
+                gpio_set_level((gpio_num_t) PAGER_PIN_WAKE0, 0);
+                flightrec_event('X', (int32_t) s_st_wake0_ms, flightrec_cts_level());
+            }
+#endif
+            // First statement after net_sleep(), before the yield: the URC drain probe, on every sleeping
+            // wake in both modes. Fire-and-forget; its answer lands inside the yield.
+            net_urc_probe();
+            check_probe_stuck_escalation();
             watchdog_kick(WD_SLEEP_EXIT);
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
             if (s_st_ncyc < ST_CYC_MAX) {
@@ -1150,6 +1587,9 @@ void modes_run(void)
             s_st_asleep_us += esp_timer_get_time() - st_t0;
             ST_MARK_BEGIN();
             s_st_sleeps++;
+            if (interval_ms == PAGER_WAKE_INTERVAL_ATTENTIVE_MS) {
+                s_st_wake_attentive++;
+            }
             if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
                 s_st_wake_timer++;
             } else {
@@ -1164,15 +1604,48 @@ void modes_run(void)
                 yield_ms = s_st_yield_ms;
             }
 #endif
+            // Only shrinks yield_ms, so a smaller sleeptest override is honoured; an ext1 wake is the one
+            // a person is watching.
+                yield_ms = PAGER_INPUT_WAKE_YIELD_MS;
+            }
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            // Bytes in the modem UART RX ring 50 ms after the wake; the yield is split around the sample
+            // so its total length is unchanged.
+            uint32_t first_ms = (yield_ms < 50u) ? yield_ms : 50u;
+            vTaskDelay(pdMS_TO_TICKS(first_ms));
+            if (sleeptest_active_flag()) {
+                uint32_t buffered = net_uart_rx_buffered_bytes();
+                if (buffered > s_st_wake_bytes_max) {
+                    s_st_wake_bytes_max = buffered;
+                }
+                if (buffered > 0) {
+                    s_st_wake_bytes_nonzero++;
+                }
+            }
+            if (yield_ms > first_ms) {
+                vTaskDelay(pdMS_TO_TICKS(yield_ms - first_ms));
+            }
+#else
             vTaskDelay(pdMS_TO_TICKS(yield_ms));
+#endif
             assert(yield_ms >= 30); // debug builds only
+            // On a lengthened cadence, hold the window open until the probe is answered; after the yield so
+                wait_for_probe_answer(interval_ms);
+            }
         } else if (btn_stuck) {
             // BTN_STUCK: no short/long resolution left to time, so poll at the sleep-mode interval.
             vTaskDelay(pdMS_TO_TICKS(PAGER_WAKE_INTERVAL_SLEEP_MS));
         } else {
         }
 
+        // If the modem UART still has buffered bytes this wake's drain burst is still arriving: defer
+        // this iteration's ack publish to the next wake. Power: one software-counter read.
+        bool wake_bytes_pending = net_uart_rx_buffered_bytes() > 0;
+
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        // s_st_mark_us is this iteration's start-of-awake-work reference.
+        int64_t st_iter_begin_us = s_st_mark_us;
+        ST_MARK(skip_sleep ? 1 : 0);
 #endif
         watchdog_kick(WD_INPUT_UI);
         input_poll(); // power effect: one GPIO read (button FSM step)
@@ -1188,12 +1661,15 @@ void modes_run(void)
                 break;
             case INPUT_EVT_BTN_SHORT:
                 ui_on_button_short();
+                s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
             case INPUT_EVT_BTN_LONG:
                 ui_on_button_long();
+                s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
             case INPUT_EVT_KEY:
                 ui_dispatch_key(ievt.key);
+                s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
             }
         }
@@ -1219,6 +1695,11 @@ void modes_run(void)
             ui_show_toast(lock_toast);
         }
 
+        // Keys and buttons render this iteration; an idle iteration's ui_render() is a no-op diff.
+        // Checked every pass, not just while UI-awake: modes_in_use() is the wider attentive window with
+        if (!render_now && ui_clock_due()) {
+            render_now = true;
+        }
         if (render_now) {
             // Always a partial; cheap when nothing changed.
             ui_render();
@@ -1233,6 +1714,7 @@ void modes_run(void)
         rtc_unlock();
 
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(2);
 #endif
         watchdog_kick(WD_MQTT);
         net_mqtt_status_t st;
@@ -1277,6 +1759,9 @@ void modes_run(void)
             break;
         }
 
+        // The registered edge also fires once at boot with a connect in flight; resetting the backoff
+        // then would issue a second CONNECT.
+            !net_connect_in_flight()) {
             // Coverage is back: retry at once. A session "connected" across the gap cannot be trusted (the
             // TCP connection can be dead for up to 45 min until keepalive expires), so reconnect (~5 kB TLS).
             ESP_LOGI(TAG, "network coverage regained - dark for %u s - reconnecting the MQTT session now",
@@ -1346,12 +1831,23 @@ void modes_run(void)
             } else {
                 schedule_backoff(&backoff_index, &next_session_retry_us);
             }
+            // net_connect_in_flight() prevents a second CONNECT while one is outstanding (+CME ERROR: 4).
+                !net_connect_in_flight()) {
                 // No-op unless `broken`: picks validated vs. unvalidated for this attempt.
                 catrust_before_reconnect();
                 ESP_LOGI(TAG, "retrying MQTT session (backoff idx=%u)", (unsigned) backoff_index);
                 bool up_ok = net_session_up();
                 note_session_up_attempt(up_ok); // arms the connect watchdog
                 if (!up_ok) {
+                    // net_session_up() can keep failing if the modem's MQTT client is stuck up; after 3
+                    // failures in a row reach for a full modem reset.
+                    if (net_connect_fail_streak_maxed() &&
+                        rate_limited_modem_recover(
+                            "net_session_up() failed 3x in a row (modem MQTT client possibly stuck)")) {
+                        note_session_up_attempt(net_session_up());
+                    } else {
+                        schedule_backoff(&backoff_index, &next_session_retry_us);
+                    }
                 }
             }
         } else {
@@ -1362,10 +1858,16 @@ void modes_run(void)
         // At most one publish per pump call, only while connected and not net_modem_busy(), rate-limited
         // so the 100 ms UI-awake poll cadence does not become an AT transaction every 100 ms.
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(3);
 #endif
         // Idle-uplink liveness ping / silent-resume repair, once per iteration. The LTE transport is
+        net_service_session();
 
         watchdog_kick(WD_PUMP);
+        // wake_bytes_pending skips this iteration only; s_next_pump_us is not advanced, so the next
+        // wake retries.
+        if (!pump_blocked && !wake_bytes_pending && st.mqtt_connected &&
+            esp_timer_get_time() >= s_next_pump_us) {
             msg_pump();
             s_next_pump_us = esp_timer_get_time() + PAGER_PUMP_MIN_INTERVAL_US;
         }
@@ -1378,6 +1880,7 @@ void modes_run(void)
         // Accelerometer poll and one GNSS state-machine step, each bounded. accel_poll() returns true on
         // an intentional shake, which the event drain turns into BTN_DOWN+BTN_SHORT next iteration.
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(4);
 #endif
         watchdog_kick(WD_LOC);
         loc_service();
@@ -1385,6 +1888,7 @@ void modes_run(void)
         // One bounded SMS state-machine step per iteration; not gated on the MQTT session (SMS works
         // without the relay; only the sms_log audit publish needs it).
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(5);
 #endif
         watchdog_kick(WD_SMS);
         sms_service();
@@ -1392,8 +1896,13 @@ void modes_run(void)
         // One step of the pending cfg.ca / two-phase apply; `st` must be this iteration's snapshot, the
         // same one handle_mqtt_loss() saw.
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(6);
 #endif
         watchdog_kick(WD_CATRUST);
+
+        // One step of the pending-nudge / book-fetch state machine; shares catrust's single-flight
+        // cafetch guard.
+        bookpull_service();
 
         maybe_publish_heartbeat();
 
@@ -1409,6 +1918,14 @@ void modes_run(void)
         rtc_save();
         rtc_unlock();
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        ST_MARK(7);
+        // Longest single iteration's awake work (excludes light-sleep time).
+        if (sleeptest_active_flag()) {
+            int64_t st_iter_us = esp_timer_get_time() - st_iter_begin_us;
+            if (st_iter_us > s_st_iter_max_us) {
+                s_st_iter_max_us = st_iter_us;
+            }
+        }
 #endif
     }
 }

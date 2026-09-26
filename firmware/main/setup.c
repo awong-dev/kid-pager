@@ -654,7 +654,10 @@ bool setup_run(const char *code)
         return fail(ui_ok, "code damaged");
     }
 
+    ident_t *id = ident_scratch();
     static setup_ca_ptr_t ca_ptr;
+    if (!decode_and_validate_bundle(plain, plain_len, id, &ca_ptr)) {
+        ident_scratch_release();
         net_session_down();
         ESP_LOGI(TAG, "bundle decrypted (%u bytes) but CBOR decode/validate failed",
                  (unsigned) plain_len);
@@ -677,21 +680,32 @@ bool setup_run(const char *code)
                  "mqtt_survived_second_socket=%d",
                  ca_ptr.url, http_status, (unsigned) bytes, (unsigned) elapsed_ms, (int) fetch_ok,
                  (int) mqtt_survived);
+        if (!fetch_ok || fetched_len >= sizeof(id->ca)) {
+            ident_scratch_release();
             net_session_down();
             return fail(ui_ok, "cannot reach broker");
         }
+        memcpy(id->ca, fetched_pem, fetched_len);
+        id->ca[fetched_len] = '\0';
+        id->ca_len = fetched_len;
     }
     // hash of whatever ended up in id->ca (empty, inline or fetched)
+    mbedtls_sha256((const unsigned char *) id->ca, id->ca_len, id->ca_hash, 0);
 
+    if (!ident_store(id)) {
+        ident_scratch_release();
         net_session_down();
         ESP_LOGI(TAG, "bundle valid but ident_store() (NVS write) failed");
         return fail(ui_ok, "code damaged"); /* NVS write failure */
     }
 
     // Power effect: one write to the modem's NVRAM, no RRC. Skipped when no CA is pinned.
+    if (id->ca[0] != '\0' && !net_write_ca(id->ca)) {
+        ident_scratch_release();
         net_session_down();
         return fail(ui_ok, "cannot reach broker");
     }
+    ident_scratch_release();
     ESP_LOGI(TAG, "SETUP bundle");
     if (ui_ok) {
         ui_show_toast("SETUP bundle");

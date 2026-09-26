@@ -73,6 +73,9 @@ bool ident_set_slot12_populated(void);
 bool ident_get_tls_broken(void);
 bool ident_set_tls_broken(bool broken);
 
+ident_t *ident_scratch(void);
+void ident_scratch_release(void);
+
 #ifdef __cplusplus
 }
 #endif

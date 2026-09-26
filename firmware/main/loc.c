@@ -637,6 +637,8 @@ bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
 }
 
 // Called via net_set_cell_change_cb() with a de-duplicated "lac:ci" key; can run on the modem event
+// task, so keep it fast.
+static void loc_on_cell_change(const char *cell_key)
 {
     int64_t now_us = esp_timer_get_time();
     s_lock();

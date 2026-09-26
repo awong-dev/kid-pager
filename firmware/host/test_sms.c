@@ -421,6 +421,255 @@ static void test_decode_received(void)
           "the fallback must treat non-hex-looking text as plain 7-bit text");
 }
 
+static void test_udh_parse_iei00_8bit_ref(void)
+{
+    // UDHL=5, IEI=0x00, IEDL=3, ref=0xAB, total=2, part=1
+    const uint8_t udh[] = { 0x05, 0x00, 0x03, 0xAB, 0x02, 0x01 };
+    uint8_t ref = 0, total = 0, part = 0;
+    CHECK(sms_parse_udh(udh, sizeof(udh), &ref, &total, &part), "IEI 0x00 UDH must parse");
+    CHECK(ref == 0xAB, "ref == 0x%02x, want 0xAB", ref);
+    CHECK(total == 2, "total == %u, want 2", total);
+    CHECK(part == 1, "part == %u, want 1", part);
+}
+
+static void test_udh_parse_iei08_16bit_ref(void)
+{
+    // UDHL=6, IEI=0x08, IEDL=4, ref16=0x1234, total=3, part=2
+    const uint8_t udh[] = { 0x06, 0x08, 0x04, 0x12, 0x34, 0x03, 0x02 };
+    uint8_t ref = 0, total = 0, part = 0;
+    CHECK(sms_parse_udh(udh, sizeof(udh), &ref, &total, &part), "IEI 0x08 UDH must parse");
+    CHECK(ref == 0x34, "16-bit ref folded to low byte: ref == 0x%02x, want 0x34", ref);
+    CHECK(total == 3, "total == %u, want 3", total);
+    CHECK(part == 2, "part == %u, want 2", part);
+}
+
+static void test_udh_parse_rejections(void)
+{
+    uint8_t ref, total, part;
+
+    // IEI 0x01 (port addressing) with no concatenation IE
+    const uint8_t other_iei[] = { 0x03, 0x01, 0x01, 0x00 };
+    CHECK(!sms_parse_udh(other_iei, sizeof(other_iei), &ref, &total, &part),
+          "an unrecognised IEI alone must be rejected");
+
+    const uint8_t bad_total[] = { 0x05, 0x00, 0x03, 0xAB, 0x00, 0x01 };
+    CHECK(!sms_parse_udh(bad_total, sizeof(bad_total), &ref, &total, &part), "total==0 must be rejected");
+
+    const uint8_t bad_part[] = { 0x05, 0x00, 0x03, 0xAB, 0x02, 0x00 };
+    CHECK(!sms_parse_udh(bad_part, sizeof(bad_part), &ref, &total, &part), "part==0 must be rejected");
+
+    const uint8_t part_over[] = { 0x05, 0x00, 0x03, 0xAB, 0x02, 0x03 };
+    CHECK(!sms_parse_udh(part_over, sizeof(part_over), &ref, &total, &part),
+          "part>total must be rejected");
+
+    // UDHL past the end of the buffer
+    const uint8_t short_buf[] = { 0x05, 0x00, 0x03, 0xAB, 0x02 };
+    CHECK(!sms_parse_udh(short_buf, sizeof(short_buf), &ref, &total, &part),
+          "a UDHL past the end of the buffer must be rejected");
+
+    // IEDL past the end of the UDH
+    const uint8_t bad_iedl[] = { 0x02, 0x00, 0x03 };
+    CHECK(!sms_parse_udh(bad_iedl, sizeof(bad_iedl), &ref, &total, &part),
+          "an IEDL past the end of the UDH must be rejected");
+
+    // IEI 0x00 with IEDL != 3
+    const uint8_t short_iedl[] = { 0x03, 0x00, 0x01, 0xAB };
+    CHECK(!sms_parse_udh(short_iedl, sizeof(short_iedl), &ref, &total, &part),
+          "IEI 0x00 with IEDL != 3 must be rejected");
+
+    CHECK(!sms_parse_udh(NULL, 0, &ref, &total, &part), "a NULL buffer must be rejected");
+}
+
+static void test_reasm_two_part_in_order(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    CHECK(sms_reasm_add(&r, 0xAB, 2, 1, "Hello, ", 7, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 1 of 2 must be PENDING");
+    CHECK(sms_reasm_add(&r, 0xAB, 2, 2, "world!", 6, 1000, out, sizeof(out), &out_len) ==
+             SMS_REASM_COMPLETE,
+          "part 2 of 2 must complete the message");
+    CHECK(out_len == 13 && memcmp(out, "Hello, world!", 13) == 0,
+          "completed body must be 'Hello, world!', got '%.*s'", (int) out_len, out);
+}
+
+static void test_reasm_out_of_order(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    // part 2 first: text still assembles in part order
+    CHECK(sms_reasm_add(&r, 0x11, 2, 2, "world!", 6, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 2 arriving first must be PENDING");
+    CHECK(sms_reasm_add(&r, 0x11, 2, 1, "Hello, ", 7, 5, out, sizeof(out), &out_len) ==
+             SMS_REASM_COMPLETE,
+          "part 1 arriving second must complete the message");
+    CHECK(out_len == 13 && memcmp(out, "Hello, world!", 13) == 0,
+          "out-of-order assembly must still read 'Hello, world!', got '%.*s'", (int) out_len, out);
+}
+
+static void test_reasm_three_part_16bit_ref(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+    uint8_t ref = 0, total = 0, part = 0;
+
+    // 16-bit-ref UDH through sms_parse_udh() then sms_reasm_add(), part 2 first
+    const uint8_t udh2[] = { 0x06, 0x08, 0x04, 0x12, 0x34, 0x03, 0x02 };
+    CHECK(sms_parse_udh(udh2, sizeof(udh2), &ref, &total, &part), "part 2 UDH must parse");
+    CHECK(sms_reasm_add(&r, ref, total, part, "beta", 4, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 2 of 3 must be PENDING");
+
+    const uint8_t udh1[] = { 0x06, 0x08, 0x04, 0x12, 0x34, 0x03, 0x01 };
+    CHECK(sms_parse_udh(udh1, sizeof(udh1), &ref, &total, &part), "part 1 UDH must parse");
+    CHECK(sms_reasm_add(&r, ref, total, part, "alpha-", 6, 10, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 1 of 3 must still be PENDING (part 3 missing)");
+
+    const uint8_t udh3[] = { 0x06, 0x08, 0x04, 0x12, 0x34, 0x03, 0x03 };
+    CHECK(sms_parse_udh(udh3, sizeof(udh3), &ref, &total, &part), "part 3 UDH must parse");
+    CHECK(sms_reasm_add(&r, ref, total, part, "-gamma", 6, 20, out, sizeof(out), &out_len) ==
+             SMS_REASM_COMPLETE,
+          "part 3 of 3 must complete the message");
+    CHECK(out_len == 16 && memcmp(out, "alpha-beta-gamma", 16) == 0,
+          "completed 3-part body must be 'alpha-beta-gamma', got '%.*s'", (int) out_len, out);
+}
+
+static void test_reasm_duplicate_part_is_idempotent(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    CHECK(sms_reasm_add(&r, 0x22, 2, 1, "one-", 4, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "first arrival of part 1 must be PENDING");
+    // a retransmitted part 1 changes nothing
+    CHECK(sms_reasm_add(&r, 0x22, 2, 1, "one-", 4, 1, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "a duplicate part 1 must still be PENDING, not COMPLETE");
+    CHECK(sms_reasm_add(&r, 0x22, 2, 2, "two", 3, 2, out, sizeof(out), &out_len) ==
+             SMS_REASM_COMPLETE,
+          "part 2 must now complete the message");
+    CHECK(out_len == 7 && memcmp(out, "one-two", 7) == 0,
+          "duplicate part must not have altered the assembled body, got '%.*s'", (int) out_len, out);
+}
+
+static void test_reasm_missing_middle_expires_as_partial(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    // part 2 never arrives
+    CHECK(sms_reasm_add(&r, 0x33, 3, 1, "first-", 6, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 1 of 3 must be PENDING");
+    CHECK(sms_reasm_add(&r, 0x33, 3, 3, "-third", 6, 1000, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "part 3 of 3 (part 2 still missing) must be PENDING");
+
+    // before the 120 s window
+    sms_reasm_expired_t expired[SMS_REASM_SLOTS];
+    CHECK(sms_reasm_expire(&r, SMS_REASM_WINDOW_US - 1, expired, SMS_REASM_SLOTS) == 0,
+          "a slot must not expire before its window elapses");
+
+    // at the window the slot expires with what it has
+    int n = sms_reasm_expire(&r, SMS_REASM_WINDOW_US, expired, SMS_REASM_SLOTS);
+    CHECK(n == 1, "exactly one slot must expire, got %d", n);
+    CHECK(expired[0].ref == 0x33 && expired[0].total == 3, "expired slot ref/total mismatch");
+    CHECK(expired[0].body_len == 12 && memcmp(expired[0].body, "first--third", 12) == 0,
+          "partial body must skip the missing middle part, got '%.*s'", (int) expired[0].body_len,
+          expired[0].body);
+
+    // the slot was freed
+    CHECK(sms_reasm_expire(&r, SMS_REASM_WINDOW_US * 10, expired, SMS_REASM_SLOTS) == 0,
+          "an already-expired slot must not be reported twice");
+}
+
+static void test_reasm_backwards_clock_never_expires_early(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+    CHECK(sms_reasm_add(&r, 0x44, 2, 1, "x", 1, 1000000, out, sizeof(out), &out_len) ==
+             SMS_REASM_PENDING,
+          "setup: part 1 must be PENDING");
+
+    sms_reasm_expired_t expired[SMS_REASM_SLOTS];
+    // a clock before the slot's first_part_us never expires it
+    CHECK(sms_reasm_expire(&r, 0, expired, SMS_REASM_SLOTS) == 0,
+          "a backwards clock must not expire a slot early");
+}
+
+static void test_reasm_third_concurrent_ref_evicts_oldest(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    CHECK(sms_reasm_add(&r, 1, 2, 1, "A1", 2, 0, out, sizeof(out), &out_len) == SMS_REASM_PENDING,
+          "ref 1 part 1 must be PENDING");
+    CHECK(sms_reasm_add(&r, 2, 2, 1, "B1", 2, 10, out, sizeof(out), &out_len) == SMS_REASM_PENDING,
+          "ref 2 part 1 must be PENDING (both slots now busy)");
+    // both SMS_REASM_SLOTS (2) are busy: the oldest (ref 1) is evicted
+    CHECK(sms_reasm_add(&r, 3, 2, 1, "C1", 2, 20, out, sizeof(out), &out_len) == SMS_REASM_PENDING,
+          "ref 3 part 1 must be PENDING (evicted ref 1's slot)");
+
+    // ref 2 is now the oldest: ref 1's part 2 evicts it and starts a fresh slot
+    CHECK(sms_reasm_add(&r, 1, 2, 2, "A2", 2, 30, out, sizeof(out), &out_len) == SMS_REASM_PENDING,
+          "ref 1's part 2 must not complete against its evicted part 1");
+
+    CHECK(sms_reasm_add(&r, 3, 2, 2, "C2", 2, 50, out, sizeof(out), &out_len) == SMS_REASM_COMPLETE,
+          "ref 3 must still complete: its slot was never evicted");
+    CHECK(out_len == 4 && memcmp(out, "C1C2", 4) == 0, "ref 3's completed body mismatch: '%.*s'",
+          (int) out_len, out);
+}
+
+static void test_reasm_overflow_and_invalid_inputs_are_dropped(void)
+{
+    sms_reasm_t r;
+    sms_reasm_init(&r);
+    char out[SMS_BODY_MAX];
+    size_t out_len = 0;
+
+    CHECK(sms_reasm_add(&r, 1, 0, 1, "x", 1, 0, out, sizeof(out), &out_len) == SMS_REASM_DROPPED,
+          "total==0 must be DROPPED");
+    CHECK(sms_reasm_add(&r, 1, 2, 0, "x", 1, 0, out, sizeof(out), &out_len) == SMS_REASM_DROPPED,
+          "part==0 must be DROPPED");
+    CHECK(sms_reasm_add(&r, 1, 2, 3, "x", 1, 0, out, sizeof(out), &out_len) == SMS_REASM_DROPPED,
+          "part>total must be DROPPED");
+    CHECK(sms_reasm_add(&r, 1, SMS_REASM_MAX_PARTS + 1, 1, "x", 1, 0, out, sizeof(out), &out_len) ==
+             SMS_REASM_DROPPED,
+          "total > SMS_REASM_MAX_PARTS must be DROPPED");
+
+    // a completed message larger than out_cap is dropped, not truncated
+    sms_reasm_t r2;
+    sms_reasm_init(&r2);
+    char tiny_out[5];
+    size_t tiny_len = 0;
+    CHECK(sms_reasm_add(&r2, 5, 2, 1, "0123", 4, 0, tiny_out, sizeof(tiny_out), &tiny_len) ==
+             SMS_REASM_PENDING,
+          "setup part 1 must be PENDING");
+    CHECK(sms_reasm_add(&r2, 5, 2, 2, "4567", 4, 1, tiny_out, sizeof(tiny_out), &tiny_len) ==
+             SMS_REASM_DROPPED,
+          "a completed message that overflows out_cap must be DROPPED, not truncated");
+}
+
 static void test_ucs2_roundtrip(void)
 {
     const char *text = "Caf\xc3\xa9 \xf0\x9f\x98\x80"; // "Café 😀"
@@ -567,11 +816,23 @@ int main(void)
     test_classify_dcs();
     test_parse_cmgr_header();
     test_decode_received();
+    test_udh_parse_iei00_8bit_ref();
+    test_udh_parse_iei08_16bit_ref();
+    test_udh_parse_rejections();
+    test_reasm_two_part_in_order();
+    test_reasm_out_of_order();
+    test_reasm_three_part_16bit_ref();
+    test_reasm_duplicate_part_is_idempotent();
+    test_reasm_missing_middle_expires_as_partial();
+    test_reasm_backwards_clock_never_expires_early();
+    test_reasm_third_concurrent_ref_evicts_oldest();
+    test_reasm_overflow_and_invalid_inputs_are_dropped();
     test_ucs2_roundtrip();
     test_audit_ring();
     test_sms_log_cbor_vs_relay();
 
     if (g_failures == 0) {
+        printf("PASS: sms (incl. UDH parse/reassembly), 0 failures\n");
         return 0;
     }
     printf("FAIL: %d failure(s)\n", g_failures);

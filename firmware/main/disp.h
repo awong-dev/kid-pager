@@ -4,6 +4,7 @@
 #define DISP_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -12,6 +13,9 @@ extern "C" {
 
 /* VCC on, reset, SSD1680 init. False if BUSY never deasserts (15 s, one retry); run headless then. */
 bool disp_init(void);
+
+/* After a panel VCC cycle: reloads both RAM planes from the shadow so the next partial is correct. */
+void disp_note_power_loss(void);
 
 /* True once a BUSY timeout persisted through a reset+re-init retry; refreshes are then no-ops. */
 bool disp_is_dead(void);
@@ -22,6 +26,9 @@ void disp_full_refresh(void);
 /* Sends only the changed row band; no-op if nothing changed; full every 20th partial. */
 void disp_partial_refresh(void);
 
+/* Weak hook run before every refresh with the lock held; ui.c waits for the LTE uplink to go quiet. */
+void disp_pre_write_gate_hook(void);
+
 /* true also re-writes the new-image plane after a partial (vendor behaviour). */
 void disp_set_partial_write_again(bool on);
 bool disp_partial_write_again(void);
@@ -31,6 +38,24 @@ int disp_dirty_rows(void);
 
 /* Partials since the last full refresh. */
 uint32_t disp_partial_count(void);
+
+/* Times the BUSY wait timed out with BUSY asserted; free-running. */
+uint32_t disp_busy_timeout_count(void);
+
+/* Completed full, partial and partial-upgraded-to-full counts; any pointer may be NULL. */
+void disp_get_refresh_stats(uint32_t *full, uint32_t *partial, uint32_t *upgraded);
+
+/* Formats the last 8 refreshes oldest first, e.g. "F@12345/1 P@12800/2"; returns snprintf()'s count. */
+int disp_refresh_ring_format(char *buf, size_t cap);
+
+/* Clears the refresh counters and ring. */
+void disp_reset_refresh_stats(void);
+
+/* Bench fault injector: SW reset (0x12) only, leaving power-on register defaults. */
+void disp_fault_inject_swreset(void);
+
+/* One-shot ~200 ms BUSY transition trace at the next disp_note_power_loss(); auto-disarms. */
+void disp_debug_arm_busy_trace(void);
 
 #ifdef __cplusplus
 }

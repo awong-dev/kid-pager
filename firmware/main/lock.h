@@ -19,6 +19,7 @@ extern "C" {
 /* RTC-resident state, padded to 8 B. */
 typedef struct {
     uint8_t locked; /* 0/1 */
+    uint8_t _pad[7];
 } lock_rtc_t;
 
 /* 4-16 printable ASCII characters (0x20-0x7E). */
@@ -42,6 +43,7 @@ typedef void (*lock_rtc_save_fn)(void); /* called with the lock held */
 void lock_bind_rtc(lock_rtc_t *rtc, lock_rtc_lock_fn lock, lock_rtc_unlock_fn unlock,
                     lock_rtc_save_fn save);
 
+/* Loads NVS "lock" into the RAM cache; forces `locked = 1` if a passcode is set (any boot). */
 void lock_init(bool rtc_was_valid);
 
 bool lock_is_set(void);      /* a passcode is configured */
@@ -54,8 +56,10 @@ bool lock_set_passcode(const char *passcode, size_t len);
 /* Erases the passcode and unlocks. Power effect: one NVS erase. */
 void lock_clear_passcode(void);
 
+/* Persists auto_min (0 = never). Power effect: one NVS write. */
 void lock_set_auto_min(uint8_t minutes);
 
+/* True on match or when no passcode is set (unlocks). Power effect: ~50-100 ms CPU per attempt. */
 bool lock_try_passcode(const char *passcode, size_t len);
 
 void lock_check_autolock(int64_t now_us);

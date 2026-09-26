@@ -62,11 +62,16 @@ bool input_awake(void);
 /* Arms the UI-awake window without an event (console `wake`). */
 void input_arm_awake(void);
 
+/* Console `btn`/`btn long`: queues the BTN_DOWN + BTN_SHORT/LONG pair, bypassing debounce. */
+void input_feed_button_short(void);
+void input_feed_button_long(void);
+
 /* True while the FSM is mid-press or mid-hold, which needs fast polling. */
 bool input_button_busy(void);
 
 /* True once a held button passed PAGER_BTN_STUCK_MS; poll coarsely, no light sleep (level wake). */
 bool input_button_stuck(void);
+
 
 #endif /* ESP_PLATFORM */
 

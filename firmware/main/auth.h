@@ -41,6 +41,14 @@ bool auth_sign(const char *topic, uint8_t *buf, size_t *len, size_t cap);
 // Checks and trims the `sig` suffix (constant-time). The map header count still includes it.
 bool auth_verify(const char *topic, uint8_t *buf, size_t *len);
 
+// Book-pull request/response authentication (PROTOCOL.md §14.7).
+
+// Raw 8-byte tag over `label || 0x00 || m`.
+bool auth_request_tag(const char *label, const uint8_t *m, size_t m_len, uint8_t out[AUTH_TAG_LEN]);
+
+// auth_verify() with a label in place of the topic.
+bool auth_verify_label(const char *label, uint8_t *buf, size_t *len);
+
 // Next /up,/status,/loc counter; *wrapped means the caller must bump and persist n_epoch.
 uint64_t auth_next_up_n(auth_rtc_t *rtc, uint32_t epoch, bool *wrapped);
 

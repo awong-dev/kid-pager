@@ -2,16 +2,24 @@
 // light-sleep/RTS handling. C++ because walter-modem is a C++ class; net.h is the C facade.
 
 #include "net.h"
+#include "net_xport.h"
+#include "net_internal.h"
 #include "pins.h"
 #include "ident.h"
 #include "carrier.h"
 #include "watchdog.h"
 #include "placeholder_ca.h"
+#include "net_connect_guard.h"
+#include "net_probe_guard.h"
+#include "publish_quiet.h"
+#include "flightrec.h"
 
 #include "WalterModem.h"
+#include "WalterDefines.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -74,6 +82,14 @@ static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
 // State: plain static storage, retained across light sleep. Not mutex-protected: the only writer
 // besides the caller's task is the MQTT event handler, and all shared fields are single words.
 
+void (*s_msg_cb)(const char *, const char *, uint16_t) = nullptr;
+
+// Transport vtable. Set at load, not in net_init(): the boot screen reads the MQTT status before
+// net_init() runs, and a null vtable there crashed (LoadProhibited).
+static const net_xport_ops_t *s_xport_ops = xport_lte_ops();
+static bool s_lte_suppressed = false;
+
+char s_down_topic[48];
 static char s_granted_edrx[16] = { 0 };
 
 // Hash of the CA last written to modem slot PAGER_TLS_CA_SLOT, so repeated net_init() calls in one
@@ -83,6 +99,18 @@ static uint8_t s_ca_written_hash[IDENT_CA_HASH_LEN];
 
 static int64_t s_clock_epoch = 0;    // 0 = no network time yet (§3.5)
 static int64_t s_clock_epoch_us = 0; // esp_timer_get_time() at the moment s_clock_epoch was read
+
+static bool s_modem_begun = false;
+
+// The URC drain probe's single-slot in-flight guard.
+static net_probe_guard_t s_probe_guard;
+
+// Wakes where the probe was not attempted; report fields, written only by net_urc_probe().
+static uint32_t s_probe_skip_busy = 0;
+static uint32_t s_probe_skip_down = 0;
+
+// Light-sleep returns woken by ext1 (the LIS3DH pin) since boot.
+static uint32_t s_ext1_wakes = 0;
 
 // GNSS event handoff: written by the modem event task, read and cleared by net_gnss_poll_event().
 static volatile bool s_gnss_event_pending = false;
@@ -284,9 +312,12 @@ static const char *effective_apn(const char *typed, const char *stored)
 
 // Losing coverage resets nothing: the modem re-registers itself and net_session_up() reconfigures
 // whatever is missing. These three are not `static` (net_internal.h).
+volatile bool s_registered = false;        // tracked from +CEREG URCs and polls
 static volatile bool s_reg_regained_edge = false; // not registered -> registered
 static volatile int64_t s_unregistered_since_us = 0;
+bool s_session_configured = false;         // TLS profile + mqttConfig are in the modem
 
+void note_registration(bool registered)
 {
     if (registered && !s_registered) {
         s_reg_regained_edge = true;
@@ -297,6 +328,7 @@ static volatile int64_t s_unregistered_since_us = 0;
     s_registered = registered;
 }
 
+bool configure_session(void);
 
 static bool net_bringup(int attach_wait_s)
 {
@@ -309,6 +341,7 @@ static bool net_bringup(int attach_wait_s)
         ESP_LOGI(TAG, "WalterModem::begin() failed");
         return false;
     }
+    s_modem_begun = true;
 
     WalterModem::setMQTTEventHandler(pager_mqtt_event_handler, nullptr);
     WalterModem::setNetworkEventHandler(pager_network_event_handler, nullptr);
@@ -339,6 +372,12 @@ static bool net_bringup(int attach_wait_s)
     if (!WalterModem::configEDRX(WALTER_MODEM_EDRX_ENABLE_WITH_RESULT, PAGER_EDRX_VALUE,
                                  PAGER_EDRX_PTW)) {
         ESP_LOGI(TAG, "configEDRX() failed - continuing without a granted eDRX confirmation");
+    }
+
+    // Pin host-interface power saving to +SQNIPSCFG: 1,100 (mode 1, 100 ms idle); the modem may persist
+    // an earlier setting. Power effect: none beyond one AT at bring-up.
+    if (!WalterModem::sendCmd("AT+SQNIPSCFG=1,100")) {
+        ESP_LOGI(TAG, "AT+SQNIPSCFG=1,100 not accepted - continuing");
     }
 
     // PROTOCOL.md §12 item 6: periodic voltage monitor, ACTIVE mode only; the threshold is recorded,
@@ -390,12 +429,17 @@ static bool net_bringup(int attach_wait_s)
 
 extern "C" bool net_init(void)
 {
+    s_xport_ops = xport_lte_ops();
     s_session_configured = false;
+    net_connect_guard_init(&s_connect_guard);
+    publish_quiet_gate_init(&s_publish_quiet);
+    net_probe_guard_init(&s_probe_guard);
     return net_bringup(PAGER_ATTACH_POLL_CAP_S);
 }
 
 // Clock, CA, TLS profile and MQTT client configuration (what a modem reset wipes). Not `static`
 // (net_internal.h). Power effect: a few AT commands, one NVRAM write if the CA changed.
+bool configure_session(void)
 {
 
     // Seed ts from the network clock (PROTOCOL.md §3.5), else ts:0. Right after attach the modem RTC can
@@ -417,6 +461,16 @@ extern "C" bool net_init(void)
     }
     if (s_clock_epoch != 0) {
         ESP_LOGI(TAG, "clock seeded from network: epoch=%lld", (long long) s_clock_epoch);
+        // Log the UTC and local conversion each boot; gmtime_r() is TZ-independent, localtime_r() uses main.c's TZ.
+        {
+            time_t t = (time_t) s_clock_epoch;
+            struct tm utc_tm, local_tm;
+            gmtime_r(&t, &utc_tm);
+            localtime_r(&t, &local_tm);
+            ESP_LOGI(TAG, "clock: epoch=%lld utc=%02d:%02d local=%02d:%02d tz=%s",
+                     (long long) s_clock_epoch, utc_tm.tm_hour, utc_tm.tm_min, local_tm.tm_hour,
+                     local_tm.tm_min, getenv("TZ") ? getenv("TZ") : "(unset)");
+        }
     } else {
         ESP_LOGI(TAG, "no network clock available; ts will read 0 (PROTOCOL.md §3.5)");
     }
@@ -466,6 +520,7 @@ extern "C" bool net_bootstrap_attach(const char *apn)
         ESP_LOGI(TAG, "WalterModem::begin() failed (bootstrap)");
         return false;
     }
+    s_modem_begun = true;
 
     WalterModem::setMQTTEventHandler(pager_mqtt_event_handler, nullptr);
     WalterModem::setNetworkEventHandler(pager_network_event_handler, nullptr);
@@ -579,10 +634,12 @@ extern "C" bool net_tls_configure(uint8_t ca_slot, bool validated)
 
 extern "C" bool net_session_up(void)
 {
+    return s_xport_ops->up();
 }
 
 extern "C" void net_session_down(void)
 {
+    s_xport_ops->down();
 }
 
 extern "C" bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
@@ -592,21 +649,40 @@ extern "C" bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t 
 {
 }
 
+extern "C" uint32_t net_publish_quiet_wait_ms(uint32_t max_wait_ms)
+{
+    return s_xport_ops->publish_quiet_wait_ms(max_wait_ms);
+}
+
+extern "C" void net_set_lte_suppressed(bool suppressed)
+{
+    s_lte_suppressed = suppressed;
+}
+
 extern "C" void net_set_msg_cb(void (*cb)(const char *topic, const char *body, uint16_t len))
 {
     s_msg_cb = cb;
 }
 
 {
+    }
+
     // Power effect: ESP32 ~1 mA for up to `ms`. Not WalterModem::sleep() (timer-only), so its RTS
+    if (s_accel_wake_enabled) {
+    }
     esp_sleep_enable_timer_wakeup((uint64_t) ms * 1000ULL);
 
     // Drive RTS high so the modem is free to sleep, as WalterModem::sleep(_, true) does. Airplane mode
     // has no modem: no RTS/flow-control steps, ext1 + timer wake only.
+
     esp_light_sleep_start();
+
+        s_ext1_wakes++;
+    }
 
     // Restore RTS/CTS flow control. The library's pin constants are file-local to WalterModem.cpp, so
     // the CONFIG_WALTER_MODEM_PIN_* / CONFIG_UART_BUF_THRESHOLD Kconfig macros are used.
+
 }
 
 extern "C" bool net_check(void)
@@ -618,6 +694,109 @@ extern "C" bool net_check(void)
     }
     note_registration(net_is_attached());
     return true;
+}
+
+// Per-wake URC drain probe: one bare "AT", one attempt (the flush happens when the modem accepts it).
+#define PAGER_URC_PROBE_ATTEMPTS 1
+// Must exceed the host's wait for the answer. FreeRTOS ticks do not advance across
+// esp_light_sleep_start(), so this is a real 15 s only while the host stays awake.
+#define PAGER_URC_PROBE_TIMEOUT_MS 15000u
+
+// probe_cb() runs on the library task, or synchronously inside checkComm() with NO_MEMORY if the
+// queue/pool was full; it sets flags and counters only. Issue-to-answer time of the last probe:
+static int64_t s_probe_issue_us = 0;
+static uint32_t s_probe_first_attempt_ms = 0;
+// The same, recorded only for answered probes, with a max and a count.
+static uint32_t s_probe_answer_ms_last = 0;
+static uint32_t s_probe_answer_ms_max = 0;
+static uint32_t s_probe_answer_n = 0;
+
+static void probe_cb(const WalterModemRsp *rsp, void *args)
+{
+    (void) args;
+    uint32_t elapsed_ms = (uint32_t) ((esp_timer_get_time() - s_probe_issue_us) / 1000);
+    s_probe_first_attempt_ms = elapsed_ms;
+    if (rsp != NULL && rsp->result == WALTER_MODEM_STATE_OK) {
+        s_probe_answer_ms_last = elapsed_ms;
+        if (elapsed_ms > s_probe_answer_ms_max) {
+            s_probe_answer_ms_max = elapsed_ms;
+        }
+        s_probe_answer_n++;
+        net_probe_guard_answered(&s_probe_guard);
+        flightrec_event('A', (int32_t) elapsed_ms, 0);
+    } else if (rsp != NULL && rsp->result == WALTER_MODEM_STATE_NO_MEMORY) {
+        net_probe_guard_noqueue(&s_probe_guard);
+    } else {
+        // Reachable in normal operation (an "AT" the modem did not answer in time); counted `timedout`,
+        // not noqueue.
+        net_probe_guard_failed(&s_probe_guard);
+    }
+}
+
+extern "C" bool net_urc_probe(void)
+{
+        s_probe_skip_down++;
+        return false;
+    }
+    if (!net_probe_guard_poll(&s_probe_guard)) {
+        // Still outstanding, or just declared stuck; modes.c watches the stuck counter for escalation.
+        return false;
+    }
+    if (net_publish_in_flight()) {
+        // A modem parked at a "> " data prompt would take this probe's "AT\r\n" as payload.
+        s_probe_skip_busy++;
+        return false;
+    }
+    net_probe_guard_attempt(&s_probe_guard); // before the call: probe_cb() may run synchronously
+    // One bounded attempt (the library default would hold the command slot); the flush happens when
+    // the modem accepts it. First bytes after RTS re-assert are swallowed: send wake characters, 60 ms.
+    flightrec_event('K', 0, 0);
+    flightrec_bytes('T', (const uint8_t *) "\r\n", 2);
+    uart_write_bytes(PAGER_MODEM_UART, "\r\n", 2);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    s_probe_issue_us = esp_timer_get_time();
+    flightrec_event('P', flightrec_cts_level(), 0);
+    WalterModem::checkComm(NULL, probe_cb, NULL, PAGER_URC_PROBE_ATTEMPTS,
+                           pdMS_TO_TICKS(PAGER_URC_PROBE_TIMEOUT_MS));
+    if (s_probe_guard.outstanding) {
+        // No synchronous noqueue() ran, so it was genuinely queued.
+        net_probe_guard_issued(&s_probe_guard);
+        return true;
+    }
+    return false; // probe_cb() already ran synchronously and counted noqueue
+}
+
+extern "C" net_probe_counters_t net_get_probe_counters(void)
+{
+    net_probe_counters_t out;
+    out.issued = s_probe_guard.issued;
+    out.answered = s_probe_guard.answered;
+    out.stuck = s_probe_guard.stuck;
+    out.noqueue = s_probe_guard.noqueue;
+    out.timedout = s_probe_guard.timedout;
+    out.skip_busy = s_probe_skip_busy;
+    out.skip_down = s_probe_skip_down;
+    out.first_attempt_ms = s_probe_first_attempt_ms;
+    out.answer_ms_last = s_probe_answer_ms_last;
+    out.answer_ms_max = s_probe_answer_ms_max;
+    out.answer_n = s_probe_answer_n;
+    return out;
+}
+
+extern "C" bool net_urc_probe_in_flight(void)
+{
+    // Goes false when the modem has answered or the library gave up.
+    return s_probe_guard.outstanding;
+}
+
+extern "C" uint32_t net_uart_rx_buffered_bytes(void)
+{
+    // PAGER_MODEM_UART has private linkage in this file, hence this accessor.
+    size_t len = 0;
+    if (uart_get_buffered_data_len(PAGER_MODEM_UART, &len) != ESP_OK) {
+        return 0;
+    }
+    return (uint32_t) len;
 }
 
 extern "C" bool net_take_registered_edge(void)
@@ -642,7 +821,15 @@ extern "C" bool net_recover_modem(void)
     ESP_LOGI(TAG, "modem unresponsive: issuing hard reset + full re-init");
     s_modem_begun = false; // net_urc_probe() must not queue against a modem mid-reset
     s_mqtt_connected = false;
+    // A physical reset wipes the MQTT client, so any outstanding connect, publish or probe and the fail
+    // streak are moot.
+    net_connect_guard_init(&s_connect_guard);
+    publish_quiet_gate_init(&s_publish_quiet);
+    net_probe_guard_init(&s_probe_guard);
     if (!WalterModem::reset()) {
+        // Keep s_modem_begun true: reset() can fail without the modem being in reset, and a false flag
+        // would disable the URC drain probe until the next recovery.
+        s_modem_begun = true;
         ESP_LOGI(TAG, "WalterModem::reset() failed");
         return false;
     }
@@ -668,10 +855,18 @@ extern "C" bool net_get_clock(int64_t *epoch_s)
     return true;
 }
 
+// Voltage and RSSI reads use 1 attempt / 5 s: the library's 30 s x 3 default could
+#define PAGER_VMON_ATTEMPTS 1
+#define PAGER_VMON_TIMEOUT_MS 5000u
+#define PAGER_CSQ_ATTEMPTS 1
+#define PAGER_CSQ_TIMEOUT_MS 5000u
+
 extern "C" bool net_get_battery_mv(int *batt_mv)
 {
     // Power effect: one AT round trip, no RRC. Requires configVoltageMonitor() from net_init().
     WalterModemRsp rsp = {};
+    if (!WalterModem::getVoltage(&rsp, NULL, NULL, PAGER_VMON_ATTEMPTS,
+                                 pdMS_TO_TICKS(PAGER_VMON_TIMEOUT_MS))) {
         return false;
     }
     if (rsp.type != WALTER_MODEM_RSP_DATA_TYPE_VOLTAGE) {
@@ -687,6 +882,8 @@ extern "C" bool net_get_rssi(int *dbm)
     // Power effect: one AT round trip, no RRC. getRSSI() is AT+CSQ in dBm (-113 + raw*2); raw 99
     // ("not known") converts to +85, outside [-113, -51], and is treated as no reading.
     WalterModemRsp rsp = {};
+    if (!WalterModem::getRSSI(&rsp, NULL, NULL, PAGER_CSQ_ATTEMPTS,
+                              pdMS_TO_TICKS(PAGER_CSQ_TIMEOUT_MS))) {
         return false;
     }
     if (rsp.type != WALTER_MODEM_RSP_DATA_TYPE_RSSI) {
@@ -705,35 +902,102 @@ extern "C" void net_service_session(void)
 {
         return;
     }
+    s_xport_ops->service();
 }
 
 extern "C" void net_get_mqtt_status(net_mqtt_status_t *out)
 {
+    s_xport_ops->status(out);
 }
 
 extern "C" void net_ack_disconnect_edge(void)
 {
+    s_xport_ops->ack_disconnect_edge();
 }
 
 extern "C" void net_ack_session_restart_edge(void)
 {
+    s_xport_ops->ack_session_restart_edge();
 }
 
 extern "C" bool net_modem_busy(void)
 {
+    return s_xport_ops->modem_busy();
+}
+
+extern "C" bool net_connect_in_flight(void)
+{
+    return s_xport_ops->connect_in_flight();
+}
+
+extern "C" bool net_publish_in_flight(void)
+{
+    // True while a publish's AT round trip is outstanding and within PUBLISH_SLEEP_HOLD_MAX_US.
+    return publish_quiet_gate_hold_sleep(&s_publish_quiet, esp_timer_get_time());
+}
+
+extern "C" bool net_connect_fail_streak_maxed(void)
+{
+    return s_xport_ops->connect_fail_streak_maxed();
 }
 
 extern "C" uint32_t net_take_memfull_delta(void)
 {
+    return s_xport_ops->take_memfull_delta();
 }
 
 extern "C" uint32_t net_take_oversize_delta(void)
 {
+    return s_xport_ops->take_oversize_delta();
 }
 
 extern "C" const char *net_get_device_id(void)
 {
     return ident_get_dev_id();
+}
+
+extern "C" net_pager_counters_t net_get_pager_counters(void)
+{
+    // The vendored component's counters are transport-independent, so read directly. Power effect: none.
+    walter_modem_pager_counters_t c = walter_modem_pager_counters();
+    net_pager_counters_t out;
+    out.datatx_retx = c.datatx_retx;
+    out.prompt_orphan = c.prompt_orphan;
+    out.buf_drop_queue = c.buf_drop_queue;
+    out.buf_drop_pool = c.buf_drop_pool;
+    out.prompt_handled = c.prompt_handled;
+    out.payload_bytes_written = c.payload_bytes_written;
+    out.txdone_timeouts = c.txdone_timeouts;
+    static_assert(sizeof(out.stall_cmd) == sizeof(c.stall_cmd), "net.h/WalterDefines.h stall_cmd size mismatch");
+    memcpy(out.stall_cmd, c.stall_cmd, sizeof(out.stall_cmd));
+    out.stall_elapsed_ms = c.stall_elapsed_ms;
+    out.stall_cts_level = c.stall_cts_level;
+    out.stall_tx_ring_bytes = c.stall_tx_ring_bytes;
+    out.rsp_no_cmd = c.rsp_no_cmd;
+    out.payload_stuck_ms = c.payload_stuck_ms;
+    out.glitch_dropped = c.glitch_dropped;
+    out.rsp_stale_cmd = c.rsp_stale_cmd;
+    return out;
+}
+
+extern "C" uint32_t net_get_publish_ring(net_publish_ring_entry_t *out, uint32_t cap)
+{
+    return lte_get_publish_ring(out, cap);
+}
+
+extern "C" uint32_t net_get_resub_swallowed_count(void)
+{
+    return lte_get_resub_swallowed_count();
+}
+
+extern "C" bool net_resub_hold(void)
+{
+    return lte_resub_hold();
+}
+
+extern "C" void net_get_resub_hold_stats(uint32_t *holds, uint32_t *max_hold_ms, uint32_t *suback_in_hold)
+{
+    lte_get_resub_hold_stats(holds, max_hold_ms, suback_in_hold);
 }
 
 extern "C" bool net_check_sim(void)
@@ -773,6 +1037,34 @@ extern "C" bool net_debug_at(const char *cmd)
 {
     return WalterModem::sendCmd(cmd);
 }
+
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+// Installs the vendored library's UART/response trace hook; flightrec.c is plain C.
+extern "C" void net_debug_install_trace_hook(void (*fn)(char kind, const uint8_t *data, size_t len))
+{
+    WalterModem::setPagerTraceHook(fn);
+}
+
+extern "C" void net_debug_rts(int mode)
+{
+    switch (mode) {
+    case 0:
+    case 1:
+        uart_set_hw_flow_ctrl(PAGER_MODEM_UART, UART_HW_FLOWCTRL_DISABLE, 0);
+        gpio_set_direction((gpio_num_t) CONFIG_WALTER_MODEM_PIN_RTS, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t) CONFIG_WALTER_MODEM_PIN_RTS, mode);
+        break;
+    case 2:
+        uart_set_pin(PAGER_MODEM_UART, CONFIG_WALTER_MODEM_PIN_TX, CONFIG_WALTER_MODEM_PIN_RX,
+                     CONFIG_WALTER_MODEM_PIN_RTS, CONFIG_WALTER_MODEM_PIN_CTS);
+        uart_set_hw_flow_ctrl(PAGER_MODEM_UART, UART_HW_FLOWCTRL_CTS_RTS, CONFIG_UART_BUF_THRESHOLD);
+        break;
+    default:
+        break;
+    }
+}
+
+static size_t s_nettest_pad_bytes = 0;
 
 extern "C" bool net_check_tcp_sized(const char *host, uint16_t port, size_t bytes)
 {
@@ -904,6 +1196,7 @@ extern "C" bool net_check_mqtt(const char *host, uint16_t port, int tls_mode)
     WalterModem::mqttDisconnect();
     return false;
 }
+#endif /* PAGER_DEBUG_NO_LIGHT_SLEEP */
 
 extern "C" bool net_gnss_config(void)
 {
@@ -1060,8 +1353,19 @@ extern "C" bool net_get_cell_info(net_cell_info_t *out)
     return s_cell_cache.valid;
 }
 
+extern "C" void net_set_accel_wake(bool on)
+{
+    s_accel_wake_enabled = on;
+}
+
 extern "C" void net_enable_accel_wake(void)
 {
+    net_set_accel_wake(true);
+}
+
+extern "C" uint32_t net_get_ext1_wakes(void)
+{
+    return s_ext1_wakes;
 }
 
 extern "C" bool net_ca_fetch_open(const char *host, uint16_t port)

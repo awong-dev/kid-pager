@@ -56,6 +56,44 @@ static void test_url_parse(void)
           "unexpected request text: %s", req);
 }
 
+/* Extra request headers (§14.7) land before the blank line that ends the request, i.e. before
+ * `Connection: close`, which is always emitted last. */
+static void test_build_request_hdrs(void)
+{
+    char req[256];
+    size_t req_len = 0;
+
+    /* NULL extra headers must match cafetch_build_request() byte for byte. */
+    CHECK(cafetch_build_request_hdrs("example.com", "/ca/abc.pem", NULL, req, sizeof(req), &req_len),
+          "hdrs(NULL) build must succeed");
+    CHECK(strcmp(req, "GET /ca/abc.pem HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n") ==
+              0,
+          "hdrs(NULL) must match cafetch_build_request()'s own bytes exactly: %s", req);
+
+    char req_plain[256];
+    size_t req_plain_len = 0;
+    CHECK(cafetch_build_request("example.com", "/ca/abc.pem", req_plain, sizeof(req_plain), &req_plain_len),
+          "plain build must succeed");
+    CHECK(strcmp(req, req_plain) == 0, "cafetch_build_request() must be byte-identical to hdrs(NULL)");
+
+    /* Extra headers as bookpull_build_headers() produces them. */
+    const char *extra = "X-Device-Id: pgr-0001\r\nX-N: 123456789\r\nX-Sig: AAAAAAAAAAA\r\n";
+    CHECK(cafetch_build_request_hdrs("example.com", "/api/device/book?bv=7", extra, req, sizeof(req),
+                                     &req_len),
+          "hdrs(extra) build must succeed");
+    CHECK(strcmp(req,
+                 "GET /api/device/book?bv=7 HTTP/1.1\r\nHost: example.com\r\n"
+                 "X-Device-Id: pgr-0001\r\nX-N: 123456789\r\nX-Sig: AAAAAAAAAAA\r\n"
+                 "Connection: close\r\n\r\n") == 0,
+          "extra headers must land between Host and Connection: close, verbatim: %s", req);
+
+    /* The extra headers precede the final "\r\n\r\n". */
+    const char *extra_pos = strstr(req, "X-Device-Id:");
+    const char *conn_pos = strstr(req, "Connection: close");
+    CHECK(extra_pos != NULL && conn_pos != NULL && extra_pos < conn_pos,
+          "extra headers must be emitted before Connection: close / the blank line");
+}
+
 static void feed_whole(cafetch_parser_t *p, const char *s)
 {
     cafetch_parser_feed(p, (const uint8_t *) s, strlen(s));
@@ -292,6 +330,7 @@ int main(void)
 {
     test_overlong_header_line_is_skipped();
     test_url_parse();
+    test_build_request_hdrs();
     test_content_length_split_headers();
     test_header_line_split_byte_by_byte();
     test_connection_close_body();

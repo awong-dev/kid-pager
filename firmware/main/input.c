@@ -148,6 +148,18 @@ void input_poll(void)
     button_fsm_step(gpio_get_level((gpio_num_t) PAGER_PIN_BUTTON), now_us);
 }
 
+{
+    /* Merge into a press the FSM already tracks instead of seeding a second BTN_DOWN. */
+    if (s_btn_state != BTN_IDLE) {
+        return;
+    }
+    s_btn_state = BTN_DOWN;
+    s_btn_t0_us = now_us;
+    s_btn_debounce_start_us = 0;
+    arm_awake_window(now_us);
+    push_event((input_event_t) { .type = INPUT_EVT_BTN_DOWN });
+}
+
 void input_feed_key(uint8_t byte)
 {
     input_key_t key = input_decode_key(byte);
@@ -161,6 +173,25 @@ void input_feed_key(uint8_t byte)
 void input_arm_awake(void)
 {
     arm_awake_window(esp_timer_get_time());
+}
+
+// Mirrors button_fsm_step(): BTN_DOWN, then the resolving event, each arming the window.
+void input_feed_button_short(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    arm_awake_window(now_us);
+    push_event((input_event_t) { .type = INPUT_EVT_BTN_DOWN });
+    arm_awake_window(now_us);
+    push_event((input_event_t) { .type = INPUT_EVT_BTN_SHORT });
+}
+
+void input_feed_button_long(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    arm_awake_window(now_us);
+    push_event((input_event_t) { .type = INPUT_EVT_BTN_DOWN });
+    arm_awake_window(now_us);
+    push_event((input_event_t) { .type = INPUT_EVT_BTN_LONG });
 }
 
 bool input_get_event(input_event_t *out)
