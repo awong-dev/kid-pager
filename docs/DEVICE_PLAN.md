@@ -293,6 +293,8 @@ stays conformant.
   being unextractable, and the eFuse-burning release mode is not something a household should be
   asked to get right.
 - **RTC changes** (`pager_rtc_t`, bump `PAGER_RTC_MAGIC`): add `auth.up_lo` (4), `auth.down_n`
+  (4), `auth.down_bits` (4), 4 B of UI state and 8 B of lock state (§5.8, shrunk from 16 B once the
+  retry lockout was removed); and, per §5.6, the
   reply and unread *bodies* leave RTC for NVS (≈ −480 B). Net ≈ 928 → ≈ 480 of 1184 B. `_Static_assert` stays, with room to spare
   for the first time.
 
@@ -793,6 +795,10 @@ partial refresh there leaves the old screen ghosted under the message, so `ui_in
 full refresh for that first message only. The Chat screen has no key-hint footer; rows have 2 px
 of leading instead.
 
+**Status bar** (10 px, always 1×): `[signal 0–4 bars] [link ok|x] [unsent n]
+… [unread n] [battery 0–4]`. The only padlock the bar ever shows is the TLS trust padlock (v0.2
+§4.3: closed while pinned, broken while broken, nothing while unpinned). The earlier
+envelope-signing "[lock if sig on]" indicator was removed. No clock *(see rationale: a clock would need a refresh every minute
 while the device is meant to be asleep; message rows carry absolute `HH:MM` instead, which never
 change)*.
 
@@ -834,6 +840,8 @@ chat, else stay; long = Home from anywhere.
 **Chat (requirement 6).** History for one peer, newest at the bottom, oldest scrolled off the top.
 `up`/`down` scroll a row, `left`/`right` a page; the view auto-follows new messages unless the user
 has scrolled up. Typing any printable key opens the composer line in place; `enter` sends, `esc`
+clears it, `esc` on an empty composer goes back. Longer than the line: shows the tail with a
+leading …; the counter appears from 120 characters. Up messages show their state (`…` pending, `sent`,
 `FAILED`). Opening a chat, or pressing any key while it is on screen, marks every rendered down
 message from that peer `read` (through the existing pending-ack queue; with 8 slots, a burst of
 more than 8 is acked over successive pumps).
@@ -921,6 +929,7 @@ counters  memfull 0  drops 0  resets 0
 
 - **Re-sync address book** — publishes a `/status` now (it carries `bv`), which is the sync trigger.
 - **Text size** — toggles 1×/2×.
+- **Passcode / Auto-lock** — §5.8. *Passcode* cycles set → change → off, asking
   for the current one first; *Auto-lock* cycles 0 (never), 1, 2, 5, 10, 30, 60 minutes.
 - **Set up again** — enters Setup mode (§3.2) to take a new setup code: rotation or re-homing. The
   current identity is kept until the new bundle has been verified and written, so a cancelled or
@@ -932,11 +941,33 @@ counters  memfull 0  drops 0  resets 0
 **Setup.** Shown when `ident` is missing or fails validation, and by *Set up again*: the typed-code
 entry and the four-step progress line of §3.2.
 
+**Greeting / boot status.** Pushed at boot, before the
+network is known to be usable; a single centered 16px status line, nothing else. Replaced by Locked
+(if a passcode is set) or Home (if not) once the network is attached and MQTT is usable — never left
+revealed underneath either.
+
+```
+[|||.] ok                              new 0  [###.]
+
+                booting
+```
+
+**Locked (requirement 8; two states).** Reached by auto-lock,
+*Lock now*, a restart while a passcode is set, or the boot Greeting screen above once the network is
+usable and a passcode is set. Status bar as usual; nothing else is reachable. (a) idle: the single
+centered word, nothing else — no instructions, no field, no unread info. (b) entering, reached ONLY
+Enter verifies, Esc or 30s idle returns to (a), a wrong code returns to (a).
 
 ```
 [|||.] ok                              new 2  [###.]
 
+                locked
+```
 
+```
+[|||.] ok                              new 2  [###.]
+
+            password: ***_
 ```
 
 ### 5.6 Message store changes (`msg.c`)
@@ -984,12 +1015,17 @@ brute-forced offline, or NVS simply erased (which yields an unprovisioned device
 - **Passcode.** 4–16 printable ASCII characters, so a digits-only PIN is just a short passcode.
   Typed on the CardKB, masked, IME bypassed. Stored in NVS namespace `lock`: `salt` (16 random
   bytes), `hash` = PBKDF2-HMAC-SHA256(passcode, salt, 10 000 iterations) via mbedTLS
+  (`UNVERIFIED`: ≈ 50–100 ms on the S3, §10), `auto_min` (u8; 0 = never; default **5**).
+  Setting or changing asks for the current passcode first; *off* too.
 - **Auto-lock, no timer.** `last_input_us` is the monotonic time of the last key or button event.
   On every input event and every UI wake: `if (passcode set && auto_min && now − last_input_us ≥
   auto_min × 60 s) lock()`. The UI already sleeps after 30 s (§5.3), so what the kid sees is:
   press the button after the interval, get the lock screen. After a **restart** the monotonic
   clock is gone and the device comes up locked whenever a passcode is set — the safe default.
   `locked` lives in RTC so a crash does not unlock. *Lock now* on Home locks immediately.
+- **Locked screen.** Nothing about the waiting messages: no count, no sender names, no body
+  (decided after beta feedback: the names leak who is writing, and the status bar's
+  unread indicator already says something is waiting). Incoming messages are stored normally; the
   button and every key other than the passcode field do nothing.
 - **Acks while locked — the rule that keeps §4 honest.** `shown` means "the e-paper refresh that
   displayed the body completed" (`PROTOCOL.md` §4). A body that arrived while locked has not been
@@ -998,6 +1034,10 @@ brute-forced offline, or NVS simply erased (which yields an unprovisioned device
   as for a device that was off. On unlock the newest-unread chat opens, the refresh completes, and
   the deferred `shown` acks go out through the normal pending-ack queue. `read` is unchanged.
   Location requests (§13) are answered regardless of lock state — the lock is about the screen.
+- **Wrong passcode.** No retry lockout (decided after beta feedback): a wrong code
+  clears the entry field and shows a toast, nothing more. PBKDF2's own ≈50–100 ms per attempt is
+  the only thing slowing down guessing, and typing on a CardKB one key at a time is already slow
+  enough. There is no attempt counter left in RTC.
 - **Forgotten passcode — recovery without a cable.** Web app *Devices → Clear passcode* publishes
   a signed `/down` of a new kind, `cfg`, carrying `lock:{clear:true}`. The device honours it
   because the signature proves it came from the relay that owns `K_dev`; it clears the `lock`
@@ -1006,6 +1046,8 @@ brute-forced offline, or NVS simply erased (which yields an unprovisioned device
   on the Device screen. `cfg` follows `book`'s rules: not a thread entry, acked `shown` on apply,
   only the newest re-published. Holding the button for 10 s at boot (factory reset, §3.5) remains
   the path that always works and always yields an unprovisioned device.
+- **RTC**: `locked` (1) — 8 B with padding, inside the room §2.7 opened. (Was 16 B, also carrying
+  `fail_count`/`backoff_until_us` for the retry lockout that was removed.)
 
 ---
 
@@ -1162,6 +1204,7 @@ Listed here so the diff to the authoritative document is reviewable on its own. 
 | UI-awake window and keyboard poll (§5.3) | Compile-time defaults (30 s window, 100 ms poll). Retune once measured |
 | Wire encoding (§2.4) | Decided: CBOR for devices, JSON kept for tools. **Open:** hand-written subset codec (recommended: about 300 lines, no dependency, static buffers) vs the `espressif/cbor` registry component |
 | IMEs (§5.3) | Not in this plan; the hook, Unicode buffers and `assets` partition are. When one is wanted: hangul first (algorithmic, no dictionary), then pinyin or kana→kanji with a dictionary sized to the partition |
+| Lock screen shows sender names | Decided: no. No count and no names on the Locked screen; the setting and its NVS key are gone |
 | Auto-lock default | 5 min; passcode optional, with a one-time prompt after setup. A parent can push `cfg lock.auto` from the web. A "required" policy is a one-field addition to `cfg` if wanted |
 
 ## 10. Unverified assumptions introduced by this plan

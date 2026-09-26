@@ -105,6 +105,37 @@ blocked every other task's next command behind it and tripped the 60 s task watc
 **A single MQTT message larger than about 1.5 kB cannot be received**, which is why the CA travels as
 a URL and a hash and not inside the setup bundle (a Let's Encrypt root is 1.9 kB).
 
+## A finished command left in the modem library's slot wedges every later command after light sleep
+
+**Symptom:** task-watchdog reset in stage "mqtt status/retry" (`/status` key 59 `stallcmd` names the
+stalled AT command, e.g. `AT+SQNSMQTTSUBSCRIBE`).
+
+**Cause (patch 1.19):** the vendored library's `_curCmd` stays occupied after a finished
+command (`_returnAfterReply()`) until the next command clears it. FreeRTOS ticks stop in light
+sleep, so after the boot `/status` publish the pager sleeps with a finished command in the slot.
+On the next wake the modem's response to the "\r\n" wake bytes (an unsolicited `+CME ERROR: 4`,
+about 50% of wakes) is handed to that stale command. The error handler re-finishes it into a state
+the command task skips forever, wedging every later command. The first blocking one (liveness
+re-SUBSCRIBE 300 s after uplink) times out and the task watchdog fires ~155 s later.
+
+**Fix:** vendor patch 1.19 pairs a response with `_curCmd` only while PENDING; counter `rsp_stale_cmd`
+on the report's `stall discriminator:` line. Patch 1.20 bounds optional-attempt calls (VMON/CSQ 1
+× 5 s, liveness 1 × 10 s, receive 1 × 15 s) to avoid the reconnect pass timing out beyond 50 s.
+
+**How to see it:** a non-zero `rsp_stale_cmd` in the bench report's stall line.
+
+## Liveness re-SUBSCRIBE's ack is lost if the pager sleeps right after the OK
+
+**Symptom:** after about 16 minutes two `MQTT session LOST` events in a row, one TLS handshake each;
+the relay never sees the re-SUBSCRIBE.
+
+**Cause:** the re-SUBSCRIBE command gets OK in 11 ms, the loop light-sleeps 2 ms later, and the
+`+SQNSMQTTONSUBSCRIBE` URC never arrives (the modem holds it, waiting for the interface to be ready).
+When awake the URC arrives in 130 ms. After the retry also fails, the S2 rule disconnects and reconnects.
+
+**Fix:** `net_resub_hold()` in skip_sleep holds the loop awake up to 3 s after re-SUBSCRIBE to fetch
+the URC before sleeping.
+
 ## Secrets and the broker rule
 
 - **Never store a secret with a trailing newline.** `echo value | gcloud secrets versions add`
@@ -141,6 +172,21 @@ a URL and a hash and not inside the setup bundle (a Let's Encrypt root is 1.9 kB
   partition at `0x11000`, built by `tools/mkassets.py`.
 - Noto Sans is the text face. Literata was tried on the real panel and rejected.
 
+## A stray 0xFF byte on every wake from light sleep
+
+**Symptom:** pages delivered 191–237 s late or never; when delivered, probes answer in 4 ms or not at all; unpaired response lines appear as `rsp_no_cmd` counter.
+
+**Cause:** the modem UART emits exactly one 0xFF byte in the millisecond when the host reconfigures flow control on wake. The vendored parser assumes messages start with "\r\n" and searches for trailing CRLF from byte 2, so 0xFF glues to the next line: "\xff\r\nOK" (unmatched probe) or "\xff\r\n+SQNSMQTTONMESSAGE:..." (unrecognised notification, lost for good).
+
+**Fix:** library patch 1.18 drops a leading 0xFF when the buffer is empty and no payload is expected, and counts dropped bytes in `glitch_dropped`.
+
+**How to see it:** flash the debug build and run `sleeptest`. The flight recorder logs every UART byte: `flightrec` dumps the PSRAM ring, `flightrec clear` resets it.
+
+## USB and light sleep
+
+
+**15-minute hold on exit:** the debug build holds the CPU running for 15 minutes after a `sleeptest` window ends (printing a "still running" reminder every 60 s), so a USB replug can retrieve the flight recorder PSRAM dump with the `flightrec` console command before the next hard reset.
+
 ## Display
 
 **Symptom:** the screen freezes on one image while the log shows screens changing and
@@ -153,6 +199,45 @@ a slow display plus that line.
 
 E-paper partial refreshes ghost. A message that *changes the screen* (greeting to chat) takes a
 full refresh; messages into an open chat stay partial.
+
+## The SSD1680 loses registers under LTE bursts
+
+**Symptom:** a torn full refresh, then every refresh garbled / half black, `dirty_rows=0` on the
+host. A bare `disptest swreset` reproduces it.
+
+**Cause:** the SSD1680 loses its register configuration during LTE uplink bursts; RAM is retained.
+The init sequence (SW reset 0x12 + registers) restores it.
+
+**Rule:** re-send the init registers before every refresh. A garbled panel that a reboot fixes is
+register loss, not a driver bug. The firmware holds display writes while a publish is in flight,
+bounded 1.5 s (disp.c `disp_pre_write_gate_hook()`), which gates the uplink/write collision.
+
+## Release build: publish payload replaced by command text
+
+**Symptom:** relay logs `SECURITY bad-sig` with `first64=b'AT+SQNSMQTTPUBLISH...'` — the modem's
+outbound payload is the text of the publish command instead of the message bytes.
+
+**Cause (root-caused in `docs/RCA_SLEEP_PUBLISH.md`, release build only):** NOT the device light-sleeping
+mid-publish. The `/up` ack this bug hit is issued from `msg_pump()` on the modes task, and
+`mqttPublish()` is synchronous, so that task is blocked inside it for the whole 30 s command
+timeout and cannot reach `net_sleep()` at all (RCA §1). The real mechanism is in the vendored
+walter-modem component: the modem's `"> "` data prompt arrives with its leading CRLF split from a
+buffered residue by an interleaved URC or a light-sleep-boundary byte loss, so the library's parser
+(`_parseRxData()`) never recognises it as the prompt (RCA §2). The modem is left sitting at the
+prompt, owed N payload bytes, with **no timeout of its own** on the prompt. The library's old retry
+logic then re-transmitted the same N-character AT command line, which the modem consumed as the
+outstanding payload and published verbatim.
+
+**Rule:** two vendored-component patches (`firmware/components/dptechnics__walter-modem/PATCHES.md`):
+patch 1.11 recognises the bare, already-stripped `"> "` prompt so it is not orphaned in the first
+place; patch 1.12 changes the timeout retry itself — a `DATA_TX_WAIT` command's first timeout now
+sends the payload bytes (not the AT command line) in case the modem is still genuinely at the
+prompt, and a second timeout fails the command outright rather than retrying blind a third time.
+`net_publish_in_flight()`/`publish_quiet.h`'s skip-sleep hold guards a different, narrower window
+(the event-task publishes, e.g. `/status` on the incoming-page edge); see that function's doc
+comment in `net.h` for what it does and does not explain. The debug build cannot show this issue
+(`sleeptest`'s own light-sleep window is the closest analogue); catch it in release soak tests, and
+watch the `datatx_retx`/`prompt_orphan` counters (`firmware/components/dptechnics__walter-modem/PATCHES.md`, 1.12) if it recurs.
 
 ## The SSD1680 two-plane differential update
 
@@ -185,6 +270,29 @@ starting row, so with the default `seq 2 12` the two leftmost bars never change 
 misread as "the leftmost band did not flip". Always start at `seq 0` when judging correctness
 by eye, and predict the expected black/white bar pattern in advance (e.g. `w b w b w b ...`).
 Read the bars off the glass as a `b w b w ...` list and diff that against the prediction.
+
+## Tools and workflow
+
+**`serial_capture.py` overwrites without warning:**
+An old filename reused appends a boot after an old one, and the seam is read as a reset.
+Always check the log file is fresh before starting a capture.
+
+**esptool reset and `serial_capture.py` collide on the USB port:**
+esptool's reset handshake and a running `serial_capture.py` cannot share the USB-Serial/JTAG
+port; a collision parks the chip in the ROM bootloader (`boot:0x22 DOWNLOAD`). Recover with a
+solo `esptool.py --after hard_reset chip_id`, then start captures in the same shell line as the
+flash.
+
+**`gcloud logging read` needs `--project example-project`:**
+The shell's default project may be another one; the read then silently returns other services' logs
+and misses relay output.
+
+**Email-link sign-in deletes the account's password:**
+Firebase removes a password from an account the moment that account completes an email-link
+sign-in (documented: "any previous unverified mechanism of sign-in will be removed"). Never sign in
+as a real user with an email link; the password is then the only way into the web app. Test with
+throwaway users created with a password, and restore a password with `tools/set_web_password.py`
+(Admin SDK over ADC).
 
 ## Finding out what the modem really sends
 

@@ -458,6 +458,7 @@ Sunday 03:00 in `TZ`). Because the sweep is weekly, a record lives for its confi
 | messages (+ their `wireIds`) | 4 weeks | 52 weeks | `retention.messages` |
 | locations | 1 week | 52 weeks | `retention.locations` |
 | device status | latest only (embedded in the device doc) | — | — |
+| push tokens | removed immediately on FCM `unregistered`/`sender ID mismatch` (§7.6) | — | — |
 
 Mechanics: `messages where createdAt < cutoff orderBy createdAt limit 500`, `BulkWriter` deletes
 of the documents and their `wireIds` docs, loop until empty; collection-group query on
@@ -472,6 +473,7 @@ the weekly sweep; switching is a one-line change.)*
 1. Retry pager deliveries still `queued` (broker publish failed) — at most 10 per device, oldest
    first, same cap as the online-edge re-publish.
 2. Clear `locReqs/{d}` documents older than 15 min.
+
 Side effect: a request every 5 min keeps a warm instance around most of the time, which trims
 cold starts on the latency-sensitive parent→pager path (§9.3). It is not a guarantee, and the
 design does not depend on it.
@@ -597,6 +599,20 @@ single Save.
   `notificationclick` opens the thread.
 - Location answers and expired requests also notify the requester.
 - iOS Safari needs the PWA installed to the home screen for push; say so on the settings page.
+- **Payload contract**: every FCM data message the relay sends is a flat,
+  all-`str` map (FCM data payloads are string-only) with exactly these keys: `kind` (`message` |
+  `geofence`), `convKey`, `id`, `senderUid`, `senderAlias`, `title`, `body`, `url` (an app-relative
+  path to open, e.g. `/chat/{alias}`). The service worker's `onBackgroundMessage` switches on
+  `kind` and calls `showNotification(data.title, {body: data.body, data: {url: data.url}})`;
+  `notificationclick` focuses an existing client already on `url` or opens a new one there. For a
+  chat message (`backends/webapp.py`'s `deliver()`), the relay sets `title = senderAlias`, `body`
+  = the message body truncated to 120 characters, and `url = /chat/{senderAlias}` -- `senderAlias`
+  is the sender's alias looked up at send time, falling back to the raw `senderUid` if the sender
+  has since been deleted, since this send is best-effort and must not fail the delivery.
+  Not implemented: `geofence` pushes. When added, a `geofence` push carries a fence name in `title`
+  (not a user alias) and `body` describing arrived/left.
+  Token hygiene: a token is deleted the first time FCM reports it dead (`UnregisteredError` or
+  `SenderIdMismatchError`); any other per-token send failure is logged and the token is kept.
 
 ### 7.7 Map
 The location card shows lat/lon, accuracy, age, and an "Open in Google Maps / Apple Maps"
