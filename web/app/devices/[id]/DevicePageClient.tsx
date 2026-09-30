@@ -26,6 +26,7 @@ import AppShell from "@/components/AppShell";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
+import { useDirectory } from "@/lib/directory";
 import {
   type SmsContact,
   type SmsContactsResponse,
@@ -123,6 +124,7 @@ function DeviceInner() {
   }
 
   const smsLost = device?.status?.smsLost ?? 0;
+  const ownerAlias = useDirectory().byUid(device?.ownerUid ?? "")?.alias;
 
   return (
     <Stack spacing={2}>
@@ -147,6 +149,9 @@ function DeviceInner() {
             SMS contacts
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            The pager can text only these numbers, and only they can text it. Every text in either
+            direction is recorded below. Managed from People &rarr; @{ownerAlias ?? "..."} &rarr;
+            Approved numbers.
           </Typography>
 
           {pending && <Chip size="small" color="warning" label="waiting for the pager to confirm" sx={{ mb: 2 }} />}
@@ -158,7 +163,28 @@ function DeviceInner() {
 
           {contacts === null ? (
             <CircularProgress size={24} />
+          ) : contacts.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              No approved numbers yet.
+            </Typography>
           ) : (
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Name</TableCell>
+                    <TableCell>Phone</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {contacts.map((c, i) => (
+                    <TableRow key={i}>
+                      <TableCell>{c.name}</TableCell>
+                      <TableCell>{c.phone}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>

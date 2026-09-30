@@ -24,6 +24,17 @@ export function formatRelativeAge(ms: number): string {
   return `${deltaD}d ago`;
 }
 
+/** Day heading in the viewer's local time zone: "Today", "Yesterday", or a short date. */
+export function formatDay(ms: number, nowMs: number = Date.now()): string {
+  const d = new Date(ms);
+  const now = new Date(nowMs);
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
 /** A `loc_req` still `sent` 15 minutes after `createdAt` is expired (derived, not stored;
  * docs/PROTOCOL.md §13.4). */
 export function isLocReqExpired(msg: Pick<MessageDoc, "kind" | "createdAt">): boolean {

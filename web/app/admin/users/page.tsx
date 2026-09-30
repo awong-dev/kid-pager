@@ -25,18 +25,45 @@ import IconButton from "@mui/material/IconButton";
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
+import { useFamily } from "@/lib/family-context";
 import type { Role, UserDoc } from "@/lib/types";
 
 interface UserRow extends UserDoc {
   uid: string;
 }
 
+const ALL_FAMILIES = "__all__";
+
+const emptyForm = {
+  alias: "",
+  displayName: "",
+  email: "",
+  phone: "",
+  role: "member" as Role,
+  familyId: "",
+};
 
 function AdminUsersInner() {
+  const { familyId: scopeFamilyId, families } = useFamily();
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
+  // "All" only when the switcher has no family selected.
+  const [filterFamily, setFilterFamily] = useState<string>(scopeFamilyId ?? ALL_FAMILIES);
 
+
+  function openCreate() {
+    // default the dialog's family picker to the switcher's family unless already picked
+    setForm((f) => ({ ...f, familyId: f.familyId || scopeFamilyId || "" }));
+    setCreateOpen(true);
+  }
+
+  const familyNameById = useMemo(() => new Map(families.map((f) => [f.id, f.name])), [families]);
+
+  const visibleUsers = useMemo(
+    () => (filterFamily === ALL_FAMILIES ? users : users.filter((u) => u.familyId === filterFamily)),
+    [users, filterFamily]
+  );
 
   async function createUser() {
     setError(null);
@@ -47,8 +74,10 @@ function AdminUsersInner() {
         email: form.email || null,
         phone: form.phone || null,
         role: form.role,
+        familyId: form.familyId || null,
       });
       setCreateOpen(false);
+      setForm({ ...emptyForm, familyId: scopeFamilyId ?? "" });
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to create user");
     }
@@ -73,13 +102,33 @@ function AdminUsersInner() {
     }
   }
 
+  const formValid =
+    form.alias.trim() &&
+    form.displayName.trim() &&
+    (form.role === "super" || form.familyId.trim().length > 0);
 
   return (
     <Stack spacing={2}>
         <Typography variant="h5">Users</Typography>
+        <Button variant="contained" onClick={openCreate}>
           Create user
         </Button>
       </Stack>
+      <TextField
+        select
+        size="small"
+        label="Family"
+        value={filterFamily}
+        onChange={(e) => setFilterFamily(e.target.value)}
+        sx={{ maxWidth: 240 }}
+      >
+        <MenuItem value={ALL_FAMILIES}>All families</MenuItem>
+        {families.map((f) => (
+          <MenuItem key={f.id} value={f.id}>
+            {f.name}
+          </MenuItem>
+        ))}
+      </TextField>
       {error && <Alert severity="error">{error}</Alert>}
 
             </TableRow>
@@ -112,6 +161,19 @@ function AdminUsersInner() {
             />
             <TextField
               select
+              label="Family"
+              value={form.familyId}
+              onChange={(e) => setForm({ ...form, familyId: e.target.value })}
+              fullWidth
+            >
+              {families.map((f) => (
+                <MenuItem key={f.id} value={f.id}>
+                  {f.name}
+                </MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              select
               label="Role"
               value={form.role}
               onChange={(e) => setForm({ ...form, role: e.target.value as Role })}
@@ -119,6 +181,7 @@ function AdminUsersInner() {
             >
               <MenuItem value="member">member</MenuItem>
               <MenuItem value="admin">admin</MenuItem>
+              <MenuItem value="super">super</MenuItem>
             </TextField>
           </Stack>
         </DialogContent>
@@ -135,6 +198,7 @@ function AdminUsersInner() {
 
 export default function AdminUsersPage() {
   return (
+    <RequireAuth requireRole="super">
       <AppShell>
         <AdminUsersInner />
       </AppShell>

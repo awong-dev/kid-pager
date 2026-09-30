@@ -1,5 +1,6 @@
 "use client";
 
+/** Family-admin "create group" dialog; members are picked from `useDirectory().contacts`. */
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -17,6 +18,7 @@ import Typography from "@mui/material/Typography";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
+import { familyQuery } from "@/lib/family-context";
 
 // Same shape as the relay's `ALIAS_RE`; client-side validation only, the relay is the authority.
 const ALIAS_RE = /^[a-z0-9][a-z0-9_-]{0,15}$/;
@@ -69,6 +71,7 @@ export default function NewGroupDialog({ open, onClose }: NewGroupDialogProps) {
     try {
       // The creating admin is included explicitly so they are a member of their own group.
       const memberUids = Array.from(new Set([me.uid, ...selected]));
+      await api.post(`/family/groups${familyQuery()}`, { name: name.trim(), alias, memberUids });
       handleClose();
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to create group");

@@ -13,6 +13,7 @@ import { useEffect, useRef } from "react";
 import { isCoarseFix, zoomForAccuracy } from "@/lib/location";
 import { OSM_ATTRIBUTION, OSM_TILE_MAX_ZOOM, OSM_TILE_URL } from "@/lib/mapTiles";
 
+const DEFAULT_MAP_HEIGHT_PX = 200;
 // Used only to pick a zoom level, not for layout.
 const VIEWPORT_PX_ESTIMATE = 260;
 
@@ -30,12 +31,15 @@ export default function LocationMap({
   accM,
   src,
   trail,
+  height = DEFAULT_MAP_HEIGHT_PX,
 }: {
   lat: number;
   lon: number;
   accM?: number | null;
   src?: string | null;
   trail?: LocationMapTrailPoint[];
+  /** CSS pixel height of the map container. */
+  height?: number;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -137,6 +141,7 @@ export default function LocationMap({
     <div
       ref={containerRef}
       aria-label="Map of the pager's last known location"
+      style={{ height, width: "100%", borderRadius: 8, outline: "none" }}
     />
   );
 }

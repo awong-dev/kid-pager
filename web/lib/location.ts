@@ -1,5 +1,6 @@
 /** Pure helpers for rendering a location fix: zoom, staleness, coarseness and the timeline. */
 
+
 // A fix older than this reads as stale in `LocationCard`.
 export const STALE_FIX_MS = 30 * 60 * 1000;
 
@@ -39,4 +40,121 @@ export function zoomForAccuracy(
   );
   if (!Number.isFinite(z)) return DEFAULT_ZOOM_NO_ACCURACY;
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z)));
+}
+
+/** Display words for a fix source. */
+export function sourceLabel(src: string | null | undefined): string {
+  return src === "gnss" ? "GPS" : src === "cell" ? "cell tower" : (src ?? "unknown source");
+}
+
+// The pager's `why` values mapped to timeline words.
+const WHY_LABELS: Record<string, string> = {
+  still: "hourly check-in",
+  move: "moving",
+  stop: "stopped",
+  cell: "cell fix",
+  gnss: "GPS fix",
+};
+
+/** Label for a timeline entry's `why`/`reqId` (`reqId` wins); an unknown `why` shows raw. */
+export function whyLabel(
+  why: string | null | undefined,
+  reqId: string | null | undefined
+): string | null {
+  if (reqId) return "requested";
+  if (!why) return null;
+  return WHY_LABELS[why] ?? why;
+}
+
+
+/** One timeline row: a stored fix, or the synthetic "position unknown" row (`positionUnknown`). */
+export interface LocationTimelineEntry {
+  id: string;
+  /** `LocationFixDoc.ts` (or `lastCell.ts`) in ms; start of a merged dwell range. */
+  startMs: number;
+  /** `LocationFixDoc.lastTs` in ms, set when a later report extended the dwell; else `null`. */
+  endMs: number | null;
+  lat: number | null;
+  lon: number | null;
+  accM: number | null;
+  src: string | null;
+  why: string | null;
+  reqId: string | null;
+  cached: boolean;
+  positionUnknown: boolean;
+}
+
+export interface LocationFixRow extends LocationFixDoc {
+  id: string;
+}
+
+/**
+ * Timeline rows from `locations` docs, newest first, within `windowDays`. A `lastCell.ts` newer
+ * than the newest fix adds a "position unknown" row (the relay stores only resolved fixes).
+ */
+export function buildLocationTimeline(
+  fixes: LocationFixRow[],
+  lastCellTsS: number | null | undefined,
+): LocationTimelineEntry[] {
+
+  const entries: LocationTimelineEntry[] = [];
+  for (const f of fixes) {
+    const startMs = f.ts * 1000;
+    const endMs = f.lastTs != null ? f.lastTs * 1000 : null;
+    if ((endMs ?? startMs) < cutoffMs) continue;
+    entries.push({
+      id: f.id,
+      startMs,
+      endMs,
+      lat: f.lat,
+      lon: f.lon,
+      accM: f.accM,
+      src: f.src,
+      why: f.why ?? null,
+      reqId: f.reqId ?? null,
+      cached: f.cached,
+      positionUnknown: false,
+    });
+  }
+  entries.sort((a, b) => (b.endMs ?? b.startMs) - (a.endMs ?? a.startMs));
+
+  if (lastCellTsS != null) {
+    const lastCellMs = lastCellTsS * 1000;
+    const newestFixMs = entries[0] ? (entries[0].endMs ?? entries[0].startMs) : 0;
+    if (lastCellMs > newestFixMs && lastCellMs >= cutoffMs) {
+      entries.unshift({
+        id: `lastCell-${lastCellTsS}`,
+        startMs: lastCellMs,
+        endMs: null,
+        lat: null,
+        lon: null,
+        accM: null,
+        src: "cell",
+        why: null,
+        reqId: null,
+        cached: false,
+        positionUnknown: true,
+      });
+    }
+  }
+
+  return entries;
+}
+
+export interface LocationTimelineDayGroup {
+  dayKey: string;
+  entries: LocationTimelineEntry[];
+}
+
+/** Groups a newest-first timeline by local calendar day, keeping order. */
+export function groupTimelineByDay(entries: LocationTimelineEntry[]): LocationTimelineDayGroup[] {
+  const groups = new Map<string, LocationTimelineEntry[]>();
+  for (const e of entries) {
+    const d = new Date(e.startMs);
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const list = groups.get(key);
+    if (list) list.push(e);
+    else groups.set(key, [e]);
+  }
+  return Array.from(groups.entries()).map(([dayKey, es]) => ({ dayKey, entries: es }));
 }

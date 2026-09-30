@@ -51,6 +51,8 @@ Firestore/Auth emulators when `NEXT_PUBLIC_USE_EMULATORS=1` (the
 To create the first admin user against a fresh emulator stack (the registry
 gate means nobody can sign in until they exist as a `users/{uid}` doc),
 run the relay's own bootstrap job from `relay/`, pointed at the emulators. It
+also creates the default `families/{fid}` doc and makes `--admin-email` a
+`super` user (not just a family `admin`):
 
 ```bash
 cd relay
@@ -118,6 +120,8 @@ the device is later recovered or replaced.
 device a policy to automatically lock after N minutes of inactivity; **Clear passcode** (button)
 immediately removes the passcode on the device, unlocking it.
 
+Contact requests and the address book are managed on `/family/alerts` (see the table in the
+main checklist below, step 12).
 
 ## Manual checklist (walk through against `docker compose up`)
 
@@ -226,5 +230,31 @@ incognito window) to act as two different people at once where noted.
     note.
 15. **Sign out**: confirm "Sign out" returns to `/login` and that navigating
     back to `/chat` redirects to `/login` rather than showing stale data.
+
+## Multi-family tenancy checklist
+
+16. **Navigation by role**: sign in as super -> switcher visible, changing it updates
+    `?family=`; as family admin -> Family menu, no Admin menu, no switcher; as member -> neither;
+    a role change on the server followed by reload lands on the new nav after the forced token
+    refresh.
+17. **Superadmin Families page and filters**: create a second family, move a member into
+    it, promote them to admin, sign in as them -> they see only their family on `/family/people`;
+    allow-list shows cross-family Locate disabled.
+18. **Family People/Devices pages and directory rewrite**: as a family admin, People lists
+    only the family; adding a person appears live; creating a device shows the setup code and the
+    device appears in the table with the right owner; as a member, `/chat` peers resolve by alias
+    without any `localStorage` key.
+19. **Family tab and read-only monitor thread**: as family admin, Family tab shows a
+    member's DM with a user in another family and the member's SMS conversation; opening one shows
+    messages read-only; as the other family's admin the same DM appears and the SMS one does not;
+    as a member, no Family tab; DM rows never show `uid:xxxx`.
+20. **Group-handling fixes**: a group message while on another page notifies with the group
+    name and opens the group; a group with more than one page of messages offers Load older; a
+    family admin creates a group from family members.
+21. **Location page scoping**: family admin sees all family devices on the map and can
+    Locate now; the other family's devices never appear, including for super until the switcher
+    is changed; a member sees only own and granted devices.
+23. **New chat dialog**: member on `people` types an unrelated alias, sends, sees "Your
+24. **Family Contacts page**: an external created through the member drawer appears;
 
 `npm run build && npx tsc --noEmit && npm run lint` should all be clean.

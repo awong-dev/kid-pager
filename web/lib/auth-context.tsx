@@ -12,12 +12,34 @@ import {
 } from "react";
 
 import { ApiError, api } from "./api";
+import type { PolicyDoc, Role, UserKind } from "./types";
 
 export interface Me {
   uid: string;
   alias: string;
   displayName: string;
   role: Role;
+  familyId: string | null;
+  kind: UserKind;
+  policy: PolicyDoc;
+  notify: { alerts: boolean };
+}
+
+// The raw `/api/me` shape; optional fields are defaulted by `normalizeMe`.
+type MeResponse = Partial<Omit<Me, "uid" | "alias" | "displayName" | "role">> &
+  Pick<Me, "uid" | "alias" | "displayName" | "role">;
+
+function normalizeMe(user: MeResponse): Me {
+  return {
+    uid: user.uid,
+    alias: user.alias,
+    displayName: user.displayName,
+    role: user.role,
+    familyId: user.familyId ?? null,
+    kind: user.kind ?? "person",
+    policy: user.policy ?? { out: "people", in: "people" },
+    notify: user.notify ?? { alerts: true },
+  };
 }
 
 export type AuthStatus = "loading" | "signed-out" | "not-registered" | "signed-in";
@@ -26,6 +48,11 @@ interface AuthContextValue {
   status: AuthStatus;
   firebaseUser: FirebaseUser | null;
   me: Me | null;
+  /** `role === 'super'` -- the one global admin. */
+  isSuper: boolean;
+  /** `role === 'admin' || isSuper`. */
+  isFamilyAdmin: boolean;
+  /** @deprecated alias for `isFamilyAdmin`. */
   isAdmin: boolean;
   notRegisteredMessage: string | null;
   signOutUser: () => Promise<void>;
@@ -49,6 +76,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       setStatus("loading");
       try {
+        let resp = await api.get<{ user: MeResponse; role: Role; claimsStale?: boolean }>(
+          "/me"
+        );
+        if (resp.claimsStale) {
+          // The server rewrote this account's claims: refresh the token, refetch once.
+          resp = await api.get<{ user: MeResponse; role: Role; claimsStale?: boolean }>("/me");
+        }
+        setMe(normalizeMe(resp.user));
         setStatus("signed-in");
       } catch (err) {
         setMe(null);
@@ -68,10 +103,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStatus("signed-out");
   }, []);
 
+  const isSuper = me?.role === "super";
+  const isFamilyAdmin = me?.role === "admin" || isSuper;
+
   const value: AuthContextValue = {
     status,
     firebaseUser,
     me,
+    isSuper,
+    isFamilyAdmin,
+    isAdmin: isFamilyAdmin,
     notRegisteredMessage: status === "not-registered" ? NOT_REGISTERED_MESSAGE : null,
     signOutUser,
   };

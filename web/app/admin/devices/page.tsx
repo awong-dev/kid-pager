@@ -20,6 +20,7 @@ import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useDirectory } from "@/lib/directory";
+import { useFamily } from "@/lib/family-context";
 import type { DeviceDoc, UserDoc } from "@/lib/types";
 
 import SetupCodePanel, { type SetupCodeResult } from "./SetupCodePanel";
@@ -33,6 +34,8 @@ interface CaConfirmState {
   action: CaAction;
 }
 
+const ALL_FAMILIES = "__all__";
+
 
 // Response of device create and rotate-credentials; only the fields read here.
 interface DeviceSetupResponse {
@@ -45,6 +48,7 @@ interface DeviceSetupResponse {
 
 function DevicesInner() {
   const { uidToAlias } = useDirectory();
+  const { familyId: scopeFamilyId, families } = useFamily();
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
@@ -53,6 +57,19 @@ function DevicesInner() {
   const [caBusy, setCaBusy] = useState(false);
   const [caError, setCaError] = useState<string | null>(null);
   const [caSuccess, setCaSuccess] = useState<string | null>(null);
+  // "All" only when the switcher has no family selected.
+  const [filterFamily, setFilterFamily] = useState<string>(scopeFamilyId ?? ALL_FAMILIES);
+
+  function openCreate() {
+    // default the dialog's family picker to the switcher's family unless already picked
+    setForm((f) => ({ ...f, familyId: f.familyId || scopeFamilyId || "" }));
+    setCreateOpen(true);
+  }
+
+  const familyNameById = new Map(families.map((f) => [f.id, f.name]));
+  const visibleDevices =
+    filterFamily === ALL_FAMILIES ? devices : devices.filter((d) => d.familyId === filterFamily);
+  const ownerOptions = form.familyId ? users.filter((u) => u.familyId === form.familyId) : users;
 
   async function createDevice() {
     setError(null);
@@ -63,6 +80,7 @@ function DevicesInner() {
         defaultToAlias: form.defaultToAlias || null,
       });
       setCreateOpen(false);
+      setForm({ ...emptyForm, familyId: scopeFamilyId ?? "" });
       setSetupResult({
         deviceId: resp.device.id,
         label: form.label,
@@ -164,9 +182,25 @@ function DevicesInner() {
   return (
     <Stack spacing={2}>
         <Typography variant="h5">Devices</Typography>
+        <Button variant="contained" onClick={openCreate}>
           Add device
         </Button>
       </Stack>
+      <TextField
+        select
+        size="small"
+        label="Family"
+        value={filterFamily}
+        onChange={(e) => setFilterFamily(e.target.value)}
+        sx={{ maxWidth: 240 }}
+      >
+        <MenuItem value={ALL_FAMILIES}>All families</MenuItem>
+        {families.map((f) => (
+          <MenuItem key={f.id} value={f.id}>
+            {f.name}
+          </MenuItem>
+        ))}
+      </TextField>
       {error && <Alert severity="error">{error}</Alert>}
 
 
@@ -181,11 +215,26 @@ function DevicesInner() {
             />
             <TextField
               select
+              label="Family"
+              value={form.familyId}
+              onChange={(e) => setForm({ ...form, familyId: e.target.value, ownerAlias: "" })}
+              helperText="Narrows the owner picker below; the device's own family is set from its owner."
+              fullWidth
+            >
+              {families.map((f) => (
+                <MenuItem key={f.id} value={f.id}>
+                  {f.name}
+                </MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              select
               label="Owner"
               value={form.ownerAlias}
               onChange={(e) => setForm({ ...form, ownerAlias: e.target.value })}
               fullWidth
             >
+              {ownerOptions.map((u) => (
                 <MenuItem key={u.uid} value={u.alias}>
                   @{u.alias}
                 </MenuItem>
@@ -276,6 +325,7 @@ function DevicesInner() {
 
 export default function DevicesPage() {
   return (
+    <RequireAuth requireRole="super">
       <AppShell>
         <DevicesInner />
       </AppShell>

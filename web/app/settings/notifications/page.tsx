@@ -1,14 +1,18 @@
 "use client";
 
 /** `/settings/notifications`: browser push via `registerForPush()` (Web Push or FCM), test button,
+ * and a family-admin "Family alerts" switch (`PATCH /api/me {notify: {alerts}}`). */
 
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
+import FormControlLabel from "@mui/material/FormControlLabel";
 import Stack from "@mui/material/Stack";
+import Switch from "@mui/material/Switch";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
+import { useAuth } from "@/lib/auth-context";
 import { ApiError, api } from "@/lib/api";
 import {
   notificationPermission,
@@ -18,12 +22,34 @@ import {
 } from "@/lib/notifications";
 
 function NotificationsInner() {
+  const { me, isFamilyAdmin } = useAuth();
   const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() =>
     notificationPermission()
   );
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [alertsEnabled, setAlertsEnabled] = useState(() => me?.notify.alerts ?? true);
+  const [alertsSaving, setAlertsSaving] = useState(false);
+  const [alertsError, setAlertsError] = useState<string | null>(null);
+
+  async function handleAlertsToggle(next: boolean) {
+    const previous = alertsEnabled;
+    setAlertsEnabled(next);
+    setAlertsSaving(true);
+    setAlertsError(null);
+    try {
+      await api.patch("/me", { notify: { alerts: next } });
+    } catch (err) {
+      setAlertsEnabled(previous);
+      setAlertsError(
+        err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to save"
+      );
+    } finally {
+      setAlertsSaving(false);
+    }
+  }
 
   async function handleEnable() {
     setBusy(true);
@@ -54,6 +80,22 @@ function NotificationsInner() {
       <Typography variant="body2" color="text.secondary">
         Current permission: <strong>{permission}</strong>
       </Typography>
+
+      {isFamilyAdmin && (
+        <>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={alertsEnabled}
+                disabled={alertsSaving}
+                onChange={(e) => void handleAlertsToggle(e.target.checked)}
+              />
+            }
+            label="Family alerts"
+          />
+          {alertsError && <Alert severity="error">{alertsError}</Alert>}
+        </>
+      )}
 
       {status && <Alert severity="success">{status}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}

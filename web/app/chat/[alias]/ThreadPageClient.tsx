@@ -3,6 +3,7 @@
 /** `/chat/[alias]`: one conversation thread (messages, composer, delivery chips, location link).
  * The alias comes from `usePathname()` because the route is a static shell. */
 
+import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -18,6 +19,7 @@ import LocationOnIcon from "@mui/icons-material/LocationOn";
 import SendIcon from "@mui/icons-material/Send";
 
 import AppShell from "@/components/AppShell";
+import MessageList, { type MessageRow } from "@/components/MessageList";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
@@ -69,6 +71,7 @@ function useAliasFromPath(): string | null {
 }
 
 function ThreadInner({ alias }: { alias: string }) {
+  const { familyId } = useFamily();
   const router = useRouter();
   const peerUid = aliasToUid(alias);
   // DM and group aliases are disjoint server-side: at most one of `peerUid`/`group` is set.
@@ -97,7 +100,10 @@ function ThreadInner({ alias }: { alias: string }) {
 
   // `pageSize` grows on "load older" and the listener re-subscribes with the bigger limit.
 
+  // Peer's pager device, for the status line and "View location" link. An admin queries any device;
+  // a member must filter on their own uid in `locatableBy`. Both need `familyId` for the rules.
 
+  const canViewLocation = Boolean(me && device?.locatableBy.includes(me.uid));
 
   // Marks unread webapp deliveries read, only while at the bottom and the tab is visible.
   // The visibility listener calls it through `markReadRef` to avoid a stale closure.
@@ -205,6 +211,8 @@ function ThreadInner({ alias }: { alias: string }) {
         }
       }
     } catch (err) {
+      // a policy-blocked send is 403 `{reason, message}`; `ApiError` keeps `message`
+      setSendError(err instanceof ApiError ? err.message : "Failed to send");
     } finally {
       setSending(false);
     }
@@ -243,9 +251,39 @@ function ThreadInner({ alias }: { alias: string }) {
             Leave
           </Button>
         )}
+        {canViewLocation && (
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<LocationOnIcon />}
+            component={Link}
+            href={`/location?who=${encodeURIComponent(alias)}`}
+          >
+            View location
+          </Button>
         )}
       </Stack>
 
+      {!peerUid && !group && <Alert severity="info">No conversation with @{alias} yet</Alert>}
+
+      <MessageList
+        messages={messages}
+        meUid={me?.uid ?? null}
+        isGroup={Boolean(group)}
+        locationAlias={alias}
+        canLoadOlder={Boolean(convKey) && messages.length >= pageSize}
+        onLoadOlder={() => {
+          // record the pre-prepend scrollHeight for the layout effect
+          if (listRef.current) {
+            prevScrollHeightRef.current = listRef.current.scrollHeight;
+          }
+          setPageSize((n) => n + PAGE_SIZE_STEP);
+        }}
+        listRef={listRef}
+        onScroll={handleScroll}
+        showNewMessagesChip={showNewMessagesChip}
+        onJumpToBottom={() => scrollToBottom(reducedMotion ? "auto" : "smooth")}
+      />
 
       <Stack direction="row" spacing={1} sx={{ alignItems: "flex-end" }}>
         <TextField

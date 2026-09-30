@@ -1,12 +1,30 @@
 "use client";
 
 /** Shows a browser notification for new messages (and, for admins, new open alerts) when the
+ * tab is hidden or the thread is not open. Renders nothing. */
 
 import { usePathname } from "next/navigation";
 import { useEffect, useRef } from "react";
 
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
+import { useFamily } from "@/lib/family-context";
+import type { AlertDoc, ConversationDoc } from "@/lib/types";
+
+/** Alerts show the relay-provided `preview` and link to `/family/alerts`. */
+function showForegroundAlertNotification(preview: string): void {
+  if (notificationPermission() !== "granted") return;
+  const n = new Notification("New family alert", {
+    body: preview,
+    icon: "/icons/icon-192.png",
+    tag: "pager-alerts",
+  });
+  n.onclick = () => {
+    window.focus();
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+    window.location.href = "/family/alerts";
+  };
+}
 
 function currentThreadAlias(pathname: string | null): string | null {
   if (!pathname) return null;
@@ -15,7 +33,25 @@ function currentThreadAlias(pathname: string | null): string | null {
   return decodeURIComponent(parts[1]!);
 }
 
+/** Like `showForegroundMessageNotification`, but titled and linked for a group. */
+function showForegroundGroupNotification(alias: string, name: string, preview: string): void {
+  if (notificationPermission() !== "granted") return;
+  const n = new Notification(`New message in ${name}`, {
+    body: preview,
+    icon: "/icons/icon-192.png",
+    tag: `pager-thread-${alias}`,
+  });
+  n.onclick = () => {
+    window.focus();
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+    window.location.href = `/chat/${encodeURIComponent(alias)}`;
+  };
+}
+
 export default function NotificationWatcher() {
+  const { me, isFamilyAdmin } = useAuth();
+  const { byUid } = useDirectory();
+  const { familyId } = useFamily();
   const pathname = usePathname();
 
   const pathnameRef = useRef(pathname);
@@ -23,7 +59,10 @@ export default function NotificationWatcher() {
     pathnameRef.current = pathname;
   }, [pathname]);
 
+  const byUidRef = useRef(byUid);
   useEffect(() => {
+    byUidRef.current = byUid;
+  }, [byUid]);
 
   useEffect(() => {
     if (!me) return;
@@ -35,6 +74,20 @@ export default function NotificationWatcher() {
 
         if (initialized && unread > prevUnread) {
           const openAlias = currentThreadAlias(pathnameRef.current);
+
+          if (data.kind === "group") {
+            const alias = data.alias;
+            if (alias !== undefined) {
+              const threadOpen = alias === openAlias;
+              if (document.visibilityState !== "visible" || !threadOpen) {
+                showForegroundGroupNotification(alias, data.name ?? alias, data.lastPreview);
+              }
+            }
+          } else {
+            const peerUid = data.uids.find((u) => u !== me.uid) ?? data.uids[0]!;
+            const threadOpen = alias !== undefined && alias === openAlias;
+            if (alias !== undefined && (document.visibilityState !== "visible" || !threadOpen)) {
+            }
           }
         }
         previousUnread.set(d.id, unread);
@@ -44,6 +97,25 @@ export default function NotificationWatcher() {
 
     return unsubscribe;
   }, [me]);
+
+  useEffect(() => {
+    if (!isFamilyAdmin || !familyId) return;
+    const seen = new Set<string>();
+    let initialized = false;
+
+        if (initialized && !seen.has(d.id)) {
+          const onAlertsPage = pathnameRef.current?.startsWith("/family/alerts") ?? false;
+          if (document.visibilityState !== "visible" || !onAlertsPage) {
+            showForegroundAlertNotification(data.preview);
+          }
+        }
+        seen.add(d.id);
+      });
+      initialized = true;
+    });
+
+    return unsubscribe;
+  }, [isFamilyAdmin, familyId]);
 
   return null;
 }

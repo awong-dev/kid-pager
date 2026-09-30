@@ -3,13 +3,30 @@
  */
 
 
+// A policy-gated 403 body is `{reason, message}` (nested under `detail` or bare); `reason` is
+// a machine code and `message` is shown verbatim.
+function parseReasonMessage(detail: unknown): { reason?: string; message?: string } | null {
+  if (!detail || typeof detail !== "object") return null;
+  const d = detail as Record<string, unknown>;
+  if (typeof d.reason !== "string" && typeof d.message !== "string") return null;
+  return {
+    reason: typeof d.reason === "string" ? d.reason : undefined,
+    message: typeof d.message === "string" ? d.message : undefined,
+  };
+}
+
 export class ApiError extends Error {
   status: number;
   detail: unknown;
+  /** Reason code from a `{reason, message}` 403 body, else `undefined`. */
+  reason?: string;
 
   constructor(status: number, detail: unknown) {
+    const parsed = parseReasonMessage(detail);
+    super(parsed?.message ?? (typeof detail === "string" ? detail : `request failed with status ${status}`));
     this.status = status;
     this.detail = detail;
+    this.reason = parsed?.reason;
   }
 }
 
