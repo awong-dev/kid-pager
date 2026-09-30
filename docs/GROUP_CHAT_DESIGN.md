@@ -11,6 +11,11 @@ is a companion to `docs/SERVER_PLAN.md` (§3 data model, §5.2 routing); for any
    prefix.** The body keeps all 160 code points. This is a device-facing protocol addition: `sndr`
    is specified in `docs/PROTOCOL.md` §3.1 (field table), §3.3 (byte budget) and §10 (CBOR key 51).
    See §4 below.
+2. **Group creation is admin-only** (family admin in multi-family deployment; superadmin creates
+   across families), **and creating or joining a group auto-creates `allow` edges in both directions
+   between every member pair**, so the send-time allow-list gate never partial-delivers. Join is
+   family-admin-only and writes `message`-only edges (no `locate`). Superseded by
+   `docs/FAMILIES_DESIGN.md` §4.
 3. **No history on join; per-copy visibility.** A member reads only the copies they were party to.
 
 **Scope:** a conversation with more than two members, every message fanned out to every other

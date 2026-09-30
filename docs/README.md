@@ -16,6 +16,7 @@
 - [FAMILIES_DESIGN.md](FAMILIES_DESIGN.md): multi-family tenancy: families, roles, conversation policies, and the web UI for each role.
 - [HOOKS_PROTOCOL.md](HOOKS_PROTOCOL.md): the contract for writing a message hook: registration, signed request, filter answer, processor delivery, callback API.
 - [FEDERATION_PROTOCOL.md](FEDERATION_PROTOCOL.md): the `/fed/v1` relay-to-relay contract: identity, peering, request signing, endpoints, event types.
+- [reference/wf_partial_2in9.h](reference/wf_partial_2in9.h): partial-refresh waveform table for the 2.9-inch SSD1680 panel (C header).
 
 ## Design notes
 

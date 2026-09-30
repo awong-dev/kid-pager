@@ -94,6 +94,16 @@ never publish).
 ### Accelerometer (LIS3DH) bench wiring
 
 
+- Address 0x18 (SDO/SA0 open or tied low). If SDO/SA0 is pulled high instead, the chip answers
+  at 0x19 and `i2cscan` shows 0x19, not 0x18. `accel_init()` looks only at 0x18 and will report
+  "not found" until either the wiring or `PAGER_I2C_ADDR_LIS3DH` (`pins.h`) changes.
+  external pull-up needed. It is an RTC GPIO, armed as the ext1 light-sleep wake.
+
+`i2cscan` is the one-line pre-flight check on the CardKB bus (expect `0x5F`). The LIS3DH is on the
+other bus, so its presence check is the boot log's `LIS3DH found (WHO_AM_I=0x33)` line or
+`acceltest`. If neither shows it, check the wiring before anything else; `acceltest` will just say
+"not present".
+
 ## Verified on hardware
 
 

@@ -189,8 +189,20 @@ failed or wrong fix is an acceptable answer, and battery matters more than fresh
   A reset puts the backoff at zero but keeps a **floor of 10 min since the last attempt**, so a child
   walking between classrooms all day cannot turn every request into an attempt.
 - **Battery floor**: below 3.55 V (LiPo, `batt_mv`), GNSS is never powered; the answer is cached or `no_fix`.
+  attached, in the eDRX idle gap, through the library `gnss*` API. **Any failure** (`LTE_CONCURRENCY`
+  refusal, timeout, no fix, confidence > 100, failed assistance refresh) ends the attempt and produces a
+  cell answer (`loc:null, err:"no_fix", cell`). There is no second route and no retry. A `CFUN=4` window
+  route was rejected because it left the pager unreachable for about 2.5 min per fix. A PSM window stays
+  rejected (`LOCATION_TRACKING_DESIGN.md` §8).
+- **Assistance (mandatory)**: before any attempt, if the last refresh is ≥ 2 h old or
+  `gnssGetAssistanceStatus()` says it is due, `gnssUpdateAssistance()` runs first, while connected. A
+  failed refresh is a failed attempt. The refresh counts inside `PROTOCOL.md` §13.3 item 2's 60 s. Its
+  byte cost is logged.
 - **Accept only a good fix**: confidence ≤ 100 (the vendor demo's threshold); mapped to `acc`.
 - **`/status`**: `loc_min_s` = 600 (the floor), `loc_period_s` = 0 (no unsolicited fixes), and
+  `loc_backoff_s` = seconds until the next attempt is allowed (0 = now). With location tracking on
+  (`LOCATION_TRACKING_DESIGN.md`), `loc_period_s` = 3600 (the maximum gap between unsolicited cell
+  reports) and `loc_move_s` = the GNSS-while-moving interval (600, 0 = off).
 - **Relay/protocol**: §13.3 item 1 is amended. The device's window is the growing backoff above,
   reported in `/status`; the relay's own mirrored 60 s rule is unchanged. `tools/pager_client.py`
   answers `loc_req` the same way (a `--loc lat,lon` option, else `no_fix`), so the e2e suite covers the
@@ -247,6 +259,8 @@ Envelope keys:
 | 47 | `sms_ts` | int | `/up` `sms_log` |
 | 48 | `sms_lost` | int | `/status` (audit entries dropped, normally 0) |
 | 50 | `link` | int | `/status` (MQTT-session generation within a boot, §9.5; key 49 is `cell`) |
+| 60 | `why` | tstr | `/loc`, unsolicited only: `still`/`cell`/`move`/`gnss`/`stop` (`LOCATION_TRACKING_DESIGN.md` §3; keys 51–59 are allocated in `PROTOCOL.md` §10) |
+| 61 | `loc_move_s` | int | `/status` (GNSS-while-moving interval, 0 = off) |
 
 `kind` gains `sms_log` (`/up`). `cfg` sub-map: `lock=0` (existing), **`ca=1`** `{url=0 tstr,
 sha=1 bstr(32)}`, **`sms=2`** array of `{n=0 tstr name, p=1 tstr phone}`. In JSON the same names
@@ -317,7 +331,11 @@ both. It is safe to repeat: the broker replaces the subscription, and `/down` is
 3. `net_service_session()`, called once per wake-and-drain iteration from `modes.c` (the ESP32 is already
    awake at each sleep-cycle wake, so the timer check is free), sends the raw
    `AT+SQNSMQTTSUBSCRIBE=0,"pager/{id}/down",1` when `s_resub_pending`, or when
+   `now - s_last_uplink_us >= N`. It is skipped while the coverage duty cycle owns the radio and during a
+   CA-apply trial: the suppressions the reconnect path already honours.
+4. The `SUBSCRIBED` event clears the pending flag and, if it closed a resume, raises a **session-restart
    edge**, so `modes.c` runs the existing `catrust_on_mqtt_connected()` + `publish_status_online()` block.
+5. No SUBACK within 30 s (two wake cycles plus RRC setup) = the session is dead: mark disconnected and
    raise the ordinary disconnect edge, so F1/F3 backoff and `net_session_up()` run. `mqttConnect()` frees
    the topic table, so the subscribe after a real reconnect is a normal one. **This is the early death
    detection the firmware otherwise lacks**: ≤30 s instead of the modem's ~6 min.

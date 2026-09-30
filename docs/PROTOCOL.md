@@ -587,6 +587,7 @@ broker-generated LWT.
 | `ts` | int | yes when `online` | epoch s, or 0 | Same rule as §3.5 |
 | `fw` | string | no | ≤16 chars | Firmware version |
 | `bv` | int | no | 0…2³²-1 | Book version (`DEVICE_PLAN.md` §4.3). Reported so the relay can detect a factory reset or a lost book message and re-publish. |
+| `loc_period_s` | int | no | 0…86400 | The periodic `/loc` interval **the device has chosen** (§13); `0` = periodic location off. *(location tracking, §13.3 item 9: for a device sending `why`-tagged reports it is the **maximum gap** between unsolicited `/loc` while its session is usable, 3600 when tracking is on; reports may come sooner.)* |
 | `loc_min_s` | int | no | 0…86400 | The device's own minimum gap between on-demand fixes (§13.3); default 120. Firmware with the growing backoff of §13.3 reports **600**: the floor it keeps since its last attempt even after a backoff reset. |
 | `ca_fp` | string | no | 16 lowercase hex chars | First 16 hex characters of the SHA-256 of the pinned CA PEM (the same digest carried in the bootstrap bundle's `ca_sha`/a `cfg.ca.sha` push, `V02_DESIGN.md` §4.4). Absent when `tls` is `unpinned` or absent. |
 | `loc_backoff_s` | int | no | 0…86400 | *(§13.3)* Seconds until the device's own growing location-attempt backoff next allows a fresh fix attempt; `0` = an attempt is allowed now. See §13.3's amendment for how this relates to `loc_min_s`. |
@@ -597,6 +598,7 @@ broker-generated LWT.
 | `bpull` | int | no | `1` | *(§3.7: the gate that keeps a book nudge away from firmware that would read it as an empty book.)* Present with value `1` when the firmware fetches its book over HTTPS; absent means it takes the full `/down` `book`. The relay stores it and sends nudges only while the last online `/status` carried it. |
 | `abn` | int | no | 0…65535 | *(crash diagnostics)* Count of abnormal resets (i.e. `rst` not `poweron`/`deepsleep`) since power-on. Absent means firmware that predates this field. **Display and diagnosis only.** |
 | `stallcmd` | string | no | ≤24 chars | *(crash diagnostics)* The AT command name the previous boot's main-loop stage was blocked on for >= 5s when it last sampled, if that boot ended in an abnormal reset (`rst` above) — e.g. a task-watchdog reset caused by a wedged modem command. Absent when there is no such breadcrumb (no stall recorded, or the previous boot's reset was not abnormal). Absent means firmware that predates this field. **Display and diagnosis only.** |
+| `loc_move_s` | int | no | 0…86400 | *(location tracking, §13.3 item 9 — `docs/LOCATION_TRACKING_DESIGN.md` §2.2)* The interval between scheduled GNSS attempts while the device believes it is moving; `0` = no scheduled GNSS (cell reports only). Absent means firmware without scheduled GNSS. **Display and diagnosis only.** |
 
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
@@ -1081,6 +1083,7 @@ real hardware (`firmware/README.md`).
 | Wake-and-drain overhead, `T` = 5 s | 1.60 mA (estimate) | 200 ms awake at an assumed 40 mA every 5 s (§8.2); the 200 ms is measured, the current is not |
 | Modem eDRX paging | 0.2–0.5 mA (estimate) | 2 paging occasions per 20.48 s cycle, ~50 ms each at ~50 mA RX, plus warm-up |
 | Modem idle floor | 0.01–0.05 mA (estimate) | Sequans GM02SP deep-sleep-between-paging |
+| Display (gated off via the eInk Friend's ENA, IO12) | ~0 mA | e-paper VCC gated between refreshes |
 
 > **Why this is worse than it looks on paper.** A design built on an ESP32 deep-sleep floor of
 > 0.01–0.10 mA would give 0.6–1.2 mA → 15–29 mAh/day → ~50–100 days. That floor is only reachable
@@ -1295,6 +1298,8 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 57 | `url` | tstr, ≤200 B | `/down` `book` nudge (§3.7 — the fetch endpoint) |
 | 58 | `bpull` | uint, `1` | `/status` (§3.7/§5.1 — book-pull capability, optional) |
 | 59 | `stallcmd` | tstr, ≤24 B | `/status` (crash diagnostics, §5.1 — previous boot's stalled-command breadcrumb, optional) |
+| 60 | `why` | tstr, ≤5 B | `/loc` (location tracking, §13.2 — why an unsolicited report was sent, optional) |
+| 61 | `loc_move_s` | uint, 0…86400 | `/status` (location tracking, §5.1 — GNSS-while-moving interval, optional) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1539,7 +1544,9 @@ a broker rule forwards it to the relay's authenticated HTTPS endpoint (§2).
 | `loc.src` | `gnss` \| `cell` | no (default `gnss`) | How the position was obtained |
 | `req` | string \| null | **yes** | The `id` of the `loc_req` (§3.2) this answers; `null` = an unsolicited periodic fix |
 | `cached` | bool | no (default `false`) | True when the device's rate limit (§13.3) answered from the last fix instead of powering GNSS |
+| `err` | `no_fix` \| `disabled` | only when `loc` is `null` | `no_fix` = the fix attempt timed out; `disabled` = location is off on the device (`loc_period_s` 0 and the user has disabled on-demand fixes). *(`no_fix` means "this envelope carries no GNSS position" for any cause — timeout, refusal, low confidence, no attempt made; with `req:null` and `cell` it is a cell-only report. No new value, so relays that predate it still accept it.)* |
 | `cell` | object, optional | no | The device's serving cell (§13.2's own sub-table below). Absent = today's behaviour exactly. |
+| `why` | `still` \| `cell` \| `move` \| `gnss` \| `stop`, optional | no | *(location tracking, §13.3 item 9)* Why an unsolicited (`req:null`) `/loc` was sent: `still` = hourly report while stationary, `cell` = new serving cell, `move` = refresh while moving, `gnss` = result of a scheduled GNSS attempt, `stop` = motion ended. Absent on answers to a `loc_req` and from older firmware. Display and storage only; an unknown value is stored as absent, never a reason to drop the envelope. *(carried per report rather than in `/status` so the mode costs no extra publish.)* |
 
 **`cell` (cell-tower location fallback).** GNSS and LTE cannot run at once on this modem, and a
 school pager is indoors most of the day, so a GNSS attempt usually ends in `no_fix`. The pager
@@ -1572,6 +1579,7 @@ model, and `relay/app/cellgeo.py` for the pluggable provider (`google` / `opence
 `none` — the default, which makes no third-party call at all).
 
 The example is ~160 bytes; the worst case is ≤ ~200 bytes without `cell`, and ≤ ~260 bytes with a
+maximal `cell` sub-map (≤ ~270 with `why`; a signed CBOR cell-only report measures 85 B) — §3.3's envelope limit applies unchanged and is nowhere near binding
 either way. A `/loc` payload that violates any rule above is malformed
 and is handled per §3.4 — logged and dropped, never crashing the ingest path.
 
@@ -1619,10 +1627,24 @@ device and the server disagree about is a limit that produces phantom `expired` 
   battery: **who may make one is a server-side allow-list decision** — the same mechanism §4.2
   applies to messages, carrying a separate "may locate" right — enforced in the relay *and* in the
   store's own access rules, and never on the device. The device answers whatever it is asked;
+  it is not the gate. *(A device's owner may always locate and read their own device, no "may locate" right needed; admins get no bypass. Server-side only, nothing on the wire changes.)*
 8. `cell` rides on the same rate-limited answer — it costs the pager nothing extra to attach (the
   serving cell is already known from the modem's registration state, no separate radio activity),
   so it does not get its own rate limit or its own `loc_req`/`/locate` path; it is only ever a
   sub-field of an ordinary `/loc` answer (§13.2).
+9. *(location tracking — `docs/LOCATION_TRACKING_DESIGN.md`)* A device MAY publish
+  unsolicited `/loc` (`req:null`, QoS 0, `why` set) at most once per 120 s whatever its `why`; a
+  report that falls due sooner waits for the 120 s mark. While its session is usable and tracking
+  is on it SHOULD publish one at least every `loc_period_s`. QoS 0 reports are not retried, so the
+  relay MUST NOT infer anything (offline, stale, lost) from a missing one. A scheduled GNSS attempt
+  obeys items 1–3 like a requested one: it counts as an attempt for the backoff, and a `loc_req`
+  arriving during it shares its result (answered on QoS 1 with its own `req`; the unsolicited
+  `why:"gnss"` report is sent only when no request shared it). An assistance refresh before an
+  attempt counts inside item 2's 60 s. The relay's item 6 never answers from an unsolicited
+  `src:"cell"` fix (`req:null`): such a request goes to the device, which may still use GNSS.
+  *(unsolicited reports are the device's choice, like `loc_period_s`; the 120 s floor bounds relay
+  writes and provider lookups, and excluding cell reports from item 6 keeps a coarse hourly point
+  from suppressing the GNSS attempt a person asked for.)*
 
 ### 13.4 Request lifecycle
 
@@ -1646,6 +1668,13 @@ A periodic fix (`req:null`) is published every `loc_period_s` when that value is
 QoS 0, and is the device's decision alone. §7.3 budgets it and flags the interval below which a
 bad-coverage day breaks the project's 10 MB bar. `loc_period_s` = 0 disables periodic location
 entirely and is a valid, fully conformant configuration; on-demand `loc_req` still works.
+
+A device that tags its reports with `why` (§13.2) follows
+§13.3 item 9 instead of a fixed period: `loc_period_s` is the maximum gap between reports while
+connected, reports are mostly cell-only (`loc:null, err:"no_fix", cell`) and GNSS runs only while
+moving, every `loc_move_s`. The relay stores a resolved cell report as a `src:"cell"` fix with
+`reqId:null`. *(cell reports ride existing uplinks for ≈0.02 mAh each, where a periodic GNSS fix
+indoors would cost 10× that and usually fail — `docs/LOCATION_TRACKING_DESIGN.md` §6.)*
 
 ---
 

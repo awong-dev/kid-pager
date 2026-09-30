@@ -57,6 +57,7 @@ Open work, unverified items and decisions still needed. Items that are done are 
 - Post-wake window minimum: 50 ms fails and 150 ms works. The minimum is unknown, and the 136 s
   delivery latency is unexplained (hardware test 2).
 - Host liveness ping energy and carrier idle timeout: per-ping current is unmeasured. The earlier
+  300 s interval was set at half the shortest observed death. A measured 13-minute timeout would
   allow 540 s and nearly halve the power cost. The interval needs a decision.
 - Battery budget current trace: the current estimate is 4% awake and 95 to 107 mAh/day, which is
   about 23 to 26 days on a 2500 mAh LiPo cell. That estimate uses the earlier 288 pings per day. With
@@ -99,6 +100,9 @@ budget are not yet characterised. Cell-tower location gives a coarse fix indoors
 accuracy improvement for outdoors, not the only source. Following this plan unblocks periodic
 location.
 
+1. Outdoors, run `gnsstest 40` to characterise the radio route. Determine whether GNSS runs in place
+   while attached, or needs a `CFUN=4` window (modem radio off, TLS session lost, full re-attach and
+   re-handshake). Record cold-boot and hot-fix times, and the re-attach time if GNSS needs a
    the window.
    in step 1.
 4. Tune the LIS3DH accelerometer. Its resets of the location and no-coverage backoff are not yet
