@@ -68,6 +68,18 @@ class Message(BaseModel):
     # alias, denormalised to avoid a `users` read per delivery. Both `None` on a DM copy.
     groupMsgId: str | None = None
     senderAlias: str | None = None
+    # Sorted unique non-null `familyId` over this message's `uids`; an admin-read rule lookup field.
+    familyIds: list[str] = []
+
+
+class Participant(BaseModel):
+    """One `conversations/{k}.participants` entry, denormalised to avoid a `users` read per row."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    alias: str
+    displayName: str
+    kind: str = "person"
 
 
 class Conversation(BaseModel):
@@ -83,6 +95,9 @@ class Conversation(BaseModel):
     lastMessageAt: datetime | None = None
     lastPreview: str = ""
     unread: dict[str, int] = {}
+    # Written on conversation create; rewritten on group join/leave and a `displayName` change.
+    familyIds: list[str] = []
+    participants: dict[str, Participant] = {}
 
 
 def conv_key(uid_a: str, uid_b: str) -> str:
@@ -105,8 +120,44 @@ def _conversations():
     return get_db().collection("conversations")
 
 
+def _users():
+    return get_db().collection("users")
+
+
 def _meta_ref():
     return get_db().collection("settings").document("meta")
+
+
+def build_participants_and_family_ids(
+    uids: list[str], *, transaction: Transaction | None = None
+    """`participants` and sorted `familyIds` for member uids; `transaction` carries the reads."""
+    users_ref = _users()
+    family_ids: set[str] = set()
+    for uid in uids:
+        ref = users_ref.document(uid)
+        snap = ref.get(transaction=transaction) if transaction is not None else ref.get()
+        if not snap.exists:
+            continue
+        data = snap.to_dict() or {}
+        participants[uid] = {
+            "alias": data.get("alias", ""),
+            "displayName": data.get("displayName", ""),
+            "kind": data.get("kind", "person"),
+        }
+        family_id = data.get("familyId")
+        if family_id:
+            family_ids.add(family_id)
+    return participants, sorted(family_ids)
+
+
+def rewrite_participants_for_user(uid: str) -> None:
+    """Re-derives `participants`/`familyIds` in every conversation listing `uid`; best-effort."""
+    query = _conversations().where(filter=FieldFilter("uids", "array_contains", uid))
+    for snap in query.stream():
+        data = snap.to_dict() or {}
+        members = data.get("uids") or []
+        participants, family_ids = build_participants_and_family_ids(members)
+        snap.reference.update({"participants": participants, "familyIds": family_ids})
 
 
 def allocate_seq() -> int:
@@ -160,6 +211,9 @@ def create_message(
         # Reads precede writes (Firestore transaction rule); the dedup `create()` is staged after.
         meta_snap = None if seq is not None else meta_ref.get(transaction=transaction)
         conv_snap = conv_ref.get(transaction=transaction)
+        # `familyIds` over this message's `uids` on every write; `participants` only when this
+        # send creates the conversation.
+        participants, family_ids = build_participants_and_family_ids(pair, transaction=transaction)
 
         if wire_ref is not None:
             # Dedup: `create()` raises AlreadyExists (not retried) for a seen (wireId, recipient).
@@ -197,6 +251,7 @@ def create_message(
                 "pendingDeviceIds": pending_device_ids or [],
                 "groupMsgId": group_msg_id,
                 "senderAlias": sender_alias,
+                "familyIds": family_ids,
             },
         )
 
@@ -214,6 +269,9 @@ def create_message(
         else:
             # Only DMs create their conversation lazily; a group is created up front.
             conv_data["uids"] = pair
+            # Written only when creating the conversation.
+            conv_data["participants"] = participants
+            conv_data["familyIds"] = family_ids
             transaction.set(conv_ref, conv_data)
 
     try:

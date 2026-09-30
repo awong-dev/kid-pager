@@ -430,6 +430,7 @@ class Ingest:
         # One INFO line per accepted status for crash diagnostics: reset reason, stage name (raw
         # int if unknown) and abnormal-reset count; `None` on older firmware.
         logger.info(
+            "status %s: state=%s link=%s rst=%s stage=%s abn=%s stallcmd=%s loc_move_s=%s",
             device_id,
             env.state,
             env.link,
@@ -437,6 +438,7 @@ class Ingest:
             stage_name(env.stage),
             env.abn,
             env.stallcmd if env.stallcmd is not None else "-",
+            env.loc_move_s,
         )
 
         previous_status = device.status
@@ -455,6 +457,7 @@ class Ingest:
             tls=env.tls,
             caFp=env.ca_fp,
             locBackoffS=env.loc_backoff_s,
+            locMoveS=env.loc_move_s,
             smsLost=env.sms_lost,
             link=env.link,
             rst=env.rst,

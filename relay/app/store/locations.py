@@ -22,6 +22,11 @@ class LocationFix(BaseModel):
     cached: bool = False
     reqId: str | None = None
     createdAt: datetime | None = None
+    # `why` is the reason the report was sent; `cellKey` (`{mcc}-{mnc}-{tac}-{ci}`, None without a
+    # cell) tells a dwell extension from a move; `lastTs` is the latest report folded into this doc.
+    why: str | None = None
+    cellKey: str | None = None
+    lastTs: int | None = None
 
 
 def _locations(device_id: str):

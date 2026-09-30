@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Literal
 
+from google.cloud.firestore import FieldFilter, Transaction
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.db.firestore import get_db
@@ -56,6 +57,9 @@ class DeviceStatus(BaseModel):
     caFp: str | None = None
     # The device's own reported location backoff.
     locBackoffS: int | None = None
+    # GNSS-while-moving interval (s) reported while tracking is on, 0/absent = off; display only
+    # (docs/PROTOCOL.md §13.3).
+    locMoveS: int | None = None
     # Device SMS audit-queue drop counter.
     smsLost: int | None = None
     # MQTT-session generation within the current boot; a changed `link` triggers the online-edge
@@ -110,6 +114,16 @@ class SmsContact(BaseModel):
         return value
 
 
+class PendingPush(BaseModel):
+    """A "newest unacked" push slot: `id`, the exact unsigned envelope `obj`, `acked`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    obj: dict[str, object]
+    acked: bool
+
+
 class Device(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -135,6 +149,15 @@ class Device(BaseModel):
     # "issued" once a setup code exists for this device (create and rotate); "provisioned" on
     # its first signed `/status`. `None` on devices created before the field existed.
     provisionState: Literal["issued", "provisioned"] | None = None
+    # Copied from the owner's `familyId` at creation; `None` on devices that predate it.
+    familyId: str | None = None
+    # Written directly via `get_db()` by the contacts store; modelled so `get_device()` returns it.
+    bookVersion: int = 0
+    # The "newest unacked" pending-push slots (book/lock/ca/sms/loc/ota/ast), written directly
+    pendingBook: PendingPush | None = None
+    pendingCfg: PendingPush | None = None
+    pendingCfgCa: PendingPush | None = None
+    pendingCfgSms: PendingPush | None = None
 
 
 def _devices():
@@ -151,6 +174,7 @@ def create_device(
     default_to_uid: str | None = None,
     auth_mode: Literal["password", "hmac"] = "hmac",
     apn: str | None = None,
+    family_id: str | None = None,
 ) -> Device:
     """`mqtt_password_hash` is accepted but not stored; the hash lives in `deviceSecrets/{d}`."""
     ref = _devices().document(device_id)
@@ -167,6 +191,7 @@ def create_device(
             "authMode": auth_mode,
             "wire": None,
             "provisionState": "issued",
+            "familyId": family_id,
         }
     )
     fetched = get_device(device_id)
@@ -258,6 +283,23 @@ def clear_auth_alarm(device_id: str) -> None:
     )
 
 
+def read_last_cell_ts(device_id: str, transaction: Transaction) -> int | None:
+    """Read half of `set_last_cell`'s monotonic check (a transaction reads before it writes)."""
+    snap = _devices().document(device_id).get(transaction=transaction)
+    if not snap.exists:
+        return None
+    last_cell = ((snap.to_dict() or {}).get("status") or {}).get("lastCell") or {}
+    return last_cell.get("ts")
+
+
+def set_last_cell(
+    device_id: str, cell: CellInfo, ts: int, transaction: Transaction, *, existing_ts: int | None
+) -> None:
+    """Stages the last-cell write only if `existing_ts` is missing or <= `ts` (QoS 0 reorders)."""
+    if existing_ts is not None and existing_ts > ts:
+        return
+    transaction.set(
+        _devices().document(device_id),
         {
             "status": {
                 "lastCell": {

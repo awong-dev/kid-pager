@@ -17,12 +17,14 @@ from app.config import Settings
 from app.db.firestore import get_db
 from app.ingest import Ingest
 from app.main import create_app
+from app.store import alerts as alerts_store
 from app.store import allow as allow_store
 from app.store import backends as backends_store
 from app.store import contacts as contacts_store
 from app.store import conversations as conversations_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import families as families_store
 from app.store import users as users_store
 from tests.conftest import (
     ack_payload,
@@ -524,7 +526,9 @@ def client(broker: FakeBrokerClient) -> Iterator[TestClient]:
 def admin_headers() -> dict[str, str]:
     auth_user = fb_auth.create_user(email="devcfg-admin@example.com")
     users_store.create_user(
+        uid=auth_user.uid, alias="devcfgadmin", display_name="Admin", role="super"
     )
+    fb_auth.set_custom_user_claims(auth_user.uid, {"role": "super", "fam": ""})
     return auth_header(auth_user.uid)
 
 
@@ -653,6 +657,10 @@ def test_admin_push_ca_requires_admin(broker: FakeBrokerClient):
 def test_approve_contact_publishes_book(
     client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
 ):
+    family = families_store.create_family(name="Devcfg20", created_by="root-devcfg20")
+    users_store.create_user(
+        uid="student20", alias="student20", display_name="student20", family_id=family.id
+    )
     _make_pager_device("pgr-b-20", "student20")
     ingest = Ingest(broker)
     ingest.handle_up(
@@ -672,7 +680,11 @@ def test_approve_contact_publishes_book(
     )
     broker.clear()
 
+    alert = alerts_store.list_alerts(family.id, "open")[0]
+    assert alert.kind == "contact_request"
     resp = client.post(
+        f"/api/family/alerts/{alert.id}/approve",
+        params={"family": family.id},
         headers=admin_headers,
     )
     assert resp.status_code == 200, resp.text

@@ -22,6 +22,7 @@ dependencies = [
     "cbor2",
     # Bootstrap-bundle crypto in `app/devsetup.py`: HKDF-SHA256 and AES-256-GCM.
     "cryptography",
+    "phonenumbers",
 ]
 
 [project.optional-dependencies]

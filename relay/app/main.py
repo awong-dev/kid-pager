@@ -10,7 +10,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app import alerts as alerts_module
 from app.backends.registry import build_registry
+from app.backends.webapp import NullFCMClient
 from app.db.firestore import get_db
 from app.ingest import Ingest
 from app.location import Location
@@ -22,6 +24,7 @@ from app.routers import (
     dev,
     device_book,
     devices,
+    family,
     internal,
     me,
     webhooks,
@@ -51,6 +54,8 @@ def create_app(
             from app.backends.fcm import FirebaseFCMClient
 
             fcm_client = FirebaseFCMClient()
+        # alerts keeps a module-level FCM client; reset it on every create_app().
+        alerts_module.set_fcm_client(fcm_client if fcm_client is not None else NullFCMClient())
         app.state.backend_registry = build_registry(app.state.broker, fcm_client=fcm_client)
         # One Routing instance shared by the webhook path and every API router.
         app.state.routing = Routing(app.state.broker, registry=app.state.backend_registry)
@@ -81,6 +86,7 @@ def create_app(
     app.include_router(devices.router)
     app.include_router(device_book.router)
     app.include_router(conversations.router)
+    app.include_router(family.router)
     app.include_router(me.router)
     app.include_router(internal.router)
 

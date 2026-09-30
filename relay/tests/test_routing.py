@@ -29,6 +29,8 @@ def routing(broker: FakeBrokerClient) -> Routing:
     return Routing(broker)
 
 
+def _make_user(uid: str, alias: str, *, family_id: str | None = None) -> None:
+    users_store.create_user(uid=uid, alias=alias, display_name=alias, family_id=family_id)
 
 
 def _make_pager_device(device_id: str, owner_uid: str, *, default_to_uid: str | None = None):
@@ -77,6 +79,7 @@ def test_send_to_allowed_recipient_creates_message(routing: Routing):
     _make_user("alice", "alice")
     _make_user("bob", "bob")
     allow_store.set_edge("alice", "bob", message=True, locate=True)
+    allow_store.set_edge("bob", "alice", message=True, locate=True)
 
     result = routing.send(
         sender_uid="alice", recipient_alias="bob", kind="text", body="hi", origin_backend_kind="webapp"
@@ -141,6 +144,7 @@ def test_cross_user_pager_delivery_not_excluded_by_matching_origin_kind(
     _make_user("alice", "alice")
     _make_user("bob", "bob")
     allow_store.set_edge("alice", "bob", message=True, locate=True)
+    allow_store.set_edge("bob", "alice", message=True, locate=True)
     _make_pager_device("pgr-bob", "bob")
 
     result = routing.send(
@@ -160,6 +164,7 @@ def test_non_matching_origin_backend_delivers_to_pager(routing: Routing, broker)
     _make_user("alice", "alice")
     _make_user("bob", "bob")
     allow_store.set_edge("alice", "bob", message=True, locate=True)
+    allow_store.set_edge("bob", "alice", message=True, locate=True)
     _make_pager_device("pgr-bob3", "bob")
 
     result = routing.send(
@@ -189,6 +194,7 @@ def test_dm_pager_page_bytes_are_byte_identical_to_before_sndr(routing: Routing,
     _make_user("dmalice", "dmalice")
     _make_user("dmbob", "dmbob")
     allow_store.set_edge("dmalice", "dmbob", message=True, locate=True)
+    allow_store.set_edge("dmbob", "dmalice", message=True, locate=True)
     _make_pager_device("pgr-dmbob", "dmbob")
 
     result = routing.send(
@@ -210,6 +216,7 @@ def test_no_alias_uses_device_default(routing: Routing, broker):
     _make_user("alice", "alice")
     _make_user("bob", "bob")
     allow_store.set_edge("bob", "alice", message=True, locate=True)
+    allow_store.set_edge("alice", "bob", message=True, locate=True)
     _make_pager_device("pgr-bob4", "bob", default_to_uid="alice")
 
     result = routing.send(
@@ -230,6 +237,8 @@ def test_no_alias_no_default_broadcasts_to_all_allowed(routing: Routing, broker)
     _make_user("dad", "dad")
     allow_store.set_edge("student", "mom", message=True, locate=True)
     allow_store.set_edge("student", "dad", message=True, locate=True)
+    allow_store.set_edge("mom", "student", message=True, locate=True)
+    allow_store.set_edge("dad", "student", message=True, locate=True)
     _make_pager_device("pgr-student", "student", default_to_uid=None)
 
     result = routing.send(
@@ -248,6 +257,7 @@ def test_wire_id_dedup_prevents_double_delivery_on_redelivery(routing: Routing):
     _make_user("student", "student")
     _make_user("mom", "mom")
     allow_store.set_edge("student", "mom", message=True, locate=True)
+    allow_store.set_edge("mom", "student", message=True, locate=True)
 
     first = routing.send(
         sender_uid="student",
@@ -316,6 +326,32 @@ def test_group_send_fans_out_to_every_member_but_sender(routing: Routing):
         assert m.senderAlias == "gowner"
         # The message document's `uids` stays the sender/recipient pair, never the full member list.
         assert set(m.uids) == {"gowner", m.recipientUid}
+
+
+def test_group_send_message_family_ids_are_per_pair_not_whole_group(routing: Routing):
+    _make_user("fowner", "fowner", family_id="fam_x")
+    _make_user("fmem1", "fmem1", family_id="fam_y")
+    _make_user("fmem2", "fmem2", family_id="fam_z")
+    _all_edges(["fowner", "fmem1", "fmem2"])
+    group = conversations_store.create_group(
+        name="Three fam",
+        alias="fam-routing-3",
+        member_uids=["fowner", "fmem1", "fmem2"],
+        created_by="fowner",
+    )
+    assert group.familyIds == ["fam_x", "fam_y", "fam_z"]
+
+    result = routing.send(
+        sender_uid="fowner",
+        recipient_alias="fam-routing-3",
+        kind="text",
+        body="hi all",
+        origin_backend_kind="webapp",
+    )
+    assert result.rejected == []
+    by_recipient = {m.recipientUid: m for m in result.messages}
+    assert by_recipient["fmem1"].familyIds == ["fam_x", "fam_y"]
+    assert by_recipient["fmem2"].familyIds == ["fam_x", "fam_z"]
 
 
 def test_group_send_with_one_pager_publishes_one_page(routing: Routing, broker):

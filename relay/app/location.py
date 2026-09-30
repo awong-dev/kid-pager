@@ -1,4 +1,5 @@
 """Device location (docs/PROTOCOL.md §13): `/loc` ingest, deduped by `locWireIds/{deviceId}_{id}` in
+one transaction with the fix and the `loc_req` fulfilment, and `/locate` request coalescing."""
 
 from __future__ import annotations
 
@@ -40,6 +41,14 @@ DEFAULT_LOC_REQ_TTL_S = 15 * 60
 # docs/PROTOCOL.md §13.3 rule 6: a fix younger than this answers a `/locate` without wire traffic.
 CACHED_ANSWER_WINDOW_S = 60
 
+# The relay's mirror of the device's 120 s floor on unsolicited `/loc` reports (docs/PROTOCOL.md
+# §13.3 item 9): bounds provider calls and writes from a flooding device.
+UNSOLICITED_REPORT_FLOOR_S = 60
+
+# A dwell doc (an unsolicited `src:"cell"` fix extended in place by later reports from the same
+# cell) stops extending at this age, so the sweep by `createdAt` cannot delete it while newest.
+DWELL_MAX_AGE_S = 24 * 60 * 60
+
 # On heavy contention for one device's `locReqs` doc the client's transactional retries can be
 # exhausted (`ValueError`); the loser then joins the winner's request: `_join_after_contention`
 # re-reads `req_ref` up to 10 times with full-jitter delays (0.05..1.0 s).
@@ -66,6 +75,14 @@ def _loc_wire_ids():
     return get_db().collection("locWireIds")
 
 
+def _cell_key(cell: CellInfo | None) -> str | None:
+    """Identifies the serving cell a stored fix came from, so a dwell extension can tell the same
+    cell from a new one. `None` when the envelope carried no `cell`."""
+    if cell is None:
+        return None
+    return f"{cell.mcc}-{cell.mnc}-{cell.tac}-{cell.ci}"
+
+
 def _fix_doc(env: LocEnvelope, loc: LocFix) -> dict:
     return {
         "ts": env.ts,
@@ -77,6 +94,10 @@ def _fix_doc(env: LocEnvelope, loc: LocFix) -> dict:
         "cached": env.cached,
         "reqId": env.req,
         "createdAt": SERVER_TIMESTAMP,
+        # See `store/locations.py`'s `LocationFix`; `lastTs` is set only by a dwell extension.
+        "why": env.why,
+        "cellKey": _cell_key(env.cell),
+        "lastTs": None,
     }
 
 
@@ -96,14 +117,41 @@ def _resolve_cell_fallback(cell: CellInfo, fix_ts: int) -> LocFix | None:
         return None
 
 
+def _unsolicited_report_too_recent(device_id: str) -> bool:
+    """True when the newest `locations` doc is an unsolicited (`reqId: None`) report younger than
+    `UNSOLICITED_REPORT_FLOOR_S`, by `max(createdAt, lastTs)`. A non-transactional read."""
+    fix_query = (
+        locations_store.locations_collection(device_id)
+        .order_by("createdAt", direction="DESCENDING")
+        .limit(1)
+    )
+    fix_snaps = fix_query.get()
+    if not fix_snaps:
+        return False
+    data = fix_snaps[0].to_dict() or {}
+    if data.get("reqId") is not None:
+        return False
+    created_age = _age_seconds(data.get("createdAt"))
+    last_ts = data.get("lastTs")
+    last_ts_age = (time.time() - last_ts) if isinstance(last_ts, (int, float)) else float("inf")
+    return min(created_age, last_ts_age) < UNSOLICITED_REPORT_FLOOR_S
+
+
 def ingest_loc(device_id: str, env: LocEnvelope) -> None:
     """Dedup on `id`, store the fix (if any) and resolve the matching `loc_req`, all in one
     transaction (docs/PROTOCOL.md §13.2). Split across two, a failure after the first commit would
     make the redelivered QoS-1 message dedup away and leave the `loc_req` stuck `sent`.
 
+    A periodic fix (`req: None`) is only added to `locations`. With no GNSS fix but a `cell`,
     `_resolve_cell_fallback` (an HTTP call, so before the transaction) may produce a `src:"cell"` fix
     treated like a real one; a GNSS fix wins. `req_ref`/`loc_field` are built only when
     `env.req is not None`.
+
+    An unsolicited cell-only report skips cell resolution when the newest doc is itself an
+    unsolicited report younger than `UNSOLICITED_REPORT_FLOOR_S`; `lastCell` is updated either way.
+    An unsolicited cell-resolved fix from the same cell as a newest `src:"cell"` doc younger than
+    `DWELL_MAX_AGE_S` extends that doc's `lastTs`/`why` instead of inserting a new one."""
+    dedup_ref = _loc_wire_ids().document(f"{device_id}_{env.id}")
 
     # The device lookup is not part of the transaction: an unknown device is dropped either way.
     # Needed when there is a `req` (for `owner_uid`) or a `cell` (for `set_last_cell`).
@@ -117,12 +165,32 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
             owner_uid = device.ownerUid
 
     effective_loc = env.loc
+    cell_fix_ts: int | None = None
     if env.cell is not None and owner_uid is not None:
         cell_fix_ts = resolve_ts(env.ts)
         if effective_loc is None:
+            if env.req is None and _unsolicited_report_too_recent(device_id):
+                logger.info(
+                    "unsolicited /loc id=%s for device=%s within %ss of the last unsolicited "
+                    "report: skipping cellgeo resolution",
+                    env.id,
+                    device_id,
+                    UNSOLICITED_REPORT_FLOOR_S,
+                )
+            else:
+                effective_loc = _resolve_cell_fallback(env.cell, cell_fix_ts)
 
     fix_ref = locations_store.new_location_ref(device_id) if effective_loc is not None else None
     fix_data = _fix_doc(env, effective_loc) if effective_loc is not None else None
+    dwell_eligible = (
+        fix_data is not None and env.req is None and effective_loc is not None and effective_loc.src == "cell"
+    )
+
+    # Built only when there is a `loc_req` to resolve.
+    req_ref = _loc_reqs().document(device_id) if owner_uid is not None and env.req is not None else None
+    loc_field = (
+        _loc_message_field(env, effective_loc) if owner_uid is not None and env.req is not None else None
+    )
     ttl = loc_req_ttl_s()
 
     def _txn(transaction: Transaction) -> None:
@@ -130,6 +198,35 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
         fulfil: _FulfilPlan | None = None
         drop_reason: str | None = None
         delete_stale_req = False
+
+        # Dwell: read the newest `locations` doc to decide whether this report extends it (same
+        # cell, same source, still unsolicited, within 24 h) instead of inserting a new one.
+        dwell_ref: DocumentReference | None = None
+        dwell_update: dict | None = None
+        if dwell_eligible:
+            assert fix_data is not None
+            newest_query = (
+                locations_store.locations_collection(device_id)
+                .order_by("createdAt", direction="DESCENDING")
+                .limit(1)
+            )
+            newest_snaps = newest_query.get(transaction=transaction)
+            if newest_snaps:
+                newest_snap = newest_snaps[0]
+                newest_data = newest_snap.to_dict() or {}
+                if (
+                    newest_data.get("src") == "cell"
+                    and newest_data.get("reqId") is None
+                    and newest_data.get("cellKey") == fix_data["cellKey"]
+                    and _age_seconds(newest_data.get("createdAt")) < DWELL_MAX_AGE_S
+                ):
+                    dwell_ref = newest_snap.reference
+                    dwell_update = {"lastTs": resolve_ts(env.ts), "why": env.why}
+
+        # Read half of the monotonic `lastCell` check; the write half is staged below.
+        last_cell_existing_ts: int | None = None
+        if env.cell is not None and owner_uid is not None:
+            last_cell_existing_ts = devices_store.read_last_cell_ts(device_id, transaction)
 
         if req_ref is not None:
             req_snap = req_ref.get(transaction=transaction)
@@ -148,17 +245,31 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
                     drop_reason = f"request already past its {ttl}s TTL"
                     delete_stale_req = True
                 else:
+                    # An owner locating their own device gets no self-conversation `kind='loc'`
+                    # message; the fix is already in `devices/{d}/locations`.
+                    requester_uids = [
+                        u for u in (req_data.get("requesterUids") or []) if u != owner_uid
+                    ]
                     loc_req_ref = messages_store.messages_ref(loc_req_msg_id)
                     loc_req_snap = loc_req_ref.get(transaction=transaction)
                     meta_ref = messages_store.meta_ref()
                     meta_snap = meta_ref.get(transaction=transaction)
                     conv_refs: dict[str, DocumentReference] = {}
                     conv_snaps: dict[str, DocumentSnapshot] = {}
+                    # One `kind='loc'` message per coalesced requester, so `familyIds` and
+                    # `participants` are per pair; the `users/{uid}` read is plain.
+                    pair_participants: dict[str, dict[str, dict[str, str]]] = {}
+                    pair_family_ids: dict[str, list[str]] = {}
                     for uid in requester_uids:
                         key = messages_store.conv_key(owner_uid, uid)
                         ref = messages_store.conversation_ref(key)
                         conv_refs[uid] = ref
                         conv_snaps[uid] = ref.get(transaction=transaction)
+                        participants, family_ids = messages_store.build_participants_and_family_ids(
+                            [owner_uid, uid]
+                        )
+                        pair_participants[uid] = participants
+                        pair_family_ids[uid] = family_ids
                     fulfil = _FulfilPlan(
                         loc_req_msg_id=loc_req_msg_id,
                         loc_req_ref=loc_req_ref,
@@ -168,6 +279,8 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
                         requester_uids=requester_uids,
                         conv_refs=conv_refs,
                         conv_snaps=conv_snaps,
+                        pair_participants=pair_participants,
+                        pair_family_ids=pair_family_ids,
                     )
         # -- every write from here on --
 
@@ -175,6 +288,17 @@ def ingest_loc(device_id: str, env: LocEnvelope) -> None:
         # `transaction.create` raises AlreadyExists (caught below, outside the transaction) if this
         # `/loc` id was already processed.
         transaction.create(dedup_ref, {"deviceId": device_id, "createdAt": SERVER_TIMESTAMP})
+
+        if env.cell is not None and owner_uid is not None:
+            assert cell_fix_ts is not None
+            devices_store.set_last_cell(
+                device_id, env.cell, cell_fix_ts, transaction, existing_ts=last_cell_existing_ts
+            )
+
+        if dwell_ref is not None:
+            assert dwell_update is not None
+            transaction.update(dwell_ref, dwell_update)
+        elif fix_ref is not None:
             transaction.set(fix_ref, fix_data)
 
         if req_ref is None:
@@ -245,6 +369,9 @@ class _FulfilPlan:
     requester_uids: list[str]
     conv_refs: dict[str, DocumentReference]
     conv_snaps: dict[str, DocumentSnapshot]
+    # per-requester `participants`/`familyIds` for the (owner, requester) pair
+    pair_participants: dict[str, dict[str, dict[str, str]]]
+    pair_family_ids: dict[str, list[str]]
 
 
 def _fulfil_loc_req_in_txn(
@@ -280,6 +407,7 @@ def _fulfil_loc_req_in_txn(
         seq += 1
         key = messages_store.conv_key(owner_uid, uid)
         uids_sorted = sorted([owner_uid, uid])
+        family_ids = plan.pair_family_ids[uid]
         new_msg_ref = messages_store.messages_ref(new_id("m_"))
         transaction.set(
             new_msg_ref,
@@ -299,6 +427,7 @@ def _fulfil_loc_req_in_txn(
                 "createdAt": SERVER_TIMESTAMP,
                 "deliveries": {},
                 "pendingDeviceIds": [],
+                "familyIds": family_ids,
             },
         )
         conv_snap = plan.conv_snaps[uid]
@@ -313,6 +442,10 @@ def _fulfil_loc_req_in_txn(
         if conv_snap.exists:
             transaction.update(plan.conv_refs[uid], conv_data)
         else:
+            # A `loc` message can be the first thing between owner and requester, so the
+            # conversation doc is created here with `participants`/`familyIds`.
+            conv_data["participants"] = plan.pair_participants[uid]
+            conv_data["familyIds"] = family_ids
             transaction.set(plan.conv_refs[uid], conv_data)
 
     if plan.meta_snap.exists:
@@ -412,6 +545,11 @@ class Location:
         ttl = loc_req_ttl_s()
         # Looked up outside `_txn`: its `fn` must read only via `transaction.get(...)`.
         pager_backend = _find_pager_backend(device)
+        # `familyIds` for the (requester, owner) pair, read plainly (users do not change during a
+        # locate) so it does not widen the abort window on `locReqs/{device.id}`.
+        _, claim_family_ids = messages_store.build_participants_and_family_ids(
+            [requester_uid, device.ownerUid]
+        )
 
         def _txn(transaction: Transaction) -> tuple[str, str | None, LocationFix | None]:
             req_snap = req_ref.get(transaction=transaction)
@@ -437,6 +575,10 @@ class Location:
             if fix_snaps:
                 fix_snap = fix_snaps[0]
                 fix_data = fix_snap.to_dict() or {}
+                # docs/PROTOCOL.md §13.3 item 9: an unsolicited `src:"cell"` fix is a coarse point
+                # and must not suppress a fresh `loc_req`; only the newest doc is checked.
+                unsolicited_cell = fix_data.get("src") == "cell" and fix_data.get("reqId") is None
+                if not unsolicited_cell and _age_seconds(fix_data.get("createdAt")) < CACHED_ANSWER_WINDOW_S:
                     if req_snap.exists:
                         # Stale locReqs row superseded by this cached answer
                         # -- clean it up now rather than waiting for tick.
@@ -454,6 +596,8 @@ class Location:
             conv_key = messages_store.conv_key(requester_uid, device.ownerUid)
             meta_ref = messages_store.meta_ref()
             meta_snap = meta_ref.get(transaction=transaction)
+            # `familyIds` on every message write, computed before the transaction.
+            family_ids = claim_family_ids
 
             seq = ((meta_snap.get("seqCounter") if meta_snap.exists else 0) or 0) + 1
             if meta_snap.exists:
@@ -489,6 +633,7 @@ class Location:
                         }
                     },
                     "pendingDeviceIds": [device.id],
+                    "familyIds": family_ids,
                 },
             )
 

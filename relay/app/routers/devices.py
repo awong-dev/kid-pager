@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app import devcfg
+from app.auth import AuthedUser, principal_for, require_user
 from app.broker import BrokerClient
 from app.store import devices as devices_store
 from app.store import sms as sms_store
@@ -23,6 +24,12 @@ def get_broker(request: Request) -> BrokerClient:
     return request.app.state.broker
 
 
+def _is_family_admin_or_super(device: Device, authed: AuthedUser) -> bool:
+    """Owner-or-admin check: family admin of the device's family, or super. Claims only."""
+    principal = principal_for(authed)
+    if principal.role == "super":
+        return True
+    return principal.role == "admin" and principal.family_id == device.familyId
 
 
 def _require_owner_or_admin(device_id: str, authed: AuthedUser) -> Device:
@@ -30,6 +37,7 @@ def _require_owner_or_admin(device_id: str, authed: AuthedUser) -> Device:
     device = devices_store.get_device(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="no such device")
+    if device.ownerUid != authed.uid and not _is_family_admin_or_super(device, authed):
         raise HTTPException(status_code=403, detail="not this device's owner")
     return device
 
@@ -66,6 +74,11 @@ def get_sms_contacts(
 
 @router.put("/{device_id}/sms-contacts")
 def put_sms_contacts(
+    device_id: str, authed: Annotated[AuthedUser, Depends(require_user)]
+) -> None:
+    """Retired: contacts are a projection of the member's approved numbers; kept for the error."""
+    raise HTTPException(
+        status_code=405, detail="Managed from People → Approved numbers"
     )
 class SmsLogEntryOut(BaseModel):
     id: str

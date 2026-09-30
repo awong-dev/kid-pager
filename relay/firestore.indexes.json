@@ -17,6 +17,36 @@
       "queryScope": "COLLECTION",
       "fields": [
       ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+      ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+      ]
+    },
+    {
+      "collectionGroup": "users",
+      "queryScope": "COLLECTION",
+      "fields": [
+      ]
+    },
+    {
+      "collectionGroup": "devices",
+      "queryScope": "COLLECTION",
+      "fields": [
+      ]
+    },
+    {
+      "collectionGroup": "contactRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+      ]
     }
   ],
   "fieldOverrides": [

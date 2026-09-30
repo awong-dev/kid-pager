@@ -43,6 +43,7 @@ def test_tick_retries_only_queued_deliveries_capped_oldest_first():
     _make_user("mom", "mom")
     _make_user("student", "student")
     allow_store.set_edge("mom", "student", message=True, locate=True)
+    allow_store.set_edge("student", "mom", message=True, locate=True)
     _make_pager_device("pgr-tick-1", "student")
 
     broker = FakeBrokerClient()
@@ -76,6 +77,7 @@ def test_tick_does_not_retry_already_sent_deliveries():
     _make_user("mom", "mom")
     _make_user("student", "student")
     allow_store.set_edge("mom", "student", message=True, locate=True)
+    allow_store.set_edge("student", "mom", message=True, locate=True)
     _make_pager_device("pgr-tick-2", "student")
 
     broker = FakeBrokerClient()
@@ -99,6 +101,7 @@ def test_tick_gives_up_after_five_failed_attempts():
     _make_user("mom", "mom")
     _make_user("student", "student")
     allow_store.set_edge("mom", "student", message=True, locate=True)
+    allow_store.set_edge("student", "mom", message=True, locate=True)
     _make_pager_device("pgr-tick-fail", "student")
 
     broker = FakeBrokerClient()

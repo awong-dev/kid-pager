@@ -62,3 +62,30 @@ class WebappBackend:
 
     def render_state(self, delivery: Delivery) -> str:
         return delivery.state
+
+
+ALERT_URL = "/family/alerts"
+
+_ALERT_TITLES = {
+    "new_conversation": lambda a: f"New chat: @{a['subjectAlias']} ↔ @{a.get('peerAlias')}",
+    "sms_unknown": lambda a: f"Text from an unknown number for @{a['subjectAlias']}",
+    "contact_request": lambda a: f"Contact request from @{a['subjectAlias']}'s pager",
+}
+
+
+def push_alert(family_id: str, alert: dict, fcm_client: FCMClient | None = None) -> None:
+    fcm = fcm_client or NullFCMClient()
+    title_fn = _ALERT_TITLES.get(alert["kind"])
+    if title_fn is None:
+        raise ValueError(f"unknown alert kind: {alert['kind']!r}")
+    data = {
+        "kind": "alert",
+        "alertKind": str(alert["kind"]),
+        "id": str(alert["id"]),
+        "title": title_fn(alert),
+        "url": ALERT_URL,
+    }
+        try:
+        except Exception:
+            # The alert doc already exists; one admin's failure must not skip the rest.
+            logger.exception("FCM alert push failed for user %s", user.uid)

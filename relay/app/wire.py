@@ -208,12 +208,16 @@ class StatusEnvelope(BaseModel):
     # Book-pull capability gate: only `1` is legal; anything else is dropped to `None`, not
     # rejected (§3.4 "unknown values").
     bpull: int | None = None
+    # GNSS-while-moving interval in seconds, 0 = off (display only; docs/PROTOCOL.md §13.3).
+    loc_move_s: int | None = None
     # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
     n: int | None = None
 
+    @field_validator("loc_period_s", "loc_min_s", "loc_backoff_s", "loc_move_s")
     @classmethod
     def _check_loc_timing(cls, value: int | None) -> int | None:
         if value is not None and not (0 <= value <= 86400):
+            raise ValueError("loc_period_s/loc_min_s/loc_backoff_s/loc_move_s out of range")
         return value
 
     @field_validator("ca_fp")
@@ -487,6 +491,10 @@ class LocFix(BaseModel):
 # strings so a leading zero ("05") survives.
 _MCC_RE = re.compile(r"^\d{3}$")
 _MNC_RE = re.compile(r"^\d{2,3}$")
+
+# Known `why` values for an unsolicited `/loc` (§13.2); anything else is stored as absent, never
+# rejected.
+_WHY_VALUES = {"still", "cell", "move", "gnss", "stop"}
 CELL_TAC_MAX = 65535
 CELL_CI_MAX = 268_435_455  # 2**28 - 1: E-UTRAN cell identity is 28 bits.
 CELL_RSRP_MIN = -156
@@ -533,8 +541,18 @@ class LocEnvelope(BaseModel):
     err: Literal["no_fix", "disabled"] | None = None
     # Optional serving cell; a malformed one is dropped by `_drop_malformed_cell`, not rejected.
     cell: CellInfo | None = None
+    # Why an unsolicited (`req:null`) `/loc` was sent; unknown values become `None` (§13.2: stored
+    # as absent, never a reason to drop the envelope).
+    why: str | None = None
     # §14.2: present on every signed envelope.
     n: int | None = None
+
+    @field_validator("why", mode="before")
+    @classmethod
+    def _check_why(cls, value: Any) -> str | None:
+        if isinstance(value, str) and value in _WHY_VALUES:
+            return value
+        return None
 
     @model_validator(mode="before")
     @classmethod

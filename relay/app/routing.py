@@ -6,6 +6,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from app import alerts as alerts_module
+from app import policy as policy_module
 from app.backends.base import Backend, DeliverResult
 from app.backends.registry import build_registry
 from app.broker import BrokerClient
@@ -22,6 +24,7 @@ from app.store.messages import Delivery, Message, MessageKind
 
 logger = logging.getLogger("relay.routing")
 
+# `sms_contact`: both sides external, or a contact that is disabled or in another family.
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,15 +83,39 @@ class Routing:
         candidates, rejected = self._candidate_recipients(sender_uid, recipient_alias, device_id)
 
         for recipient_uid in candidates:
+            reason = self._policy_reject_reason(sender_uid, recipient_uid)
+            if reason is not None:
                 logger.warning(
+                    "SECURITY sender %s not allowed to message recipient %s (alias=%r) reason=%s",
                     sender_uid,
                     recipient_uid,
                     recipient_alias,
+                    reason,
                 )
                 rejected.append(
+                    RejectedRecipient(alias=recipient_alias, uid=recipient_uid, reason=reason)
                 )
                 continue
+            # Read before storing: create_message does not report whether the doc existed.
+            conv_existed = (
+                messages_store.get_conversation(
+                    messages_store.conv_key(sender_uid, recipient_uid)
+                )
+                is not None
+            )
         return SendResult(messages=created, rejected=rejected)
+
+    def _maybe_alert_new_conversation(
+    ) -> None:
+        """Alerts when this send created a DM and the sender's open policy had no allow edge."""
+        sender = users_store.get_user(sender_uid)
+        recipient = users_store.get_user(recipient_uid)
+        if sender is None or recipient is None:
+            return
+        if sender.policy.out != "open":
+            return
+        if allow_store.is_message_allowed(sender_uid, recipient_uid):
+            return
 
 
     def _candidate_recipients(
@@ -112,6 +139,17 @@ class Routing:
                 default_uid = device.defaultToUid
         if default_uid is not None:
             return [default_uid], []
+
+
+    def _policy_reject_reason(self, sender_uid: str, recipient_uid: str) -> RejectReason | None:
+        """The per-recipient gate shared by the DM and group loops."""
+        sender = users_store.get_user(sender_uid)
+        recipient = users_store.get_user(recipient_uid)
+        if sender is None or recipient is None:
+            if allow_store.is_message_allowed(sender_uid, recipient_uid):
+                return None
+            return "not_allowed"
+        return policy_module.check(sender, recipient, has_edge_out, has_edge_in)
 
 
     def _send_group(
@@ -150,12 +188,17 @@ class Routing:
         created: list[Message] = []
         rejected: list[RejectedRecipient] = []
         for recipient_uid in sorted(uid for uid in group.uids if uid != sender_uid):
+            reason = self._policy_reject_reason(sender_uid, recipient_uid)
+            if reason is not None:
                 logger.warning(
+                    "SECURITY sender %s not allowed to message group member %s (group=%s) reason=%s",
                     sender_uid,
                     recipient_uid,
                     group.convKey,
+                    reason,
                 )
                 rejected.append(
+                    RejectedRecipient(alias=group.alias, uid=recipient_uid, reason=reason)
                 )
                 continue
         return SendResult(messages=created, rejected=rejected)

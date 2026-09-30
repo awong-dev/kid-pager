@@ -1,4 +1,5 @@
 """`/internal/tick`'s and `/internal/sweep`'s scheduled work: retries queued pager deliveries, fails
+stale bridge outbox rows, and the retention sweep over every collection class."""
 
 from __future__ import annotations
 
@@ -148,6 +149,9 @@ def _sweep_by_created_at(
     return deleted
 
 
+def _sweep_alerts(cutoff: datetime, batch_size: int) -> int:
+
+
 def _sweep_expired(
     query_factory, now_epoch_s: int, batch_size: int, *, expires_field: str = "expiresAt"
 ) -> int:
@@ -186,6 +190,7 @@ class SweepResult:
     orphanedWireIdsDeleted: int = 0
     conversationsDeleted: int = 0
     gchatLinkCodesDeleted: int = 0
+    alertsDeleted: int = 0
 
 
 def sweep() -> SweepResult:
@@ -225,4 +230,5 @@ def sweep() -> SweepResult:
         orphanedWireIdsDeleted=orphaned_wire_ids_deleted,
         conversationsDeleted=conversations_deleted,
         gchatLinkCodesDeleted=gchat_link_codes_deleted,
+        alertsDeleted=alerts_deleted,
     )

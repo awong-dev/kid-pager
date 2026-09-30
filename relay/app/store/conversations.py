@@ -7,6 +7,11 @@ from google.cloud.firestore import FieldFilter, Transaction
 
 from app.db.firestore import get_db, run_transaction
 from app.ids import new_id
+from app.store.messages import (
+    Conversation,
+    build_participants_and_family_ids,
+    get_conversation,
+)
 from app.store.users import ALIAS_RE, RESERVED_ALIASES, InvalidAlias
 
 
@@ -42,6 +47,10 @@ def create_group(
     alias_ref = _aliases().document(alias)
 
     def _txn(transaction: Transaction) -> None:
+        # `participants`/`familyIds` over the full member list, written once on creation.
+        participants, family_ids = build_participants_and_family_ids(
+            members, transaction=transaction
+        )
         transaction.create(alias_ref, {"convKey": key})
         transaction.set(
             conv_ref,
@@ -54,6 +63,8 @@ def create_group(
                 "lastMessageAt": None,
                 "lastPreview": "",
                 "unread": {},
+                "participants": participants,
+                "familyIds": family_ids,
             },
         )
 
@@ -102,6 +113,13 @@ def add_member(conv_key: str, uid: str) -> Conversation:
         if not snap.exists:
             raise KeyError(f"no such conversation: {conv_key!r}")
         members = sorted(set(snap.get("uids") or []) | {uid})
+        # A join rewrites `participants` and `familyIds`.
+        participants, family_ids = build_participants_and_family_ids(
+            members, transaction=transaction
+        )
+        transaction.update(
+            ref, {"uids": members, "participants": participants, "familyIds": family_ids}
+        )
 
     run_transaction(_txn)
     fetched = get_conversation(conv_key)
@@ -118,6 +136,13 @@ def remove_member(conv_key: str, uid: str) -> Conversation:
         if not snap.exists:
             raise KeyError(f"no such conversation: {conv_key!r}")
         members = sorted(set(snap.get("uids") or []) - {uid})
+        # A leave rewrites `participants` and `familyIds`.
+        participants, family_ids = build_participants_and_family_ids(
+            members, transaction=transaction
+        )
+        transaction.update(
+            ref, {"uids": members, "participants": participants, "familyIds": family_ids}
+        )
 
     run_transaction(_txn)
     fetched = get_conversation(conv_key)

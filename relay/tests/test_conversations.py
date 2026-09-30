@@ -16,6 +16,7 @@ from app.store import allow as allow_store
 from app.store import backends as backends_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
+from app.store import families as families_store
 from app.store import messages as messages_store
 from app.store import users as users_store
 from tests.fake_transport import FakeBrokerClient
@@ -52,6 +53,28 @@ def _make_user(uid: str, alias: str) -> dict[str, str]:
 
 def _make_admin(uid: str, alias: str) -> dict[str, str]:
     fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(uid=uid, alias=alias, display_name=alias, role="super")
+    fb_auth.set_custom_user_claims(uid, {"role": "super", "fam": ""})
+    return auth_header(uid)
+
+
+def _make_family_admin_in(uid: str, alias: str, family_id: str) -> dict[str, str]:
+    """Group creation is `POST /api/family/groups`, gated on `require_family_admin`: these tests
+    need a family admin (role `admin`, a `familyId`), not the global `super`."""
+    fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(
+        uid=uid, alias=alias, display_name=alias, role="admin", family_id=family_id
+    )
+    fb_auth.set_custom_user_claims(uid, {"role": "admin", "fam": family_id})
+    return auth_header(uid)
+
+
+def _make_family_member_in(uid: str, alias: str, family_id: str) -> dict[str, str]:
+    fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(
+        uid=uid, alias=alias, display_name=alias, role="member", family_id=family_id
+    )
+    fb_auth.set_custom_user_claims(uid, {"role": "member", "fam": family_id})
     return auth_header(uid)
 
 
@@ -74,6 +97,7 @@ def test_send_message_success_returns_201_with_id(client: TestClient):
     mom_headers = _make_user("mom", "mom")
     _make_user("kid", "kid")
     allow_store.set_edge("mom", "kid", message=True, locate=True)
+    allow_store.set_edge("kid", "mom", message=True, locate=True)
 
     resp = client.post(
         "/api/conversations/kid/messages", json={"body": "pickup at 3"}, headers=mom_headers
@@ -124,6 +148,7 @@ def test_mark_read_sets_webapp_delivery_to_read(client: TestClient):
     mom_headers = _make_user("mom5", "mom5")
     kid_headers = _make_user("kid5", "kid5")
     allow_store.set_edge("mom5", "kid5", message=True, locate=True)
+    allow_store.set_edge("kid5", "mom5", message=True, locate=True)
 
     resp = client.post(
         "/api/conversations/kid5/messages", json={"body": "hi"}, headers=mom_headers
@@ -145,6 +170,7 @@ def test_mark_read_clears_conversation_unread_for_recipient(client: TestClient):
     mom_headers = _make_user("mom5b", "mom5b")
     kid_headers = _make_user("kid5b", "kid5b")
     allow_store.set_edge("mom5b", "kid5b", message=True, locate=True)
+    allow_store.set_edge("kid5b", "mom5b", message=True, locate=True)
 
     resp = client.post(
         "/api/conversations/kid5b/messages", json={"body": "hi"}, headers=mom_headers
@@ -173,7 +199,9 @@ def test_mark_read_mismatched_alias_is_404(client: TestClient):
     kid_headers = _make_user("kid5c", "kid5c")
     _make_user("other5c", "other5c")
     allow_store.set_edge("mom5c", "kid5c", message=True, locate=True)
+    allow_store.set_edge("kid5c", "mom5c", message=True, locate=True)
     allow_store.set_edge("other5c", "kid5c", message=True, locate=True)
+    allow_store.set_edge("kid5c", "other5c", message=True, locate=True)
 
     resp = client.post(
         "/api/conversations/kid5c/messages", json={"body": "hi"}, headers=mom_headers
@@ -196,6 +224,7 @@ def test_mark_read_by_non_recipient_is_404(client: TestClient):
     _make_user("kid6", "kid6")
     stranger_headers = _make_user("stranger6", "stranger6")
     allow_store.set_edge("mom6", "kid6", message=True, locate=True)
+    allow_store.set_edge("kid6", "mom6", message=True, locate=True)
 
     resp = client.post(
         "/api/conversations/kid6/messages", json={"body": "hi"}, headers=mom_headers
@@ -271,14 +300,76 @@ def test_locate_target_with_no_device_is_409(client: TestClient):
     assert resp.status_code == 409
 
 
+def test_owner_can_locate_own_device_without_allow_edge(client: TestClient):
+    """No `locate` edge is needed for one's own device; docs/PROTOCOL.md §13.3 rules 5-6 still
+    apply (a second call coalesces)."""
+    kid_headers = _make_user("kid12", "kid12")
+    _make_pager_device("pgr-conv-own-1", "kid12")
+
+    resp = client.post("/api/conversations/kid12/locate", headers=kid_headers)
+    assert resp.status_code == 202, resp.text
+    first = resp.json()
+    assert first["requestId"]
+    assert first["cached"] is False
+
+    resp2 = client.post("/api/conversations/kid12/locate", headers=kid_headers)
+    assert resp2.status_code == 202, resp2.text
+    assert resp2.json()["requestId"] == first["requestId"]
+
+
+def test_admin_without_locate_edge_cannot_locate_someone_elses_device(client: TestClient):
+    """`_make_admin` is the global `super` role, not a family admin: super gets `/locate` only
+    through an edge."""
+    admin_headers = _make_admin("adm13", "adm13")
+    _make_user("kid13", "kid13")
+    _make_pager_device("pgr-conv-own-2", "kid13")
+
+    resp = client.post("/api/conversations/kid13/locate", headers=admin_headers)
+    assert resp.status_code == 403
+
+
+def test_family_admin_can_locate_family_members_device_without_edge(client: TestClient):
+    """A family admin may `/locate` a member of their own family with no `locate` edge."""
+    family = families_store.create_family(name="loc-fam-a", created_by="root-uid")
+    admin_headers = _make_family_admin_in("locadm1", "locadm1", family.id)
+    _make_family_member_in("lockid1", "lockid1", family.id)
+    _make_pager_device("pgr-conv-fam-1", "lockid1")
+
+    resp = client.post("/api/conversations/lockid1/locate", headers=admin_headers)
+    assert resp.status_code == 202, resp.text
+
+
+def test_family_admin_cannot_locate_other_familys_device(client: TestClient):
+    """Same as above, but the target is in a different family."""
+    family_a = families_store.create_family(name="loc-fam-b1", created_by="root-uid")
+    family_b = families_store.create_family(name="loc-fam-b2", created_by="root-uid")
+    admin_headers = _make_family_admin_in("locadm2", "locadm2", family_a.id)
+    _make_family_member_in("lockid2", "lockid2", family_b.id)
+    _make_pager_device("pgr-conv-fam-2", "lockid2")
+
+    resp = client.post("/api/conversations/lockid2/locate", headers=admin_headers)
+    assert resp.status_code == 403
+
+
+def test_owner_with_no_device_locating_self_is_409(client: TestClient):
+    kid_headers = _make_user("kid14", "kid14")
+    resp = client.post("/api/conversations/kid14/locate", headers=kid_headers)
+    assert resp.status_code == 409
+
+
 def test_locate_requires_auth(client: TestClient):
     resp = client.post("/api/conversations/kid7/locate")
     assert resp.status_code == 401
 
 
 def test_send_group_message_and_mark_read(client: TestClient):
+    family = families_store.create_family(name="gapi-fam5-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gapi-admin5", "gapi-admin5", family.id)
+    kid_headers = _make_family_member_in("gapi-kid5", "gapi-kid5", family.id)
+    _make_family_member_in("gapi-kid6", "gapi-kid6", family.id)
 
     created = client.post(
+        "/api/family/groups",
         json={
             "name": "Family",
             "alias": "gapi-fam5",
@@ -306,9 +397,13 @@ def test_send_group_message_and_mark_read(client: TestClient):
 
 
 def test_send_group_message_by_non_member_is_403(client: TestClient):
+    family = families_store.create_family(name="gapi-fam6-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gapi-admin6", "gapi-admin6", family.id)
+    _make_family_member_in("gapi-kid7", "gapi-kid7", family.id)
     outsider_headers = _make_user("gapi-outsider", "gapi-outsider")
 
     created = client.post(
+        "/api/family/groups",
         json={
             "name": "Family",
             "alias": "gapi-fam6",
@@ -325,9 +420,13 @@ def test_send_group_message_by_non_member_is_403(client: TestClient):
 
 
 def test_add_member_then_leave(client: TestClient):
+    family = families_store.create_family(name="gapi-fam7-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gapi-admin7", "gapi-admin7", family.id)
+    kid_headers = _make_family_member_in("gapi-kid8", "gapi-kid8", family.id)
     _make_user("gapi-newmem", "gapi-newmem")
 
     created = client.post(
+        "/api/family/groups",
         json={
             "name": "Family",
             "alias": "gapi-fam7",
@@ -357,10 +456,14 @@ def test_add_member_then_leave(client: TestClient):
 
 
 def test_add_member_by_non_member_is_403(client: TestClient):
+    family = families_store.create_family(name="gapi-fam8-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gapi-admin8", "gapi-admin8", family.id)
+    _make_family_member_in("gapi-kid9", "gapi-kid9", family.id)
     outsider_headers = _make_user("gapi-outsider2", "gapi-outsider2")
     _make_user("gapi-target", "gapi-target")
 
     created = client.post(
+        "/api/family/groups",
         json={
             "name": "Family",
             "alias": "gapi-fam8",
@@ -378,24 +481,46 @@ def test_add_member_by_non_member_is_403(client: TestClient):
     assert resp.status_code == 403
 
 
+def test_add_member_writes_message_edge_only_not_locate(client: TestClient):
+    """Group join has no mutual-`locate` side effect: only `message`, both ways."""
+    family = families_store.create_family(name="gapi-fam8b-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gapi-admin8b", "gapi-admin8b", family.id)
+    _make_family_member_in("gapi-kid9b", "gapi-kid9b", family.id)
+    _make_user("gapi-newmem8b", "gapi-newmem8b")
 
+    created = client.post(
+        "/api/family/groups",
         json={
             "name": "Family",
+            "alias": "gapi-fam8b",
+            "memberUids": ["gapi-admin8b", "gapi-kid9b"],
         },
         headers=admin_headers,
     )
+    assert created.status_code == 201, created.text
 
     resp = client.post(
+        "/api/conversations/gapi-fam8b/members",
+        json={"uid": "gapi-newmem8b"},
         headers=admin_headers,
     )
+    assert resp.status_code == 200, resp.text
 
+    edge = allow_store.get_edge("gapi-newmem8b", "gapi-admin8b")
+    assert edge is not None
+    assert edge.message is True
+    assert edge.locate is False
 
 
 def test_add_member_pushes_book_to_new_pager_member(client: TestClient):
+    family = families_store.create_family(name="gbk-fam3-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gbk-admin3", "gbk-admin3", family.id)
+    _make_family_member_in("gbk-kid3", "gbk-kid3", family.id)
     _make_user("gbk-newmem3", "gbk-newmem3")
     _make_pager_device("gbk-dev3", "gbk-newmem3")
 
     created = client.post(
+        "/api/family/groups",
         json={"name": "Family", "alias": "gbk-fam3", "memberUids": ["gbk-admin3", "gbk-kid3"]},
         headers=admin_headers,
     )
@@ -419,10 +544,14 @@ def test_add_member_pushes_book_to_new_pager_member(client: TestClient):
 
 
 def test_leave_group_pushes_book_to_leaving_pager_member_only(client: TestClient):
+    family = families_store.create_family(name="gbk-fam4-family", created_by="root-uid")
+    admin_headers = _make_family_admin_in("gbk-admin4", "gbk-admin4", family.id)
+    kid_headers = _make_family_member_in("gbk-kid4", "gbk-kid4", family.id)
     _make_pager_device("gbk-dev4-admin", "gbk-admin4")
     _make_pager_device("gbk-dev4-kid", "gbk-kid4")
 
     created = client.post(
+        "/api/family/groups",
         json={"name": "Family", "alias": "gbk-fam4", "memberUids": ["gbk-admin4", "gbk-kid4"]},
         headers=admin_headers,
     )

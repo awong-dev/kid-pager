@@ -6,13 +6,16 @@ import time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 
+from app.auth import AuthedUser, principal_for, require_user
 from app.broker import BrokerClient
 from app.location import Location, NoLocatableDevice
 from app.routing import Routing
 from app.store import allow as allow_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
 from app.store import messages as messages_store
 from app.store import users as users_store
 from app.store.conversations import Conversation
@@ -32,6 +35,13 @@ class SendMessageResponse(BaseModel):
     id: str
 
 
+# Human text for a policy-gated 403's `{reason, message}` body; `policy_in` is formatted per call.
+_POLICY_REJECT_MESSAGES = {
+    "policy_out": "Your family admin has limited who you can message.",
+    "not_allowed": "You are not on each other's approved lists.",
+}
+
+
 def get_routing(request: Request) -> Routing:
     return request.app.state.routing
 
@@ -43,6 +53,19 @@ def get_location(request: Request) -> Location:
 def get_broker(request: Request) -> BrokerClient:
     """The app's broker client."""
     return request.app.state.broker
+
+
+def _resolve_message_alias(alias: str, sender_uid: str) -> str:
+    if users_store.get_uid_for_alias(alias) is not None:
+        return alias
+    if conversations_store.get_by_alias(alias) is not None:
+        return alias
+    try:
+        phone = externals_store.normalize_phone(alias)
+    except ValueError:
+        return alias
+    sender = users_store.get_user(sender_uid)
+        return alias
 
 
 @router.post("/{alias}/messages", status_code=201)
@@ -60,8 +83,10 @@ def send_message(
         )
     if len(body.encode("utf-8")) > BODY_MAX_UTF8_BYTES:
 
+    resolved_alias = _resolve_message_alias(alias, authed.uid)
     result = routing.send(
         sender_uid=authed.uid,
+        recipient_alias=resolved_alias,
         kind="text",
         body=body,
         origin_backend_kind="webapp",
@@ -70,6 +95,15 @@ def send_message(
         reason = result.rejected[0].reason
         if reason == "unknown_alias":
             raise HTTPException(status_code=404, detail="unknown recipient")
+        if reason == "not_member":
+            raise HTTPException(status_code=403, detail="not allowed to message this recipient")
+        # policy_out / policy_in / not_allowed: the web shows the server's `{reason, message}`.
+        message = (
+            f"@{alias} is not accepting messages from you."
+            if reason == "policy_in"
+            else _POLICY_REJECT_MESSAGES[reason]
+        )
+        raise HTTPException(status_code=403, detail={"reason": reason, "message": message})
     if not result.messages:
         # unreachable: no `wire_id` is passed, so dedup cannot fire; kept visible, not asserted
         raise HTTPException(status_code=500, detail="send failed")
@@ -112,11 +146,26 @@ def mark_read(
 def _push_book_to_members(uids: list[str], broker: BrokerClient) -> None:
 
 
+def _create_missing_message_edges(member_uids: list[str]) -> None:
     """Create `message`-only `allow` edges both ways between every member pair, never `locate`.
+
+    Existing edges are left alone so an admin's allow-list is never widened or narrowed.
+    """
+    for a in member_uids:
+        for b in member_uids:
+            if a == b:
+                continue
+            if allow_store.get_edge(a, b) is None:
+                allow_store.set_edge(a, b, message=True, locate=False)
 
 
 class AddMemberRequest(BaseModel):
     uid: str
+
+
+def _group_creator_family_id(group: Conversation) -> str | None:
+    creator = users_store.get_user(group.createdBy) if group.createdBy else None
+    return creator.familyId if creator is not None else None
 
 
 @router.post("/{alias}/members", status_code=200)
@@ -129,9 +178,24 @@ def add_group_member(
     group = conversations_store.get_by_alias(alias)
     if group is None:
         raise HTTPException(status_code=404, detail="no such group")
+
+    # joining needs a family admin of the group creator's family (or super)
+    principal = principal_for(authed)
+    is_authorized = principal.role == "super" or (
+        principal.role == "admin"
+        and principal.family_id is not None
+        and principal.family_id == _group_creator_family_id(group)
+    )
+    if not is_authorized:
+        raise HTTPException(
+            status_code=403,
+            detail="only a family admin of the group creator's family may add members",
+        )
         raise HTTPException(status_code=404, detail=f"no such user: {req.uid!r}")
 
     updated = conversations_store.add_member(group.convKey, req.uid)
+    # `message` edges only, never `locate`
+    _create_missing_message_edges(updated.uids)
     # push to every current member; harmless for the existing ones
     _push_book_to_members(updated.uids, broker)
     return updated
@@ -179,6 +243,21 @@ def locate(
     if target_uid is None:
         raise HTTPException(status_code=404, detail="unknown recipient")
 
+    # A user may always locate their own device without a `locate` edge, as may a family admin of
+    # the target's family. Super gets no bypass. The §13.3 rules 5-7 still apply.
+    if target_uid != authed.uid:
+        principal = principal_for(authed)
+        target_user = users_store.get_user(target_uid)
+        is_family_admin = (
+            principal.role == "admin"
+            and principal.family_id is not None
+            and target_user is not None
+            and target_user.familyId == principal.family_id
+        )
+        if not is_family_admin:
+            edge = allow_store.get_edge(authed.uid, target_uid)
+            if edge is None or not edge.locate:
+                raise HTTPException(status_code=403, detail="not allowed to locate this user")
 
     # Multi-device case: pick the lowest non-revoked device id.
     candidates = [

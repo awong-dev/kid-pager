@@ -1,3 +1,4 @@
+// Firestore security rules bounding client reads. The relay is the only writer (firebase-admin
 // bypasses these rules); relay/tests/test_rules.py drives this file through the emulator.
 rules_version = '2';
 
@@ -7,48 +8,117 @@ service cloud.firestore {
       return exists(/databases/$(db)/documents/users/$(request.auth.uid));
     }
 
+    // Claims only: `role` and `fam`; `role() == 'admin'` is a family admin scoped by `fam()`.
+    // A bare legacy `admin: true` claim grants nothing.
+    function role() { return request.auth.token.get('role', ''); }
+    function fam() { return request.auth.token.get('fam', ''); }
+    function isSuper() { return role() == 'super'; }
+    function isFamAdmin(f) { return role() == 'admin' && fam() == f; }
+    function sameFam(f) { return fam() != '' && fam() == f; }
+
+    match /families/{f} {
+      allow read: if request.auth != null && (isSuper() || sameFam(f));
+
+      match /alerts/{a} {
+        allow read: if request.auth != null && (isSuper() || isFamAdmin(f));
+      }
     }
 
     match /users/{uid} {
+      // Super, self, or a same-family member (`.get('familyId', null)`, see `devices/{d}`).
+      // Externals have `familyId: null`, so a member resolves one only through `participants`.
+      allow read: if request.auth != null && (
+        isSuper() || request.auth.uid == uid ||
+        sameFam(resource.data.get('familyId', null))
+      );
 
+      // No family copy on `backends/{b}`: self or super only.
       match /backends/{b} {
+        allow read: if request.auth.uid == uid || isSuper();
       }
     }
 
     // A `list` is authorised by a pre-check on the query's filters, so it must filter on `uids`
+    // array-contains self (or `familyIds` array-contains the family); `convKey` alone is denied.
+    //
+    // Super, a party (`uids`), or a family admin whose family is in `familyIds` (`.get(..., [])`
+    // so a missing field excludes that clause instead of throwing).
     match /messages/{id} {
+      allow read: if registered() && (
+        isSuper() ||
+        request.auth.uid in resource.data.uids ||
+        (role() == 'admin' && fam() in resource.data.get('familyIds', []))
+      );
     }
 
     match /conversations/{k} {
+      allow read: if registered() && (
+        isSuper() ||
+        request.auth.uid in resource.data.uids ||
+        (role() == 'admin' && fam() in resource.data.get('familyIds', []))
+      );
     }
 
     match /devices/{d} {
+      // `.get(...)` instead of bare field access: a `list` runs an abstract pre-check with no field
+      // values, and a bare access would throw PERMISSION_DENIED for every list query.
+      // Super, or same-family and (owner, `locate` edge holder, or family admin of the family).
       allow read: if request.auth != null && (
+        isSuper() || (
+          sameFam(resource.data.get('familyId', null)) && (
+            resource.data.ownerUid == request.auth.uid ||
+            request.auth.uid in resource.data.get('locatableBy', []) ||
+            role() == 'admin'
+          )
+        )
       );
 
+      // The parent (`devices/{d}`) predicate via `get()`.
       match /locations/{l} {
+        allow read: if request.auth != null && (
+          isSuper() || (
+            sameFam(get(/databases/$(db)/documents/devices/$(d)).data.get('familyId', null)) && (
+              get(/databases/$(db)/documents/devices/$(d)).data.ownerUid == request.auth.uid ||
+              request.auth.uid in
+                get(/databases/$(db)/documents/devices/$(d)).data.get('locatableBy', []) ||
+              role() == 'admin'
+            )
+          )
+        );
       }
 
+      // Device-direct SMS audit log: super, the device's owner, or a family admin of its family.
+      // Narrower than `locations`: a location permission does not imply SMS history access.
       match /smsLog/{l} {
         allow read: if request.auth != null && (
+          isSuper() ||
+          get(/databases/$(db)/documents/devices/$(d)).data.ownerUid == request.auth.uid ||
+          isFamAdmin(get(/databases/$(db)/documents/devices/$(d)).data.get('familyId', null))
         );
       }
     }
 
     match /allow/{e} {
       allow read: if request.auth != null && (
+        isSuper() ||
+        request.auth.uid in [resource.data.fromUid, resource.data.toUid] ||
+        (role() == 'admin' && fam() in resource.data.get('familyIds', []))
       );
     }
 
     // `contactRequests`: readable by super, the device owner or a family admin of the family.
     match /contactRequests/{r} {
       allow read: if request.auth != null && (
+        isSuper() ||
+        request.auth.uid == resource.data.ownerUid ||
+        isFamAdmin(resource.data.get('familyId', null))
       );
     }
 
     match /settings/{s} {
     }
 
+    // Clients never write; role/family are custom claims set by the relay.
     match /{document=**} {
       allow write: if false;
     }

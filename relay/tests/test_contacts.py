@@ -1,3 +1,4 @@
+of a `contact_request` alert."""
 
 from __future__ import annotations
 
@@ -13,11 +14,13 @@ from app import devauth
 from app.config import Settings
 from app.db.firestore import get_db
 from app.main import create_app
+from app.store import alerts as alerts_store
 from app.store import allow as allow_store
 from app.store import backends as backends_store
 from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import families as families_store
 from app.store import users as users_store
 from tests.conftest import up_topic
 from tests.fake_transport import FakeBrokerClient
@@ -26,6 +29,8 @@ from tests.firebase_test_utils import auth_header
 _HMAC_KEY = b"k" * 32
 
 
+def _make_user(uid: str, alias: str, *, family_id: str | None = None) -> None:
+    users_store.create_user(uid=uid, alias=alias, display_name=alias, family_id=family_id)
 
 
 def _make_pager_device(device_id: str, owner_uid: str) -> None:
@@ -188,13 +193,37 @@ def client() -> Iterator[TestClient]:
         yield c
 
 
+def _make_family_admin(uid: str, alias: str, family_id: str) -> dict[str, str]:
+    fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(
+        uid=uid, alias=alias, display_name=alias, role="admin", family_id=family_id
+    )
+    fb_auth.set_custom_user_claims(uid, {"role": "admin", "fam": family_id})
+    return auth_header(uid)
 
 
     ingest, _broker = _ingest()
 
 
+def test_block_contact_request_alert_adds_blocked_number_and_marks_handled(client: TestClient):
+    family = _make_family("Block1")
+    headers = _make_family_admin("cadmin5", "cadmin5", family.id)
 
+    resp = client.post(f"/api/family/alerts/{alert.id}/block", headers=headers)
     assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "handled"
+    updated_family = families_store.get_family(family.id)
+    assert updated_family is not None
+    assert "+15557770000" in updated_family.blockedNumbers
+
+
+    family = _make_family("Dismiss1")
+    headers = _make_family_admin("cadmin8", "cadmin8", family.id)
+
+    resp = client.post(f"/api/family/alerts/{alert.id}/dismiss", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "dismissed"
+
 
     )
     )

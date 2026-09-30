@@ -52,9 +52,54 @@ def require_user(
     return AuthedUser(uid=uid, claims=claims, user=user)
 
 
+@dataclass(frozen=True, slots=True)
+class Principal:
+    """The token's `role`/`fam` custom claims only; without them: `member`, no family."""
+
+    uid: str
+    role: str
+    family_id: str | None
+
+
+def principal_for(authed: AuthedUser) -> Principal:
+    role = authed.claims.get("role") or "member"
+    fam = authed.claims.get("fam") or None
+    return Principal(uid=authed.uid, role=role, family_id=fam)
+
+
+def require_super(
     authed: Annotated[AuthedUser, Depends(require_user)],
 ) -> AuthedUser:
+    """Role `super` by claim only."""
+    if principal_for(authed).role != "super":
+        raise HTTPException(status_code=403, detail="super admin only")
     return authed
+
+
+def require_family_admin(
+    authed: Annotated[AuthedUser, Depends(require_user)],
+    family: Annotated[str | None, Query()] = None,
+    x_family: Annotated[str | None, Header(alias="X-Family")] = None,
+) -> tuple[Principal, str]:
+    """`admin` acts on their own family; `super` names any via `?family=`/`X-Family`."""
+    principal = principal_for(authed)
+    requested = family or x_family
+    if principal.role == "admin":
+        if principal.family_id is None:
+            raise HTTPException(status_code=403, detail="family admin only")
+        if requested is not None and requested != principal.family_id:
+            raise HTTPException(status_code=403, detail="cannot act on another family")
+        return principal, principal.family_id
+    if principal.role == "super":
+        if not requested:
+            raise HTTPException(status_code=400, detail="?family= or X-Family is required")
+        return principal, requested
+    raise HTTPException(status_code=403, detail="family admin only")
+
+
+def set_claims(uid: str, role: str, family_id: str | None) -> None:
+    """Writes the `role` and `fam` custom claims; a no-op under `AUTH_BACKEND=home`."""
+    fb_auth.set_custom_user_claims(uid, {"role": role, "fam": family_id or ""})
 
 
 # `/internal/*` OIDC verification: a Google OIDC token from the Scheduler/Tasks service

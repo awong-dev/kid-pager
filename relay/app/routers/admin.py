@@ -1,3 +1,4 @@
+"""`/api/admin/*`: super-only user, allow-list and device administration.
 
 Write routes carry a per-uid rate limit (`RATE_LIMIT_ADMIN_WRITE_LIMIT` per window, default 60/min).
 """
@@ -12,6 +13,7 @@ from typing import Annotated, Literal
 
 from firebase_admin import auth as fb_auth
 
+from app.auth import AuthedUser, principal_for, require_super, set_claims
 from app.broker import BrokerClient
 from app.db.firestore import get_db
 from app.ingest import Ingest
@@ -20,13 +22,17 @@ from app.store import backends as backends_store
 from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import families as families_store
+from app.store import messages as messages_store
 from app.store import rate_limits as rate_limits_store
 from app.store import settings as settings_store
 from app.store import users as users_store
 from app.store.allow import AllowEdge, EdgeInput
 from app.store.devices import Device
+from app.store.families import Family
 from app.store.settings import RetentionSetting, RetentionSettings
 
+router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_super)])
 
 MQTT_PASSWORD_BYTES = 24
 
@@ -63,7 +69,9 @@ def get_app_settings(request: Request) -> Settings:
 
 
 def require_admin_write_rate_limit(
+    authed: Annotated[AuthedUser, Depends(require_super)],
 ) -> None:
+    """Adds the rate-limit check; FastAPI caches the dependency, so the token is verified once."""
     limit, window_s = _admin_write_rate_limit()
     if not rate_limits_store.check_and_increment(
         f"admin:{authed.uid}", limit=limit, window_s=window_s
@@ -77,6 +85,8 @@ class CreateUserRequest(BaseModel):
     email: str | None = None
     phone: str | None = None
     role: Literal["admin", "member"] = "member"
+    # super may pin a new user's family; unset defaults to the calling super's own family
+    familyId: str | None = None
     uid: str | None = None  # optional: pin a specific uid (tests, re-runs)
 
 
@@ -84,11 +94,21 @@ class PatchUserRequest(BaseModel):
     displayName: str | None = None
     email: str | None = None
     phone: str | None = None
+    # super may also promote/demote to `super`
+    role: Literal["super", "admin", "member"] | None = None
+    # Moves a user between families; absent and `null` both mean "leave familyId alone".
+    familyId: str | None = None
     disabled: bool | None = None
 
 
 @router.post("/users", dependencies=[Depends(require_admin_write_rate_limit)])
+def create_user(
+    req: CreateUserRequest, authed: Annotated[AuthedUser, Depends(require_super)]
+) -> User:
         raise HTTPException(status_code=400, detail="email or phone is required")
+
+    # an omitted `familyId` defaults to the calling super's own family
+    family_id = req.familyId if req.familyId is not None else principal_for(authed).family_id
 
 
     try:
@@ -97,23 +117,72 @@ class PatchUserRequest(BaseModel):
             display_name=req.displayName,
             email=req.email,
             role=req.role,
+            family_id=family_id,
         )
     except (users_store.AliasTaken, users_store.InvalidAlias) as exc:
         # roll back the Auth account so a rejected alias leaves no orphaned Auth user
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # claims are the only source of truth for `role`/`fam`
+    set_claims(user.uid, user.role, user.familyId)
     return user
 
 
 @router.get("/users")
+def list_users(family: Annotated[str | None, Query()] = None) -> list[User]:
+    """`?family=` narrows the listing to one family (filtered in Python)."""
+    users = users_store.list_users()
+    if family is not None:
+        users = [u for u in users if u.familyId == family]
+    return users
+
+
+def _patch_user_impl(
+    uid: str,
+    *,
+    display_name: str | None,
+    email: str | None,
+    phone: str | None,
+    role: str | None,
+    family_id: str | None,
+    disabled: bool | None,
+    broker: BrokerClient,
 ) -> User:
+    """Shared by the admin and family PATCH routes: patch, re-issue claims, bump affected books."""
     existing = users_store.get_user(uid)
     if existing is None:
         raise HTTPException(status_code=404, detail="no such user")
+    if family_id is not None:
+        # no store setter for `familyId`: write the field directly
+        get_db().collection("users").document(uid).update({"familyId": family_id})
     user = users_store.update_user(
         uid,
+        display_name=display_name,
+        email=email,
+        phone=phone,
+        role=role,
+        disabled=disabled,
     )
+    if role is not None or family_id is not None:
+        set_claims(uid, user.role, user.familyId)
+        messages_store.rewrite_participants_for_user(uid)
     return user
+
+
+@router.patch("/users/{uid}", dependencies=[Depends(require_admin_write_rate_limit)])
+def patch_user(
+    uid: str, req: PatchUserRequest, broker: Annotated[BrokerClient, Depends(get_broker)]
+) -> User:
+    return _patch_user_impl(
+        uid,
+        display_name=req.displayName,
+        email=req.email,
+        phone=req.phone,
+        role=req.role,
+        family_id=req.familyId,
+        disabled=req.disabled,
+        broker=broker,
+    )
 
 
 @router.delete("/users/{uid}", dependencies=[Depends(require_admin_write_rate_limit)])
@@ -159,6 +228,10 @@ def _message_sets_by_owner(edges: list[AllowEdge]) -> dict[str, frozenset[str]]:
 
 @router.put("/allowlist", dependencies=[Depends(require_admin_write_rate_limit)])
 def put_allowlist(
+    req: PutAllowlistRequest,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    # `?family=` narrows which existing edges the replace touches; still replace-all and super-only
+    family: Annotated[str | None, Query()] = None,
 ) -> list[AllowEdge]:
     edges = [
         EdgeInput(
@@ -170,6 +243,11 @@ def put_allowlist(
         for e in req.entries
     ]
     # snapshot before `replace_all` so the diff is against the pre-request state (PROTOCOL.md §3.7)
+    try:
+        result = allow_store.replace_all(edges, family_id=family)
+    except allow_store.LocateCrossFamily as exc:
+        # a `locate: true` edge whose ends do not share a non-null `familyId` is refused
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_message_sets = _message_sets_by_owner(result)
     changed_owner_uids = {
         owner_uid
@@ -247,9 +325,14 @@ def _broker_push_outcome(
     return "manual", _manual_acl_lines(device_id)
 
 
+def _create_device_impl(
     req: CreateDeviceRequest,
+    broker: BrokerClient,
+    settings: Settings,
 ) -> DeviceSetupCodeResponse:
+    """The setup-code flow shared with `POST /api/family/devices`, after its own scope check."""
     owner_uid = _resolve_uid(req.ownerAlias)
+    owner = users_store.get_user(owner_uid)
     default_to_uid = _resolve_uid(req.defaultToAlias) if req.defaultToAlias else None
     try:
         apn = apn_presets.validate_apn(req.apn)
@@ -264,6 +347,8 @@ def _broker_push_outcome(
     devices_store.create_device(
         owner_uid=owner_uid,
         label=req.label,
+        # a device's family is copied from its owner
+        family_id=owner.familyId if owner is not None else None,
         mqtt_password_hash=password_hash,
         default_to_uid=default_to_uid,
         apn=apn,
@@ -307,14 +392,36 @@ def _broker_push_outcome(
     )
 
 
+@router.post("/devices", dependencies=[Depends(require_admin_write_rate_limit)])
+def create_device(
+    req: CreateDeviceRequest,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> DeviceSetupCodeResponse:
+    return _create_device_impl(req, broker, emqx, settings)
+
+
 @router.get("/devices")
+def list_devices(family: Annotated[str | None, Query()] = None) -> list[Device]:
+    """`?family=` narrows the listing to one family."""
+    devices = devices_store.list_devices()
+    if family is not None:
+        devices = [d for d in devices if d.familyId == family]
+    return devices
 
 
         raise HTTPException(status_code=404, detail="no such device")
     return {"ok": True}
 
 
+@router.delete("/devices/{device_id}", dependencies=[Depends(require_admin_write_rate_limit)])
+
+
+def _rotate_credentials_impl(
     device_id: str,
+    broker: BrokerClient,
+    settings: Settings,
+    ingest: Ingest,
 ) -> DeviceSetupCodeResponse:
     device = devices_store.get_device(device_id)
     if device is None:
@@ -368,14 +475,33 @@ def _broker_push_outcome(
 
 
 @router.post(
+    "/devices/{device_id}/rotate-credentials",
+    dependencies=[Depends(require_admin_write_rate_limit)],
 )
+def rotate_credentials(
     device_id: str,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    ingest: Annotated[Ingest, Depends(get_ingest)],
+) -> DeviceSetupCodeResponse:
+    return _rotate_credentials_impl(device_id, broker, emqx, settings, ingest)
+
+
     """Revoke the device and delete its broker credential."""
     device = devices_store.get_device(device_id)
     if device is None:
         raise HTTPException(status_code=404, detail="no such device")
     emqx.delete_user(device.mqttUsername)
     return devices_store.revoke_device(device_id)
+
+
+@router.post(
+    "/devices/{device_id}/revoke", dependencies=[Depends(require_admin_write_rate_limit)]
+)
+def revoke_device(
+    device_id: str,
+) -> Device:
+    return _revoke_device_impl(device_id, emqx)
 
 
 class LockCfg(BaseModel):
@@ -390,12 +516,21 @@ class PushCfgRequest(BaseModel):
     lock: LockCfg
 
 
+def _push_cfg_impl(device_id: str, req: PushCfgRequest, broker: BrokerClient) -> dict[str, bool]:
+    if devices_store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    lock = {k: v for k, v in req.lock.model_dump().items() if v is not None}
+    ok = devcfg.push_cfg(device_id, lock, broker)
+    return {"ok": ok}
+
+
 @router.post("/devices/{device_id}/cfg", dependencies=[Depends(require_admin_write_rate_limit)])
 def push_cfg(
     device_id: str,
     req: PushCfgRequest,
     broker: Annotated[BrokerClient, Depends(get_broker)],
 ) -> dict[str, bool]:
+    return _push_cfg_impl(device_id, req, broker)
 
 
 class PushCaRequest(BaseModel):
@@ -417,6 +552,8 @@ def list_apn_presets() -> list[apn_presets.ApnPreset]:
     return {"apn": apn}
 
 
+def _push_ca_impl(
+    device_id: str, req: PushCaRequest, broker: BrokerClient, settings: Settings
 ) -> dict[str, bool]:
     """`push` sends the relay's CA as a `/down cfg.ca` pointer; `unpin` sends `cfg.ca = {url: ""}`."""
     if devices_store.get_device(device_id) is None:
@@ -436,6 +573,14 @@ def list_apn_presets() -> list[apn_presets.ApnPreset]:
     return {"ok": ok}
 
 
+@router.post("/devices/{device_id}/ca", dependencies=[Depends(require_admin_write_rate_limit)])
+def push_ca(
+    device_id: str,
+    req: PushCaRequest,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> dict[str, bool]:
+    return _push_ca_impl(device_id, req, broker, settings)
 class PutSettingsRequest(BaseModel):
 
 
@@ -446,3 +591,30 @@ def put_settings(req: PutSettingsRequest) -> RetentionSettings:
 @router.get("/settings")
 def get_settings() -> RetentionSettings:
     return settings_store.get_retention()
+
+
+class CreateFamilyRequest(BaseModel):
+    name: str
+
+
+class PatchFamilyRequest(BaseModel):
+    name: str | None = None
+
+
+@router.get("/families")
+def list_families() -> list[Family]:
+    return families_store.list_families()
+
+
+@router.post("/families", dependencies=[Depends(require_admin_write_rate_limit)])
+def create_family(
+    req: CreateFamilyRequest, authed: Annotated[AuthedUser, Depends(require_super)]
+) -> Family:
+    return families_store.create_family(name=req.name, created_by=authed.uid)
+
+
+@router.patch("/families/{fid}", dependencies=[Depends(require_admin_write_rate_limit)])
+def patch_family(fid: str, req: PatchFamilyRequest) -> Family:
+    try:
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

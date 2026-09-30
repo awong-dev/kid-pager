@@ -10,6 +10,7 @@ import httpx
 import pytest
 from firebase_admin import auth as fb_auth
 
+from app.db.firestore import get_db
 from app.store import allow as allow_store
 from app.store import backends as backends_store
 from app.store import cas as cas_store
@@ -41,6 +42,66 @@ def _run_query(parent_path: str, token: str | None, body: dict) -> httpx.Respons
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     base = f"{BASE_URL}/{parent_path}" if parent_path else BASE_URL
     return httpx.post(f"{base}:runQuery", headers=headers, json=body, timeout=10.0)
+
+
+def set_claims(uid: str, *, role: str | None = None, fam: str | None = None) -> None:
+    """Set the `role`/`fam` custom claims that `role()`/`fam()` read; never the legacy `admin`
+    claim."""
+    claims: dict[str, str] = {}
+    if role is not None:
+        claims["role"] = role
+    if fam is not None:
+        claims["fam"] = fam
+    fb_auth.set_custom_user_claims(uid, claims)
+
+
+def _set_family(collection: str, doc_id: str, family_id: str | None) -> None:
+    """Stamp `familyId` onto an existing document via the admin SDK (bypassing rules)."""
+    get_db().collection(collection).document(doc_id).set(
+        {"familyId": family_id}, merge=True
+    )
+
+
+def _set_allow_family_ids(from_uid: str, to_uid: str, family_ids: list[str]) -> None:
+    get_db().collection("allow").document(f"{from_uid}_{to_uid}").set(
+        {"familyIds": family_ids}, merge=True
+    )
+
+
+def _set_family_ids(collection: str, doc_id: str, family_ids: list[str]) -> None:
+    """Stamp `familyIds` onto an existing `conversations`/`messages` document via the admin SDK."""
+    get_db().collection(collection).document(doc_id).set(
+        {"familyIds": family_ids}, merge=True
+    )
+
+
+def _family_ids_query(collection: str, family_id: str) -> dict:
+    return {
+        "structuredQuery": {
+            "from": [{"collectionId": collection}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "familyIds"},
+                    "op": "ARRAY_CONTAINS",
+                    "value": {"stringValue": family_id},
+                }
+            },
+        }
+    }
+
+
+def _make_family_admin(uid: str, alias: str, fam: str) -> str:
+    """Creates a registered `role: admin` user claimed for `fam` and
+    returns a fresh ID token for them."""
+    fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(uid=uid, alias=alias, display_name="Admin", role="admin")
+    set_claims(uid, role="admin", fam=fam)
+    return mint_id_token(uid)
+
+
+def _create_family(family_id: str, name: str = "Fam") -> None:
+    get_db().collection("families").document(family_id).set(
+    )
 
 
 @pytest.fixture
@@ -212,6 +273,9 @@ def test_device_owner_can_read_their_device(two_pairs):
         mqtt_username="pgr-rules-1",
         mqtt_password_hash="x",
     )
+    # devices/{d} requires the reader to share the device's family; the owner always does.
+    _set_family("devices", "pgr-rules-1", "famA")
+    set_claims("u2", fam="famA")
     token = mint_id_token("u2")
     resp = _get("devices/pgr-rules-1", token)
     assert resp.status_code == 200
@@ -239,6 +303,8 @@ def test_locatable_by_uid_can_read_device_and_its_locations(two_pairs):
         mqtt_password_hash="x",
     )
     devices_store.set_locatable_by("pgr-rules-3", ["u1"])
+    _set_family("devices", "pgr-rules-3", "famA")
+    set_claims("u1", fam="famA")
 
     token = mint_id_token("u1")
     resp = _get("devices/pgr-rules-3", token)
@@ -257,6 +323,64 @@ def test_locatable_by_uid_can_read_device_and_its_locations(two_pairs):
     assert resp3.status_code == 403
 
 
+def test_owner_can_read_own_device_locations_but_not_non_owner_or_admin(two_pairs):
+    """A device's owner reads its own `locations` with no `locate` edge; a non-owner without
+    `locatableBy` and an admin outside `locatableBy` are denied for `get` and `list`."""
+    from app.store.locations import LocationFix, add_location
+
+    devices_store.create_device(
+        device_id="pgr-rules-own-1",
+        owner_uid="u2",
+        label="d",
+        mqtt_username="pgr-rules-own-1",
+        mqtt_password_hash="x",
+    )
+    _set_family("devices", "pgr-rules-own-1", "famA")
+    set_claims("u2", fam="famA")
+    loc_id = add_location("pgr-rules-own-1", LocationFix(ts=1, fixTs=1, lat=1.0, lon=2.0))
+    path = f"devices/pgr-rules-own-1/locations/{loc_id}"
+    list_query = {
+        "structuredQuery": {
+            "from": [{"collectionId": "locations"}],
+            "orderBy": [{"field": {"fieldPath": "createdAt"}, "direction": "DESCENDING"}],
+        }
+    }
+
+    owner_token = mint_id_token("u2")
+    assert _get(path, owner_token).status_code == 200
+    resp = _run_query("devices/pgr-rules-own-1", owner_token, list_query)
+    assert resp.status_code == 200, resp.text
+    assert len([row for row in resp.json() if "document" in row]) == 1
+
+    other_token = mint_id_token("u3")
+    assert _get(path, other_token).status_code == 403
+    assert _run_query("devices/pgr-rules-own-1", other_token, list_query).status_code == 403
+
+    fb_auth.create_user(uid="admin-loc-1", email="admin-loc-1@example.com")
+    users_store.create_user(uid="admin-loc-1", alias="adminloc1", display_name="Admin", role="admin")
+    fb_auth.set_custom_user_claims("admin-loc-1", {"admin": True})
+    admin_token = mint_id_token("admin-loc-1")
+    assert _get(path, admin_token).status_code == 403
+    assert _run_query("devices/pgr-rules-own-1", admin_token, list_query).status_code == 403
+
+    assert _get(path, None).status_code == 403
+
+
+def test_locations_are_client_read_only(two_pairs):
+    """Creating or updating `devices/{d}/locations/{id}` is denied even for the device's owner; the
+    collection has no write rule."""
+    devices_store.create_device(
+        device_id="pgr-rules-3b",
+        owner_uid="u1",
+        label="d",
+        mqtt_username="pgr-rules-3b",
+        mqtt_password_hash="x",
+    )
+    token = mint_id_token("u1")
+    resp = _write("devices/pgr-rules-3b/locations/fake1", token, {"lat": 1.0, "lon": 2.0})
+    assert resp.status_code == 403
+
+
 def test_locatable_by_uid_can_list_query_devices_and_their_locations(two_pairs):
     """A `list` is checked against the query's declared filters alone: `locatableBy array_contains
     <caller>` is provable, `ownerUid` alone is not."""
@@ -268,15 +392,37 @@ def test_locatable_by_uid_can_list_query_devices_and_their_locations(two_pairs):
         mqtt_password_hash="x",
     )
     devices_store.set_locatable_by("pgr-rules-4", ["u1"])
+    _set_family("devices", "pgr-rules-4", "famA")
+    set_claims("u1", fam="famA")
     from app.store.locations import LocationFix, add_location
 
     add_location("pgr-rules-4", LocationFix(ts=1, fixTs=1, lat=1.0, lon=2.0))
 
     token = mint_id_token("u1")
+    # `devices/{d}` requires `sameFam(familyId)`, which a `locatableBy`-only filter cannot prove, so
+    # the query also filters on `familyId`.
     devices_query = {
         "structuredQuery": {
             "from": [{"collectionId": "devices"}],
             "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "locatableBy"},
+                                "op": "ARRAY_CONTAINS",
+                                "value": {"stringValue": "u1"},
+                            }
+                        },
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "familyId"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": "famA"},
+                            }
+                        },
+                    ],
                 }
             },
         }
@@ -296,11 +442,32 @@ def test_locatable_by_uid_can_list_query_devices_and_their_locations(two_pairs):
     assert resp2.status_code == 200, resp2.text
     assert len([row for row in resp2.json() if "document" in row]) == 1
 
+    # A same-family caller with no locatableBy entry gets an empty result: the array-contains filter
+    # excludes it.
+    set_claims("u3", fam="famA")
     other_token = mint_id_token("u3")
     other_query = {
         "structuredQuery": {
             "from": [{"collectionId": "devices"}],
             "where": {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "locatableBy"},
+                                "op": "ARRAY_CONTAINS",
+                                "value": {"stringValue": "u3"},
+                            }
+                        },
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "familyId"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": "famA"},
+                            }
+                        },
+                    ],
                 }
             },
         }
@@ -439,7 +606,9 @@ def test_cells_is_default_deny(two_pairs):
     assert resp_write.status_code == 403
 
 
+def test_contact_request_readable_by_owner_and_family_admin_not_a_third_party(two_pairs):
     """`contactRequests/{deviceId}_{reqId}` is readable by the device owner and a family admin of
+    its family, not by an unrelated user, another family's admin, or a bare `admin: true` claim."""
     from app.store import contacts as contacts_store
 
     devices_store.create_device(
@@ -451,6 +620,7 @@ def test_cells_is_default_deny(two_pairs):
     )
     )
     doc_key = contacts_store.key("pgr-rules-contacts-1", "u_rules1")
+    _set_family("contactRequests", doc_key, "famA")
 
     owner_token = mint_id_token("u1")
     resp_owner = _get(f"contactRequests/{doc_key}", owner_token)
@@ -464,15 +634,34 @@ def test_cells_is_default_deny(two_pairs):
     users_store.create_user(
         uid="admin-contacts-1", alias="admincontacts1", display_name="Admin", role="admin"
     )
+    set_claims("admin-contacts-1", role="admin", fam="famA")
     admin_token = mint_id_token("admin-contacts-1")
     resp_admin = _get(f"contactRequests/{doc_key}", admin_token)
     assert resp_admin.status_code == 200
+
+    fb_auth.create_user(uid="admin-contacts-2", email="admin-contacts-2@example.com")
+    users_store.create_user(
+        uid="admin-contacts-2", alias="admincontacts2", display_name="Admin", role="admin"
+    )
+    set_claims("admin-contacts-2", role="admin", fam="famB")
+    other_family_admin_token = mint_id_token("admin-contacts-2")
+    resp_other_family = _get(f"contactRequests/{doc_key}", other_family_admin_token)
+    assert resp_other_family.status_code == 403
+
+    fb_auth.create_user(uid="bare-admin-contacts-1", email="bare-admin-contacts-1@example.com")
+    users_store.create_user(uid="bare-admin-contacts-1", alias="bareadmincr1", display_name="Bare")
+    fb_auth.set_custom_user_claims("bare-admin-contacts-1", {"admin": True})
+    bare_admin_token = mint_id_token("bare-admin-contacts-1")
+    resp_bare_admin = _get(f"contactRequests/{doc_key}", bare_admin_token)
+    assert resp_bare_admin.status_code == 403
 
     resp_unauth = _get(f"contactRequests/{doc_key}", None)
     assert resp_unauth.status_code == 403
 
 
+def test_sms_log_readable_by_owner_and_family_admin_not_a_third_party(two_pairs):
     """`devices/{id}/smsLog/{logId}` is readable by the owner and the device's family admin only; a
+    `locate`-only `locatableBy` grant and another family's admin are denied."""
     from app.store import sms as sms_store
 
     devices_store.create_device(
@@ -482,6 +671,7 @@ def test_cells_is_default_deny(two_pairs):
         mqtt_username="pgr-rules-sms-1",
         mqtt_password_hash="x",
     )
+    _set_family("devices", "pgr-rules-sms-1", "famA")
     devices_store.set_locatable_by("pgr-rules-sms-1", ["u1"])
     sms_store.create_log(
         "pgr-rules-sms-1",
@@ -513,9 +703,19 @@ def test_cells_is_default_deny(two_pairs):
 
     fb_auth.create_user(uid="admin-sms-1", email="admin-sms-1@example.com")
     users_store.create_user(uid="admin-sms-1", alias="adminsms1", display_name="Admin", role="admin")
+    set_claims("admin-sms-1", role="admin", fam="famA")
     admin_token = mint_id_token("admin-sms-1")
     resp_admin = _get("devices/pgr-rules-sms-1/smsLog/s_rules1", admin_token)
     assert resp_admin.status_code == 200
+
+    fb_auth.create_user(uid="admin-sms-2", email="admin-sms-2@example.com")
+    users_store.create_user(uid="admin-sms-2", alias="adminsms2", display_name="Admin", role="admin")
+    set_claims("admin-sms-2", role="admin", fam="famB")
+    other_family_admin_token = mint_id_token("admin-sms-2")
+    resp_other_family = _get(
+        "devices/pgr-rules-sms-1/smsLog/s_rules1", other_family_admin_token
+    )
+    assert resp_other_family.status_code == 403
 
     resp_write = _write(
         "devices/pgr-rules-sms-1/smsLog/s_rules1", owner_token, {"body": "hacked"}
@@ -679,3 +879,236 @@ def test_former_group_member_keeps_old_copies_but_loses_the_summary(group_convo)
 
     resp_conv = _get(f"conversations/{conv.convKey}", token)
     assert resp_conv.status_code == 403
+
+
+# The legacy `admin` custom claim is never consulted: a bare `admin: true` claim with no
+# `role`/`fam` is denied wherever a plain member is.
+def test_family_doc_readable_by_same_family_member_and_super_not_other_family(two_pairs):
+    """`sameFam(f)` compares the caller's `fam` claim with the family id in the path; stamping a
+    document's `familyId` alone is not enough for a reader."""
+    _create_family("famA")
+    _create_family("famB")
+
+    set_claims("u2", fam="famA")
+    same_family_token = mint_id_token("u2")
+    assert _get("families/famA", same_family_token).status_code == 200
+
+    set_claims("u3", fam="famB")
+    other_family_token = mint_id_token("u3")
+    assert _get("families/famA", other_family_token).status_code == 403
+
+    fb_auth.create_user(uid="super-fam-1", email="super-fam-1@example.com")
+    users_store.create_user(uid="super-fam-1", alias="superfam1", display_name="Super")
+    set_claims("super-fam-1", role="super", fam="famA")
+    super_token = mint_id_token("super-fam-1")
+    assert _get("families/famA", super_token).status_code == 200
+    assert _get("families/famB", super_token).status_code == 200
+
+
+def test_family_alerts_readable_only_by_family_admin_or_super(two_pairs):
+    _create_family("famA")
+    _set_family("users", "u1", "famA")
+    get_db().collection("families").document("famA").collection("alerts").document(
+        "a1"
+    ).set({"kind": "sms_unknown", "status": "open", "ts": 1})
+
+    fb_auth.create_user(uid="admin-alerts-1", email="admin-alerts-1@example.com")
+    users_store.create_user(uid="admin-alerts-1", alias="adminalerts1", display_name="Admin", role="admin")
+    set_claims("admin-alerts-1", role="admin", fam="famA")
+    admin_token = mint_id_token("admin-alerts-1")
+    assert _get("families/famA/alerts/a1", admin_token).status_code == 200
+
+    fb_auth.create_user(uid="admin-alerts-2", email="admin-alerts-2@example.com")
+    users_store.create_user(uid="admin-alerts-2", alias="adminalerts2", display_name="Admin", role="admin")
+    set_claims("admin-alerts-2", role="admin", fam="famB")
+    other_family_admin_token = mint_id_token("admin-alerts-2")
+    assert _get("families/famA/alerts/a1", other_family_admin_token).status_code == 403
+
+    # A member of famA (not an admin) is denied too -- alerts are an admin
+    # inbox, not a general family read.
+    member_token = mint_id_token("u1")
+    assert _get("families/famA/alerts/a1", member_token).status_code == 403
+
+    fb_auth.create_user(uid="super-alerts-1", email="super-alerts-1@example.com")
+    users_store.create_user(uid="super-alerts-1", alias="superalerts1", display_name="Super")
+    set_claims("super-alerts-1", role="super", fam="famA")
+    super_token = mint_id_token("super-alerts-1")
+    assert _get("families/famA/alerts/a1", super_token).status_code == 200
+
+
+def test_same_family_member_reads_users_doc_other_family_member_denied(two_pairs):
+    _set_family("users", "u1", "famA")
+    _set_family("users", "u2", "famA")
+    _set_family("users", "u3", "famB")
+
+    set_claims("u2", fam="famA")
+    same_family_token = mint_id_token("u2")
+    assert _get("users/u1", same_family_token).status_code == 200
+
+    set_claims("u3", fam="famB")
+    other_family_token = mint_id_token("u3")
+    assert _get("users/u1", other_family_token).status_code == 403
+
+
+def test_bare_legacy_admin_claim_grants_nothing(two_pairs):
+    """A bare `admin: true` claim with no `role`/`fam` is denied everywhere a plain member is
+    denied."""
+    _create_family("famA")
+    _set_family("users", "u2", "famA")
+    devices_store.create_device(
+        device_id="pgr-rules-bare-1",
+        owner_uid="u2",
+        label="d",
+        mqtt_username="pgr-rules-bare-1",
+        mqtt_password_hash="x",
+    )
+    _set_family("devices", "pgr-rules-bare-1", "famA")
+    allow_store.set_edge("u1", "u2", message=True, locate=False)
+    _set_allow_family_ids("u1", "u2", ["famA"])
+
+    fb_auth.create_user(uid="bare-admin-1", email="bare-admin-1@example.com")
+    users_store.create_user(uid="bare-admin-1", alias="bareadmin1", display_name="Bare")
+    fb_auth.set_custom_user_claims("bare-admin-1", {"admin": True})
+    token = mint_id_token("bare-admin-1")
+
+    assert _get("families/famA", token).status_code == 403
+    assert _get("users/u2", token).status_code == 403
+    assert _get("devices/pgr-rules-bare-1", token).status_code == 403
+    assert _get("allow/u1_u2", token).status_code == 403
+
+
+def test_family_admin_reads_family_device_and_locations_other_family_admin_denied(two_pairs):
+    devices_store.create_device(
+        device_id="pgr-rules-famdev-1",
+        owner_uid="u2",
+        label="d",
+        mqtt_username="pgr-rules-famdev-1",
+        mqtt_password_hash="x",
+    )
+    _set_family("devices", "pgr-rules-famdev-1", "famA")
+    from app.store.locations import LocationFix, add_location
+
+    loc_id = add_location(
+        "pgr-rules-famdev-1", LocationFix(ts=1, fixTs=1, lat=1.0, lon=2.0)
+    )
+
+    fb_auth.create_user(uid="admin-famdev-1", email="admin-famdev-1@example.com")
+    users_store.create_user(uid="admin-famdev-1", alias="adminfamdev1", display_name="Admin", role="admin")
+    set_claims("admin-famdev-1", role="admin", fam="famA")
+    admin_token = mint_id_token("admin-famdev-1")
+    assert _get("devices/pgr-rules-famdev-1", admin_token).status_code == 200
+    assert (
+        _get(f"devices/pgr-rules-famdev-1/locations/{loc_id}", admin_token).status_code
+        == 200
+    )
+
+    fb_auth.create_user(uid="admin-famdev-2", email="admin-famdev-2@example.com")
+    users_store.create_user(uid="admin-famdev-2", alias="adminfamdev2", display_name="Admin", role="admin")
+    set_claims("admin-famdev-2", role="admin", fam="famB")
+    other_family_admin_token = mint_id_token("admin-famdev-2")
+    assert _get("devices/pgr-rules-famdev-1", other_family_admin_token).status_code == 403
+    assert (
+        _get(
+            f"devices/pgr-rules-famdev-1/locations/{loc_id}", other_family_admin_token
+        ).status_code
+        == 403
+    )
+
+
+def test_allow_edge_readable_by_family_admin_of_either_party_not_a_third_family(two_pairs):
+    allow_store.set_edge("u1", "u2", message=True, locate=False)
+    _set_allow_family_ids("u1", "u2", ["famA", "famB"])
+
+    fb_auth.create_user(uid="admin-allow-1", email="admin-allow-1@example.com")
+    users_store.create_user(uid="admin-allow-1", alias="adminallow1", display_name="Admin", role="admin")
+    set_claims("admin-allow-1", role="admin", fam="famA")
+    admin_a_token = mint_id_token("admin-allow-1")
+    assert _get("allow/u1_u2", admin_a_token).status_code == 200
+
+    fb_auth.create_user(uid="admin-allow-2", email="admin-allow-2@example.com")
+    users_store.create_user(uid="admin-allow-2", alias="adminallow2", display_name="Admin", role="admin")
+    set_claims("admin-allow-2", role="admin", fam="famB")
+    admin_b_token = mint_id_token("admin-allow-2")
+    assert _get("allow/u1_u2", admin_b_token).status_code == 200
+
+    fb_auth.create_user(uid="admin-allow-3", email="admin-allow-3@example.com")
+    users_store.create_user(uid="admin-allow-3", alias="adminallow3", display_name="Admin", role="admin")
+    set_claims("admin-allow-3", role="admin", fam="famC")
+    admin_c_token = mint_id_token("admin-allow-3")
+    assert _get("allow/u1_u2", admin_c_token).status_code == 403
+
+
+def test_family_admin_reads_cross_family_dm_symmetric_third_family_and_member_denied(
+    two_pairs,
+):
+    """u1<->u2's DM with `familyIds = [famA, famB]` is readable by a family admin of either family,
+    denied to a third family's admin and to a non-party member."""
+    key = messages_store.conv_key("u1", "u2")
+    msg = two_pairs
+    _set_family_ids("conversations", key, ["famA", "famB"])
+    _set_family_ids("messages", msg.id, ["famA", "famB"])
+
+    admin_a_token = _make_family_admin("admin-conv-a", "adminconva", "famA")
+    assert _get(f"conversations/{key}", admin_a_token).status_code == 200
+    assert _get(f"messages/{msg.id}", admin_a_token).status_code == 200
+
+    admin_b_token = _make_family_admin("admin-conv-b", "adminconvb", "famB")
+    assert _get(f"conversations/{key}", admin_b_token).status_code == 200
+    assert _get(f"messages/{msg.id}", admin_b_token).status_code == 200
+
+    admin_c_token = _make_family_admin("admin-conv-c", "adminconvc", "famC")
+    assert _get(f"conversations/{key}", admin_c_token).status_code == 403
+    assert _get(f"messages/{msg.id}", admin_c_token).status_code == 403
+
+    # u3: a plain member of famA, not party to the DM: `role() == 'admin'` is false, so the admin
+    # clause does not apply.
+    set_claims("u3", fam="famA")
+    member_token = mint_id_token("u3")
+    assert _get(f"conversations/{key}", member_token).status_code == 403
+    assert _get(f"messages/{msg.id}", member_token).status_code == 403
+
+
+def test_sms_conversation_denied_to_other_family_admin(two_pairs):
+    """An SMS conversation's `familyIds` holds only the member's family: readable by its admin,
+    denied to another family's admin."""
+    key = messages_store.conv_key("u1", "u2")
+    msg = two_pairs
+    _set_family_ids("conversations", key, ["famA"])
+    _set_family_ids("messages", msg.id, ["famA"])
+
+    same_family_admin_token = _make_family_admin(
+        "admin-sms-conv-1", "adminsmsconv1", "famA"
+    )
+    assert _get(f"conversations/{key}", same_family_admin_token).status_code == 200
+    assert _get(f"messages/{msg.id}", same_family_admin_token).status_code == 200
+
+    other_family_admin_token = _make_family_admin(
+        "admin-sms-conv-2", "adminsmsconv2", "famB"
+    )
+    assert _get(f"conversations/{key}", other_family_admin_token).status_code == 403
+    assert _get(f"messages/{msg.id}", other_family_admin_token).status_code == 403
+
+
+def test_family_admin_query_by_own_familyIds_allowed_other_family_denied(two_pairs):
+    """The family monitor query must carry `familyIds array-contains <own fam>`; a query naming a
+    different family is denied outright, not empty."""
+    key = messages_store.conv_key("u1", "u2")
+    msg = two_pairs
+    _set_family_ids("conversations", key, ["famA", "famB"])
+    _set_family_ids("messages", msg.id, ["famA", "famB"])
+
+    admin_token = _make_family_admin("admin-conv-query-1", "adminconvquery1", "famA")
+
+    resp = _run_query("", admin_token, _family_ids_query("conversations", "famA"))
+    assert resp.status_code == 200, resp.text
+    assert any("document" in entry for entry in resp.json()), resp.text
+
+    resp_msgs = _run_query("", admin_token, _family_ids_query("messages", "famA"))
+    assert resp_msgs.status_code == 200, resp_msgs.text
+    assert any("document" in entry for entry in resp_msgs.json()), resp_msgs.text
+
+    denied_conv = _run_query("", admin_token, _family_ids_query("conversations", "famB"))
+    assert denied_conv.status_code == 403, denied_conv.text
+
+    denied_msgs = _run_query("", admin_token, _family_ids_query("messages", "famB"))
+    assert denied_msgs.status_code == 403, denied_msgs.text

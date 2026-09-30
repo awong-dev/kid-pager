@@ -454,7 +454,9 @@ def client(broker: FakeBrokerClient) -> Iterator[TestClient]:
 def admin_headers() -> dict[str, str]:
     auth_user = fb_auth.create_user(email="sms-admin@example.com")
     users_store.create_user(
+        uid=auth_user.uid, alias="smsadmin", display_name="Admin", role="super"
     )
+    fb_auth.set_custom_user_claims(auth_user.uid, {"role": "super", "fam": ""})
     return auth_header(auth_user.uid)
 
 
@@ -502,6 +504,7 @@ def test_get_sms_contacts_unknown_device_404(client: TestClient):
     assert resp.status_code == 404
 
 
+def test_put_sms_contacts_is_405_pointing_at_the_people_page(
     client: TestClient, broker: FakeBrokerClient
 ):
     _make_user("owner7", "owner7")
@@ -512,11 +515,18 @@ def test_get_sms_contacts_unknown_device_404(client: TestClient):
         json={"contacts": [{"name": "Mom", "phone": "+12065550100"}]},
         headers=auth_header("owner7"),
     )
+    assert resp.status_code == 405, resp.text
+    assert resp.json() == {"detail": "Managed from People → Approved numbers"}
+    assert broker.published == []
+    assert devices_store.get_device("pgr-api-7").smsContacts == []
 
 
+def test_put_sms_contacts_is_405_for_an_unauthenticated_caller(client: TestClient):
     _make_user("owner8", "owner8")
     _make_pager_device("pgr-api-8", "owner8")
 
+    resp = client.put("/api/devices/pgr-api-8/sms-contacts", json={"contacts": []})
+    assert resp.status_code == 401
 
 
 def test_get_sms_log_resolves_name_and_orders_newest_first(client: TestClient):

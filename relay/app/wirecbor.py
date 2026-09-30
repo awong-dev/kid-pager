@@ -80,6 +80,10 @@ KEYMAP: dict[str, int] = {
     "bpull": 58,
     # Crash diagnostics (optional): the AT command name the main loop was stuck on.
     "stallcmd": 59,
+    # `why` = reason an unsolicited `/loc` was sent (tstr, still|cell|move|gnss|stop), `loc_move_s`
+    # = GNSS-while-moving interval (int, 0 = off); docs/PROTOCOL.md §13.2.
+    "why": 60,
+    "loc_move_s": 61,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
