@@ -701,9 +701,49 @@ static int cmd_gnsstest(int argc, char **argv)
         return 1;
     }
     bool ok = loc_debug_run((uint32_t) seconds);
+    printf("gnsstest: %s (see the log above for confidence/satellite/session detail)\n",
            ok ? "FIX" : "no fix / refused / already running - see log");
     return ok ? 0 : 1;
 }
+
+// `gnss [on|off]`: bare form prints; an argument persists loc/gnss to NVS.
+// `loctrack [on|off]` enables the background location tracker.
+static int cmd_loctrack(int argc, char **argv)
+{
+    if (argc == 1) {
+        printf("loctrack: %s\n", loc_get_track_enabled() ? "on" : "off");
+        return 0;
+    }
+    if (argc != 2 || (strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0)) {
+        printf("usage: loctrack [on|off]\n");
+        return 1;
+    }
+    loc_set_track_enabled(strcmp(argv[1], "on") == 0);
+    printf("loctrack: %s\n", loc_get_track_enabled() ? "on" : "off");
+    return 0;
+}
+
+// `locmove [<s>]` sets the GNSS-while-moving interval (0 = off).
+static int cmd_locmove(int argc, char **argv)
+{
+    if (argc == 1) {
+        printf("locmove: %us\n", (unsigned) loc_get_move_gnss_s());
+        return 0;
+    }
+    if (argc != 2) {
+        printf("usage: locmove [<seconds>]\n");
+        return 1;
+    }
+    long seconds = strtol(argv[1], NULL, 10);
+    if (seconds < 0) {
+        printf("locmove: seconds must be >= 0 (0 disables GNSS-while-moving)\n");
+        return 1;
+    }
+    loc_set_move_gnss_s((uint32_t) seconds);
+    printf("locmove: %us%s\n", (unsigned) seconds, seconds == 0 ? " (off)" : "");
+    return 0;
+}
+
 // `coverage` prints the coverage duty-cycle state.
 static int cmd_coverage(int argc, char **argv)
 {
@@ -1216,6 +1256,24 @@ static void start_normal_console(void)
         .func = &cmd_gnsstest,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&gnsstest_cmd));
+
+    const esp_console_cmd_t loctrack_cmd = {
+        .command = "loctrack",
+        .help = "loctrack [on|off] -- A/B switch for the background location tracker; "
+                "bare form prints the current setting",
+        .hint = NULL,
+        .func = &cmd_loctrack,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&loctrack_cmd));
+
+    const esp_console_cmd_t locmove_cmd = {
+        .command = "locmove",
+        .help = "locmove [<seconds>] -- GNSS-while-moving interval, 0 = off; bare form prints the "
+                "current value",
+        .hint = NULL,
+        .func = &cmd_locmove,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&locmove_cmd));
 
     const esp_console_cmd_t coverage_cmd = {
         .command = "coverage",

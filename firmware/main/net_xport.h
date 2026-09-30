@@ -35,9 +35,15 @@ typedef struct {
     /* net_take_memfull_delta() / net_take_oversize_delta() */
     uint32_t (*take_memfull_delta)(void);
     uint32_t (*take_oversize_delta)(void);
+
+    /* net_liveness_ping_now() */
+    void (*ping_now)(void);
 } net_xport_ops_t;
 
 const net_xport_ops_t *xport_lte_ops(void);
+
+/* Calls the callback registered via net_set_uplink_window_cb(); no-op if none. */
+void net_dispatch_uplink_window(void);
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,5 @@
+/* On-demand and background location: policy, `/loc` CBOR and the GNSS attempt state machine
+ * (docs/PROTOCOL.md §3.2, §13). */
 #ifndef LOC_H
 #define LOC_H
 
@@ -27,11 +29,38 @@ extern "C" {
 
 #define LOC_STATUS_MIN_S 600u    /* reported /status loc_min_s */
 #define LOC_STATUS_PERIOD_S 0u   /* reported /status loc_period_s */
+#define LOC_STATUS_PERIOD_TRACKING_S 3600u /* loc_period_s while tracking is on */
 
 #define LOC_ID_MAX 17     /* "l_" + 8 hex + NUL, PROTOCOL.md §1 */
 #define LOC_MAX_QUEUED 4  /* loc_req ids sharing one in-flight attempt's answer */
 #define LOC_CELL_KEY_MAX 24 /* "lac:ci" opaque string */
 #define LOC_MOTION_RING 16  /* motion-event timestamps kept for the 3-min span check */
+
+#define LOC_CELL_RING_N 4               /* distinct recent cells remembered */
+#define LOC_CELL_RING_WINDOW_S 3600u    /* a cell counts as seen within this window */
+#define LOC_NEWCELL_WINDOW_S 900u       /* LOC_NEWCELL_COUNT new cells within this -> MOVING */
+#define LOC_NEWCELL_COUNT 2
+#define LOC_STILL_MOTION_GAP_S 300u     /* no accel edge for this long ... */
+#define LOC_STILL_CELL_GAP_S 900u       /* ... and no new cell for this long -> STILL */
+
+#define LOC_HOURLY_CELL_S 3300u         /* hourly cell report gate while still */
+#define LOC_CELL_REPORT_SERVING_S 60u   /* a cell must serve this long before it is reported */
+#define LOC_MOVE_REFRESH_S 600u         /* "move" report interval while MOVING */
+#define LOC_MOVE_GNSS_DEFAULT_S 600u    /* `locmove` default, 0 = off */
+#define LOC_MOVE_GNSS_EDGE_WINDOW_S 60u /* needs an accel edge this recent ... */
+#define LOC_MOVE_GNSS_CELL_WINDOW_S 600u /* ... or (no LIS3DH) a new cell this recent */
+#define LOC_GNSS_ASSIST_MAX_AGE_S 7200u /* assistance refresh at most every 2 h */
+#define LOC_GNSS_DAILY_CAP 48           /* stuck-INT1 backstop */
+#define LOC_GNSS_DAY_S 86400u
+
+/* Minimum gap between any two unsolicited /loc reports; an earlier one waits for the gate. */
+#define LOC_UNSOLICITED_MIN_GAP_S 120u
+
+/* Bound on a web (loc_req) answer, including any assistance refresh (docs/PROTOCOL.md §13.3). */
+#define LOC_WEB_REQUEST_BOUND_S 60u
+
+/* Default of the runtime `loctrack` flag, read once in loc_init(). */
+#define LOC_TRACK_DEFAULT_ENABLED true
 
 /* Attach `cell` to a cached /loc answer once the fix is this old (docs/PROTOCOL.md §13.2). */
 #define LOC_CELL_STALE_FIX_S 600u
@@ -44,6 +73,7 @@ typedef enum {
 
 /* RTC sub-struct (docs/PROTOCOL.md §9.3); policy state is RAM-only; `_reserved` keeps the layout. */
 typedef struct {
+    uint8_t _reserved;
     uint8_t _pad[7];
 } loc_rtc_t;
 
@@ -134,10 +164,109 @@ bool loc_trigger_motion_event(loc_policy_t *p, int64_t now_us);
 bool loc_build_cbor(uint8_t *out, size_t cap, size_t *out_len, bool signed_env, uint64_t n,
                      const char *id, int64_t ts, bool have_fix, double lat, double lon,
                      bool have_acc, int32_t acc_m, int64_t fix_ts, bool src_cell, const char *req,
+                     bool cached, const char *err, const loc_cell_t *cell, const char *why);
 
 /* Parses a verified `loc_req` envelope (docs/PROTOCOL.md §13); false if not one or no `id`. */
 bool loc_parse_req_cbor(const uint8_t *buf, uint16_t len, bool sig_pair_present, char *out_id,
                         size_t out_id_cap);
+
+typedef enum {
+    LOC_MSTATE_STILL = 0,
+    LOC_MSTATE_MOVING = 1,
+} loc_mstate_t;
+
+/* One slot of the recent-cells ring; a new key evicts the least recently seen. */
+typedef struct {
+    char key[LOC_CELL_KEY_MAX];
+    int64_t last_seen_us;
+    bool used;
+} loc_cell_ring_slot_t;
+
+typedef struct {
+    loc_cell_ring_slot_t slot[LOC_CELL_RING_N];
+} loc_cell_ring_t;
+
+typedef struct {
+    int64_t events_us[4];
+    int n;
+} loc_newcell_ring_t;
+
+/* What loc_track_tick() says is due to publish; GNSS outcomes are reported by the device layer. */
+typedef enum {
+    LOC_REPORT_NONE = 0,
+    LOC_REPORT_STILL,   /* why:"still": hourly cell fix */
+    LOC_REPORT_CELL,    /* why:"cell": new serving cell */
+    LOC_REPORT_MOVE,    /* why:"move": periodic refresh while moving */
+    LOC_REPORT_GNSS,    /* why:"gnss": a scheduled GNSS attempt's outcome */
+    LOC_REPORT_STOP,    /* why:"stop": MOVING -> STILL */
+} loc_report_t;
+
+/* Tracking state (RAM only), separate from loc_policy_t: the two rate limiters share nothing. */
+typedef struct {
+    bool have_lis3dh; /* false: cell change is the only motion signal */
+    loc_mstate_t state;
+
+    loc_cell_ring_t cell_ring;
+    loc_newcell_ring_t newcell_events;
+    loc_motion_ring_t motion; /* own instance */
+    int64_t last_motion_edge_us; /* every accel edge, 0 = none yet this session */
+    int64_t last_new_cell_us;    /* every "new" cell (ring-miss), 0 = none yet */
+    int64_t moving_since_us;     /* when the current MOVING episode began */
+
+    bool have_cur_cell;
+    char cur_cell_key[LOC_CELL_KEY_MAX];        /* most recently observed serving cell */
+    int64_t cur_cell_since_us;                  /* when it started serving */
+    bool have_last_reported_cell;
+    char last_reported_cell_key[LOC_CELL_KEY_MAX]; /* cell attached to the last report of any kind */
+    bool gnss_published_this_episode;           /* a `why:gnss` fix went out since MOVING began */
+
+    int64_t last_loc_us;         /* last unsolicited /loc of ANY kind, 0 = none this session */
+    loc_report_t pending_report; /* latched by the unsolicited gate; never dropped */
+
+    uint32_t gnss_backoff_s;              /* doubling backoff of the move schedule */
+    int64_t gnss_last_attempt_us;         /* 0 = no scheduled attempt this episode yet */
+    int64_t gnss_last_assist_refresh_us;  /* 0 = never refreshed this power session */
+    int64_t gnss_attempt_ring_us[LOC_GNSS_DAILY_CAP]; /* rolling 24h attempt log, oldest-first */
+    int gnss_attempt_ring_n;
+} loc_track_t;
+
+void loc_track_init(loc_track_t *t, bool have_lis3dh);
+loc_mstate_t loc_track_state(const loc_track_t *t);
+
+/* Accel edge: always recorded; sustained motion fires STILL->MOVING. True on that transition. */
+bool loc_track_on_motion(loc_track_t *t, int64_t now_us);
+
+/* Serving-cell change; the first cell only seeds the ring. True if it caused STILL->MOVING. */
+bool loc_track_on_cell(loc_track_t *t, int64_t now_us, const char *cell_key);
+
+/* True if an unsolicited /loc may publish now (LOC_UNSOLICITED_MIN_GAP_S since the last). */
+bool loc_track_gate_ok(const loc_track_t *t, int64_t now_us);
+
+/* Tracker step; returns the due report. Call loc_track_note_report_sent() after publishing it. */
+loc_report_t loc_track_tick(loc_track_t *t, int64_t now_us);
+
+/* Records a published report (gate clock, reported cell, and the GNSS-fix-this-episode latch). */
+void loc_track_note_report_sent(loc_track_t *t, int64_t now_us, loc_report_t which, bool gnss_fix);
+
+/* Scheduled in-motion GNSS is due; daily cap and assistance freshness are checked separately. */
+bool loc_track_gnss_due(const loc_track_t *t, int64_t now_us, uint32_t move_gnss_s);
+
+/* True if assistance was never refreshed this session or is at least 2 h old. */
+bool loc_track_gnss_assist_due(const loc_track_t *t, int64_t now_us);
+void loc_track_gnss_assist_refreshed(loc_track_t *t, int64_t now_us);
+
+/* True at 48 scheduled attempts in a rolling 24 h; ages out old entries. */
+bool loc_track_gnss_cap_reached(loc_track_t *t, int64_t now_us);
+
+/* Records that a scheduled attempt starts now (daily-cap ring and schedule clock). */
+void loc_track_gnss_attempt_started(loc_track_t *t, int64_t now_us);
+
+/* Steps the GNSS backoff on failure (same doubling as loc_next_backoff_s()); success resets it. */
+void loc_track_gnss_attempt_done(loc_track_t *t, bool success);
+
+/* min(base_budget_s, 60 - assist_elapsed_s), floored at 0 (LOC_WEB_REQUEST_BOUND_S). */
+uint32_t loc_web_gnss_budget_s(uint32_t base_budget_s, uint32_t assist_elapsed_s);
+
 #ifdef ESP_PLATFORM
 #include "auth.h"
 
@@ -162,9 +291,18 @@ bool loc_attempt_in_progress(void);
 /* One phase-machine step per modes_run() pass; publishes `/loc` for queued requests when done. */
 void loc_service(void);
 
+/* /status fields (docs/PROTOCOL.md §10); loc_period_s is the tracking period while tracking. */
 uint32_t loc_get_min_s(void);
 uint32_t loc_get_period_s(void);
 uint32_t loc_get_backoff_remaining_s(void);
+
+/* Console `loctrack`: gates the background tracker; RAM only; tracker state is kept when off. */
+void loc_set_track_enabled(bool enabled);
+bool loc_get_track_enabled(void);
+
+/* Console `locmove`: GNSS-while-moving interval in seconds, 0 = off; RAM only. */
+void loc_set_move_gnss_s(uint32_t seconds);
+uint32_t loc_get_move_gnss_s(void);
 
 /* Called per drained INT1 event from accel_poll(); RAM/RTC work only, never starts an attempt. */
 void loc_on_motion_event(void);

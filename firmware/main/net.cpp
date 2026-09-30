@@ -84,6 +84,8 @@ static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
 
 void (*s_msg_cb)(const char *, const char *, uint16_t) = nullptr;
 
+static net_uplink_window_cb_t s_uplink_window_cb = nullptr;
+
 // Transport vtable. Set at load, not in net_init(): the boot screen reads the MQTT status before
 // net_init() runs, and a null vtable there crashed (LoadProhibited).
 static const net_xport_ops_t *s_xport_ops = xport_lte_ops();
@@ -664,6 +666,25 @@ extern "C" void net_set_msg_cb(void (*cb)(const char *topic, const char *body, u
     s_msg_cb = cb;
 }
 
+extern "C" void net_set_uplink_window_cb(net_uplink_window_cb_t cb)
+{
+    s_uplink_window_cb = cb;
+}
+
+extern "C" void net_dispatch_uplink_window(void)
+{
+    if (s_uplink_window_cb) {
+        s_uplink_window_cb();
+    }
+}
+
+extern "C" void net_liveness_ping_now(void)
+{
+    if (s_xport_ops->ping_now) {
+        s_xport_ops->ping_now();
+    }
+}
+
 {
     }
 
@@ -856,6 +877,7 @@ extern "C" bool net_get_clock(int64_t *epoch_s)
 }
 
 // Voltage and RSSI reads use 1 attempt / 5 s: the library's 30 s x 3 default could
+// blow the 95 s watchdog budget in the re-announce pass. Callers fall back to the last good value.
 #define PAGER_VMON_ATTEMPTS 1
 #define PAGER_VMON_TIMEOUT_MS 5000u
 #define PAGER_CSQ_ATTEMPTS 1
@@ -1351,6 +1373,11 @@ extern "C" bool net_get_cell_info(net_cell_info_t *out)
         *out = s_cell_cache;
     }
     return s_cell_cache.valid;
+}
+
+extern "C" void net_force_cell_refresh(void)
+{
+    s_cell_info_stale = true;
 }
 
 extern "C" void net_set_accel_wake(bool on)

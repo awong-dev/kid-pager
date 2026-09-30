@@ -58,6 +58,7 @@ void rail_init(void)
     };
     gpio_config(&cfg);
     // Exclude both pads from sleep GPIO isolation (CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND); otherwise
+    // they float in light sleep and the board pull-ups switch the rails.
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_3V3_EN);
     s_rail_on = true;
     s_restored_us = esp_timer_get_time(); // counts as a restore edge

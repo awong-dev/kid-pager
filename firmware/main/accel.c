@@ -56,6 +56,23 @@ static int64_t s_refractory_us = (int64_t) ACCEL_REFRACTORY_S * 1000000;
 static int64_t s_last_reported_us = 0;
 static uint32_t s_edges_reported = 0;
 
+// Own bus; battery-powered breakout, so never torn down. Internal pull-ups on as backup.
+static void accel_bus_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = PAGER_PIN_ACCEL_SDA,
+        .scl_io_num = PAGER_PIN_ACCEL_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    i2c_param_config(I2C_NUM_1, &conf);
+    // Keep the internal pull-up through light sleep.
+    gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_ACCEL_SDA);
+    gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_ACCEL_SCL);
+}
+
 static bool reg_write(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };

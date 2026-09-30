@@ -465,6 +465,7 @@ uint32_t ui_kb_skipped_read_count(void) { return s_kb_skipped_reads; }
 static uint32_t s_kb_bus_releases = 0;
 
 // Power effect: removes the CardKB's phantom-power path through the I2C pull-ups while the rail
+// is off. The accelerometer is on its own bus and is untouched.
 void ui_kb_bus_release(void)
 {
     if (s_i2c_installed) {

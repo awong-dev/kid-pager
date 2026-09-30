@@ -212,6 +212,7 @@ static void disp_send_data1(uint8_t b) { disp_send_data(&b, 1); }
 
 static void disp_power_on(void)
 {
+    // Power effect: enables the panel regulator (ENA, active-high).
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
@@ -541,6 +542,7 @@ static void disp_gpio_init(void)
     gpio_config(&out_cfg);
 
     // CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND isolates GPIOs in light sleep; keep RST, DC, CS and
+    // VCC_EN driven so they cannot float. SPI clock/data pads are peripheral-muxed and idle.
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_RST);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_DC);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_CS);
@@ -556,6 +558,7 @@ static void disp_gpio_init(void)
     // BUSY is also excluded from sleep isolation so its first read after wake is valid.
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_BUSY);
 
+    // ENA is owned by rail.c. The eInk Friend SRAM shares SCK/MOSI; keep it deselected (CS high).
 }
 
 static bool disp_spi_init(void)

@@ -310,6 +310,7 @@ static void on_auth_epoch_wrap(void)
 #define STK_LOC_PERIOD_S 27
 #define STK_LOC_MIN_S 28
 #define STK_LOC_BACKOFF_S 43
+#define STK_LOC_MOVE_S 61 // `locmove` tunable (0 = GNSS-while-moving off)
 #define STK_TLS 39           // "unpinned"/"pinned"/"broken"/"proxy"
 #define STK_CA_FP 42         // absent when unpinned
 #define STK_SMS_LOST 48      // sms_log audit entries dropped for lack of NVS space
@@ -433,6 +434,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_uint(&w, STK_LOC_PERIOD_S, loc_get_period_s()); // always 0, periodic fixes parked
     cbor_w_uint(&w, STK_LOC_MIN_S, loc_get_min_s());        // the 10-minute trigger floor
     cbor_w_uint(&w, STK_LOC_BACKOFF_S, loc_get_backoff_remaining_s());
+    cbor_w_uint(&w, STK_LOC_MOVE_S, loc_get_move_gnss_s());
     cbor_w_tstr(&w, STK_TLS, tls_str, strlen(tls_str));
     if (have_ca_fp) {
         cbor_w_tstr(&w, STK_CA_FP, ca_fp, strlen(ca_fp));
@@ -1199,6 +1201,7 @@ static void run_modem_health_check(void)
     for (int attempt = 0; attempt < 3; attempt++) {
         if (net_check()) {
             uint32_t dark_s = net_unregistered_for_s();
+            if (dark_s >= PAGER_NO_NETWORK_RESET_S && !s_ca_apply_suppress &&
                 rate_limited_modem_recover("no network for 30 min")) {
                 note_session_up_attempt(net_session_up());
             }
@@ -1545,6 +1548,7 @@ void modes_run(void)
             // Wake path: the rail comes up here only for real input (an ext1 wake), or lazily via
             // ui_ensure_powered() when a render needs it; a timer wake with nothing to draw leaves it off.
             // wake_is_ext1: any ext1 wake (button or LIS3DH): short yield, no probe wait. wake_is_button:
+            // the IO8 bit only, the one input that opens the attentive window.
             {
                 esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
                     int64_t wake_now_us = esp_timer_get_time();
@@ -1761,6 +1765,7 @@ void modes_run(void)
 
         // The registered edge also fires once at boot with a connect in flight; resetting the backoff
         // then would issue a second CONNECT.
+        if (net_take_registered_edge() && !s_ca_apply_suppress &&
             !net_connect_in_flight()) {
             // Coverage is back: retry at once. A session "connected" across the gap cannot be trusted (the
             // TCP connection can be dead for up to 45 min until keepalive expires), so reconnect (~5 kB TLS).
@@ -1832,6 +1837,7 @@ void modes_run(void)
                 schedule_backoff(&backoff_index, &next_session_retry_us);
             }
             // net_connect_in_flight() prevents a second CONNECT while one is outstanding (+CME ERROR: 4).
+            if (!s_ca_apply_suppress && esp_timer_get_time() >= next_session_retry_us &&
                 !net_connect_in_flight()) {
                 // No-op unless `broken`: picks validated vs. unvalidated for this attempt.
                 catrust_before_reconnect();
@@ -1861,6 +1867,8 @@ void modes_run(void)
         ST_MARK(3);
 #endif
         // Idle-uplink liveness ping / silent-resume repair, once per iteration. The LTE transport is
+        // suppressed while the coverage duty cycle or a CA apply owns the radio; this is called regardless.
+        net_set_lte_suppressed(s_coverage_owns_radio || s_ca_apply_suppress);
         net_service_session();
 
         watchdog_kick(WD_PUMP);
@@ -1872,6 +1880,8 @@ void modes_run(void)
             s_next_pump_us = esp_timer_get_time() + PAGER_PUMP_MIN_INTERVAL_US;
         }
 
+        // Modem health check every 60 wake cycles in sleep mode; skipped during a CA apply trial or while
+        // the coverage duty cycle keeps the radio dark on purpose (it would force a spurious reset).
             g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP &&
             (wake_cycle_count % PAGER_CHECKCOMM_EVERY_N_WAKES) == 0) {
             run_modem_health_check();

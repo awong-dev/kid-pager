@@ -4,7 +4,38 @@ ESP-IDF 5.x project for the Walter device (ESP32-S3 + Sequans LTE-M modem). The 
 
 ## Hardware
 
+
+| Part | Role | Interface / power |
 |---|---|---|
+| Walter module (DPTechnics) | ESP32-S3-WROOM-1-N16R2 + Sequans GM02SP LTE-M modem + GNSS | — |
+
+There is no wake button; IO8 (header pin 23) is unused on the breadboard build.
+
+### Walter header map
+
+Top view, USB-C at the top, datasheet pin numbers. Left column is the display side, right column
+is the input side.
+
+```
+                                        ┌─────── USB-C ───────┐
+                                        └────────┤ SIM ├────────┘
+
+```
+
+Per-peripheral view of the same wiring:
+
+|---|---|---|---|---|---|---|---|
+| SRCS | 8 IO38 | | | | | | |
+| SDCS | — | | | | | | |
+| RST | 7 IO13 | | | | | | |
+| BUSY | 6 IO11 | | | | | | |
+
+Walter-internal, never available: IO14/IO48 (modem UART RX/TX), IO21/IO47 (RTS/CTS), IO45
+(modem reset), IO46 (LTE_WAKE0), IO19/IO20 (USB), IO3 (strapping, testpoint only). IO44/IO43 are
+UART0 and unused (the console is USB Serial/JTAG).
+
+### Power domains
+
 
 ## Device behaviour contract
 
@@ -54,6 +85,7 @@ Host unit tests (no ESP-IDF): `make -C firmware/host test`.
 ## Known limitations
 
   clean-session setting, so `net.cpp` registers no will and `/status` cannot be published retained.
+- `ui.c` render functions run on more than one task without a shared lock.
 - A boot that fails to attach has no retry path of its own beyond the modem-reset path in
   `modes.c`, and `net_init()` / `net_recover_modem()` block the loop for up to 300 s while
   attaching.

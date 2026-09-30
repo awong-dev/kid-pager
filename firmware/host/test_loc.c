@@ -274,6 +274,7 @@ static void test_loc_build_cbor_vs_relay(void)
     bool ok = loc_build_cbor(got, sizeof(got), &got_len, /*signed_env=*/false, 0, "l_3c9a11f0",
                              1757700000, /*have_fix=*/true, 37.774929, -122.419416,
                              /*have_acc=*/true, 14, 1757699991, /*src_cell=*/false, "m_7f3a2b10",
+                             /*cached=*/false, NULL, /*cell=*/NULL, /*why=*/NULL);
     CHECK(ok, "loc_build_cbor() must succeed for the fix vector");
     hex_decode(FIX_HEX, want, sizeof(want), &want_len);
     CHECK(got_len == want_len, "fix vector length mismatch: got %zu want %zu", got_len, want_len);
@@ -283,6 +284,7 @@ static void test_loc_build_cbor_vs_relay(void)
     /* no_fix: loc:null, err:"no_fix", req set. */
     ok = loc_build_cbor(got, sizeof(got), &got_len, /*signed_env=*/false, 0, "l_deadbeef", 1757700000,
                         /*have_fix=*/false, 0, 0, /*have_acc=*/false, 0, 0, /*src_cell=*/false,
+                        "m_7f3a2b10", /*cached=*/false, "no_fix", /*cell=*/NULL, /*why=*/NULL);
     CHECK(ok, "loc_build_cbor() must succeed for the no_fix vector");
     hex_decode(NOFIX_HEX, want, sizeof(want), &want_len);
     CHECK(got_len == want_len, "no_fix vector length mismatch: got %zu want %zu", got_len, want_len);
@@ -292,8 +294,10 @@ static void test_loc_build_cbor_vs_relay(void)
     /* Contract check: have_fix and a non-NULL err must never both hold (or
      * both be absent). */
     CHECK(!loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_bad", 0, true, 0, 0, false, 0, 0,
+                          false, NULL, false, "no_fix", NULL, NULL),
           "have_fix=true with a non-NULL err must be rejected");
     CHECK(!loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_bad", 0, false, 0, 0, false, 0, 0,
+                          false, NULL, false, NULL, NULL, NULL),
           "have_fix=false with no err must be rejected");
 }
 
@@ -318,6 +322,8 @@ static void test_loc_build_cbor_cell_vs_relay(void)
                         .have_rsrp = true, .rsrp = -95 };
     bool ok = loc_build_cbor(got, sizeof(got), &got_len, /*signed_env=*/false, 0, "l_3c9a11f0",
                              1757700000, /*have_fix=*/false, 0, 0, /*have_acc=*/false, 0, 0,
+                             /*src_cell=*/false, "m_7f3a2b10", /*cached=*/false, "no_fix", &cell,
+                             /*why=*/NULL);
     CHECK(ok, "loc_build_cbor() must succeed for the no_fix+cell vector");
     hex_decode(NOFIX_CELL_HEX, want, sizeof(want), &want_len);
     CHECK(got_len == want_len && memcmp(got, want, want_len) == 0,
@@ -328,6 +334,7 @@ static void test_loc_build_cbor_cell_vs_relay(void)
     loc_cell_t cell_pad = { .mcc = "234", .mnc = "07", .tac = 1, .ci = 1, .have_rsrp = false };
     ok = loc_build_cbor(got, sizeof(got), &got_len, /*signed_env=*/false, 0, "l_3c9a11f0", 1757700000,
                         /*have_fix=*/false, 0, 0, /*have_acc=*/false, 0, 0, /*src_cell=*/false,
+                        /*req=*/NULL, /*cached=*/false, "no_fix", &cell_pad, /*why=*/NULL);
     CHECK(ok, "loc_build_cbor() must succeed for the leading-zero-mnc/no-rsrp vector");
     hex_decode(NOFIX_CELL_PAD_HEX, want, sizeof(want), &want_len);
     CHECK(got_len == want_len && memcmp(got, want, want_len) == 0,
@@ -338,10 +345,13 @@ static void test_loc_build_cbor_cell_vs_relay(void)
     /* A malformed cell (bad mcc width) is treated as absent (§13.2), also on the encode side. */
     loc_cell_t bad_cell = { .mcc = "31", .mnc = "410", .tac = 1, .ci = 1 };
     ok = loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_3c9a11f0", 1757700000, false, 0, 0,
+                        false, 0, 0, false, NULL, false, "no_fix", &bad_cell, /*why=*/NULL);
     CHECK(ok, "a malformed cell must not fail the whole build");
     size_t got_len_nocell;
     uint8_t got_nocell[192];
     CHECK(loc_build_cbor(got_nocell, sizeof(got_nocell), &got_len_nocell, false, 0, "l_3c9a11f0",
+                         1757700000, false, 0, 0, false, 0, 0, false, NULL, false, "no_fix", NULL,
+                         /*why=*/NULL),
           "test setup: the no-cell control build must succeed");
     CHECK(got_len == got_len_nocell && memcmp(got, got_nocell, got_len) == 0,
           "a malformed cell must encode identically to no cell at all");
@@ -381,6 +391,404 @@ static void test_parse_req_cbor(void)
           "a plain content message must not be accepted as loc_req");
 }
 
+/* Location tracking: STILL/MOVING transitions, flap ring, report scheduler, GNSS schedule, daily
+ * cap, transition-only backoff reset, 2 h assistance rule, 120 s report floor, web GNSS budget. */
+
+/* With a LIS3DH: sustained accel motion fires STILL->MOVING; MOVING->STILL needs no accel edge for
+ * 300 s and no new cell for 900 s. */
+static void test_track_still_moving_with_lis3dh(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL, "a freshly-initialised tracker starts STILL");
+
+    /* Seed a first cell before entering MOVING: the first cell only seeds the ring, not "new". */
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "setup: learn the first cell (not itself \"new\")");
+
+    CHECK(!loc_track_on_motion(&t, now), "one edge alone can never span >=60s");
+    now += 65 * US_PER_S;
+    CHECK(loc_track_on_motion(&t, now), "a 65s span within the 3min window must enter MOVING");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING, "state must now read MOVING");
+
+    /* Neither condition alone leaves MOVING (loc_track_tick()'s return value is ignored). */
+    now += LOC_STILL_MOTION_GAP_S * US_PER_S; /* no edge for 300s, but a genuinely new cell 1s ago */
+    CHECK(loc_track_on_cell(&t, now - 1 * US_PER_S, "200:2") == false,
+          "a second, genuinely new cell (1 of 2 needed to re-enter MOVING) is recorded");
+    loc_track_tick(&t, now);
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING,
+          "no accel edge but a recent new cell must NOT yet leave MOVING");
+
+    now += LOC_STILL_CELL_GAP_S * US_PER_S; /* now also >=900s since that cell */
+    loc_track_tick(&t, now);
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL,
+          "no accel edge for 300s AND no new cell for 900s must leave MOVING");
+}
+
+/* Without a LIS3DH, accel never transitions anything (§1: cell change is the only motion signal):
+ * 2 new cells within 15 min enter MOVING, no new cell for 900 s leaves it. */
+static void test_track_no_lis3dh_cell_only(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/false);
+
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_motion(&t, now), "an accel edge must never fire without a LIS3DH");
+    CHECK(!loc_track_on_motion(&t, now + 65 * US_PER_S),
+          "a whole sustained span of accel edges must still never fire without a LIS3DH");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL, "state must still read STILL");
+
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "first-ever cell: learn only, not a change");
+    now += 60 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "200:2"), "one new cell alone must not yet enter MOVING");
+    now += 60 * US_PER_S;
+    CHECK(loc_track_on_cell(&t, now, "300:3"), "a second new cell within 15min must enter MOVING");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING, "state must now read MOVING");
+
+    now += LOC_STILL_CELL_GAP_S * US_PER_S;
+    loc_track_tick(&t, now);
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL,
+          "no new cell for 900s must leave MOVING even with zero accel signal");
+}
+
+/* Flap ring: a cell flapping A/B/A within the 60-minute window never counts as 2 new cells. */
+static void test_track_flap_ring_never_moving(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/false);
+    int64_t now = 1000 * US_PER_S;
+
+    CHECK(!loc_track_on_cell(&t, now, "A"), "first-ever cell: learn only");
+    now += 5 * 60 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "B"), "A->B is a genuine new cell (1 of 2 needed)");
+    now += 5 * 60 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "A"),
+          "B->A within 60min of A's own last sighting is NOT a new cell (flap ring membership)");
+    now += 5 * 60 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "B"),
+          "A->B again, B still a ring member too -- still not new");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL,
+          "A/B/A/B flapping inside the 60min ring must never enter MOVING");
+}
+
+/* Report scheduler (§2.1): hourly cell fix while STILL, debounced cell-change report, periodic
+ * refresh while MOVING, and the stop report's only-if-new gate. */
+static void test_track_report_scheduler(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+
+    /* Hourly cell, STILL: the very first tick (last_loc_us==0) is due at
+     * once; the next one is not due until LOC_HOURLY_CELL_S later. */
+    int64_t now = 1000 * US_PER_S;
+    CHECK(loc_track_on_cell(&t, now, "100:1") == false, "setup: learn the first cell");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "first-ever tick must report `still` at once");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+    CHECK(loc_track_tick(&t, now + 1) == LOC_REPORT_NONE, "right after a report, nothing is due");
+    now += (LOC_HOURLY_CELL_S - 1) * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE, "1s short of the hourly gate: not yet due");
+    now += 1 * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "at the hourly gate: `still` is due again");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+
+    /* Cell-change report: needs to have served >=60s AND differ from the
+     * last *reported* cell (not just the last observed one) AND the 120s
+     * gate below to actually publish. */
+    now += 200 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "200:2"), "a genuine new cell (1 of 2) is recorded");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE, "a cell that has served 0s must not report yet");
+    now += (LOC_CELL_REPORT_SERVING_S - 1) * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE, "1s short of the serving debounce: not yet");
+    now += 1 * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_CELL, "served >=60s and differs from last reported");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_CELL, false);
+
+    /* Move report: only once MOVING, LOC_MOVE_REFRESH_S after the last /loc. Let the second cell's
+     * own cell-change report fire and be acknowledged first, or pending `cell` outranks `move`. */
+    now += 60 * US_PER_S;
+    CHECK(loc_track_on_cell(&t, now, "300:3"), "second new cell (2 of 2) enters MOVING");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING, "setup: must now be MOVING");
+    now += LOC_CELL_REPORT_SERVING_S * US_PER_S; /* "300:3" now old enough to report too */
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_CELL,
+          "setup: the new MOVING-triggering cell earns its own `cell` report first");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_CELL, false);
+
+    now += (LOC_MOVE_REFRESH_S - 1) * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE, "1s short of the move-refresh gate: not yet");
+    now += 1 * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_MOVE, "at the move-refresh gate: `move` is due");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_MOVE, false);
+
+    /* Stop report: MOVING -> STILL is silent unless the cell differs from
+     * the last one reported, or a GNSS fix went out this episode. */
+    now += LOC_STILL_CELL_GAP_S * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE,
+          "a MOVING->STILL transition with the SAME cell as last reported, and no GNSS fix, "
+          "must be silent");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_STILL, "the transition itself must still have happened");
+}
+
+/* Stop report DOES fire when the cell differs from the last reported one. */
+static void test_track_stop_report_on_cell_change(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "setup: learn the first cell");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "setup: initial still report");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+
+    now += 10 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "200:2"), "setup: first new cell");
+    now += 10 * US_PER_S;
+    CHECK(loc_track_on_cell(&t, now, "300:3"), "setup: second new cell -> MOVING");
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING, "setup: must be MOVING");
+
+    now += LOC_STILL_CELL_GAP_S * US_PER_S + LOC_STILL_MOTION_GAP_S * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STOP,
+          "MOVING->STILL with a different cell than last reported must report `stop`");
+}
+
+/* Stop report also fires when a GNSS fix was published this episode, even
+ * if the cell happens to match the last reported one. */
+static void test_track_stop_report_on_gnss_published(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "setup: learn the first cell");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "setup: initial still report");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+
+    CHECK(!loc_track_on_motion(&t, now), "setup: first edge alone cannot span >=60s");
+    now += 65 * US_PER_S;
+    CHECK(loc_track_on_motion(&t, now), "setup: sustained motion -> MOVING");
+    now += 120 * US_PER_S; /* clear the 120s gate from the setup `still` report above */
+    loc_track_note_report_sent(&t, now, LOC_REPORT_GNSS, /*gnss_fix=*/true);
+    CHECK(loc_track_state(&t) == LOC_MSTATE_MOVING, "setup: must still be MOVING");
+
+    now += LOC_STILL_MOTION_GAP_S * US_PER_S + LOC_STILL_CELL_GAP_S * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STOP,
+          "MOVING->STILL after a GNSS fix this episode must report `stop` even with the same cell");
+}
+
+/* A 120 s minimum gap applies to every unsolicited report; an early one waits for the gate and a
+ * higher-priority report can supersede a waiting lower one. */
+static void test_track_unsolicited_min_gap_not_dropped(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "setup: learn the first cell");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "setup: initial still report");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+
+    /* A cell-change report becomes "wanted" only 61s after the report
+     * above (well inside the 120s gate). */
+    now += 1 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "200:2"), "setup: a genuine new cell");
+    now += LOC_CELL_REPORT_SERVING_S * US_PER_S; /* served long enough, but gate still open */
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE,
+          "a report due before the 120s gate clears must NOT publish yet");
+
+    /* It must not be lost: once the gate clears, the SAME report fires,
+     * with no new trigger needed. */
+    now = 1000 * US_PER_S + LOC_UNSOLICITED_MIN_GAP_S * US_PER_S; /* exactly 120s after `still` */
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_CELL,
+          "the latched cell-change report must fire the instant the 120s gate opens");
+}
+
+static void test_track_unsolicited_min_gap_superseded_by_higher_priority(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "100:1"), "setup: learn the first cell");
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_STILL, "setup: initial still report");
+    loc_track_note_report_sent(&t, now, LOC_REPORT_STILL, false);
+
+    now += 1 * US_PER_S;
+    CHECK(!loc_track_on_cell(&t, now, "200:2"), "setup: a genuine new cell (1 of 2)");
+    now += LOC_CELL_REPORT_SERVING_S * US_PER_S;
+    CHECK(loc_track_tick(&t, now) == LOC_REPORT_NONE, "the cell report is latched, gated");
+
+    /* A second new cell (2 of 2) enters MOVING; still gated, nothing to see yet. */
+    now += 1 * US_PER_S;
+    CHECK(loc_track_on_cell(&t, now, "300:3"), "setup: second new cell -> MOVING");
+    /* Sustained motion makes MOVING->STILL with a differing cell due: `stop` outranks the latched
+     * `cell` once the gate opens. */
+    now += LOC_STILL_CELL_GAP_S * US_PER_S + LOC_STILL_MOTION_GAP_S * US_PER_S;
+    loc_report_t got = loc_track_tick(&t, now);
+    CHECK(got == LOC_REPORT_STOP, "a higher-priority `stop` becoming due must supersede a "
+                                  "still-latched `cell`, got %d",
+          (int) got);
+}
+
+/* GNSS-while-moving schedule (§2.2): first attempt one interval after MOVING begins; exit-tail
+ * edge and cell-recency guard; independent of `locmove`=0. */
+static void test_track_gnss_schedule(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_motion(&t, now), "setup: first edge alone cannot span >=60s");
+    now += 65 * US_PER_S;
+    CHECK(loc_track_on_motion(&t, now), "setup: sustained motion -> MOVING");
+    int64_t moving_started = now;
+
+    CHECK(!loc_track_gnss_due(&t, now, LOC_MOVE_GNSS_DEFAULT_S),
+          "no GNSS attempt is due the instant MOVING begins");
+    CHECK(!loc_track_gnss_due(&t, now, 0), "locmove=0 must always mean off");
+
+    now = moving_started + (LOC_MOVE_GNSS_DEFAULT_S - 1) * US_PER_S;
+    CHECK(!loc_track_gnss_due(&t, now, LOC_MOVE_GNSS_DEFAULT_S),
+          "1s short of one full interval into motion: not yet due");
+
+    now = moving_started + LOC_MOVE_GNSS_DEFAULT_S * US_PER_S;
+    CHECK(!loc_track_gnss_due(&t, now, LOC_MOVE_GNSS_DEFAULT_S),
+          "at the interval, but with no recent accel edge: the exit-tail guard must refuse it");
+    CHECK(!loc_track_on_motion(&t, now),
+          "already MOVING: this edge cannot itself re-transition, but it does satisfy the guard");
+    CHECK(loc_track_gnss_due(&t, now, LOC_MOVE_GNSS_DEFAULT_S),
+          "one full interval into motion, with a recent edge, the first attempt must be due");
+
+    loc_track_gnss_attempt_started(&t, now);
+    loc_track_gnss_attempt_done(&t, /*success=*/false);
+    CHECK(!loc_track_gnss_due(&t, now + 1, LOC_MOVE_GNSS_DEFAULT_S),
+          "right after a failed attempt, the next one must not be due immediately");
+}
+
+/* Daily cap: 48 scheduled attempts, then refused; a rolling 24 h window that self-heals. */
+static void test_track_gnss_daily_cap(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+
+    for (int i = 0; i < LOC_GNSS_DAILY_CAP; i++) {
+        CHECK(!loc_track_gnss_cap_reached(&t, now), "attempt %d/%d must still be under the cap", i,
+              LOC_GNSS_DAILY_CAP);
+        loc_track_gnss_attempt_started(&t, now);
+        now += 601 * US_PER_S; /* clear of the 600s floor between attempts */
+    }
+    CHECK(loc_track_gnss_cap_reached(&t, now), "the 49th attempt today must be refused");
+
+    /* 24 h after the first attempt (at the loop's starting `now`, 1000 s) it ages out, freeing a slot. */
+    int64_t past_24h = 1000 * US_PER_S + ((int64_t) LOC_GNSS_DAY_S + 1) * US_PER_S;
+    CHECK(!loc_track_gnss_cap_reached(&t, past_24h),
+          "once the oldest attempt is >=24h old, the cap must allow another one");
+}
+
+/* Transition-only backoff reset (§1/§2.3): gnss_backoff_s resets only on STILL->MOVING, not on
+ * later motion/cell events while MOVING. */
+static void test_track_transition_only_backoff_reset(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    int64_t now = 1000 * US_PER_S;
+    CHECK(!loc_track_on_motion(&t, now), "setup: first edge alone cannot span >=60s");
+    now += 65 * US_PER_S;
+    CHECK(loc_track_on_motion(&t, now), "setup: sustained motion -> MOVING");
+    CHECK(t.gnss_backoff_s == 0, "backoff must be zero right after the transition");
+
+    /* Fail a scheduled attempt: backoff advances. */
+    loc_track_gnss_attempt_started(&t, now);
+    loc_track_gnss_attempt_done(&t, false);
+    CHECK(t.gnss_backoff_s == 300, "one failure must step the backoff to 300s, got %u",
+          (unsigned) t.gnss_backoff_s);
+
+    /* Further motion/cell events while STILL MOVING must NOT reset it. */
+    now += 30 * US_PER_S;
+    CHECK(!loc_track_on_motion(&t, now), "a lone edge alone must not re-fire the sustained classifier");
+    CHECK(t.gnss_backoff_s == 300, "an ordinary motion edge while already MOVING must not touch backoff");
+
+    now += 40 * US_PER_S; /* a fresh 65s-span edge, still while MOVING */
+    CHECK(!loc_track_on_motion(&t, now), "already MOVING: a new sustained span must not re-transition");
+    CHECK(t.gnss_backoff_s == 300, "a re-sustained motion event while already MOVING must not reset "
+                                    "the backoff either");
+}
+
+/* 2 h assistance rule (§2.2): due when never refreshed this session or the last refresh is 2 h old. */
+static void test_track_gnss_assist_2h_rule(void)
+{
+    loc_track_t t;
+    loc_track_init(&t, /*have_lis3dh=*/true);
+    CHECK(loc_track_gnss_assist_due(&t, 0), "never refreshed this session: due at once");
+
+    int64_t now = 1000 * US_PER_S;
+    loc_track_gnss_assist_refreshed(&t, now);
+    CHECK(!loc_track_gnss_assist_due(&t, now + 1), "right after a refresh: not due");
+
+    now += (LOC_GNSS_ASSIST_MAX_AGE_S - 1) * US_PER_S;
+    CHECK(!loc_track_gnss_assist_due(&t, now), "1s short of 2h: still not due");
+    now += 1 * US_PER_S;
+    CHECK(loc_track_gnss_assist_due(&t, now), "at 2h since the last refresh: due again");
+}
+
+/* Web-request GNSS budget (PROTOCOL.md §13.3 item 2): min(base_budget_s, 60 - assist_elapsed_s),
+ * floored at 0. */
+static void test_loc_web_gnss_budget(void)
+{
+    CHECK(loc_web_gnss_budget_s(LOC_ATTEMPT_S, 0) == LOC_ATTEMPT_S,
+          "no assistance refresh spent: the ordinary 20s budget is untouched");
+    CHECK(loc_web_gnss_budget_s(LOC_FIRST_ATTEMPT_S, 0) == LOC_FIRST_ATTEMPT_S,
+          "no assistance refresh spent: the cold-boot 40s budget is untouched");
+    CHECK(loc_web_gnss_budget_s(LOC_FIRST_ATTEMPT_S, 25) == 35,
+          "a 25s refresh must cap a 40s budget down to the 35s remaining inside the 60s bound");
+    CHECK(loc_web_gnss_budget_s(LOC_ATTEMPT_S, 50) == 10,
+          "a 50s refresh leaves only 10s remaining inside the 60s bound, tighter than the "
+          "ordinary 20s budget, so 10 wins");
+    CHECK(loc_web_gnss_budget_s(LOC_FIRST_ATTEMPT_S, 60) == 0,
+          "a refresh that alone reached the 60s bound must leave a zero GNSS-wait budget");
+    CHECK(loc_web_gnss_budget_s(LOC_FIRST_ATTEMPT_S, 90) == 0,
+          "a refresh that overran the 60s bound must also floor at zero, not underflow");
+}
+
+/* `why` field, byte-compared against a minimal independent CBOR encoder (definite-length map; uint,
+ * tstr, map, null, float64). */
+static void test_loc_build_cbor_why_vs_reference(void)
+{
+    static const char *STILL_WHY_HEX =
+        "a70001016a6c5f3363396131316630021a68c45fa008f609f60b666e6f5f666978183c657374696c6c";
+    static const char *CELL_WHY_HEX =
+        "a80001016a6c5f3363396131316630021a68c45fa008f609f60b666e6f5f6669781831a50063333130016334"
+        "313002193039031a05397fb104385e183c6463656c6c";
+    static const char *GNSS_WHY_HEX =
+        "a60001016a6c5f3363396131316630021a68c45fa008a300fb4042e330df9bdc6a01fbc05e9ad7b634dad3031a"
+        "68c45f9709f6183c64676e7373";
+
+    uint8_t got[192], want[192];
+    size_t got_len, want_len;
+
+    bool ok = loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_3c9a11f0", 1757700000,
+                             /*have_fix=*/false, 0, 0, false, 0, 0, false, /*req=*/NULL,
+                             /*cached=*/false, "no_fix", /*cell=*/NULL, "still");
+    CHECK(ok, "loc_build_cbor() must succeed for the still+why vector");
+    hex_decode(STILL_WHY_HEX, want, sizeof(want), &want_len);
+    CHECK(got_len == want_len && memcmp(got, want, want_len) == 0,
+          "still+why vector must match the reference encoder exactly (got %zu bytes, want %zu)",
+          got_len, want_len);
+
+    loc_cell_t cell = { .mcc = "310", .mnc = "410", .tac = 12345, .ci = 87654321, .have_rsrp = true,
+                        .rsrp = -95 };
+    ok = loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_3c9a11f0", 1757700000, false, 0, 0,
+                        false, 0, 0, false, NULL, false, "no_fix", &cell, "cell");
+    CHECK(ok, "loc_build_cbor() must succeed for the cell+why vector");
+    hex_decode(CELL_WHY_HEX, want, sizeof(want), &want_len);
+    CHECK(got_len == want_len && memcmp(got, want, want_len) == 0,
+          "cell+why vector must match the reference encoder exactly (got %zu bytes, want %zu)",
+          got_len, want_len);
+
+    ok = loc_build_cbor(got, sizeof(got), &got_len, false, 0, "l_3c9a11f0", 1757700000,
+                        /*have_fix=*/true, 37.774929, -122.419416, /*have_acc=*/false, 0, 1757699991,
+                        /*src_cell=*/false, NULL, false, NULL, NULL, "gnss");
+    CHECK(ok, "loc_build_cbor() must succeed for the gnss+why vector");
+    hex_decode(GNSS_WHY_HEX, want, sizeof(want), &want_len);
+    CHECK(got_len == want_len && memcmp(got, want, want_len) == 0,
+          "gnss+why vector must match the reference encoder exactly (got %zu bytes, want %zu)",
+          got_len, want_len);
+}
+
 int main(void)
 {
     test_backoff_sequence();
@@ -396,6 +804,21 @@ int main(void)
     test_loc_build_cbor_vs_relay();
     test_loc_build_cbor_cell_vs_relay();
     test_parse_req_cbor();
+
+    test_track_still_moving_with_lis3dh();
+    test_track_no_lis3dh_cell_only();
+    test_track_flap_ring_never_moving();
+    test_track_report_scheduler();
+    test_track_stop_report_on_cell_change();
+    test_track_stop_report_on_gnss_published();
+    test_track_unsolicited_min_gap_not_dropped();
+    test_track_unsolicited_min_gap_superseded_by_higher_priority();
+    test_track_gnss_schedule();
+    test_track_gnss_daily_cap();
+    test_track_transition_only_backoff_reset();
+    test_track_gnss_assist_2h_rule();
+    test_loc_web_gnss_budget();
+    test_loc_build_cbor_why_vs_reference();
 
     if (g_failures == 0) {
         printf("PASS: 0 failures\n");

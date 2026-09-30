@@ -94,6 +94,8 @@ uint32_t lte_get_publish_ring(net_publish_ring_entry_t *out, uint32_t cap)
 // Session liveness / silent-resume state, written from the MQTT event task and the modes task.
 static volatile int64_t s_last_uplink_us = 0;   // last publish send or SUBACK, esp_timer_get_time()
 static volatile bool s_resub_pending = false;   // a modem-initiated resume needs a raw re-SUBSCRIBE
+// net_liveness_ping_now() sets this; it is treated like the idle timeout and cleared once consumed.
+static volatile bool s_ping_now_requested = false;
 static volatile bool s_resub_wait = false;      // raw re-SUBSCRIBE sent, waiting on its SUBACK
 static volatile int64_t s_resub_sent_us = 0;    // when the outstanding raw re-SUBSCRIBE was sent
 static volatile bool s_session_restart_edge = false; // set once the resume repair's SUBACK lands
@@ -402,6 +404,12 @@ static bool lte_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
     // mqttPublish() takes a non-const buffer
     bool ok = WalterModem::mqttPublish(topic, (uint8_t *) buf, len, qos, &rsp);
     if (ok) {
+        // only QoS 1 resets the idle clock; `ok` means the modem answered OK, not that the broker
+        // PUBACKed (that is the later +SQNSMQTTONPUBLISH URC)
+        if (qos != 0) {
+            s_last_uplink_us = esp_timer_get_time();
+            net_dispatch_uplink_window();
+        }
         // the matching publish_quiet_gate_done() is in the PUBLISHED handler
     } else {
         // the command never queued, so no PUBLISHED URC will clear the in-flight count
@@ -424,6 +432,11 @@ static bool lte_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
     WalterModemRsp rsp = {};
     bool ok = WalterModem::mqttPublish(topic, buf, len, qos, &rsp);
     if (ok) {
+        // as in lte_publish(): only QoS 1 resets the idle clock
+        if (qos != 0) {
+            s_last_uplink_us = esp_timer_get_time();
+            net_dispatch_uplink_window();
+        }
         // the matching publish_quiet_gate_done() is in the PUBLISHED handler
     } else {
         // no PUBLISHED URC is coming for a publish that never queued
@@ -491,6 +504,7 @@ static void lte_service_session(void)
             s_resub_sent_us = now;
             lte_resub_hold_note_sent(now);
             s_resub_second_try = true;
+            net_dispatch_uplink_window(); // fires on send
             return;
         }
         ESP_LOGI(TAG, "liveness ping: second re-SUBSCRIBE could not be sent -- declaring the "
@@ -513,9 +527,13 @@ static void lte_service_session(void)
     // RESUB_VERDICT_NONE: fall through to the ping check, which is gated on !s_resub_wait
 
     bool resume_repair = s_resub_pending;
+    // net_liveness_ping_now() forces an early ping through the idle-timeout path; the send resets
+    bool ping_now = s_ping_now_requested && !s_resub_wait;
     bool idle_ping = s_mqtt_connected && !s_resub_wait &&
+    if (!resume_repair && !idle_ping && !ping_now) {
         return;
     }
+    s_ping_now_requested = false; // consumed; a request blocked by !s_resub_wait never reaches here
 
     int64_t idle_s = (now - s_last_uplink_us) / 1000000;
 
@@ -536,8 +554,12 @@ static void lte_service_session(void)
     s_resub_pending = false;
     s_resub_is_resume = resume_repair;
     s_last_uplink_us = now;
+    net_dispatch_uplink_window(); // fires on send
     if (resume_repair) {
         ESP_LOGI(TAG, "liveness ping: re-SUBSCRIBE sent (resume repair)");
+    } else if (ping_now) {
+        ESP_LOGI(TAG, "liveness ping: re-SUBSCRIBE sent early (net_liveness_ping_now(), idle %llds)",
+                 (long long) idle_s);
     } else {
         ESP_LOGI(TAG, "liveness ping: re-SUBSCRIBE sent (idle %llds)", (long long) idle_s);
     }
@@ -597,6 +619,12 @@ static uint32_t lte_take_oversize_delta(void)
     return v;
 }
 
+// Latches the flag; lte_service_session() sends the ping on its next pass.
+static void lte_ping_now(void)
+{
+    s_ping_now_requested = true;
+}
+
 static const net_xport_ops_t s_lte_ops = {
     .up = lte_session_up,
     .down = lte_session_down,
@@ -612,6 +640,7 @@ static const net_xport_ops_t s_lte_ops = {
     .connect_fail_streak_maxed = lte_connect_fail_streak_maxed,
     .take_memfull_delta = lte_take_memfull_delta,
     .take_oversize_delta = lte_take_oversize_delta,
+    .ping_now = lte_ping_now,
 };
 
 const net_xport_ops_t *xport_lte_ops(void)

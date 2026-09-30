@@ -77,6 +77,13 @@ bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos);
 
 /* Binary publish; `mid` (nullable) gets the message id. True means accepted, not PUBACKed. */
 
+/* Fires after a liveness SUBSCRIBE is sent and after any QoS 1 publish (open RRC window). */
+typedef void (*net_uplink_window_cb_t)(void);
+void net_set_uplink_window_cb(net_uplink_window_cb_t cb);
+
+/* Forces an early liveness SUBSCRIBE; no-op while a SUBACK is outstanding. */
+void net_liveness_ping_now(void);
+
 /* Blocks up to `max_wait_ms` while a publish is outstanding or just done; returns ms waited. */
 uint32_t net_publish_quiet_wait_ms(uint32_t max_wait_ms);
 
@@ -271,6 +278,7 @@ void net_gnss_cancel(void);
 /* Non-blocking: true and fills *out at most once per net_gnss_start_fix(). */
 bool net_gnss_poll_event(net_gnss_event_t *out);
 
+/* OPSTATE_NO_RF for coverage.c's duty cycle; call net_session_down() first. Power: radio off. */
 bool net_radio_off(void);
 
 /* OPSTATE_FULL; does not wait for re-attach (poll net_is_attached()). Power: re-attach begins. */
@@ -295,6 +303,9 @@ typedef struct {
 
 /* Cached cell snapshot, refreshed by one AT+SQNMONI only when stale; returns out->valid. */
 bool net_get_cell_info(net_cell_info_t *out);
+
+/* Marks the cell cache stale so the next net_get_cell_info() refreshes it. */
+void net_force_cell_refresh(void);
 
 /* Arms or disarms LIS3DH INT1 as a light-sleep wake source; arm only after a good WHO_AM_I. */
 void net_set_accel_wake(bool on);
