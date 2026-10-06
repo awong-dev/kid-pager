@@ -7,6 +7,13 @@ Requires FreeType (`pip install freetype-py`). Rendering is monochrome, hinted
 fetched or embedded. The Noto Sans CJK file is not in the repo; pass a local copy.
 
 Default image: DejaVu Sans for Latin/Greek/Cyrillic plus Noto Sans CJK, both pinned to the same
+per-size baseline (Noto's ascender values):
+  python3 tools/mkassets.py --lang sc \
+      --sans-font tools/fonts/dejavu/DejaVuSans.ttf \
+      --cjk-font <a local Noto Sans CJK .ttc> \
+      --baseline "12=13,16=18" \
+      -o build/assets.bin
+
 --sans-axes "opsz=7,wght=500" sets variable-font design coordinates on the text face; it has no
 effect on a static font. --baseline "12=13,16=18" pins the per-size baseline, which by default is
 the text face's own ascender and positions every glyph, CJK included.

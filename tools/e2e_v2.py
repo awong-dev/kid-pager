@@ -5,6 +5,7 @@ stack (EMQX + Firebase emulators + relay, `DEV_MODE=1`), imports `tools/pager_cl
 library (one process plays the pager device and every human in the scenario), and runs named
 scenarios: bootstrap, text round-trip, allow-list and republish; location (periodic fixes, read
 permission, on-demand `/locate` incl. coalescing, cached answer, `no_fix`, derived expiry);
+retention and byte accounting.
 
 Usage (needs the relay virtualenv -- imports `httpx`/`firebase-admin`):
     relay/.venv/bin/python tools/e2e_v2.py                 # all scenarios
@@ -877,6 +878,7 @@ def scenario_setup_code() -> None:
 
 def scenario_address_book() -> None:
     """Device `contact_req` for `+15550001111 Grandma` -> admin approves (creates the family SMS
+    contact, never a person) -> device gets the updated `book` and acks `shown`; the contact is
     not in `c[]` and reaches the pager only as `cfg.sms`; a device `up` to its alias gets
     `unknown recipient` and no thread; admin pushes `cfg` `lock.auto=2` and the device acks."""
     bootstrap_admin()
@@ -884,6 +886,7 @@ def scenario_address_book() -> None:
 
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
+    family_id = admin.me()["user"]["familyId"] or "default"
     create_device_with_secret(admin, "pgr-e2e-book", "abstudent")
 
     device = make_device("pgr-e2e-book")
@@ -892,18 +895,36 @@ def scenario_address_book() -> None:
 
     req_id = device.publish_contact_req("Grandma", "+15550001111")
 
+    def _pending_alert() -> dict | None:
+        alerts = admin.family_list_alerts(family_id, status="open")
         return next(
+            None,
         )
 
     wait_until(
+        lambda: _pending_alert() is not None,
         timeout=10,
     )
+    alert = _pending_alert()
+    assert alert is not None
+    assert alert["peerPhone"] == "+15550001111", alert
+
+    approved = admin.family_approve_alert(family_id, alert["id"])
+    assert approved["status"] == "handled", approved
 
     wait_until(
+        lambda: {"name": "Grandma", "phone": "+15550001111"} in device.sms_contacts,
         timeout=10,
+        description="device to receive and apply cfg.sms containing Grandma",
+    )
+    wait_until(
+        lambda: device.book is not None,
+        timeout=10,
+        description="device to receive and apply a book",
     )
     assert device.book is not None
     print(
+        f"address_book: device applied sms_contacts={device.sms_contacts}; book bv={device.book['bv']} "
     )
 
     wait_until(
@@ -912,9 +933,14 @@ def scenario_address_book() -> None:
     )
     print("address_book: device's book ack ('shown') landed at the relay")
 
+    device.inbox.clear()
+    device.publish_msg("hi grandma", to=contact_alias)
     wait_until(
+        lambda: any(e.data.get("from") == "system" for e in device.inbox),
         timeout=10,
     )
+    system_reply = next(e.data for e in device.inbox if e.data.get("from") == "system")
+    assert oracle.thread("abstudent", contact_alias) == [], "no relay message to an SMS contact"
 
     wait_until(
         lambda: device.lock_auto_min == 2,
@@ -932,10 +958,18 @@ def scenario_address_book() -> None:
 
 
 def scenario_sms_log() -> None:
+    """Admin creates the SMS contact Mom and picks her for the student; the derived
+    `devices.smsContacts` pushes `/down cfg.sms` and the device acks `shown`; `sms out` to the
+    listed contact and `sms in` from an unlisted number land in `devices/{id}/smsLog` with the
+    right `st`, readable via `GET /api/devices/{id}/sms-log` (name resolved only when listed)."""
     bootstrap_admin()
 
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
+    family_id = admin.me()["user"]["familyId"] or "default"
+    smsstudent = admin.admin_user_add(
+        "smsstudent", "SMSStudent", email="smsstudent@example.com", phone=None
+    )
     create_device_with_secret(admin, "pgr-e2e-sms", "smsstudent")
 
     device = make_device("pgr-e2e-sms")
@@ -944,6 +978,12 @@ def scenario_sms_log() -> None:
 
     mom_phone = "+15550002222"
     stranger_phone = "+15550003333"
+    mom = admin.family_create_contact(family_id, mom_phone, "Mom")
+    pushed = admin.family_put_approved(
+        family_id, smsstudent["uid"], contacts=[{"uid": mom["uid"]}]
+    )
+    assert pushed["contacts"] == [{"uid": mom["uid"], "message": True}], pushed
+    print("sms_log: admin created contact Mom and approved it for the student")
 
     wait_until(
         lambda: any(c.get("phone") == mom_phone for c in device.sms_contacts),

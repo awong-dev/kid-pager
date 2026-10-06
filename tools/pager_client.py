@@ -31,10 +31,15 @@ Commands:
   Device: connect, disconnect, crash, inbox, msg, ack, autoack, status, bytes,
           loc <lat> <lon> [acc] | loc auto <period_s> [--walk] |
           loc min <s> | loc fail on|off | loc backoff <s> |
+          loc cell <mcc,mnc,tac,ci[,rsrp]>|off |
+          loc report <still|cell|move|gnss|stop> | loc track <period_s>,
           contactreq <name> [phone-or-alias],
           sms out <phone> <text...> | sms in <phone> <text...>
   Server: login, contacts, chat, say, watch, tick, sweep, locate <alias>,
           locations <alias> [n],
+          alerts <family> [open|all] / approve <family> <alert_id> [link|create] [alias] /
+          block <family> <alert_id> / dismiss <family> <alert_id> /
+          cfg <device_id> [--auto <min>] [--clear],
           backend add <kind> <json-config>,
           smscontacts get <device_id> | smscontacts set <device_id> <name> <phone> [<name> <phone>...] |
           smslog <device_id> [limit]
@@ -196,6 +201,10 @@ class DeviceClient:
         self._client: mqtt.Client | None = None
         self._loc_period_s = 0
         self._loc_min_s = 120
+        # `loc track <period_s>` sets both: `_tracking` gates `/status`'s `loc_move_s`,
+        # `_loc_move_s` is the reported value.
+        self._tracking = False
+        self._loc_move_s = 0
         # §14.2 `/up`, `/status`, `/loc` counter `n = (epoch << 20) | lo`; `crash()` bumps epoch.
         self._up_epoch = 0
         self._up_lo = 0
@@ -420,9 +429,14 @@ class DeviceClient:
             "loc_min_s": self._loc_min_s,
             "tls": self.tls,
             "loc_backoff_s": self.loc_backoff_s,
+            # MQTT-session generation within this boot; constant (sessions are never resumed).
+            "link": 1,
         }
         if self.ca_fp is not None:
             obj["ca_fp"] = self.ca_fp
+        # Reported only while `loc track` is on.
+        if self._tracking:
+            obj["loc_move_s"] = self._loc_move_s
         self._publish(self.status_topic, obj, qos=1, retain=True)
 
     def publish_ack(self, msg_id: str, ack: str) -> None:
@@ -565,6 +579,13 @@ class DeviceClient:
         return fix
 
     def publish_loc(
+        self,
+        *,
+        req: str | None,
+        loc: dict[str, Any] | None,
+        cached: bool,
+        err: str | None = None,
+        why: str | None = None,
     ) -> str:
         loc_id = new_id("l_")
         obj: dict[str, Any] = {"v": 1, "id": loc_id, "ts": now_ts(), "loc": loc, "req": req}
@@ -575,9 +596,16 @@ class DeviceClient:
         # §13.2: `cell` is attached whenever an answer has no fix and a cell is configured.
         if loc is None and self._cell is not None:
             obj["cell"] = self._cell
+        # `why`: reason for an unsolicited report; absent unless set.
+        if why is not None:
+            obj["why"] = why
         # PROTOCOL.md §2: QoS 1 when `req` is non-null, QoS 0 for an unsolicited periodic fix.
         qos = 1 if req is not None else 0
         self._publish(self.loc_topic, obj, qos=qos)
+        print(
+            f"-> loc {loc_id} req={req} cached={cached} err={err} loc={loc} "
+            f"cell={obj.get('cell')} why={why}"
+        )
         return loc_id
 
     def loc_now(self, lat: float, lon: float, acc: int | None = None) -> None:
@@ -590,6 +618,30 @@ class DeviceClient:
             self.publish_loc(req=None, loc=None, cached=False, err="no_fix")
         else:
             self.publish_loc(req=None, loc=fix, cached=False)
+
+    def loc_report(self, why: str) -> None:
+        """`loc report <why>`: one unsolicited cell-only `/loc` tagged `why` (no §13.3 attempt)."""
+        self.publish_loc(req=None, loc=None, cached=False, err="no_fix", why=why)
+
+    def loc_track(self, period_s: int) -> None:
+        """`loc track <period_s>`: an unsolicited `why:"still"` report every `period_s` until
+        `loc_stop_auto`; turns `_tracking` on so `/status` reports `loc_move_s`."""
+        self.loc_stop_auto()
+        self._loc_period_s = period_s
+        self._tracking = True
+        self._loc_move_s = period_s
+        if period_s <= 0:
+            self._tracking = False
+            return
+        self._auto_stop = threading.Event()
+        stop_event = self._auto_stop
+
+        def _loop() -> None:
+            while not stop_event.wait(period_s):
+                self.loc_report("still")
+
+        self._auto_thread = threading.Thread(target=_loop, daemon=True)
+        self._auto_thread.start()
 
     def loc_auto(self, period_s: int, walk: bool = False) -> None:
         """`loc auto <period_s> [--walk]`: periodic fixes until `loc_stop_auto()`, `disconnect()` or
@@ -619,6 +671,8 @@ class DeviceClient:
 
     def loc_stop_auto(self) -> None:
         self._loc_period_s = 0
+        self._tracking = False
+        self._loc_move_s = 0
         if self._auto_stop is not None:
             self._auto_stop.set()
         if self._auto_thread is not None:
@@ -793,6 +847,8 @@ class ServerClient:
         self.alias: str | None = None
         self.uid: str | None = None
         self._id_token: str | None = None
+        # Filled lazily via `GET /api/me` for `_device_id_for_owner`'s family-scoping filter.
+        self._family_id: str | None | Literal["unset"] = "unset"
 
     @property
     def firestore_base(self) -> str:
@@ -814,7 +870,13 @@ class ServerClient:
         data = resp.json()
         self.uid = data["uid"]
         self.alias = alias
+        self._family_id = "unset"
         print(f"logged in as {alias} (uid={self.uid})")
+
+    def _my_family_id(self) -> str | None:
+        if self._family_id == "unset":
+            self._family_id = self.me()["user"]["familyId"]
+        return self._family_id
 
 
     def api_get(self, path: str) -> httpx.Response:
@@ -848,6 +910,7 @@ class ServerClient:
 
     def add_backend(self, kind: str, config: dict[str, Any], *, enabled: bool = True) -> dict[str, Any]:
         """`POST /api/me/backends`. Only `gchat` is valid; the relay creates it `enabled=False`
+        until `verify_backend()` succeeds."""
         resp = self.api_post("/api/me/backends", {"kind": kind, "config": config, "enabled": enabled})
         if resp.status_code >= 400:
             raise RuntimeError(f"add_backend failed: {resp.status_code} {resp.text}")
@@ -917,11 +980,16 @@ class ServerClient:
 
     def admin_deny(self, from_alias: str, to_alias: str) -> None:
         entries = self._current_allowlist_entries()
+        # An explicit `message: false` edge: same-family persons are implicitly approved and only a
+        # stored deny beats that.
         entries = [
             e
             for e in entries
             if not (e["fromAlias"] == from_alias and e["toAlias"] == to_alias)
         ]
+        entries.append(
+            {"fromAlias": from_alias, "toAlias": to_alias, "message": False, "locate": False}
+        )
         resp = self.api_put("/api/admin/allowlist", {"entries": entries})
         if resp.status_code >= 400:
             raise RuntimeError(f"admin deny failed: {resp.status_code} {resp.text}")
@@ -947,20 +1015,88 @@ class ServerClient:
             raise RuntimeError(f"admin settings retention failed: {resp.status_code} {resp.text}")
         return resp.json()
 
-
-    ) -> list[dict[str, Any]]:
+    def me(self) -> dict[str, Any]:
+        """`GET /api/me`; used to look up the user's own `familyId` for the `family_*` methods."""
+        resp = self.api_get("/api/me")
         resp.raise_for_status()
-
-        self,
-        *,
-        alias: str | None = None,
-    ) -> dict[str, Any]:
-        if alias is not None:
-            body["alias"] = alias
-        if resp.status_code >= 400:
         return resp.json()
 
+
+    def family_list_alerts(
+        self, family: str, status: Literal["open", "all"] = "open"
+    ) -> list[dict[str, Any]]:
+        resp = self.api_get(f"/api/family/alerts?family={family}&status={status}")
+        resp.raise_for_status()
+        return resp.json()["alerts"]
+
+    def family_approve_alert(
+        self,
+        family: str,
+        alert_id: str,
+        *,
+        mode: Literal["link", "create"] | None = None,
+        alias: str | None = None,
+        name: str | None = None,
+        for_alias: str | None = None,
+    ) -> dict[str, Any]:
+        """`POST /api/family/alerts/{id}/approve`: `contact_request` takes `mode`/`alias`,
+        `sms_unknown` takes `name`/`forAlias`, `new_conversation` takes neither."""
+        body: dict[str, Any] = {}
+        if mode is not None:
+            body["mode"] = mode
+        if alias is not None:
+            body["alias"] = alias
+        if name is not None:
+            body["name"] = name
+        if for_alias is not None:
+            body["forAlias"] = for_alias
+        resp = self.api_post(f"/api/family/alerts/{alert_id}/approve?family={family}", body)
         if resp.status_code >= 400:
+            raise RuntimeError(f"family approve_alert failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def family_block_alert(self, family: str, alert_id: str) -> dict[str, Any]:
+        resp = self.api_post(f"/api/family/alerts/{alert_id}/block?family={family}", {})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"family block_alert failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def family_dismiss_alert(self, family: str, alert_id: str) -> dict[str, Any]:
+        resp = self.api_post(f"/api/family/alerts/{alert_id}/dismiss?family={family}", {})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"family dismiss_alert failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def family_put_approved(
+        self,
+        family: str,
+        uid: str,
+        *,
+        people: list[dict[str, Any]] | None = None,
+        contacts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """`PUT /api/family/members/{uid}/approved`: replaces the member's allow edges (`people`)
+        and approved SMS contacts (`contacts`); never creates a contact."""
+        body = {"people": people or [], "contacts": contacts or []}
+        resp = self.api_put(f"/api/family/members/{uid}/approved?family={family}", body)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"family put_approved failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def family_create_contact(self, family: str, phone: str, name: str) -> dict[str, Any]:
+        """`POST /api/family/contacts?family=`: idempotent per number; 409 if `name` is taken."""
+        resp = self.api_post(
+            f"/api/family/contacts?family={family}", {"phone": phone, "name": name}
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"family create_contact failed: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def family_delete_contact(self, family: str, uid: str) -> dict[str, Any]:
+        """`DELETE /api/family/contacts/{uid}?family=`."""
+        resp = self.api_delete(f"/api/family/contacts/{uid}?family={family}")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"family delete_contact failed: {resp.status_code} {resp.text}")
         return resp.json()
 
     def admin_push_cfg(
@@ -1125,9 +1261,37 @@ class ServerClient:
     def _device_id_for_owner(self, owner_uid: str) -> str | None:
         """Device id owned by `owner_uid` that this caller may locate. Firestore authorises a `list`
         from its declared filters alone, so the query filters on `locatableBy array-contains` and
+        `familyId` (when set) and matches `owner_uid` client-side."""
+        family_id = self._my_family_id()
+        locatable_by_filter = {
+            "fieldFilter": {
+                "field": {"fieldPath": "locatableBy"},
+                "op": "ARRAY_CONTAINS",
+                "value": {"stringValue": self.uid},
+            }
+        }
+        if family_id is not None:
+            where = {
+                "compositeFilter": {
+                    "op": "AND",
+                    "filters": [
+                        locatable_by_filter,
+                        {
+                            "fieldFilter": {
+                                "field": {"fieldPath": "familyId"},
+                                "op": "EQUAL",
+                                "value": {"stringValue": family_id},
+                            }
+                        },
+                    ],
+                }
+            }
+        else:
+            where = locatable_by_filter
         query = {
             "structuredQuery": {
                 "from": [{"collectionId": "devices"}],
+                "where": where,
             }
         }
         resp = self.firestore_run_query(query)
@@ -1260,7 +1424,27 @@ class PagerShell(cmd.Cmd):
             print(
                 "usage: loc <lat> <lon> [acc] | loc auto <period_s> [--walk] | "
                 "loc min <s> | loc fail on|off | loc backoff <s> | "
+                "loc cell <mcc,mnc,tac,ci[,rsrp]>|off | "
+                "loc report <still|cell|move|gnss|stop> | loc track <period_s>"
             )
+            return
+        if parts[0] == "report":
+            if len(parts) != 2 or parts[1] not in ("still", "cell", "move", "gnss", "stop"):
+                print("usage: loc report <still|cell|move|gnss|stop>")
+                return
+            self.device.loc_report(parts[1])
+            return
+        if parts[0] == "track":
+            if len(parts) != 2:
+                print("usage: loc track <period_s>")
+                return
+            try:
+                period_s = int(parts[1])
+            except ValueError:
+                print("usage: loc track <period_s>")
+                return
+            self.device.loc_track(period_s)
+            print(f"loc track: period={period_s}s")
             return
         if parts[0] == "cell":
             # Same shorthand as --cell.
@@ -1444,6 +1628,8 @@ class PagerShell(cmd.Cmd):
         parts = shlex.split(arg)
         if not parts:
             print(
+                "usage: admin user-add|device-add|allow|deny|settings|alerts|"
+                "approve|block|dismiss|cfg|ca ..."
             )
             return
         sub, rest = parts[0], parts[1:]
@@ -1457,8 +1643,14 @@ class PagerShell(cmd.Cmd):
             self._admin_deny(rest)
         elif sub == "settings":
             self._admin_settings(rest)
+        elif sub == "alerts":
+            self._admin_alerts(rest)
         elif sub == "approve":
             self._admin_approve(rest)
+        elif sub == "block":
+            self._admin_block(rest)
+        elif sub == "dismiss":
+            self._admin_dismiss(rest)
         elif sub == "cfg":
             self._admin_cfg(rest)
         elif sub == "ca":
@@ -1532,20 +1724,44 @@ class PagerShell(cmd.Cmd):
             return
         self._out(result)
 
+    def _admin_alerts(self, args: list[str]) -> None:
+        if not args:
+            print("usage: admin alerts <family> [open|all]")
             return
+        family = args[0]
+        status = args[1] if len(args) > 1 else "open"
+        if status not in ("open", "all"):
+            print("usage: admin alerts <family> [open|all]")
+            return
+        self._out(self.server.family_list_alerts(family, status))
 
     def _admin_approve(self, args: list[str]) -> None:
         parser = argparse.ArgumentParser(prog="admin approve", add_help=False)
+        parser.add_argument("family")
+        parser.add_argument("alert_id")
+        parser.add_argument("mode", nargs="?", choices=["link", "create"])
         parser.add_argument("alias", nargs="?")
         try:
             ns = parser.parse_args(args)
         except SystemExit:
             return
         self._out(
+            self.server.family_approve_alert(
+                ns.family, ns.alert_id, mode=ns.mode, alias=ns.alias
             )
         )
 
+    def _admin_block(self, args: list[str]) -> None:
+        if len(args) != 2:
+            print("usage: admin block <family> <alert_id>")
             return
+        self._out(self.server.family_block_alert(args[0], args[1]))
+
+    def _admin_dismiss(self, args: list[str]) -> None:
+        if len(args) != 2:
+            print("usage: admin dismiss <family> <alert_id>")
+            return
+        self._out(self.server.family_dismiss_alert(args[0], args[1]))
 
     def _admin_cfg(self, args: list[str]) -> None:
         parser = argparse.ArgumentParser(prog="admin cfg", add_help=False)
