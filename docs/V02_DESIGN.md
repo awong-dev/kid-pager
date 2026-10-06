@@ -189,6 +189,7 @@ failed or wrong fix is an acceptable answer, and battery matters more than fresh
   A reset puts the backoff at zero but keeps a **floor of 10 min since the last attempt**, so a child
   walking between classrooms all day cannot turn every request into an attempt.
 - **Battery floor**: below 3.55 V (LiPo, `batt_mv`), GNSS is never powered; the answer is cached or `no_fix`.
+- **Route to the radio: in place only** (`LOCATION_TRACKING_DESIGN.md`). The fix is requested while
   attached, in the eDRX idle gap, through the library `gnss*` API. **Any failure** (`LTE_CONCURRENCY`
   refusal, timeout, no fix, confidence > 100, failed assistance refresh) ends the attempt and produces a
   cell answer (`loc:null, err:"no_fix", cell`). There is no second route and no retry. A `CFUN=4` window
@@ -216,6 +217,8 @@ failed or wrong fix is an acceptable answer, and battery matters more than fresh
 The pager may send and receive SMS directly through the modem, to a **parent-managed allow-list of
 phone numbers**, as a delivery path that does not depend on the relay.
 
+- **Who controls the list**: only the device's owner (or an admin), through Family → Contacts and the
+  member's approved list. The pager has no UI to add, edit or remove a number. Max 8 entries
   `{name ≤ 16 chars, phone E.164}`. Stored on `devices/{id}.smsContacts`; delivered as `/down` `cfg`
   with `cfg.sms = [{n, p}, …]` (the whole list each time, newest-wins, acked `shown` on apply). The
   pager keeps it in NVS.
@@ -238,9 +241,21 @@ phone numbers**, as a delivery path that does not depend on the relay.
   rules: readable by the device's owner and admins only.
 - **Web**: on the device's page, an *SMS contacts* editor and an *SMS log* table (time, direction,
   number/name, status, text), with blocked entries highlighted.
+- **Only SMS path.** The relay has no SMS backend, so this is the only SMS path. The list is derived,
+  not hand-edited: the member's approved Family → Contacts plus, for an `open`/`any_sms` member, every
+  family contact (max 8, by name). Contact names are unique per family because the pager matches by name.
 - Not verified: SMS on each SIM (some data-only SIMs do not carry SMS at all); the modem's `+CMTI`
   behaviour under eDRX; text-mode UCS-2 on this firmware. `smstest` checks them. Everything fails safe:
   an SMS that cannot be sent is a `FAILED` thread entry plus an `sms_log` with `st:"failed"`.
+
+**Malformed uploads leave a trail.** If a signature-verified `sms_log` from a registered, non-revoked
+device cannot be stored normally (the envelope does not decode, or a field such as `peer`/`dir`/`st`/`id`/`body`
+is invalid), the relay still writes `smsLog/bad_<sha256(unsigned)[:12]>` (deterministic, so a retry does
+not duplicate) with `malformed:true`, `reason`, `ts` (relay receive time), `rawHex` (unsigned bytes,
+capped at 512) and best-effort `peer`/`dir`/`st`/`msgId` pulled from the raw bytes; `body` is null. For
+undecodable payloads this applies only when the bytes contain `sms_log`. `GET /api/devices/{id}/sms-log`
+returns these rows with `malformed:true` and `reason`/`rawHex` (normal rows: `malformed:false`);
+`dir`/`peer`/`st`/`body` may be null on a flagged row.
 
 ## 7. Wire additions (the only place new keys are allocated)
 

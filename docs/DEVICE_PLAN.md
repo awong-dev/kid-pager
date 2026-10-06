@@ -704,6 +704,9 @@ bridge phone is separate from this list.
 (**UNVERIFIED**: not yet measured on hardware; see §10). Full refreshes follow `firmware/main/refreshpol.c`,
 not a fixed count.
 
+Input: the LIS3DH motion interrupt on IO16 is the light-sleep wake source (ext1). On the breadboard build
+the wake button on IO8 is compiled out by default (`PAGER_WAKE_BUTTON_ENABLED 0`). The CardKB is on I²C
+(SDA IO10, SCL IO9) and cannot wake anything, so it must be polled. `firmware/main/pins.h` holds the pin
 map. On the carrier board, which `board.c` detects, the front-light button is on IO4 (active-low) and
 stays a light-sleep wake source.
 
@@ -764,6 +767,8 @@ stays" free.
   30 s × ~40 mA ≈ 0.33 mAh per interaction; 20 interactions/day ≈ 7 mAh/day on top of §8.4's
   43–50. Worth measuring whether 100 ms light-sleep between polls (I_light(0.1) ≈ 21 mA) keeps I²C
   usable; if so the term halves. The window is independent of the 10-minute *modem* active window.
+  The window is 119 s in the current build (`PAGER_UI_AWAKE_S` in `input.c`). The cost figures above
+  were computed for 30 s; at 119 s the window term is about four times larger.
 - **Waking from a keyboard press (optional; needs the key-hold check in §10).** If the CardKB holds the
   last key in its buffer until read, polling it once per wake-and-drain cycle (one I²C read, ~0.1 ms)
   gives "press any key to wake the UI" with ≤ 5 s latency and no button. Enabled only if that check
@@ -808,6 +813,8 @@ change)*.
   every UI wake. Bars from dBm: ≥ −85 → 4, ≥ −95 → 3, ≥ −105 → 2, ≥ −115 → 1, else 0; not
   registered → `x`. Redraw only when the *bucket* changes.
 - **Battery.** `net_get_battery_mv()` at every UI wake and hourly, cached in `modes.c` as today.
+  Segments from mV (LiPo has a steeper curve, so these thresholds are **UNVERIFIED** and are set from a
+  discharge test, §10): ≥ 4000 → 4, ≥ 3850 → 3, ≥ 3700 → 2, ≥ 3550 → 1, < 3550 → 0 plus a "charge me"
   toast once per boot. Percent stays a UI-side mapping per `PROTOCOL.md` §5.1.
 - **Unread** = down messages in the ring not yet `read`.
 
@@ -922,6 +929,7 @@ session   s_3ab91c02   book v7
 counters  memfull 0  drops 0  resets 0
 > Re-sync address book
   Text size: normal
+  Rotate display: off
   Passcode: set          Auto-lock: 5 min
   Set up again
   Factory reset
@@ -929,6 +937,9 @@ counters  memfull 0  drops 0  resets 0
 
 - **Re-sync address book** — publishes a `/status` now (it carries `bv`), which is the sync trigger.
 - **Text size** — toggles 1×/2×.
+- **Rotate display** — toggles the panel's persistent 180-degree rotation; same
+  `disp_set_flip()` (NVS `disp_flip`) the console's `flip on|off` uses, forcing one full refresh so
+  the new orientation shows as a single clean frame.
 - **Passcode / Auto-lock** — §5.8. *Passcode* cycles set → change → off, asking
   for the current one first; *Auto-lock* cycles 0 (never), 1, 2, 5, 10, 30, 60 minutes.
 - **Set up again** — enters Setup mode (§3.2) to take a new setup code: rotation or re-homing. The
@@ -956,6 +967,7 @@ revealed underneath either.
 *Lock now*, a restart while a passcode is set, or the boot Greeting screen above once the network is
 usable and a passcode is set. Status bar as usual; nothing else is reachable. (a) idle: the single
 centered word, nothing else — no instructions, no field, no unread info. (b) entering, reached ONLY
+by an IO8 short press (never by typing): the same line becomes `password:` plus the masked field;
 Enter verifies, Esc or 30s idle returns to (a), a wrong code returns to (a).
 
 ```
@@ -1214,6 +1226,7 @@ Listed here so the diff to the authoritative document is reviewable on its own. 
 | 5.3 | CardKB sends `0xB4`–`0xB7` for arrows, `0x1B` esc, `0x09` tab | Key-code check on hardware, 5 min |
 | 5.3 | CardKB holds the last key until read (enables key-to-wake) | Press a key, wait 5 s, read; 2 min |
 | 5.4 | `walter-modem` v1.5.0 exposes a signal-quality call usable from application code | Read `src/WalterModem.h`, 10 min, no hardware |
+| 5.4 | LiPo mV thresholds for the battery icon | Discharge curve under the device's own load |
 | 5.3 | I²C polling works across 100 ms light-sleep cycles | One afternoon with a current trace |
 | 2.6 | The hosted broker's built-in auth accepts the credential shape the relay pushes | Phase 2's e2e |
 | 3.3 | Which public root the hosted broker's certificate chains to | `openssl s_client -showcerts` against the real account; 2 min |

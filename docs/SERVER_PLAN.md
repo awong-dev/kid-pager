@@ -54,10 +54,12 @@
  ┌──────────────── Cloud Run relay — request-driven, min instances 0 ───────────────────────┐
  │ FastAPI  ── /api/*          (send, locate, backends, admin — every WRITE goes through here) │
  │          ── /webhooks/mqtt  (broker rule engine → HTTP: /up, /status, /loc)                 │
+ │          ── /webhooks/*     (Google Chat)                                                   │
  │          ── /internal/*     (Cloud Scheduler tick + weekly sweep, Cloud Tasks retries)      │
  │ Routing engine ──► deliveries ──► Backend adapters:                                         │
  │   (allow-list, fan-out)            pager  ── broker REST publish ──► Broker ─MQTT─► Device  │
  │                                    webapp (Firestore write + FCM push)                      │
+ │                                    gchat (Chat API), email/slack… later                     │
  └───────────────────────────┬────────────────────────────────────────────────────────────────┘
                              │ firebase-admin (service account, ADC)
                      ┌───────▼────────┐          ┌───────────────────────────────┐
@@ -114,6 +116,7 @@ need no lookups, and **transactions** for anything monotonic or unique. **Multi-
 adds `familyId` to users, devices, and collections, with visibility scoped by family.
 
 ```
+families/{fid}                 {name, blockedNumbers: [], createdAt, createdBy}
 families/{fid}/alerts/{id}     {kind: 'new_conversation'|'sms_unknown'|'contact_request',
                                 status: 'open'|'handled'|'dismissed', ts, subjectUid, subjectAlias,
                                 peerUid|null, peerAlias|null, peerPhone|null, preview (≤120),
@@ -233,11 +236,21 @@ settings/meta                  {schemaVersion: 2, lastSweepAt, seqCounter}
   1 day — cells do not move, the provider APIs (`app/cellgeo.py`) bill per call, and the cache is
   what keeps cell-based locations working through a provider outage. **Privacy**: a cache entry (and
   the provider lookup that fills it) carries only the cell identity, never anything about the
+  pager's owner. Server-only, same default-deny posture as `cas` — no `match`
   block in `firestore.rules`, nothing here is ever read directly by a client (unlike `locations`,
   the web app never queries `cells`). `relay/tests/test_rules.py` pins it. No retention sweep
   needed (unlike `locations`/`messages`): the 30-day/1-day TTLs above are enforced at read time by
   `app/store/cells.py`'s own `get_cached`, the same "derived, not swept" pattern `PROTOCOL.md` §4's
   `expired` state uses.
+- **Two inbound-lookup collections:** `gchatSpaces/{spaceId}` → `{uid, bid, senderName}` and
+  `gchatLinkCodes/{code}` → `{uid, bid, expiresAt}` — the doc id is the lookup key, as for `aliases/{alias}`.
+  Relay-only, no `match` block (default-deny), pinned in `relay/tests/test_rules.py`. The stored
+  `uid` is checked on every subsequent inbound message in that space, so a group or shared space
+  cannot let a second person send as the originally-linked user.
+- **`contactNames/{fid}_{h16}` → `{uid, familyId}`** reserves a family SMS contact's name key
+  (`truncate_sms_name(name).casefold()`, `h16` = first 16 hex of its SHA-256) with `create()`, so two contacts in one
+  family can never share the name the pager matches on. Relay-only, default-deny, pinned in
+  `test_rules.py`.
 - Indexes: `messages(convKey, seq)`, `messages(pendingDeviceIds array-contains, createdAt)`,
   `messages(createdAt)` for the sweep, `locations(createdAt)` collection-group for the sweep.
   Multi-family: `conversations(familyIds CONTAINS, lastMessageAt DESC)`,
@@ -359,6 +372,7 @@ a request within 60 s of a fulfilled one is answered from `locations` with `cach
 touching the device at all.
 
 ### 4.7 Budget lines
+PROTOCOL.md §7.2/§7.3 carry a `/loc` line, and §11 of this document tracks the GNSS power cost. The
 
 ### 4.8 The relay is not an MQTT client
 The relay's *role* is what PROTOCOL.md describes, but its *transport* is the broker's rule engine
@@ -402,6 +416,7 @@ relay/app/
   ingest.py          /up acks + replies, /status (+ online-edge re-publish), /loc — called by
                      the webhook router, unit-tested with fake payloads
   routing.py         allow-list check, recipient resolution, fan-out → deliveries → adapters
+  backends/          base.py (Protocol), pager.py, webapp.py, gchat.py, registry.py
   auth.py            verify Firebase ID token → user; require_user / require_admin (custom claim)
   location.py        loc_req lifecycle, coalescing, cached answers; cell-tower fallback resolution
                      (§13.2) when a /loc answer has no GNSS fix
@@ -412,6 +427,7 @@ relay/app/
   tasks.py           Cloud Tasks enqueue (prod) / inline thread (dev) for delivery retries
   routers/           me.py, conversations.py, admin.py, devices.py (GET /api/devices, owner/admin
                      sms-contacts + sms-log — V02_DESIGN.md §6), ca.py (public GET /ca/{sha}.pem —
+                     V02_DESIGN.md §4.4), webhooks.py (mqtt, gchat),
                      internal.py (tick, sweep, task handler — OIDC-authenticated), dev.py, legacy.py
 ```
 Not present: `mqtt_transport.py` (paho), a background thread, the reconnect/backoff
@@ -428,6 +444,7 @@ requires `require_family_admin` (family admin or super with `?family=`); `/api/a
 GET  /api/me                                           → {user, role, familyId, kind, policy, notify, claimsStale}
 GET  /api/directory                                    → {entries: [{uid, alias, displayName, kind, familyId, role}]}
 POST/PATCH/DELETE /api/me/backends[/{id}]              → user's own backends
+POST /api/me/backends/{id}/verify {code}               → gchat link verification
 POST /api/me/push-tokens {token} / DELETE …/{token}    → FCM registration tokens
 PATCH /api/me {notify}                                 → toggle alerts notifications
 POST /api/conversations/{alias}/messages {body}        → 201 {id}; alias can be E.164 phone number
@@ -436,16 +453,20 @@ POST /api/conversations/{alias}/locate                 → 202 {request_id}
 GET  /api/family                                       → family doc, member/device counts (family admin)
 GET/POST /api/family/members                           → list; create {alias, displayName, email|phone, role}
 PATCH /api/family/members/{uid}                        → displayName, role, disabled, policy{out,in}
+PUT  /api/family/members/{uid}/approved                → {people:[{alias,message,locate}], contacts:[{uid,message}]}
 GET/POST/PATCH /api/family/contacts                    → externals {uid, alias, phone, displayName, approvedFor:[uid…]}
 GET/POST /api/family/devices, /{id}/rotate, /revoke, /cfg, /ca, DELETE /{id}  → device CRUD (family admin)
 POST /api/family/groups                                → {name, alias, memberUids} (family admin)
 GET /api/family/alerts?status=open|all                 → list alerts
 POST /api/family/alerts/{id}/{approve|block|dismiss}  → act on alert
 GET/POST /api/admin/families                           → list; create (super)
+PATCH /api/admin/families/{fid}                        → name (super)
 PATCH /api/admin/users/{uid}                           → familyId, role: super (super)
 GET  /api/admin/users, /api/admin/devices              → with ?family= filter (super)
 PUT  /api/admin/allowlist?family=                      → replace-all edges, in-family or cross-family (super)
 PUT  /api/devices/{id}/sms-contacts                    → 405; managed from /family/members/{uid}/approved
+DELETE /api/family/contacts/{uid}                      → delete a family SMS contact, its edges and name; re-derive cfg.sms
+GET /api/family/members/{uid}/approved                 → `{people, contacts:[{uid,message}]}`
 GET  /ca/{sha256hex}.pem                               → public, no auth, immutable; 404 for an unknown hash
 GET  /api/devices                                      → caller's own devices: [{id, label, status}]
 GET  /api/devices/{id}/sms-log?limit=&before=          → {entries: [{id, ts, smsTs, dir, peer, name, st, body}]}
@@ -526,6 +547,9 @@ new conversations). Approved-numbers PUT derives `devices.smsContacts` and pushe
 
 **Superadmin** (`/api/admin/*`) manages families, all users across families, all devices, the
 allow-list (cross-family edges only), and retention settings. Locations readable everywhere but
+`/locate` requires an edge or family-admin status. SMS contacts (externals) are created only on
+Family → Contacts or by approving a pager contact request or an `sms_unknown` alert; nothing
+creates one on send.
 
 ### 5.6 Location (`location.py`)
 - `/loc` ingest (via webhook): validate (`LocEnvelope`), dedup on `wireId`, add to
@@ -588,6 +612,7 @@ design does not depend on it.
 - The broker is a fake `BrokerClient` in unit tests (records publishes; tests post webhook
   payloads straight to `ingest`). The real EMQX rule-engine path is covered by `e2e_v2.py` against
   the compose stack.
+- HTTP adapters (Chat) are tested against recorded request/response fixtures with the
   signature checks exercised for real; FCM sends go through a stub `messaging` client; Cloud
   Tasks runs in inline mode.
 - Coverage the suite must keep: webhook auth, allow-list denial, fan-out to N
@@ -628,6 +653,8 @@ sender alias, body preview). Delivery goes `read` when the browser reports the t
 (`POST …/messages/{id}/read`), so the sender sees "read" for the web too. Every user gets an
 implicit `webapp` backend at creation.
 
+### 6.4 `sms` — removed
+The relay neither sends nor receives SMS. SMS runs through the bridge phone
 
 ### 6.5 `gchat` — Google Chat app
 Outbound: `spaces.messages.create` with the relay's service account (Chat API enabled by
@@ -680,6 +707,7 @@ its slot.
 /family/contacts       external contacts (name, number, approved-for member chips), rename, add; linked families
 /family/alerts         inbox of SMS unknowns, new conversations, contact requests; approve/block/dismiss; badge
 /location              device map (own, edge-granted, family devices for admins), "Locate now" enabled for scoped set
+/settings/backends     list + add (Google Chat link code, Email later) + enable toggles
 /settings/notifications  enable browser notifications → registers FCM token; Family alerts toggle for admins
 /admin/families        table (name, SMS number, admins, members, devices, created); create family, edit, move users
 /admin/users           table; create (alias, name, email/phone, role, family); disable; delete; Family column + filter
@@ -774,6 +802,7 @@ admin settings retention messages=4w locations=10d
 
 **`tools/e2e_v2.py`** imports the client as a library, brings up `relay/docker-compose.yml`
 (EMQX OSS with the rule + webhook configured by `tools/emqx_setup.py`, Firebase emulators, relay
+with `DEV_MODE=1`), and runs named scenarios:
 - `bootstrap`: admin sign-in, create parent + student, connect them, create device (broker
   credential pushed via EMQX's REST API).
 - `text_roundtrip`: parent → student via API → pager receives → `shown`/`read` chips update;

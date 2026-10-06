@@ -173,6 +173,7 @@ Additional rules:
 | Book nudge (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"book","bv":7,"url":"https://…/api/device/book","ack":null,"n":…,"sig":"…"}` — ≤338 bytes signed JSON; no `d`/`c`/`p`/`more` | A `book` with no `c` and no `p`. Sent only to a device whose `/status` carries `bpull:1`; the device fetches the book over HTTPS and acks `shown` once it is applied (§3.7); only newest re-published. *(A full book lists every allowed user and group, which no longer fits the 640-byte legacy envelope, §3.7.)* |
 | Group request (device → relay) | `/up` | `{"v":1,"id":"u_…","ts":…,"kind":"grp_req","name":"Cousins","m":["mom","carol"],"ack":null,"n":…,"sig":"…"}` — ≤380 bytes signed JSON, ≤250 signed CBOR; no `from`/`to`/`body` | Asks the relay to create a group with the owner as creator (§3.8); deduped on `id`, 1 per minute per device; no reply on the wire. *(See `docs/CHAT_UI_DESIGN.md`.)* **Not implemented:** no firmware sends it, and the relay has no handler, so it is dropped as an unknown `kind` (§3.4). |
 | Config (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"lock":{"clear":true,"auto":5}},"ack":null,"n":…,"sig":"…"}` | Not a thread entry; carries device settings; acked `shown` on apply (the `lock` shape is in `DEVICE_PLAN.md` §5.8); only newest re-published. |
+| Config, OTA job (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"ota":{"img":"<64 hex>","isz":685168,"url":"https://storage.googleapis.com/<bucket>/fw/<id16>/full.z","osz":338784,"osha":"<64 hex>","fmt":"full"}},"ack":null,"n":…,"sig":"…"}` — ≤523 bytes signed JSON, ≤296 signed CBOR with the default bucket name (§3.3) | A `cfg` carrying `ota` (below). Sent only to a device whose last online `/status` carried `ota:1`; acked `shown` on acceptance **or** rejection; progress travels in `/status` (§5.1), not in acks. *(OTA firmware update, `docs/OTA_DESIGN.md`.)* |
 | Ack (device → relay) | `/up` | `{"v":1,"id":"m_7f3a","ts":…,"ack":"shown"}` — **51 bytes**; no `from`, no `body` | — |
 | Up message (device reply) | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","body":"ok coming","ack":null}` — **84 bytes** | Thread entry, routed to default recipient. |
 | Up message, addressed | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","to":"mom","body":"ok coming","ack":null}` — **95 bytes** | Thread entry, routed to named recipient. |
@@ -210,6 +211,12 @@ user's alias. It is a request for a fix, not a message:
 or returns an error). Fields: `name` is required (1–16 code points, ≤48 UTF-8 bytes); `ph` is
 optional (E.164 or absent). The device includes `n` and `sig` as with any `/up` from an `hmac`
 device. The request is deduped on `id` like any up message. A request whose `ph` or implied alias matches an existing book contact is a no-op.
+A `ph` of digits only is a phone number, never an alias: 10 digits are read as `+1` and the
+digits, 11 digits starting with `1` as `+` and the digits, any other digit string is rejected. A
+request rejected at ingest (bad number, blocked number, or an alias neither in the owner's book
+nor a person with a `message` edge to the owner) is answered by one `system` down message naming
+the request's `name` and the reason; a request the book already satisfies is answered
+`<name>: already in your book` and not recorded.
 
 **`kind:"book"` (relay → device).** An address book is a down message with `kind:"book"`, `ack:null`,
 carrying the approved contacts and pending requests for this device:
@@ -235,6 +242,31 @@ holds `lock` (see `DEVICE_PLAN.md` §5.8 for structure), `ca` (`V02_DESIGN.md` �
 - **Newest only:** the relay expires any older unacked `cfg` when it creates a new one. Re-publish
   on an online edge (§5.3) includes `cfg`.
 - A `/down cfg` is signed by the relay, carrying `n` and `sig`.
+
+**`cfg.ota` (relay → device, OTA firmware update).** *(an image is named by the SHA-256 esptool
+appends to it, so the object can come straight from a public bucket and the signed `cfg` alone
+authorises the update; `docs/OTA_DESIGN.md`.)* A fifth `cfg` member, CFG key 4 (§10),
+holding either a job or a cancel:
+- Full-image job: `{"img":"<64 hex>","isz":685168,"url":"https://storage.googleapis.com/<bucket>/fw/<id16>/full.z","osz":338784,"osha":"<64 hex>","fmt":"full"}`.
+  `img` is the target's image id (the appended SHA-256), `isz` its size in bytes, `url` the
+  absolute `https://` URL of the object (one direct GET, `Range` resume allowed), `osz` and `osha`
+  the object's size and SHA-256 as downloaded, `fmt` `full` (zlib).
+- Delta job: the same plus `"fmt":"delta"`, `"base":"<64 hex>"` (the image id the patch applies
+  to) and `"psz"` (detools patch bytes after inflation).
+- Cancel: `{"cancel":true}` aborts any stored job; no other member.
+- Encoding: in CBOR `img`, `osha` and `base` are bstr(32) and `fmt` is `0` (full) or `1` (delta).
+  In JSON the three hashes are **64 lowercase hex characters, not base64url**, an exception to
+  §10's JSON note *(the relay's JSON form emits hex, `relay/app/firmware.py` `build_cfg_ota`)*.
+  `isz` and `osz` are 1…2097152.
+- Relay: only a super admin pushes a job or a cancel, and a job only to a device whose last online
+  `/status` carried `ota:1` (§5.1). The relay sends a delta whose `base` matches the device's
+  reported `img`, otherwise the full object.
+- Device: ack `shown` once the job is stored in NVS, or once it is rejected. It is rejected for a
+  `base` that is not the running image, a running image still pending verify, no rollback
+  bootloader, `img` already running, `img` on the device's failed list, `isz` larger than the OTA
+  slot, or a `url` that is not `https://`. A rejection still reports `ota_st:"fail"` with an
+  `ota_err` (§5.1). A newer `cfg.ota` replaces the stored job. In airplane mode the job stays
+  parked and costs nothing. Newest only and re-published on an online edge like any `cfg`.
 
 ### 3.3 Envelope size limit
 
@@ -286,6 +318,23 @@ bound is §3.7's 4096 bytes.
 
 *(The one escaping assumption the limit depends on.)* Publishers MUST serialise non-ASCII `body` characters as **raw UTF-8, not `\uXXXX`
 escapes**. §3's "minified UTF-8 JSON" already implies this, but the consequence is load-bearing:
+
+*(OTA, contact-request replies and battery stats; measured with the relay's own
+encoder so the worst case stays a number in this section.)* A maximal `/down` `cfg.ota` delta job
+(hex hashes, both sizes at 2 MiB, `n` at its maximum) is **523 bytes** signed JSON and 296 signed
+CBOR with the default bucket name (`<project>-pager-fw`, ≤ 39 characters, `url` 115 bytes), and
+**547 / 320** with a 63-character bucket name. That makes it the largest signed JSON payload
+here, so the headroom figure above becomes **≥ 93 bytes** (≥ 117 with the default bucket). The
+relay checks both encodings against the legacy 640-byte limit before it publishes a `cfg`
+(`devcfg._assert_within_envelope_limit`), so a longer `url` fails at push time and never reaches
+a device. A cancel is 136 / 55. A §3.2 `contact_req` rejection reply is a `system` down message
+whose `body` is ≤ 90 bytes (a 48-byte name plus the longest reason, 42 bytes). An online
+`/status` with every §5.1 field at its maximum is 448 bytes JSON / 215 CBOR; the OTA fields (keys
+62–67) bring it to 559 / 278, and `bs` (key 68) brings the CBOR form to 327 with a one-hour
+window's typical counters and 399 with every counter at 2³²−1. The JSON form with `bs` is 695–858
+bytes, over the limit, so **`bs` is CBOR-only: a device that encodes `/status` as JSON MUST omit
+`bs`** *(the firmware emits `/status` only in CBOR, so this costs nothing today and keeps the
+JSON form legal)*.
 
 ### 3.4 Malformed payload handling
 
@@ -438,7 +487,15 @@ to another)*. The body is one CBOR map with integer keys (§10), signed per §14
 comes).** `bookVersion` is bumped and a nudge (or, per the gate, a full book) is published on every
 change that alters the device's book: contact approval/rejection, group create/join/leave, an
 allow-list change to the owner's outgoing edges, device creation or a `defaultToUid` change, and a
+`displayName` change of anyone the book lists. The same applies to a change to the owner's
+nickname for a listed entry, a member joining or leaving the owner's family, and a `disabled` or
+`policy` change of a family member. *(the book lists the whole family and per-owner nicknames,
+`docs/ADDRESS_BOOK_DESIGN.md`.)* An online `/status` from a device whose
 `bookVersion` is still 0 bumps it to 1 and publishes (§5.3).
+
+**Periodic check.** The §5.4(d) heartbeat carries `bv`, so a device that missed a nudge is
+re-nudged within an hour; there is no periodic fetch. *(an hourly signed GET would cost ~2.4
+mAh/day to learn what the heartbeat already reports.)*
 
 ### 3.8 `kind:"grp_req"` (device → relay)
 
@@ -506,6 +563,7 @@ state. States are **monotonic** — a message never moves backwards.
 | `queued` | relay | message committed to the relay's store by the send API | Also the state of a message whose publish attempt failed (broker down). |
 | `sent` | relay | broker returns **PUBACK** for the QoS 1 `/down` publish — equivalently, the broker's REST publish API accepts the QoS 1 publish with a 2xx | Means *the broker accepted it*, **not** that the device received it. The UI must not say "delivered" here. *(the two are the same fact carried over different transports (§2), so the state machine, its rules and its timings are untouched.)* |
 | `shown` | relay, on device report | device publishes `{"id":…,"ack":"shown"}` on `/up` | Device publishes this **after the e-paper refresh completes** (BUSY deasserted), never before. **Exception:** if the device is locked, `shown` is **not** published for a message that arrived while locked; the message stays `sent` and is re-published on an online edge (§5.3). |
+| `read` | relay, on device report | device publishes `{"id":…,"ack":"read"}` on `/up` | Triggered by a short press of button IO8 while the message is on screen. |
 | `expired` | relay | still `queued` or `sent` 24 h after creation | *(a pickup pager delivering "be at the gym at 3:15" two days late is worse than not delivering it. A terminal, relay-only state; the device never sees or acks it.)* |
 
 ### 4.1 Rules
@@ -563,6 +621,7 @@ is never trusted to know who it may talk to).**
 
 The allow-list decision is made by the relay **and** re-stated in the data store's own access
 rules; neither alone is the enforcement point. Case 3's `system` reply is the single exception to
+§3.4's "never auto-reply on MQTT". *(Also §3.2's `contact_req` rejection replies, same shape, one per offending `id`.)* *(A DM to an external whose sender has no SMS number (`users.smsNumber`) gets `sms not set up; ask your admin`.)* *(A `to` naming a bridged Google Chat contact or group whose bridge phone is not paired gets `bridge not set up; ask your admin`, the same shape.)*
 
 ---
 
@@ -599,6 +658,12 @@ broker-generated LWT.
 | `abn` | int | no | 0…65535 | *(crash diagnostics)* Count of abnormal resets (i.e. `rst` not `poweron`/`deepsleep`) since power-on. Absent means firmware that predates this field. **Display and diagnosis only.** |
 | `stallcmd` | string | no | ≤24 chars | *(crash diagnostics)* The AT command name the previous boot's main-loop stage was blocked on for >= 5s when it last sampled, if that boot ended in an abnormal reset (`rst` above) — e.g. a task-watchdog reset caused by a wedged modem command. Absent when there is no such breadcrumb (no stall recorded, or the previous boot's reset was not abnormal). Absent means firmware that predates this field. **Display and diagnosis only.** |
 | `loc_move_s` | int | no | 0…86400 | *(location tracking, §13.3 item 9 — `docs/LOCATION_TRACKING_DESIGN.md` §2.2)* The interval between scheduled GNSS attempts while the device believes it is moving; `0` = no scheduled GNSS (cell reports only). Absent means firmware without scheduled GNSS. **Display and diagnosis only.** |
+| `img` | string | no | 16 lowercase hex chars | *(OTA, `docs/OTA_DESIGN.md` §5: the relay picks a delta by it.)* The first 16 hex characters of the running image id (§3.2 `cfg.ota`). The relay sends a delta whose `base` starts with it and treats `img` equal to a job's target as that job done. Absent means firmware without OTA. |
+| `ota` | int | no | `1` | *(OTA: the gate that keeps `cfg.ota` away from firmware or a bootloader that cannot roll back, like `bpull`.)* Present with value `1` when the firmware supports `cfg.ota` and its rollback bootloader has been confirmed. The relay refuses an OTA job while the last online `/status` lacks it. |
+| `ota_t` | string | no | 16 lowercase hex chars | *(OTA)* Short id of the stored job's target image; present only while the device holds a job. **Display only.** |
+| `ota_st` | string | no | `wait` \| `dl` \| `ready` \| `inst` \| `ok` \| `fail` \| `rb` | *(OTA)* Job state: waiting for a download window, downloading, verified and waiting to install, installing, done, failed (see `ota_err`), rolled back. Present with `ota_t`. The relay ends its job record on `ok`, `fail` or `rb` for that target; otherwise **display only.** |
+| `ota_pct` | int | no | 0…100 | *(OTA)* Download progress. **Display only.** |
+| `bs` | map | no | sub-map below | *(battery stats, `docs/BATTERY_STATS_DESIGN.md`: the breadboard build has no fuel gauge, so drain is modelled from time spent in each state. The carrier board's gauge is read for the battery level, not for this window.)* The battery-stats window, in every online `/status` once the window holds ≥ 1 s. CBOR only (§3.3). **Display and modelling only.** |
 
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
@@ -608,6 +673,30 @@ whether to re-publish unacked `/down` messages, exactly as it already does for `
 They are optional, so
 a `/status` without them remains valid, and a relay MUST treat their absence as "unknown", not as `0`.
 **Compatibility (§0):** every field in this table added since the first release is optional. An *older* relay MUST NOT reject a `/status` merely because it carries a field the relay predates (§3.1's "unknown fields MUST be ignored" already covers this). The relay's acceptance of a field MUST be deployed before any firmware that sends it.
+
+A malformed field must cost only itself. A relay drops a
+malformed OTA field (`img` … `ota_err`) or a malformed `bs` alone, treating it as absent, and never
+the whole `/status`. OTA firmware sets `fw` to `esp_app_get_description()->version`, cut to 16
+characters. A boot `/status` carrying the job's target as `img` means the job is `ok`.
+
+**`bs` sub-map** (key 68, keys in §10; JSON uses the same names; all uint ≤ 2³²−1). Every key is
+required except `mvn`; the arrays carry at least the listed entries, and extra entries are
+ignored. *(the device counts time per state over one window and the relay sums windows, so a
+re-sent window must be recognisable and a reset must not lose one, `docs/BATTERY_STATS_DESIGN.md`.)*
+
+| Name | Meaning |
+|---|---|
+| `sq` | Window number: +1 per committed window, kept across software, panic and watchdog resets, 0 after a power-on. A `/status` whose publish failed is followed by a larger window with the **same** `sq`, which replaces the first (the relay keys a sample by `session` and `sq`). |
+| `dt` | Wall seconds the window covers. |
+| `sl` | ESP32 light-sleep seconds. |
+| `aw` | `[timer, attn, hot, ui, modem, fetch]`: ESP32-awake seconds by cause, in rising priority order; each loop iteration is charged to its highest cause. `dt ≈ sl + Σaw` (±1 s). |
+| `ns` | Light-sleep entries. |
+| `x1` | ext1 (accelerometer) wakes. |
+| `rl` | 3V3 peripheral rail-on seconds (display and CardKB). |
+| `rf` | `[full, partial, upgraded]` display refreshes. |
+| `cn` | MQTT session (re)connects, i.e. TLS handshakes. |
+| `md` | `[off, search, gnss]`: modem-state seconds over the whole window, sleep included; registered idle is `dt − off − search − gnss`. |
+| `re` | Radio events: successful publishes, liveness SUBSCRIBEs and inbound MQTT messages (each costs an RRC tail). |
 
 ### 5.2 LWT payload (48 bytes)
 
@@ -660,6 +749,10 @@ keeps the TLS+MQTT session up on eDRX while the ESP32 is in deep sleep; that dev
 Status is published: (a) immediately after MQTT connect, (b) on every mode change, (c) when
 `batt_mv` has moved more than 50 mV since the last publish, and (d) as a heartbeat, at most
 **once per 3600 s**.
+
+*(OTA, `docs/OTA_DESIGN.md` §5: progress is reported in `/status`, not in acks.)* (e) While an OTA
+job runs, also when its download starts, at 50 %, and at `ready`, `fail` and `rb`: four extra
+publishes, about 1 KB per OTA.
 
 *(the heartbeat period is 2× the MQTT keepalive interval (§6). Marginal cost
 ≈ 0.33 kB of data and ≈ 0 extra radio sessions. An independent hourly status timer would add ~24
@@ -827,6 +920,7 @@ audit envelope** (§3.6), non-negotiable, so the relay has a complete record of 
 the SIM even though it never carried the message itself. Not verified whether the production SIM
 carries SMS at all. If it does not, the feature fails safe (every send attempt logs `st:"failed"`, §3.6) rather than silently
 pretending to work.
+
 ### 7.4 Measurement — validating the model
 
 §7.3 is a theoretical count of JSON bytes plus assumed TLS/TCP framing overhead. There is one
@@ -982,10 +1076,12 @@ Two v1.5.0 features the design relies on:
 | # | Wake source | Mechanism | Trigger | Mode | Verified? | RTC state that must survive |
 |---|---|---|---|---|---|---|
 | 1 | **Wake-and-drain timer** (primary) | `esp_sleep_enable_timer_wakeup(T)` + `esp_light_sleep_start()`, `T` = 5 s sleep / 2 s active | Wake, reassert RTS, let the modem flush the URC it held, let the library's RX and event tasks dispatch it to the MQTT handler, which calls `mqttReceive(topic, mid, …)`. **No polling call is made** (§8.0). | both | Mechanism yes; the RTS hold-off behaviour is **not verified** (§8.3) | Light sleep retains RAM, so *nothing* has to survive — this is the point |
+| 2 | Button IO8 | `esp_sleep_enable_ext1_wakeup(...)`, active high to 3V, RTC GPIO | Short press = mark read / open composer; long press = send reply | both | Yes — IO8 is an RTC GPIO | `mode`, `active_until`, msg ring, `pending_acks` (deep-sleep path only) |
 | 3 | RTC timer — keepalive | — | **Not needed.** The MQTT client is in the modem and the library exposes no ping API; PINGREQ is the modem's job (§6.2). The status heartbeat rides an ordinary poll wake using a counter in RTC memory. | — | n/a | `status_pub_count` |
 | 4 | RTC timer — active-mode exit | `esp_timer` while awake, not a sleep wake | 10 min with no button/keyboard activity → sleep mode | active | Yes | `mode`, `active_until` |
 | 4b | MQTT event (no sleep involved) | `setMQTTEventHandler()` → `_eventProcessingTask` | `_MESSAGE` short-circuits the wake-and-drain latency while the ESP32 happens to be awake; `_DISCONNECTED` drives recovery; `_MEMORY_FULL` flags a missed drain | both | Yes — v1.5.0 API | none (handler runs while awake) |
 | 5 | Modem URC / RI line into deep sleep | `ext1` on the modem RX line | **Not supported by the library's public API; not pursued.** See §8.3 for why, and for the one variant that could still work if someone wants the battery back. | — | n/a | — |
+| 6 | LIS3DH INT1 (IO6) | `ext1` | Motion wake | — | **Out of scope.** Reserved only. | — |
 | 7 | CardKB | — | **Cannot wake the ESP32.** No interrupt line to an RTC GPIO; polled at 100 ms only while the composer is open. A reply always starts with a button press. | active | Yes (by construction) | — |
 
 **No GPIO reassignment is needed for the modem UART.** The
@@ -1084,6 +1180,7 @@ real hardware (`firmware/README.md`).
 | Modem eDRX paging | 0.2–0.5 mA (estimate) | 2 paging occasions per 20.48 s cycle, ~50 ms each at ~50 mA RX, plus warm-up |
 | Modem idle floor | 0.01–0.05 mA (estimate) | Sequans GM02SP deep-sleep-between-paging |
 | Display (gated off via the eInk Friend's ENA, IO12) | ~0 mA | e-paper VCC gated between refreshes |
+| **Sleep-mode total** | **≈ 4.0–4.5 mA → 95–107 mAh/day** | On a ~2500 mAh LiPo cell: **~23–26 days idle** |
 
 > **Why this is worse than it looks on paper.** A design built on an ESP32 deep-sleep floor of
 > 0.01–0.10 mA would give 0.6–1.2 mA → 15–29 mAh/day → ~50–100 days. That floor is only reachable
@@ -1300,6 +1397,13 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 59 | `stallcmd` | tstr, ≤24 B | `/status` (crash diagnostics, §5.1 — previous boot's stalled-command breadcrumb, optional) |
 | 60 | `why` | tstr, ≤5 B | `/loc` (location tracking, §13.2 — why an unsolicited report was sent, optional) |
 | 61 | `loc_move_s` | uint, 0…86400 | `/status` (location tracking, §5.1 — GNSS-while-moving interval, optional) |
+| 62 | `img` | tstr(16) | `/status` (OTA, §5.1 — running image id, short form, optional) |
+| 63 | `ota` | uint, `1` | `/status` (OTA, §5.1 — `cfg.ota` capability gate, optional) |
+| 64 | `ota_t` | tstr(16) | `/status` (OTA, §5.1 — job target image id, short form, optional) |
+| 65 | `ota_st` | tstr | `/status` (OTA, §5.1 — job state, optional) |
+| 66 | `ota_pct` | uint, 0…100 | `/status` (OTA, §5.1 — download progress, optional) |
+| 67 | `ota_err` | tstr, ≤8 B | `/status` (OTA, §5.1 — failure or rejection code, optional) |
+| 68 | `bs` | map | `/status` (battery stats, `docs/BATTERY_STATS_DESIGN.md`; optional, CBOR only, §3.3) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1323,6 +1427,14 @@ book parser.)*
 
 `lock` map (inside `/down` `cfg.lock`): `clear=0` (bool), `auto=1` (int minutes).
 
+`ota=4` (map inside `/down` `cfg`, `docs/OTA_DESIGN.md` §5, §3.2): `img=0` (bstr(32)), `isz=1`
+(uint), `url=2` (tstr, `https://`), `osz=3` (uint), `osha=4` (bstr(32)), `fmt=5` (uint, `0` full,
+`1` delta), `base=6` (bstr(32), delta only), `psz=7` (uint, delta only), `cancel=8` (bool; a map
+line above so that line's existing allocation reads unchanged.)*
+
+`bs` map (inside `/status`, key 68 above, §5.1): `sq=0, dt=1, sl=2, aw=3` (array of 6 uint)`,
+sub-keys are ignored.
+
 `ca` map (inside `/down` `cfg.ca`, `V02_DESIGN.md` §4.4): `url=0` (tstr; `""` means un-pin), `sha=1`
 (bstr(32), the CA PEM's SHA-256 — same digest as the bootstrap bundle's `ca_sha`; absent when
 `url` is `""`).
@@ -1335,6 +1447,9 @@ even though both happen to use `n` for a display name.
 **JSON note (§3, §14.3):** the CBOR sub-map keys above are integers; in JSON the same *names* are
 used (`{"lock":{...}}`, `{"ca":{"url":...,"sha":...}}`), and, exactly like `sig`, a `bstr`-typed
 field (`ca_sha`/`cfg.ca.sha`) is base64url text without padding in JSON, raw bytes in CBOR.
+*(OTA: hex is what the relay emits and what every other image id in the system uses.)* The one
+exception is `cfg.ota`'s `img`, `osha` and `base`: 64 lowercase hex characters in JSON, bstr(32)
+in CBOR.
 
 ---
 
@@ -1430,6 +1545,7 @@ the future.
   `+3V3`/`+1V8` regulated rails, and that net is not sourced anywhere inside Walter's onboard
   Power Management block (which only produces `+3V3`/`+1V8`);
   - Walter's onboard regulator (`TPS6208833`) is a **buck-boost**, which only makes sense if `VIN`
+  is expected to sometimes sit *below* 3.3V — i.e. a single LiPo cell directly, not
   only a fixed 5V USB input;
   - DPTechnics' own official reference battery design in the same repo (`walter-feels`) wires its
   battery charger IC's `VBAT` output — the real, live cell voltage — **directly into Walter's
@@ -1865,3 +1981,8 @@ accepted gap as the validation-off fallback in `V02_DESIGN.md` §4.2.)*
 
 **Device on failure.** `409` → retry once, immediately, with a fresh `n`. `400`/`401`/`404` → log
 and count, no retry until the next nudge. `5xx`, a timeout, an oversize body or a verification
+failure → no ack; retry on the next nudge or online edge, at most once per 60 s. A device makes at
+most **3** failed attempts on one nudge on its own (the first plus two retries, ≥60 s apart; the
+`409` immediate retry is not counted), then waits for the next nudge, online edge or heartbeat
+re-nudge (§3.7). *(an outage otherwise costs a TLS attempt a minute.)*
+

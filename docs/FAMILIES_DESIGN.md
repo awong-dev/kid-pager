@@ -1,5 +1,7 @@
 # Multi-family web UI and tenancy design
 
+**Status:** implemented. §10 lists where the build differs from this text.
+
 **SMS in this design.** The relay has no SMS backend of its own. A member's SMS number (`users.smsNumber`)
 comes from their bridge phone (`docs/BRIDGE_PHONE_DESIGN.md`). An external is reached through the sender's
 bridge phone, or through the pager's own modem SMS (`cfg.sms`, see `docs/V02_DESIGN.md` §6). Where a rule
@@ -38,6 +40,8 @@ the same book, `cfg.sms` and envelopes as before.
 6. **An SMS number is an "external" user.** `users/{uid}` with `kind: 'external'`, `familyId`, no Firebase
    Auth account, alias = `uid`, `displayName` = the name an admin gave it, and `phone` on the user doc. An
    external reaches the pager through `cfg.sms`. An external whose family member has a number also carries an
+   `sms` backend row (`kind:"sms", verifiedAt: now, config:{phone}`), per `docs/BRIDGE_PHONE_DESIGN.md`
+   decision 3.
    allow-list.** "Approved people" and "approved numbers" *are* the member's outgoing `allow` edges (to users
    and to externals respectively). A policy that says *any* bypasses the edge check for that participant type;
    a policy that says *approved* requires it. A DM from S to R passes only if S's **outbound** policy admits R
@@ -59,6 +63,7 @@ the same book, `cfg.sms` and envelopes as before.
     (`docs/CONTACT_REQ_DESIGN.md` decision 7). A pager add writes the `added` marker, and the number reaches
     `cfg.sms` only through this derivation (`docs/BOOK_ADD_ANYONE_DESIGN.md` decision 12). The list therefore
     stays policy-derived and capped at 8. `any_sms` cannot be honoured on the device, because the firmware shows
+    only listed numbers. The relay-side audit log still records blocked texts. A firmware follow-up, not part
 
 ## 2. Policies
 Two pickers per member, five presets each. Machine codes are stored; labels are what the UI shows; the
@@ -101,6 +106,7 @@ Defaults are applied at user creation from role (`member` → `people`/`people`,
 
 
 ```
+families/{fid}                 {name, createdAt, createdBy}
 families/{fid}/alerts/{id}     {kind: 'new_conversation'|'sms_unknown'|'contact_request',
                                 status: 'open'|'handled'|'dismissed', ts, subjectUid, subjectAlias,
                                 peerUid|null, peerAlias|null, peerPhone|null, preview (≤120),
@@ -113,6 +119,7 @@ allow/{from}_{to}              + familyIds [fromFam?, toFam?]       (for family-
 conversations/{k}              + familyIds [..], participants: {uid: {alias, displayName, kind}}
 messages/{id}                  + familyIds [..]
 contactRequests/{key}          + familyId
+contactNames/{fid}_{h16}       {uid, familyId}: unique contact name per family
 ```
 
 `participants` is written when the conversation doc is created, and refreshed on group join or leave and on
@@ -177,9 +184,11 @@ members whose rules-visible set is narrower than the people they talk to.
 | `PATCH /api/family/members/{uid}` | `displayName`, `role` (admin↔member), `disabled`, `policy{out,in}` |
 | `GET/POST/PATCH /api/family/contacts` | externals used by this family (`{phone, name}`); PATCH renames |
 | `POST /api/family/groups` | group create, members restricted to own family and edge peers |
+| `GET /api/family/alerts`, `POST /api/family/alerts/{id}/{approve\|block\|dismiss}` | approve = create external if needed, plus edges. Block = mark, and add to `families.blockedNumbers` |
 | `GET /api/family/conversations` | optional; the web reads Firestore directly by `familyIds` |
 
 **`/api/admin/*`** (super only): `GET/POST /api/admin/families`, `PATCH /api/admin/families/{fid}` (`name`),
+`PATCH /api/admin/users/{uid}` (gains `familyId` and `role: super`), and `GET /api/admin/users|devices` (gain
 `?family=`). `PUT /api/admin/allowlist` replaces all edges, and accepts `?family=` to replace only the edges
 touching that family. It is the only writer of cross-family edges. `/api/admin/contacts/*` moves to
 `/api/family/alerts/*`.
@@ -289,6 +298,7 @@ Unchanged, except that `/settings/notifications` gains a per-user toggle "Family
 
 - **Alert creation** (`relay/app/alerts.py`): `new_conversation` when `routing.send` creates a `conversations`
   doc for a DM whose sender has `out: open` and no `message` edge to the recipient. `sms_unknown` from a device
+  `sms_log` of an unlisted number. `contact_request` when a pager `contact_req` is stored (it wraps the
   `contactRequests` write).
 - **Push**: `backends/webapp.py` `push_alert(family_id, alert)` sends `{kind: "alert", alertKind, id, title, body,
   `pager-alert-{id}` tag.
@@ -311,6 +321,7 @@ location scoping, the in-family check on `locate`); then policies and numbers (t
 the approved people and numbers editor, externals by digits alias, `NewChatDialog` with the phone input, derived
 `smsContacts`, 403 reasons in the thread); then alerts (the alerts collection, push and service-worker arm, the
 `/family/alerts` page with contact requests merged, and the `new_conversation` alert); then removal of
+`/admin/contacts` and `require_admin`. Visibility depends on the tenancy core. Policies depend on visibility for
 the web part, and the relay part can start after the tenancy core. Alerts depend on policies.
 
 ## 9. Open questions
@@ -330,6 +341,7 @@ the web part, and the relay part can start after the tenancy core. Alerts depend
 7. **Group join** no longer has a silent mutual-`locate` side effect, and it is admin-only. Any member who relied on
    self-service join is affected.
 
+## 10. Implementation notes
 
 Where the build deviates from the sections above. The code is the reference.
 

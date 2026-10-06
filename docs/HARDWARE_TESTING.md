@@ -39,6 +39,7 @@ esptool.py --chip esp32s3 erase_region 0x9000 0x6000          # wipe settings ->
 | `sleeptest <minutes> [yield_ms] [interval_ms]` | Light-sleep window with optional overrides; records pages, session loss, timing; saves to NVS then resets. `sleeptest` alone prints the saved report. `yield_ms` is `0` or 30..10000, `interval_ms` is `0` or 200..60000; `0` (or omitting the argument) keeps the build default, so `sleeptest 6 0 0` and `sleeptest 6` are the same run |
 | `coverage` | Debug the no-coverage radio duty cycle (deregister with `at AT+COPS=2`, recover with `at AT+COPS=0`) |
 | `acceltest [samples <n>\|ths <0-127>\|dur <0-127>\|refr <seconds>]` | LIS3DH register/sample dump and runtime tuning. Re-probes WHO_AM_I every call, so wiring the chip needs no reboot. `acceltest` alone prints registers, THS in mg, the refractory setting, edges reported and ext1 wake count |
+| `flip on\|off\|status` | Persist and apply a 180-degree display rotation (NVS `disp_flip`) so the pager can be read upside down; `on`/`off` force one full refresh immediately |
 
 Run modem commands only after `MQTT session usable` has appeared. Before that they collide with
 the pager's own attach. Never send a slow raw command (`AT+COPS=0`, `AT+CFUN`) while the
@@ -98,11 +99,15 @@ never publish).
   at 0x19 and `i2cscan` shows 0x19, not 0x18. `accel_init()` looks only at 0x18 and will report
   "not found" until either the wiring or `PAGER_I2C_ADDR_LIS3DH` (`pins.h`) changes.
   external pull-up needed. It is an RTC GPIO, armed as the ext1 light-sleep wake.
+- Power: breakout VIN from the power board's 3V terminal, always on.
 
 `i2cscan` is the one-line pre-flight check on the CardKB bus (expect `0x5F`). The LIS3DH is on the
 other bus, so its presence check is the boot log's `LIS3DH found (WHO_AM_I=0x33)` line or
 `acceltest`. If neither shows it, check the wiring before anything else; `acceltest` will just say
 "not present".
+
+### Power board (Adafruit 6092)
+
 
 ## Verified on hardware
 
@@ -131,6 +136,7 @@ other bus, so its presence check is the boot log's `LIS3DH found (WHO_AM_I=0x33)
   reconnected in 3 s, page delivered afterwards.
 - A page delivered during real light sleep with a 150 ms wake window (35 s and 136 s after sending).
 - CardKB keyboard: every printable key, Enter (0x0d), Esc and the four arrows (0xb4-0xb7) decode as
+  the host test predicts; a key wakes the UI within one wake cycle; a typed reply publishes within
 - Display partial refresh with the two-plane fix: after `disptest again 1`, `bars` and `seq 0 12 1500`,
   all 13 adjacent 8-row bands are correct and the pattern reads `w b w b w b w b w b w b w` as predicted.
 - Display register-loss fix: `disptest bars` → `disptest swreset` → `disptest bars` → `disptest seq 0 3
