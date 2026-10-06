@@ -101,6 +101,7 @@ def _make_family_admin(uid: str, alias: str, fam: str) -> str:
 
 def _create_family(family_id: str, name: str = "Fam") -> None:
     get_db().collection("families").document(family_id).set(
+        {"name": name, "blockedNumbers": [], "createdBy": "system"}
     )
 
 
@@ -519,6 +520,26 @@ def test_gchat_link_codes_is_default_deny(two_pairs):
     assert resp_unauth.status_code == 403
 
     resp_write = _write("gchatLinkCodes/999111", owner_token, {"uid": "u3"})
+    assert resp_write.status_code == 403
+
+
+def test_contact_names_is_default_deny(two_pairs):
+    """`contactNames/{fid}_{hash}` is relay-only: no client, not even a member of the owning family,
+    may read or write it."""
+    from app.store import externals as externals_store
+
+    ext = externals_store.get_or_create("fam-rules", "+15550001111", "Grandma")
+    doc_id = externals_store._name_ref("fam-rules", externals_store.name_key("Grandma")).id
+
+    owner_token = mint_id_token("u1")
+    resp = _get(f"contactNames/{doc_id}", owner_token)
+    assert resp.status_code == 403
+    assert ext.uid  # the reservation exists because the contact was created
+
+    resp_unauth = _get(f"contactNames/{doc_id}", None)
+    assert resp_unauth.status_code == 403
+
+    resp_write = _write(f"contactNames/{doc_id}", owner_token, {"uid": "hacked"})
     assert resp_write.status_code == 403
 
 
@@ -1112,3 +1133,32 @@ def test_family_admin_query_by_own_familyIds_allowed_other_family_denied(two_pai
 
     denied_msgs = _run_query("", admin_token, _family_ids_query("messages", "famB"))
     assert denied_msgs.status_code == 403, denied_msgs.text
+
+
+def test_book_nick_readable_by_owner_and_family_admin_only_writes_denied(two_pairs):
+    """`users/{o}/book/{p}` is read by the owner, a family admin of the stamped `familyId`, or
+    super; no client may write."""
+    _set_family("users", "u1", "famA")
+    _set_family("users", "u2", "famA")
+    get_db().collection("users").document("u1").collection("book").document("u2").set(
+        {"nick": "Bro", "familyId": "famA", "updatedBy": "u1"}
+    )
+    path = "users/u1/book/u2"
+
+    set_claims("u1", fam="famA")
+    owner_token = mint_id_token("u1")
+    assert _get(path, owner_token).status_code == 200
+
+    same_family_admin = _make_family_admin("admin-book-a", "adminbooka", "famA")
+    assert _get(path, same_family_admin).status_code == 200
+
+    other_family_admin = _make_family_admin("admin-book-b", "adminbookb", "famB")
+    assert _get(path, other_family_admin).status_code == 403
+
+    set_claims("u2", fam="famA")
+    sibling_token = mint_id_token("u2")
+    assert _get(path, sibling_token).status_code == 403
+
+    for token in (owner_token, same_family_admin, sibling_token):
+        assert _write(path, token, {"nick": "Hacked"}).status_code == 403
+        assert _write("users/u1/book/u3", token, {"nick": "New"}).status_code == 403

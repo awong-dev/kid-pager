@@ -15,6 +15,7 @@ from app.db.firestore import get_db
 from app.wire import CellInfo
 
 # `phone` is a real E.164 number, never an alias reference (same shape as `app/wire.py`'s
+# `_SMS_PEER_RE`).
 _SMS_PHONE_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 SMS_CONTACT_NAME_MAX_CODEPOINTS = 16
@@ -75,6 +76,14 @@ class DeviceStatus(BaseModel):
     # `bpull` (docs/PROTOCOL.md §3.7/§5.1): nudges are sent only while the last online `/status`
     # carried it; only ever `1`.
     bpull: int | None = None
+    # Display only, except `img` (the relay's delta choice) and `otaCap` (the push gate, only
+    # ever `1`).
+    img: str | None = None
+    otaCap: int | None = None
+    otaTarget: str | None = None
+    otaState: str | None = None
+    otaPct: int | None = None
+    otaErr: str | None = None
     updatedAt: datetime | None = None
     # Set once `sigFailures` crosses AUTH_ALARM_THRESHOLD within AUTH_ALARM_WINDOW_S; cleared on
     # key rotation.
@@ -124,6 +133,19 @@ class PendingPush(BaseModel):
     acked: bool
 
 
+class OtaJob(BaseModel):
+    """The OTA job a super admin pushed; cleared on cancel or when the device reports it done."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    target16: str
+    kind: Literal["full", "delta"]
+    osz: int
+    estBytes: int
+    by_uid: str
+    at: datetime | None = None
+
+
 class Device(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -138,6 +160,8 @@ class Device(BaseModel):
     # The SMS contact allow-list, the relay's source of truth, pushed as `/down cfg.sms` on every
     # change; `pendingCfgSms` tracks what the device has acked.
     smsContacts: list[SmsContact] = []
+    # The pending OTA job (`OtaJob`); `None` when none is outstanding.
+    otaJob: OtaJob | None = None
     # Carrier APN baked into this device's setup codes and bundles
     # (app/apn_presets.py). None = carrier default.
     apn: str | None = None

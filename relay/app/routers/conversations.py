@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app import book
 from app.auth import AuthedUser, principal_for, require_user
 from app.broker import BrokerClient
 from app.location import Location, NoLocatableDevice
@@ -56,6 +57,7 @@ def get_broker(request: Request) -> BrokerClient:
 
 
 def _resolve_message_alias(alias: str, sender_uid: str) -> str:
+    """Resolve a phone-shaped alias to the sender's family SMS contact, else return it unchanged."""
     if users_store.get_uid_for_alias(alias) is not None:
         return alias
     if conversations_store.get_by_alias(alias) is not None:
@@ -65,7 +67,13 @@ def _resolve_message_alias(alias: str, sender_uid: str) -> str:
     except ValueError:
         return alias
     sender = users_store.get_user(sender_uid)
+    if sender is None or sender.familyId is None:
         return alias
+    # the sender's family's own contact for this number
+    existing = externals_store.get_family_contact(sender.familyId, phone)
+    if existing is not None:
+        return existing.alias
+    return alias
 
 
 @router.post("/{alias}/messages", status_code=201)
@@ -144,6 +152,8 @@ def mark_read(
 
 
 def _push_book_to_members(uids: list[str], broker: BrokerClient) -> None:
+    """Bump and push each member's book (a uid with no device is a no-op)."""
+    book.bump_and_push(uids, broker, reason="group")
 
 
 def _create_missing_message_edges(member_uids: list[str]) -> None:
@@ -191,7 +201,11 @@ def add_group_member(
             status_code=403,
             detail="only a family admin of the group creator's family may add members",
         )
+    new_member = users_store.get_user(req.uid)
+    if new_member is None:
         raise HTTPException(status_code=404, detail=f"no such user: {req.uid!r}")
+    if new_member.kind == "external":
+        raise HTTPException(status_code=400, detail="an SMS contact cannot join a group")
 
     updated = conversations_store.add_member(group.convKey, req.uid)
     # `message` edges only, never `locate`

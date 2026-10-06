@@ -86,11 +86,13 @@ def test_backend_create_trips_429_after_the_configured_limit(client: TestClient)
     for i in range(2):
         resp = client.post(
             "/api/me/backends",
+            json={"kind": "gchat", "config": {}, "enabled": False},
             headers=headers,
         )
         assert resp.status_code == 200, resp.text
     resp = client.post(
         "/api/me/backends",
+        json={"kind": "gchat", "config": {}, "enabled": False},
         headers=headers,
     )
     assert resp.status_code == 429
@@ -102,12 +104,14 @@ def test_backend_create_rate_limit_is_per_user(client: TestClient):
     for i in range(2):
         resp = client.post(
             "/api/me/backends",
+            json={"kind": "gchat", "config": {}, "enabled": False},
             headers=headers1,
         )
         assert resp.status_code == 200
     # A different user's own quota is untouched by the first user's calls.
     resp = client.post(
         "/api/me/backends",
+        json={"kind": "gchat", "config": {}, "enabled": False},
         headers=headers2,
     )
     assert resp.status_code == 200
@@ -121,12 +125,14 @@ def test_backend_create_allows_again_after_the_window_resets(
     for i in range(2):
         resp = client.post(
             "/api/me/backends",
+            json={"kind": "gchat", "config": {}, "enabled": False},
             headers=headers,
         )
         assert resp.status_code == 200
     # window_s=0: every call is its own fresh window.
     resp = client.post(
         "/api/me/backends",
+        json={"kind": "gchat", "config": {}, "enabled": False},
         headers=headers,
     )
     assert resp.status_code == 200
@@ -214,14 +220,20 @@ def test_gchat_webhook_ip_cap_trips_429_before_jwt_check(webhook_client: TestCli
 
 
 def test_webhook_ip_cap_keys_on_x_forwarded_for_not_the_proxy_peer(webhook_client: TestClient):
+    """`request.client.host` is a shared Google front-end address; `_client_ip` keys on
+    `X-Forwarded-For`'s originating entry instead."""
+    body = {"type": "MESSAGE"}
     for _ in range(2):
         resp = webhook_client.post(
+            "/webhooks/gchat", json=body, headers={"X-Forwarded-For": "203.0.113.9, 10.0.0.1"}
         )
         assert resp.status_code == 401
     resp = webhook_client.post(
+        "/webhooks/gchat", json=body, headers={"X-Forwarded-For": "203.0.113.9, 10.0.0.1"}
     )
     assert resp.status_code == 429
     # A different originating IP behind the same proxy still has its budget.
     resp = webhook_client.post(
+        "/webhooks/gchat", json=body, headers={"X-Forwarded-For": "198.51.100.4, 10.0.0.1"}
     )
     assert resp.status_code == 401

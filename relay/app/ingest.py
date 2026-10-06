@@ -9,15 +9,23 @@ import re
 import time
 from typing import Any, Literal
 
+import phonenumbers
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from app import alerts, book, devauth, devcfg, devsetup, location, wire
 from app.broker import BrokerClient
 from app.routing import Routing
+from app.store import alerts as alerts_store
+from app.store import allow as allow_store
+from app.store import battery as battery_store
 from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
+from app.store import families as families_store
 from app.store import messages as messages_store
 from app.store import sms as sms_store
+from app.store import users as users_store
 from app.wire import (
     LocEnvelope,
     SmsLogEnvelope,
@@ -31,6 +39,24 @@ logger = logging.getLogger("relay.ingest")
 
 # PROTOCOL.md §4.2 case 3: the one exception to "never auto-reply on MQTT".
 UNKNOWN_RECIPIENT_BODY = "unknown recipient"
+
+
+
+def bad_number_body(name: str) -> str:
+    return f"{name}: number must be 10 digits or start with +"
+
+
+def blocked_body(name: str) -> str:
+    return f"{name}: number not allowed"
+
+
+def in_book_body(name: str) -> str:
+    return f"{name}: already in your book"
+
+
+def no_contact_body(name: str, alias: str) -> str:
+    return f"{name}: no contact @{alias}"
+
 
 def record_bad_sig(device_id: str) -> None:
     """Count a bad signature as `sigFailures` and raise `devices/{d}.status.authAlarm` after more than
@@ -50,12 +76,16 @@ def record_bad_sig(device_id: str) -> None:
 # docs/PROTOCOL.md §3.2/§3.1: `name` is 1-16 code points, <=48 UTF-8 bytes.
 _CONTACT_NAME_MAX_CODEPOINTS = 16
 _CONTACT_NAME_MAX_UTF8_BYTES = 48
+_CONTACT_PH_MAX_CHARS = 16
+# E.164 shape: `+` then 7-15 digits, first digit 1-9.
 _PHONE_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
 class ContactReqEnvelope(BaseModel):
     """A payload received on `pager/{device_id}/up` with `kind:"contact_req"` (docs/PROTOCOL.md §3.2).
 
+    `ph` is a phone number or an alias reference (docs/PROTOCOL.md §3.1): the envelope checks only
+    length and control characters; `classify_ph` decides phone / alias / bad.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -105,9 +135,41 @@ class ContactReqEnvelope(BaseModel):
     def _check_ph(cls, value: str | None) -> str | None:
         if value is None:
             return value
+        if not (1 <= len(value) <= _CONTACT_PH_MAX_CHARS):
+            raise ValueError("contact_req ph must be 1-16 characters")
+        if wire.CONTROL_CHAR_RE.search(value):
+            raise ValueError("contact_req ph contains control characters")
         return value
 
 
+def classify_ph(ph: str) -> tuple[Literal["phone", "alias", "bad"], str]:
+    """Digits are never an alias: 10 digits are `+1` and the digits, 11 starting with `1` are `+` and
+    the digits, `+digits` must be a possible E.164 number, any other digit string is bad. Returns
+    `(kind, normalized)`: the E.164 number, the alias, or `ph` itself for `bad`."""
+    if re.fullmatch(r"[0-9]{10}", ph):
+        return "phone", "+1" + ph
+    if re.fullmatch(r"1[0-9]{10}", ph):
+        return "phone", "+" + ph
+    if re.fullmatch(r"\+[0-9]+", ph):
+        if not _PHONE_E164_RE.match(ph):
+            return "bad", ph
+        try:
+            ok = phonenumbers.is_possible_number(phonenumbers.parse(ph, None))
+        except phonenumbers.NumberParseException:
+            ok = False
+        return ("phone", ph) if ok else ("bad", ph)
+    if ph.isascii() and ph.isdigit():
+        return "bad", ph
+    if wire.ALIAS_RE.match(ph):
+        return "alias", ph
+    return "bad", ph
+
+
+def _has_open_sms_unknown(family_id: str, e164: str) -> bool:
+    return any(
+        a.kind == "sms_unknown" and a.peerPhone == e164
+        for a in alerts_store.list_alerts(family_id, "open")
+    )
 
 
 def _device_id_from_topic(topic: str, expected_suffix: str) -> str | None:
@@ -123,6 +185,35 @@ def _bid_from_boot_up_topic(topic: str) -> str | None:
     if len(parts) != 4 or parts[0] != "pager" or parts[1] != "boot" or parts[3] != "up":
         return None
     return parts[2]
+
+
+        return True
+    return env.ota_st in ("ok", "fail", "rb") and env.ota_t in (None, target16)
+
+
+_E164_RAW = re.compile(rb"\+[1-9]\d{6,14}")
+_MSG_ID_RAW = re.compile(rb"s_[0-9a-f]{8}")
+# JSON `"dir":"out"` or CBOR key 45 (0x18 0x2d) + text(3|2).
+_DIR_RAW = re.compile(rb'(?:"dir"\s*:\s*"|\x18\x2d[\x62\x63])(out|in)')
+# JSON `"st":"sent"` or CBOR key 46 (0x18 0x2e) + text header.
+_ST_RAW = re.compile(rb'(?:"st"\s*:\s*"|\x18\x2e[\x64-\x67])(sent|failed|recv|blocked)')
+
+
+def _extract_sms_fields(raw: bytes) -> dict[str, str | None]:
+    """Best-effort pulls from an unparseable sms_log envelope's raw bytes."""
+
+    def first(rx: re.Pattern[bytes]) -> str | None:
+        m = rx.search(raw)
+        if m is None:
+            return None
+        return (m.group(1) if rx.groups else m.group(0)).decode("ascii")
+
+    return {
+        "peer": first(_E164_RAW),
+        "dir": first(_DIR_RAW),
+        "st": first(_ST_RAW),
+        "id": first(_MSG_ID_RAW),
+    }
 
 
 class Ingest:
@@ -202,6 +293,9 @@ class Ingest:
         decoded = wire.decode_envelope_bytes(unsigned)
         if decoded is None:
             wire.log_malformed(topic, payload, "signed payload did not decode")
+            # Audit trail: an undecodable-but-signed sms_log still leaves a flagged row.
+            if b"sms_log" in unsigned and device is not None and device.revokedAt is None:
+                self._store_malformed_sms(device_id, unsigned, "signed payload did not decode")
             return None
         data, encoding = decoded
         n = data.get("n")
@@ -278,13 +372,101 @@ class Ingest:
             wire.log_malformed(topic, payload, str(exc))
             return
 
+        if contacts_store.get_by_device_and_req(device_id, env.id) is not None:
+            logger.info("contact_req %s from device %s is a redelivery", env.id, device_id)
+            return
+        owner = users_store.get_user(device.ownerUid)
+        if owner is None:
+            logger.warning("contact_req %s: device %s has no owner user", env.id, device_id)
+            return
+
+        outcome, phone, alias = self._classify_contact_req(owner, env)
+        logger.info("contact_req outcome=%s device=%s req=%s", outcome, device_id, env.id)
+
+        if outcome == "in_book":
+            self._send_system_reply(device_id, in_book_body(env.name), cause_id=env.id)
+            return
+        if outcome in ("bad_number", "blocked", "no_contact"):
+            if outcome == "bad_number":
+                body = bad_number_body(env.name)
+            elif outcome == "blocked":
+                body = blocked_body(env.name)
+            else:
+                body = no_contact_body(env.name, alias or "")
+            contacts_store.create_rejected(
+                device_id=device_id,
+                owner_uid=device.ownerUid,
+                req_id=env.id,
+                name=env.name,
+                phone=phone,
+                alias=alias,
+                reason=outcome,
+            )
+            self._send_system_reply(device_id, body, cause_id=env.id)
+            return
+
                 device_id=device_id,
                 req_id=env.id,
                 name=env.name,
+                phone=phone,
+                alias=alias,
             )
             return
 
 
+    def _classify_contact_req(
+        self, owner: users_store.User, env: ContactReqEnvelope
+    ) -> tuple[str, str | None, str | None]:
+        if env.ph is None:
+            return "bad_number", None, None
+        kind, value = classify_ph(env.ph)
+        if kind == "bad":
+            return "bad_number", None, None
+
+        if kind == "phone":
+            family = (
+                families_store.get_family(owner.familyId) if owner.familyId is not None else None
+            )
+            if family is not None and value in family.blockedNumbers:
+                return "blocked", value, None
+            # A phone is only ever an SMS contact (a sign-in phone is never a lookup key).
+
+        target = users_store.get_user_by_alias(value)
+        if target is not None:
+            if target.uid == owner.uid:
+                return "in_book", None, value
+            inbound = allow_store.get_edge(target.uid, owner.uid)
+            if (
+                target.kind == "person"
+                and not target.disabled
+            ):
+        return "no_contact", None, value
+
+    def _store_malformed_sms(self, device_id: str, raw: bytes, reason: str) -> None:
+        """Best-effort flagged `smsLog` row for an sms_log upload we could not store normally."""
+        try:
+            fields = _extract_sms_fields(raw)
+            log_id = "bad_" + hashlib.sha256(raw).hexdigest()[:12]
+            created = sms_store.create_malformed(
+                device_id,
+                log_id,
+                ts=int(time.time()),
+                reason=reason[:200],
+                raw_hex=raw[:512].hex(),
+                peer=fields["peer"],
+                dir_=fields["dir"],
+                st=fields["st"],
+                msg_id=fields["id"],
+            )
+            logger.info(
+                "sms_log malformed device=%s log=%s reason=%s%s",
+                device_id,
+                log_id,
+                reason,
+                "" if created else " (duplicate, already stored)",
+            )
+        except Exception:  # audit is best-effort
+            logger.exception("could not store malformed sms_log for device=%s", device_id)
 
     def _handle_sms_log(
         self,
@@ -311,7 +493,31 @@ class Ingest:
             env = SmsLogEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
             wire.log_malformed(topic, payload, str(exc))
+            raw = payload
+            if device.authMode == "hmac":
+                secret = self._get_secret(device_id)
+                if secret is not None:
+                    ok, unsigned = devauth.verify(secret.hmacKey, topic, payload)
+                    if ok:
+                        raw = unsigned
+            reason = "invalid fields: " + ", ".join(
+                sorted({str(e["loc"][0]) for e in getattr(exc, "errors", list)() if e["loc"]})
+            )
+            self._store_malformed_sms(device_id, raw, reason.rstrip(": "))
             return
+
+        # The device's family attributes the peer: its own contact for that number, or none.
+        owner = users_store.get_user(device.ownerUid)
+        e164: str | None = None
+        peer_uid: str | None = None
+        if owner is not None and owner.familyId is not None:
+            try:
+                e164 = externals_store.normalize_phone(env.peer)
+            except ValueError:
+                e164 = None
+            if e164 is not None:
+                contact = externals_store.get_family_contact(owner.familyId, e164)
+                peer_uid = contact.uid if contact is not None else None
 
         created = sms_store.create_log(
             device_id,
@@ -322,6 +528,7 @@ class Ingest:
             peer=env.peer,
             st=env.st,
             body=env.body,
+            peer_uid=peer_uid,
         )
         # Logged whether this call created the row or found it already there (broker redelivery);
         # `sms_store.create_log` dedups silently.
@@ -334,6 +541,16 @@ class Ingest:
             "" if created else " (duplicate, already stored)",
         )
         if env.st == "blocked":
+        if (
+            created
+            and env.dir == "in"
+            and owner is not None
+            and owner.familyId is not None
+            and e164 is not None
+            and peer_uid is None
+            and not _has_open_sms_unknown(owner.familyId, e164)
+        ):
+            alerts.sms_unknown(owner.familyId, e164, owner.uid, env.body)
 
     def _handle_ack(self, device_id: str, env: UpEnvelope) -> None:
         assert env.ack is not None and env.ack in ("shown", "read")
@@ -465,7 +682,25 @@ class Ingest:
             abn=env.abn,
             bpull=env.bpull,
             stallcmd=env.stallcmd,
+            img=env.img,
+            otaCap=env.ota,
+            otaTarget=env.ota_t,
+            otaState=env.ota_st,
+            otaPct=env.ota_pct,
+            otaErr=env.ota_err,
         )
+
+        # One time-series sample per online /status; a malformed `bs` is dropped alone.
+        if env.state == "online":
+            try:
+                bs = battery_store.parse_bs(env.bs, device_id) if env.bs is not None else None
+                battery_store.add_sample(device_id, env, resolved_ts, bs)
+            except Exception:
+                logger.exception("battery sample failed device=%s", device_id)
+
+        # The web's `otaJob` lives until the device reports the job finished (`ok`/`fail`/`rb` for
+        # that target) or the new image is running.
+            devcfg.clear_ota_job(device_id)
 
         # On a transition into `broken`, log a security event.
         if env.tls == "broken" and previous_status.tls != "broken":

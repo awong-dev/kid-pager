@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict
 
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -39,13 +43,24 @@ def create_backend(
     return fetched
 
 
+
+
 def get_backend(uid: str, bid: str) -> Backend | None:
     snap = _backends(uid).document(bid).get()
     if not snap.exists:
         return None
+    data = snap.to_dict() or {}
+    if not _live_kind(uid, bid, data):
+        return None
+    return Backend.model_validate({"id": bid, **data})
 
 
 def list_backends(uid: str) -> list[Backend]:
+    out: list[Backend] = []
+    for snap in _backends(uid).stream():
+        data = snap.to_dict() or {}
+            out.append(Backend.model_validate({"id": snap.id, **data}))
+    return out
 
 
 def update_backend(

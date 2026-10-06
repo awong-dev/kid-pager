@@ -9,6 +9,14 @@ import re
 import time
 from typing import Any, Literal
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from app import wirecbor
 
@@ -172,10 +180,36 @@ class UpEnvelope(BaseModel):
         return self.ack is not None
 
 
+OTA_STATES = frozenset({"wait", "dl", "ready", "inst", "ok", "fail", "rb"})
+_HEX16_RE = re.compile(r"[0-9a-f]{16}")
+_OTA_ERR_RE = re.compile(r"[a-z]{1,8}")
+
+
+def _ota_field_ok(name: str | None, value: object) -> bool:
+    """Per-field rules for `/status`'s OTA fields."""
+    if value is None:
+        return True
+    if name in ("img", "ota_t"):
+        return isinstance(value, str) and _HEX16_RE.fullmatch(value) is not None
+    if name == "ota_st":
+        return isinstance(value, str) and value in OTA_STATES
+    if name == "ota_err":
+        return isinstance(value, str) and _OTA_ERR_RE.fullmatch(value) is not None
+    if name == "ota_pct":
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
+    if name == "ota":
+        return isinstance(value, int) and not isinstance(value, bool) and value == 1
+    return False
+
+
 class StatusEnvelope(BaseModel):
     """A payload on `pager/{device_id}/status` (device publish or broker LWT), §5.1/§5.2."""
 
     model_config = ConfigDict(extra="ignore")
+
+    # Battery-stats sub-map (key 68), kept raw: `app/store/battery.py` validates it so a bad `bs`
+    # drops alone.
+    bs: Any = None
 
     v: int = 1
     state: Literal["online", "offline"]
@@ -210,8 +244,20 @@ class StatusEnvelope(BaseModel):
     bpull: int | None = None
     # GNSS-while-moving interval in seconds, 0 = off (display only; docs/PROTOCOL.md §13.3).
     loc_move_s: int | None = None
+    # OTA fields (keys 62-67), display only except `img`/`ota` (the relay's delta choice and push
+    # gate); a malformed value drops to `None` (`_drop_bad_ota_field`).
+    img: str | None = None
+    ota: int | None = None
+    ota_t: str | None = None
+    ota_st: str | None = None
+    ota_pct: int | None = None
+    ota_err: str | None = None
     # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
     n: int | None = None
+
+    @classmethod
+    def _drop_bad_ota_field(cls, value: object, info: ValidationInfo) -> object:
+        return value if _ota_field_ok(info.field_name, value) else None
 
     @field_validator("loc_period_s", "loc_min_s", "loc_backoff_s", "loc_move_s")
     @classmethod
@@ -606,6 +652,7 @@ class LocEnvelope(BaseModel):
 
 
 # `peer` is always a real E.164 number, never an alias reference; same shape as `app/ingest.py`'s
+# `_PHONE_E164_RE`.
 _SMS_PEER_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 SMS_LOG_DIR_VALUES = ("out", "in")
 SMS_LOG_ST_VALUES = ("sent", "failed", "recv", "blocked")

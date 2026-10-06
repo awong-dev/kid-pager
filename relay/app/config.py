@@ -37,6 +37,10 @@ class Settings:
     # "fcm" injects `app.backends.fcm.FirebaseFCMClient` into the `webapp` backend; "null"
     # (default) keeps the no-op `NullFCMClient`. Any other value is treated as "null".
     push_backend: str = "null"
+    # Public OTA bucket: `fw_index_url` is `fw/index.json`, `fw_bucket_base` its base URL with
+    # a trailing slash. Either unset = every OTA route answers 503.
+    fw_index_url: str | None = None
+    fw_bucket_base: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -56,4 +60,6 @@ class Settings:
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
             push_backend=os.environ.get("PUSH_BACKEND", "null").strip().lower(),
+            fw_index_url=(os.environ.get("FW_INDEX_URL") or "").strip() or None,
+            fw_bucket_base=(os.environ.get("FW_BUCKET_BASE") or "").strip() or None,
         )

@@ -191,6 +191,7 @@ class SweepResult:
     conversationsDeleted: int = 0
     gchatLinkCodesDeleted: int = 0
     alertsDeleted: int = 0
+    batteryDeleted: int = 0
 
 
 def sweep() -> SweepResult:
@@ -224,6 +225,13 @@ def sweep() -> SweepResult:
         lambda: db.collection("gchatLinkCodes"), int(time.time()), batch_size
     )
 
+    # `devices/{id}/battery` samples.
+    battery_deleted = _sweep_by_created_at(
+        lambda: db.collection_group("battery"),
+        _cutoff(retention.batteryDays * 86400),
+        batch_size,
+    )
+
     )
         messagesDeleted=messages_deleted,
         wireIdsDeleted=wire_ids_deleted,
@@ -231,4 +239,5 @@ def sweep() -> SweepResult:
         conversationsDeleted=conversations_deleted,
         gchatLinkCodesDeleted=gchat_link_codes_deleted,
         alertsDeleted=alerts_deleted,
+        batteryDeleted=battery_deleted,
     )

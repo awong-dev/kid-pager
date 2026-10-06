@@ -55,6 +55,12 @@
       "fieldPath": "createdAt",
       "indexes": [
       ]
+    },
+    {
+      "collectionGroup": "battery",
+      "fieldPath": "createdAt",
+      "indexes": [
+      ]
     }
   ]
 }

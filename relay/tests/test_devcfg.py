@@ -24,6 +24,7 @@ from app.store import contacts as contacts_store
 from app.store import conversations as conversations_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
 from app.store import families as families_store
 from app.store import users as users_store
 from tests.conftest import (
@@ -124,11 +125,46 @@ def test_build_book_unregistered_device_raises():
         devcfg.build_book("no-such-device")
 
 
+def test_build_book_never_lists_an_external():
+    family = families_store.create_family(name="BookExt", created_by="root")
+    users_store.create_user(
+        uid="student3", alias="student3", display_name="student3", family_id=family.id
     )
+    users_store.create_user(
+        uid="mom3", alias="mom3", display_name="Mom", family_id=family.id
+    )
+    ext = externals_store.get_or_create(family.id, "+15550001111", "Grandma")
     _make_pager_device("pgr-b-3", "student3")
+    _approve("student3", ext.uid)
+    allow_store.set_edge("student3", "mom3", message=True, locate=False)
 
     obj = devcfg.build_book("pgr-b-3")
 
+    assert [c["a"] for c in obj["c"]] == ["mom3"]
+    assert ext.alias not in [c["a"] for c in obj["c"]]
+    assert all(c["t"] != "sms" for c in obj["c"])
+
+    allow_store.delete_edge("student3", "mom3")
+    users_store.update_user("mom3", disabled=True)
+    only_ext = devcfg.build_book("pgr-b-3")
+    assert only_ext["c"] == []
+
+
+def test_build_book_excludes_implied_externals_from_c():
+    family = families_store.create_family(name="BookImplied", created_by="root")
+    users_store.create_user(
+        uid="student3i", alias="student3i", display_name="student3i", family_id=family.id
+    )
+    get_db().collection("users").document("student3i").update(
+        {"policy": {"out": "open", "in": "any"}}
+    )
+    ext = externals_store.get_or_create(family.id, "+15550001112", "Grandma")
+    _make_pager_device("pgr-b-3i", "student3i")
+
+    obj = devcfg.build_book("pgr-b-3i")
+
+    assert obj["c"] == []
+    assert ext.alias not in [c["a"] for c in obj["c"]]
 
 
 def test_build_book_caps_approved_contacts_at_ten():
@@ -685,6 +721,7 @@ def test_approve_contact_publishes_book(
     resp = client.post(
         f"/api/family/alerts/{alert.id}/approve",
         params={"family": family.id},
+        json={},
         headers=admin_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -693,6 +730,16 @@ def test_approve_contact_publishes_book(
         json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
     ]
     assert len(books) == 1
+    _uid, alias = externals_store.contact_ids(family.id, "+15550009999")
+    assert alias not in [c["a"] for c in books[0]["c"]]
+    cfgs = [
+        json.loads(p.payload)
+        for p in broker.published
+        if json.loads(p.payload).get("kind") == "cfg"
+    ]
+    assert [c["cfg"] for c in cfgs if "sms" in c["cfg"]] == [
+        {"sms": [{"n": "Grandma", "p": "+15550009999"}]}
+    ]
 
 
 def test_push_book_gate_bpull_absent_sends_full_book():

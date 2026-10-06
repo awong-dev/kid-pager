@@ -38,6 +38,7 @@ def _base_alert(kind: str) -> dict:
         "subjectAlias": None,
         "peerUid": None,
         "peerAlias": None,
+        "peerName": None,
         "peerPhone": None,
         "preview": "",
         "heldBody": None,
@@ -51,6 +52,7 @@ def _base_alert(kind: str) -> dict:
     """Fired when `routing.send()` creates a DM with no approving edge; `None` if no family."""
     if sender.familyId is None:
         return None
+    peer_phone = recipient.phone if recipient.kind == "external" else None
     alert = _base_alert("new_conversation")
     alert.update(
         {
@@ -66,14 +68,21 @@ def _base_alert(kind: str) -> dict:
     return create(sender.familyId, alert)
 
 
+def sms_unknown(family_id: str, phone: str, target_uid: str | None, body: str) -> str:
+    """An open alert for a device-direct text from a number the family has no contact for."""
     subject = users_store.get_user(target_uid) if target_uid is not None else None
     alert = _base_alert("sms_unknown")
     alert.update(
         {
+            "status": "open",
             "subjectUid": subject.uid if subject is not None else None,
             "subjectAlias": subject.alias if subject is not None else None,
+            "peerUid": None,
+            "peerAlias": None,
+            "peerName": None,
             "peerPhone": phone,
             "preview": body[:PREVIEW_MAX_CHARS],
+            "heldBody": None,
         }
     )
     return create(family_id, alert)

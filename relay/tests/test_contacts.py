@@ -13,6 +13,7 @@ from firebase_admin import auth as fb_auth
 from app import devauth
 from app.config import Settings
 from app.db.firestore import get_db
+from app.ingest import Ingest, classify_ph
 from app.main import create_app
 from app.store import alerts as alerts_store
 from app.store import allow as allow_store
@@ -20,6 +21,7 @@ from app.store import backends as backends_store
 from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
 from app.store import families as families_store
 from app.store import users as users_store
 from tests.conftest import up_topic
@@ -146,7 +148,10 @@ def test_contact_req_name_too_long_is_dropped_as_malformed():
 
 
 
+def test_contact_req_bad_ph_format_is_rejected_with_a_reply():
+    ingest, broker = _ingest()
 
+    assert req is not None and req.status == "rejected" and req.reason == "bad_number"
 
 
 def test_hmac_signed_contact_req_is_verified_then_stored():
@@ -227,4 +232,24 @@ def test_block_contact_request_alert_adds_blocked_number_and_marks_handled(clien
 
     )
     )
+
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(
+    ("ph", "expected"),
+    [
+        ("2065550100", ("phone", "+12065550100")),
+        ("12065550100", ("phone", "+12065550100")),
+        ("+442071838750", ("phone", "+442071838750")),
+        ("+12065550100", ("phone", "+12065550100")),
+        ("+1206", ("bad", "+1206")),
+        ("5550100", ("bad", "5550100")),
+        ("123456789012", ("bad", "123456789012")),
+        ("grandma", ("alias", "grandma")),
+        ("Grandma", ("bad", "Grandma")),
+        ("+abc", ("bad", "+abc")),
+    ],
+)
+def test_classify_ph(ph: str, expected: tuple[str, str]):
+    assert classify_ph(ph) == expected

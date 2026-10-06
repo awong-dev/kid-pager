@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from typing import Literal
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter, Transaction
 from pydantic import BaseModel, ConfigDict
 
@@ -75,6 +76,54 @@ def list_requests(
     name: str,
     phone: str | None = None,
     alias: str | None = None,
+            {
+                "deviceId": device_id,
+                "reqId": req_id,
+                "ownerUid": owner_uid,
+                "name": name,
+                "phone": phone,
+                "alias": alias,
+                "reason": None,
+                "createdAt": SERVER_TIMESTAMP,
+        )
+
+
+def create_rejected(
+    *,
+    device_id: str,
+    owner_uid: str,
+    req_id: str,
+    name: str,
+    phone: str | None = None,
+    alias: str | None = None,
+    reason: str,
+) -> ContactRequest:
+    """A request rejected at ingest: `status:"rejected"`, `decidedBy:"relay"`, no alert."""
+    doc_key = key(device_id, req_id)
+    existing = get_request(doc_key)
+    if existing is not None:
+        return existing
+    try:
+        _contact_requests().document(doc_key).create(
+            {
+                "deviceId": device_id,
+                "reqId": req_id,
+                "ownerUid": owner_uid,
+                "name": name,
+                "phone": phone,
+                "alias": alias,
+                "status": "rejected",
+                "reason": reason,
+                "createdAt": SERVER_TIMESTAMP,
+                "decidedAt": SERVER_TIMESTAMP,
+                "decidedBy": "relay",
+            }
+        )
+    except AlreadyExists:
+        pass
+    fetched = get_request(doc_key)
+    assert fetched is not None
+    return fetched
 
 
 def approve(doc_key: str, *, decided_by: str) -> ContactRequest:

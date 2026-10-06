@@ -7,6 +7,7 @@ from datetime import datetime
 from google.api_core.exceptions import NotFound
 from google.cloud.firestore import SERVER_TIMESTAMP, ArrayUnion
 
+from app import wire
 from app.db.firestore import get_db
 
 
@@ -18,6 +19,21 @@ class Family(BaseModel):
     blockedNumbers: list[str] = []
     createdAt: datetime | None = None
     createdBy: str | None = None
+
+
+FAMILY_NAME_MAX_CODEPOINTS = 40
+
+
+def validate_family_name(raw: str) -> str:
+    """Strip; 1-40 code points; no control characters. `ValueError` otherwise."""
+    name = raw.strip()
+    if not name:
+        raise ValueError("family name must not be empty")
+    if len(name) > FAMILY_NAME_MAX_CODEPOINTS:
+        raise ValueError(f"family name exceeds {FAMILY_NAME_MAX_CODEPOINTS} characters")
+    if wire.CONTROL_CHAR_RE.search(name):
+        raise ValueError("family name contains control characters")
+    return name
 
 
 def _families():

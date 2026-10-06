@@ -39,6 +39,7 @@ def _webhook_ip_rate_limit() -> tuple[int, int]:
 
 
 def _client_ip(request: Request) -> str:
+    """Element 0 of `X-Forwarded-For`: behind Hosting the TCP peer is Google's front end.
 
     A forged leading entry only picks its own bucket; the limit sits before the real JWT check.
     """

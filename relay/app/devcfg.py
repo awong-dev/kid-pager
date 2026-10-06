@@ -47,12 +47,16 @@ _PENDING_CFG_FIELD = "pendingCfg"
 _PENDING_CFG_CA_FIELD = "pendingCfgCa"
 # `cfg.sms` has its own pending slot, for the same reason.
 _PENDING_CFG_SMS_FIELD = "pendingCfgSms"
+# `cfg.ota` (job or cancel) has its own slot; a newer push (including a cancel) replaces the
+# older one.
+_PENDING_CFG_OTA_FIELD = "pendingCfgOta"
 # Every field `ack()`/`republish_pending()` iterate over: seven independent "newest unacked"
 _ALL_PENDING_FIELDS = (
     _PENDING_BOOK_FIELD,
     _PENDING_CFG_FIELD,
     _PENDING_CFG_CA_FIELD,
     _PENDING_CFG_SMS_FIELD,
+    _PENDING_CFG_OTA_FIELD,
 )
 
 
@@ -76,6 +80,7 @@ def _default_alias(device: devices_store.Device) -> str | None:
 
 
 def _contact_type_hint(uid: str) -> str:
+    """`c[].t` icon hint (docs/PROTOCOL.md §3.1): `chat` for a `gchat` backend, else `web`."""
     kinds = {b.kind for b in backends_store.list_backends(uid) if b.enabled}
     if "gchat" in kinds:
         return "chat"
@@ -91,6 +96,15 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
     ]
 
 
+    from app import book
+
+    return [
+        {
+            "a": e.alias,
+            "n": e.label[:_BOOK_NAME_MAX_CODEPOINTS],
+        }
+        for e in book.entries_for(owner_uid)
+    ]
 
 
 def _contact_sort_key(contact: dict[str, Any], default_alias: str | None) -> tuple[int, str, str]:
@@ -290,6 +304,56 @@ def push_ca(
     _assert_within_envelope_limit(obj)
     _set_pending(device_id, _PENDING_CFG_CA_FIELD, obj)
     return broker.publish_down(device_id, obj)
+
+
+def push_ota(
+    device_id: str,
+    cfg_ota: dict[str, Any],
+    broker: BrokerClient,
+    *,
+    job: dict[str, Any] | None = None,
+) -> bool:
+    """`/down cfg.ota`; `job`, if given, is stored as `devices/{d}.otaJob` for the web."""
+    if devices_store.get_device(device_id) is None:
+        logger.warning("push_ota: no such device %s", device_id)
+        return False
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "cfg",
+        "cfg": {"ota": cfg_ota},
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    _set_pending(device_id, _PENDING_CFG_OTA_FIELD, obj)
+    if job is not None:
+        _devices().document(device_id).set({"otaJob": {**job, "at": datetime.now(UTC)}}, merge=True)
+    return broker.publish_down(device_id, obj)
+
+
+def cancel_ota(device_id: str, broker: BrokerClient) -> bool:
+    """`cfg.ota = {cancel: true}` and clears `otaJob`."""
+    if devices_store.get_device(device_id) is None:
+        logger.warning("cancel_ota: no such device %s", device_id)
+        return False
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "cfg",
+        "cfg": {"ota": {"cancel": True}},
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    _set_pending(device_id, _PENDING_CFG_OTA_FIELD, obj)
+    clear_ota_job(device_id)
+    return broker.publish_down(device_id, obj)
+
+
+def clear_ota_job(device_id: str) -> None:
+    """Sets `devices/{d}.otaJob` to null (job cancelled or reported done)."""
+    _devices().document(device_id).set({"otaJob": None}, merge=True)
 
 
 def unpin_ca(device_id: str, broker: BrokerClient) -> bool:

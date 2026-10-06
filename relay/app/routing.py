@@ -25,6 +25,9 @@ from app.store.messages import Delivery, Message, MessageKind
 logger = logging.getLogger("relay.routing")
 
 # `sms_contact`: both sides external, or a contact that is disabled or in another family.
+# `no_sms_number`: an external/person pair where the person has no smsNumber.
+RejectReason = Literal[
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,11 @@ class SendResult:
     @property
     def ok(self) -> bool:
         return bool(self.messages) and not self.rejected
+
+
+def _is_external(uid: str) -> bool:
+    user = users_store.get_user(uid)
+    return user is not None and user.kind == "external"
 
 
 class Routing:
@@ -83,6 +91,14 @@ class Routing:
         candidates, rejected = self._candidate_recipients(sender_uid, recipient_alias, device_id)
 
         for recipient_uid in candidates:
+                logger.warning(
+                    sender_uid,
+                    recipient_uid,
+                    recipient_alias,
+                )
+                rejected.append(
+                )
+                continue
             reason = self._policy_reject_reason(sender_uid, recipient_uid)
             if reason is not None:
                 logger.warning(
@@ -139,6 +155,12 @@ class Routing:
                 default_uid = device.defaultToUid
         if default_uid is not None:
             return [default_uid], []
+        broadcast = [
+            uid for uid in allow_store.allowed_recipients(sender_uid) if not _is_external(uid)
+        ]
+        return broadcast, []
+
+
 
 
     def _policy_reject_reason(self, sender_uid: str, recipient_uid: str) -> RejectReason | None:
@@ -149,6 +171,9 @@ class Routing:
             if allow_store.is_message_allowed(sender_uid, recipient_uid):
                 return None
             return "not_allowed"
+        # In-family persons count as approved; an explicit `message: false` edge beats that.
+        has_edge_out = book.edge_or_family(sender, recipient)
+        has_edge_in = book.edge_or_family(recipient, sender)
         return policy_module.check(sender, recipient, has_edge_out, has_edge_in)
 
 
@@ -187,7 +212,11 @@ class Routing:
 
         created: list[Message] = []
         rejected: list[RejectedRecipient] = []
+        sender_is_external = _is_external(sender_uid)
         for recipient_uid in sorted(uid for uid in group.uids if uid != sender_uid):
+            # SMS contacts never join a relay group; a stale member is skipped. A bridge external
+                logger.debug("skipping sms contact in group %s fan-out", group.convKey)
+                continue
             reason = self._policy_reject_reason(sender_uid, recipient_uid)
             if reason is not None:
                 logger.warning(

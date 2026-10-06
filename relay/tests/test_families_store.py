@@ -36,7 +36,9 @@ def test_list_families():
     assert {"List A", "List B"} <= names
 
 
+def test_update_family_name():
     family = families_store.create_family(name="Old Name", created_by="root-uid")
+    updated = families_store.update_family(family.id, name="New Name")
     assert updated.name == "New Name"
 
 

@@ -59,6 +59,24 @@ def _clean_emulators() -> Iterator[None]:
     yield
 
 
+@pytest.fixture(autouse=True)
+def _default_person_family(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives each bare user its own one-person family, since `create_user` refuses none."""
+    import functools
+
+    from app.store import users as users_store
+
+    original = users_store.create_user
+
+    @functools.wraps(original)
+    def _create_user(**kwargs):
+        if kwargs.get("kind", "person") == "person" and kwargs.get("family_id") is None:
+            kwargs["family_id"] = f"solo-{kwargs['uid']}"
+        return original(**kwargs)
+
+    monkeypatch.setattr(users_store, "create_user", _create_user)
+
+
 @pytest.fixture
 def broker() -> FakeBrokerClient:
     return FakeBrokerClient()

@@ -36,6 +36,12 @@ service cloud.firestore {
       match /backends/{b} {
         allow read: if request.auth.uid == uid || isSuper();
       }
+
+      // Per-owner nicknames; the relay is the only writer, the catch-all denies client writes.
+      match /book/{peer} {
+        allow read: if request.auth != null && (isSuper() || request.auth.uid == uid ||
+          isFamAdmin(resource.data.get('familyId', null)));
+      }
     }
 
     // A `list` is authorised by a pre-check on the query's filters, so it must filter on `uids`

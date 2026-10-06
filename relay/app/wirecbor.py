@@ -84,11 +84,27 @@ KEYMAP: dict[str, int] = {
     # = GNSS-while-moving interval (int, 0 = off); docs/PROTOCOL.md §13.2.
     "why": 60,
     "loc_move_s": 61,
+    # `/status` OTA fields: img = running image id (short), ota = capability gate,
+    # ota_t/ota_st/ota_pct/ota_err = job target/state/percent/error.
+    "img": 62,
+    "ota": 63,
+    "ota_t": 64,
+    "ota_st": 65,
+    "ota_pct": 66,
+    "ota_err": 67,
+    # `/status` battery-stats sub-map.
+    "bs": 68,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
 # Sub-map keys, PROTOCOL.md §10 "Sub-map keys".
 LOC_KEYMAP: dict[str, int] = {"lat": 0, "lon": 1, "acc": 2, "fix_ts": 3, "src": 4}
+# `/status` `bs` sub-map; arrays pass through.
+BS_KEYMAP: dict[str, int] = {
+    "sq": 0, "dt": 1, "sl": 2, "aw": 3, "ns": 4, "x1": 5,
+    "rl": 6, "rf": 7, "mvn": 8, "cn": 9, "md": 10, "re": 11,
+}  # fmt: skip
+_REVERSE_BS: dict[int, str] = {v: k for k, v in BS_KEYMAP.items()}
 CONTACT_KEYMAP: dict[str, int] = {"a": 0, "n": 1, "t": 2}
 REQUEST_KEYMAP: dict[str, int] = {"n": 0, "s": 1}
 LOCK_KEYMAP: dict[str, int] = {"clear": 0, "auto": 1}
@@ -98,6 +114,22 @@ CA_KEYMAP: dict[str, int] = {"url": 0, "sha": 1}
 # `CONTACT_KEYMAP` though both use `n`.
 SMS_CONTACT_KEYMAP: dict[str, int] = {"n": 0, "p": 1}
 # PROTOCOL.md §10's `cfg` sub-map: `lock=0`, `ca=1`, `sms=2`; 3 (`wifi`) is retired, do not reuse.
+# `cfg.ota`: `img`/`osha`/`base` are 64-hex digests in JSON and 32-byte bstr in CBOR; `fmt` is
+# "full"/"delta" in JSON and 0/1 in CBOR.
+OTA_KEYMAP: dict[str, int] = {
+    "img": 0,
+    "isz": 1,
+    "url": 2,
+    "osz": 3,
+    "osha": 4,
+    "fmt": 5,
+    "base": 6,
+    "psz": 7,
+    "cancel": 8,
+}
+_OTA_HASH_KEYS = ("img", "osha", "base")
+_OTA_FMT_TO_INT: dict[str, int] = {"full": 0, "delta": 1}
+_OTA_FMT_FROM_INT: dict[int, str] = {v: k for k, v in _OTA_FMT_TO_INT.items()}
 # docs/PROTOCOL.md §13.2: `cell = {mcc, mnc, tac, ci, rsrp}`.
 CELL_KEYMAP: dict[str, int] = {"mcc": 0, "mnc": 1, "tac": 2, "ci": 3, "rsrp": 4}
 
@@ -109,9 +141,37 @@ _REVERSE_CA = {v: k for k, v in CA_KEYMAP.items()}
 _REVERSE_SMS_CONTACT = {v: k for k, v in SMS_CONTACT_KEYMAP.items()}
 _REVERSE_CFG = {v: k for k, v in CFG_KEYMAP.items()}
 _REVERSE_CELL = {v: k for k, v in CELL_KEYMAP.items()}
+_REVERSE_OTA = {v: k for k, v in OTA_KEYMAP.items()}
+
+
+def _ota_to_int(v: dict[str, Any]) -> dict[int, Any]:
+    out: dict[int, Any] = {}
+    for k, val in v.items():
+        if k in _OTA_HASH_KEYS and isinstance(val, str):
+            val = bytes.fromhex(val)
+        elif k == "fmt" and isinstance(val, str):
+            val = _OTA_FMT_TO_INT[val]
+        out[OTA_KEYMAP[k]] = val
+    return out
+
+
+def _ota_to_names(v: dict[Any, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, val in v.items():
+        name = _REVERSE_OTA.get(k)
+        if name is None:
+            continue
+        if name in _OTA_HASH_KEYS and isinstance(val, bytes):
+            val = val.hex()
+        elif name == "fmt" and isinstance(val, int):
+            val = _OTA_FMT_FROM_INT.get(val, val)
+        out[name] = val
+    return out
 
 
 def _value_to_int_keys(name: str, value: Any) -> Any:
+    if name == "bs" and isinstance(value, dict):
+        return {BS_KEYMAP[k]: v for k, v in value.items() if k in BS_KEYMAP}
     if name == "loc" and isinstance(value, dict):
         return {LOC_KEYMAP[k]: v for k, v in value.items()}
     if name == "cell" and isinstance(value, dict):
@@ -134,6 +194,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
                 out[CFG_KEYMAP["sms"]] = [
                     {SMS_CONTACT_KEYMAP[sk]: sv for sk, sv in item.items()} for item in v
                 ]
+            elif k == "ota" and isinstance(v, dict):
+                out[CFG_KEYMAP["ota"]] = _ota_to_int(v)
             else:
                 # §3.2: unknown members of cfg are ignored: a future member passes through under
                 # its JSON name.
@@ -143,6 +205,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
 
 
 def _value_to_names(name: str, value: Any) -> Any:
+    if name == "bs" and isinstance(value, dict):
+        return {_REVERSE_BS[k]: v for k, v in value.items() if k in _REVERSE_BS}
     if name == "loc" and isinstance(value, dict):
         return {_REVERSE_LOC[k]: v for k, v in value.items()}
     if name == "cell" and isinstance(value, dict):
@@ -163,6 +227,8 @@ def _value_to_names(name: str, value: Any) -> Any:
                 out["sms"] = [
                     {_REVERSE_SMS_CONTACT[sk]: sv for sk, sv in item.items()} for item in v
                 ]
+            elif k == CFG_KEYMAP["ota"] and isinstance(v, dict):
+                out["ota"] = _ota_to_names(v)
             else:
                 out[_REVERSE_CFG.get(k, k)] = v
         return out

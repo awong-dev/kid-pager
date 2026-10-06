@@ -10,12 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 from firebase_admin import auth as fb_auth
 
+from app import book as book_module
 from app import devcfg
 from app.config import Settings
 from app.main import create_app
 from app.store import allow as allow_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
 from app.store import families as families_store
 from app.store import users as users_store
 from tests.fake_transport import FakeBrokerClient
@@ -81,7 +83,13 @@ def client(fake_emqx: FakeEmqxAdmin, broker: FakeBrokerClient) -> Iterator[TestC
 def admin_headers() -> dict[str, str]:
     auth_user = fb_auth.create_user(email="root-admin@example.com")
     users_store.create_user(
+        uid=auth_user.uid,
+        alias="rootadmin",
+        display_name="Root Admin",
+        role="super",
+        family_id="default",
     )
+    fb_auth.set_custom_user_claims(auth_user.uid, {"role": "super", "fam": "default"})
     return auth_header(auth_user.uid)
 
 
@@ -103,6 +111,7 @@ def test_create_user_creates_auth_and_firestore_and_alias(
     assert users_store.get_uid_for_alias("mom") == data["uid"]
 
     refreshed = fb_auth.get_user(data["uid"])
+    assert refreshed.custom_claims == {"role": "member", "fam": "default"}
 
 
 def test_create_user_requires_email_or_phone(client: TestClient, admin_headers: dict[str, str]):
@@ -153,6 +162,7 @@ def test_patch_user_updates_fields_and_admin_claim(
 
     # Claims are exactly `{role, fam}`; `fam` is empty because this route sets no family.
     refreshed = fb_auth.get_user(created["uid"])
+    assert refreshed.custom_claims == {"role": "admin", "fam": "default"}
 
 
 def test_patch_user_404_for_unknown_uid(client: TestClient, admin_headers: dict[str, str]):
@@ -289,6 +299,152 @@ def test_create_device_picks_up_locatable_by_from_a_pre_existing_allow_edge(
 
     device = devices_store.get_device("pgr-5005")
     assert device.locatableBy == [mom_uid]
+
+
+def test_create_device_default_recipient_external_is_400(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    family = families_store.create_family(name="DefExt", created_by="root")
+    users_store.create_user(
+        uid="def-owner", alias="defowner", display_name="Owner", family_id=family.id
+    )
+    ext = externals_store.get_or_create(family.id, "+12065550100", "Grandma")
+
+    resp = client.post(
+        "/api/admin/devices",
+        json={
+            "deviceId": "pgr-defext",
+            "ownerAlias": "defowner",
+            "label": "p",
+            "defaultToAlias": ext.alias,
+        },
+        headers=admin_headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == "the default recipient cannot be an SMS contact"
+    assert devices_store.get_device("pgr-defext") is None
+
+
+def test_create_device_seeds_cfg_sms_for_open_owner(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    from app.db.firestore import get_db
+
+    family = families_store.create_family(name="SeedSms", created_by="root")
+    users_store.create_user(
+        uid="seed-open", alias="seedopen", display_name="Open", family_id=family.id
+    )
+    users_store.create_user(
+        uid="seed-people", alias="seedpeople", display_name="People", family_id=family.id
+    )
+    get_db().collection("users").document("seed-open").update(
+        {"policy": {"out": "open", "in": "any"}}
+    )
+    externals_store.get_or_create(family.id, "+12065550100", "Grandma")
+
+    for device_id, owner in (("pgr-seed-1", "seedopen"), ("pgr-seed-2", "seedpeople")):
+        resp = client.post(
+            "/api/admin/devices",
+            json={"deviceId": device_id, "ownerAlias": owner, "label": "p"},
+            headers=admin_headers,
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert [(c.name, c.phone) for c in devices_store.get_device("pgr-seed-1").smsContacts] == [
+        ("Grandma", "+12065550100")
+    ]
+    assert devices_store.get_device("pgr-seed-2").smsContacts == []
+
+
+def test_patch_user_family_change_rederives_cfg_sms(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    from app.db.firestore import get_db
+
+    fam_a = families_store.create_family(name="MoveA", created_by="root")
+    fam_b = families_store.create_family(name="MoveB", created_by="root")
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "alias": "mover",
+            "displayName": "Mover",
+            "email": "mover@example.com",
+            "familyId": fam_a.id,
+        },
+        headers=admin_headers,
+    ).json()
+    get_db().collection("users").document(created["uid"]).update(
+        {"policy": {"out": "open", "in": "any"}}
+    )
+    devices_store.create_device(
+        device_id="pgr-mover",
+        owner_uid=created["uid"],
+        label="p",
+        mqtt_username="pgr-mover",
+        mqtt_password_hash="x",
+        auth_mode="password",
+        family_id=fam_a.id,
+    )
+    externals_store.get_or_create(fam_a.id, "+12065550100", "FromA")
+    externals_store.get_or_create(fam_b.id, "+12065550101", "FromB")
+    book_module.rederive_sms_contacts(created["uid"], FakeBrokerClient())
+    assert [c.name for c in devices_store.get_device("pgr-mover").smsContacts] == ["FromA"]
+
+    resp = client.patch(
+        f"/api/admin/users/{created['uid']}",
+        json={"familyId": fam_b.id},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [c.name for c in devices_store.get_device("pgr-mover").smsContacts] == ["FromB"]
+
+
+def test_put_allowlist_rederives_touched_owners(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    family = families_store.create_family(name="AllowSms", created_by="root")
+    users_store.create_user(
+        uid="al-kid", alias="alkid", display_name="Kid", family_id=family.id
+    )
+    devices_store.create_device(
+        device_id="pgr-al",
+        owner_uid="al-kid",
+        label="p",
+        mqtt_username="pgr-al",
+        mqtt_password_hash="x",
+        auth_mode="password",
+        family_id=family.id,
+    )
+    ext = externals_store.get_or_create(family.id, "+12065550100", "Grandma")
+    assert devices_store.get_device("pgr-al").smsContacts == []
+
+    resp = client.put(
+        "/api/admin/allowlist",
+        json={
+            "entries": [
+                {"fromAlias": "alkid", "toAlias": ext.alias, "message": True, "locate": False}
+            ]
+        },
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [c.phone for c in devices_store.get_device("pgr-al").smsContacts] == ["+12065550100"]
+
+    resp = client.put("/api/admin/allowlist", json={"entries": []}, headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert devices_store.get_device("pgr-al").smsContacts == []
+
+
+def test_admin_create_user_backend_route_is_gone(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    user = users_store.create_user(uid="nobackend", alias="nobackend", display_name="N")
+    resp = client.post(
+        f"/api/admin/users/{user.uid}/backends",
+        json={"kind": "sms", "phone": "+15559990000"},
+        headers=admin_headers,
+    )
+    assert resp.status_code in (404, 405), resp.text
 
 
 def test_create_device_copies_owner_family_id(
@@ -532,16 +688,19 @@ def test_allowlist_locate_true_cross_family_is_400(
 def test_allowlist_locate_true_null_family_is_400(
     client: TestClient, admin_headers: dict[str, str]
 ):
+    """Same refusal when one end has no family (an external)."""
     client.post(
         "/api/admin/users",
         json={"alias": "nullmom", "displayName": "m", "email": "nullmom@example.com"},
         headers=admin_headers,
     )
+    external = externals_store.get_or_create("default", "+12065550177", "ext")
 
     resp = client.put(
         "/api/admin/allowlist",
         json={
             "entries": [
+                {"fromAlias": "nullmom", "toAlias": external.alias, "message": True, "locate": True}
             ]
         },
         headers=admin_headers,
@@ -717,6 +876,9 @@ def test_display_name_change_bumps_listing_owners(
         "/api/admin/allowlist",
         json={
             "entries": [
+                {"fromAlias": "owner-dn", "toAlias": "contact-dn", "message": True, "locate": False},
+                # reverse edge: the default `people` policy needs both ends to approve
+                {"fromAlias": "contact-dn", "toAlias": "owner-dn", "message": True, "locate": False},
             ]
         },
         headers=admin_headers,
@@ -881,6 +1043,7 @@ def test_create_and_list_families(client: TestClient, admin_headers: dict[str, s
     assert "The Ngs" in names
 
 
+def test_patch_family_renames(client: TestClient, admin_headers: dict[str, str]):
     created = client.post(
         "/api/admin/families", json={"name": "Old"}, headers=admin_headers
     ).json()
@@ -893,6 +1056,7 @@ def test_create_and_list_families(client: TestClient, admin_headers: dict[str, s
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["name"] == "New"
+    assert "smsNumber" not in data
 
 
 def test_patch_family_missing_is_404(client: TestClient, admin_headers: dict[str, str]):
@@ -911,6 +1075,7 @@ def test_super_creates_a_family_and_moves_a_user(client: TestClient, admin_heade
         json={"alias": "movable", "displayName": "Movable", "email": "movable@example.com"},
         headers=admin_headers,
     ).json()
+    assert created["familyId"] == "default"
 
     resp = client.patch(
         f"/api/admin/users/{created['uid']}",
@@ -937,6 +1102,7 @@ def test_patch_user_role_super_is_accepted(client: TestClient, admin_headers: di
     assert resp.status_code == 200, resp.text
     assert resp.json()["role"] == "super"
     refreshed = fb_auth.get_user(created["uid"])
+    assert refreshed.custom_claims == {"role": "super", "fam": "default"}
 
 
 def test_create_user_with_family_id(client: TestClient, admin_headers: dict[str, str]):
@@ -1051,3 +1217,232 @@ def test_list_devices_filters_by_family_query_param(client: TestClient, admin_he
     assert resp.status_code == 200, resp.text
     ids = {d["id"] for d in resp.json()}
     assert ids == {"pgr-filt-a"}
+
+
+def test_create_user_without_any_family_is_400_and_leaves_no_auth_user(
+    client: TestClient,
+):
+    auth_user = fb_auth.create_user(email="nofam-super@example.com")
+    users_store.create_user(
+        uid=auth_user.uid, alias="nofamsuper", display_name="S", role="super", family_id="x"
+    )
+    fb_auth.set_custom_user_claims(auth_user.uid, {"role": "super", "fam": ""})
+
+    resp = client.post(
+        "/api/admin/users",
+        json={"alias": "orphan", "displayName": "O", "email": "orphan@example.com"},
+        headers=auth_header(auth_user.uid),
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == "familyId is required"
+    with pytest.raises(fb_auth.UserNotFoundError):
+        fb_auth.get_user_by_email("orphan@example.com")
+    assert users_store.get_uid_for_alias("orphan") is None
+
+
+def test_create_user_normalises_phone_and_rejects_garbage(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    resp = client.post(
+        "/api/admin/users",
+        json={"alias": "phoney", "displayName": "P", "phone": "2065550100"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["phone"] == "+12065550100"
+
+    resp = client.post(
+        "/api/admin/users",
+        json={"alias": "phoney2", "displayName": "P", "phone": "abc"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "phone must be a number like +12065550100"
+
+
+def test_super_family_patch_validates_the_name(client: TestClient, admin_headers: dict[str, str]):
+    family = families_store.create_family(name="Orig", created_by="rootadmin")
+    ok = client.patch(f"/api/admin/families/{family.id}", json={"name": " New "}, headers=admin_headers)
+    assert ok.status_code == 200 and ok.json()["name"] == "New"
+    for bad in ("", "y" * 41, "a\tb"):
+        resp = client.patch(
+            f"/api/admin/families/{family.id}", json={"name": bad}, headers=admin_headers
+        )
+        assert resp.status_code == 400, bad
+    assert families_store.get_family(family.id).name == "New"
+
+
+from tests.test_firmware import (
+    BASE_URL,
+    ID_NEW,
+    ID_OLD,
+    INDEX_URL,
+    index_server,  # noqa: F401 -- fixture
+)
+
+
+@pytest.fixture
+def ota_client(
+    fake_emqx: FakeEmqxAdmin, broker: FakeBrokerClient, index_server: dict  # noqa: F811
+) -> Iterator[TestClient]:
+    settings = make_settings(fw_index_url=INDEX_URL, fw_bucket_base=BASE_URL)
+    app = create_app(settings=settings, broker_client=broker)
+    app.state.emqx_admin = fake_emqx
+    with TestClient(app) as c:
+        yield c
+
+
+def _ota_device(device_id: str = "pgr-ota-r", *, img: str | None = None, cap: int | None = 1) -> None:
+    devices_store.create_device(
+        device_id=device_id,
+        owner_uid="owner-ota",
+        label="d",
+        mqtt_username=device_id,
+        mqtt_password_hash="x",
+        auth_mode="password",
+    )
+    fields: dict = {"state": "online", "img": img, "otaCap": cap}
+    devices_store.update_status(device_id, **fields)
+
+
+def test_ota_routes_503_when_not_configured(client: TestClient, admin_headers: dict[str, str]):
+    _ota_device()
+    assert client.get("/api/admin/firmware", headers=admin_headers).status_code == 503
+    r = client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 503
+    assert r.json()["detail"] == "OTA not configured"
+
+
+def test_ota_routes_502_when_index_unreachable(
+    ota_client: TestClient, admin_headers: dict[str, str], index_server: dict  # noqa: F811
+):
+    _ota_device()
+    index_server["status"] = 503
+    assert ota_client.get("/api/admin/firmware", headers=admin_headers).status_code == 502
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 502
+
+
+def test_ota_routes_require_super(ota_client: TestClient):
+    assert ota_client.get("/api/admin/firmware").status_code in (401, 403)
+
+
+def test_list_firmware_newest_first_with_delta_for_matching_device(
+    ota_client: TestClient, admin_headers: dict[str, str]
+):
+    _ota_device(img=ID_OLD[:16])
+    builds = ota_client.get(
+        "/api/admin/firmware?device=pgr-ota-r", headers=admin_headers
+    ).json()["builds"]
+    assert [b["id16"] for b in builds] == [ID_NEW[:16], ID_OLD[:16]]
+    assert builds[0] == {
+        "id16": ID_NEW[:16], "version": "beta-57-gdeadbee", "size": 685168,
+        "published": 1_790_000_000, "kind": "delta", "osz": 42513,
+        "estBytes": int(42513 * 1.045) + 7168,
+    }
+    assert builds[1]["kind"] == "full"
+    plain = ota_client.get("/api/admin/firmware", headers=admin_headers).json()["builds"]
+    assert {b["kind"] for b in plain} == {"full"}
+    assert ota_client.get(
+        "/api/admin/firmware?device=nope", headers=admin_headers
+    ).status_code == 404
+
+
+def test_push_ota_404s(ota_client: TestClient, admin_headers: dict[str, str]):
+    _ota_device()
+    r = ota_client.post(
+        "/api/admin/devices/nope/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 404
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": "0" * 16}, headers=admin_headers
+    )
+    assert r.status_code == 404
+
+
+def test_push_ota_409_without_gate(
+    ota_client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    _ota_device(cap=None)
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "device does not report ota:1"
+    assert broker.published == []
+
+
+def test_push_ota_409_already_running(
+    ota_client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    _ota_device(img=ID_NEW[:16])
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "already running that build"
+    assert broker.published == []
+
+
+def test_push_ota_409_already_running_img_variants(
+    ota_client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    for img in (ID_NEW[:16].upper(), ID_NEW, " " + ID_NEW[:16]):
+        _ota_device(img=img)
+        r = ota_client.post(
+            "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+        )
+        assert r.status_code == 409, img
+        assert r.json()["detail"] == "already running that build"
+    assert broker.published == []
+
+
+def test_push_ota_422_bad_body(ota_client: TestClient, admin_headers: dict[str, str]):
+    _ota_device()
+    for body in ({}, {"target": "xyz"}, {"target": ID_NEW[:16], "cancel": True}, {"cancel": False}):
+        r = ota_client.post("/api/admin/devices/pgr-ota-r/ota", json=body, headers=admin_headers)
+        assert r.status_code == 422, body
+
+
+def test_push_ota_delta_when_img_matches_base(
+    ota_client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    _ota_device(img=ID_OLD[:16])
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "ok": True, "kind": "delta", "osz": 42513, "estBytes": int(42513 * 1.045) + 7168,
+    }
+    sent = json.loads(broker.published[-1].payload)
+    ota = sent["cfg"]["ota"]
+    assert ota["fmt"] == "delta" and ota["base"] == ID_OLD and ota["psz"] == 686466
+    assert ota["url"] == BASE_URL + f"fw/{ID_NEW[:16]}/from-{ID_OLD[:16]}.dz"
+    job = devices_store.get_device("pgr-ota-r").otaJob
+    assert job.target16 == ID_NEW[:16] and job.kind == "delta" and job.osz == 42513
+    assert job.estBytes == r.json()["estBytes"] and job.by_uid and job.at is not None
+
+
+def test_push_ota_full_otherwise_then_cancel(
+    ota_client: TestClient, admin_headers: dict[str, str], broker: FakeBrokerClient
+):
+    _ota_device(img="9" * 16)
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"target": ID_NEW[:16]}, headers=admin_headers
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "full" and r.json()["osz"] == 338784
+    assert json.loads(broker.published[-1].payload)["cfg"]["ota"]["fmt"] == "full"
+    assert devices_store.get_device("pgr-ota-r").otaJob is not None
+
+    r = ota_client.post(
+        "/api/admin/devices/pgr-ota-r/ota", json={"cancel": True}, headers=admin_headers
+    )
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert json.loads(broker.published[-1].payload)["cfg"] == {"ota": {"cancel": True}}
+    assert devices_store.get_device("pgr-ota-r").otaJob is None

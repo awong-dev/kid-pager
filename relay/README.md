@@ -120,6 +120,7 @@ entirely).
 ### End-to-end test scenarios
 
 End-to-end integration tests (brings up the real Docker Compose stack —
+EMQX, the Firestore/Auth emulators, and the relay — configures EMQX's rule engine, and drives it end to end through
 `tools/pager_client.py`'s combined device+server client):
 
 ```bash
@@ -138,6 +139,12 @@ Scenarios available (see `tools/e2e_v2.py`'s module docstring for details):
 - **bytes**: data budget accounting and SIM constraints
 - **setup_code**: real admin-create → code → bootstrap → provisioned flow
 - **address_book**: device requests contact approval, book/cfg ingest and ack
+
+## Message backends
+
+`gchat` (`app/backends/gchat.py`) is a real adapter against an outside service. The tests,
+`tools/e2e_v2.py` and the compose stack exercise it with a locally-signed test JWT, never a real
+Google account. One account-level step is needed before a real deployment can use it:
 
 - **Google Chat**: Chat apps can only be installed by accounts on **Google Workspace**, not
   consumer Gmail; with consumer Gmail this backend cannot be used (Email is not implemented).

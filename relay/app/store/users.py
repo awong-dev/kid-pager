@@ -56,11 +56,14 @@ class User(BaseModel):
     alias: str
     displayName: str
     email: str | None = None
+    # Sign-in number only, never an SMS route.
     phone: str | None = None
     role: Role = "member"
     # Every user belongs to one family; `None` only for externals.
     familyId: str | None = None
     kind: Kind = "person"
+    # An external belongs to one family (`familyId` stays null so rules and `sameFam` hold).
+    ownerFamilyId: str | None = None
     policy: Policy = Field(default_factory=lambda: Policy.model_validate(_DEFAULT_MEMBER_POLICY))
     notify: Notify = Field(default_factory=Notify)
     disabled: bool = False
@@ -98,9 +101,14 @@ def create_user(
     role: Role = "member",
     family_id: str | None = None,
     kind: Kind = "person",
+    owner_family_id: str | None = None,
 ) -> User:
     """Creates the user and alias atomically (`AliasTaken` if taken); policy defaults by `role`."""
     _validate_alias(alias)
+    if kind == "person" and family_id is None:
+        raise ValueError("a person must have a familyId")
+    if kind == "external" and family_id is not None:
+        raise ValueError("an external must not have a familyId")
     db = get_db()
     user_ref = db.collection("users").document(uid)
     alias_ref = db.collection("aliases").document(alias)
@@ -117,6 +125,7 @@ def create_user(
                 "role": role,
                 "familyId": family_id,
                 "kind": kind,
+                "ownerFamilyId": owner_family_id,
                 "policy": _default_policy(role),
                 "notify": {"alerts": True},
                 "disabled": False,

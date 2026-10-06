@@ -1,6 +1,7 @@
 """`/api/me/*`: the caller's profile, directory, backends and push tokens.
 
 `POST /api/me/backends` is rate limited per user (`RATE_LIMIT_BACKEND_CREATE_LIMIT` per
+`RATE_LIMIT_BACKEND_CREATE_WINDOW_S`, default 10/hour) and creates link-flow kinds disabled.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ logger = logging.getLogger("relay.routers.me")
 router = APIRouter()
 
 # Backend kinds with a link/verify flow: created `enabled=False`; `verify_backend` enables them.
+LINK_FLOW_KINDS: frozenset[str] = frozenset({"gchat"})
 
 DEFAULT_BACKEND_CREATE_LIMIT = 10
 DEFAULT_BACKEND_CREATE_WINDOW_S = 3600
@@ -104,6 +106,7 @@ class DirectoryEntry(BaseModel):
     kind: str
     familyId: str | None
     role: str
+    # Only set for `kind == 'external'`: the contact's `users.phone`.
     phone: str | None = None
 
 
@@ -162,6 +165,7 @@ def get_directory(
         user = users_store.get_user(uid)
         if user is None:
             continue
+        phone = user.phone if user.kind == "external" else None
         entries.append(
             DirectoryEntry(
                 uid=user.uid,
@@ -221,6 +225,7 @@ def create_backend(
     created = backends_store.create_backend(
         authed.uid, kind=req.kind, config=config, enabled=enabled
     )
+    # Best-effort `start_link` (gchat issues a link code): a failure must not fail creation.
     impl = registry.get(req.kind)
     if impl is not None:
         try:
@@ -261,6 +266,7 @@ def patch_backend(
     if row is None:
         raise HTTPException(status_code=404, detail="no such backend")
 
+    return backends_store.update_backend(authed.uid, bid, config=req.config, enabled=req.enabled)
 
 
 @router.delete("/api/me/backends/{bid}")

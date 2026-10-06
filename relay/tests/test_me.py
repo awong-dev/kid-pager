@@ -12,6 +12,7 @@ from app.config import Settings
 from app.main import create_app
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import externals as externals_store
 from app.store import messages as messages_store
 from app.store import users as users_store
 from tests.fake_transport import FakeBrokerClient
@@ -42,6 +43,8 @@ def client() -> Iterator[TestClient]:
 
 def _make_user(uid: str, alias: str) -> dict[str, str]:
     fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(uid=uid, alias=alias, display_name=alias, family_id="me-fam")
+    fb_auth.set_custom_user_claims(uid, {"role": "member", "fam": "me-fam"})
     return auth_header(uid)
 
 
@@ -53,6 +56,7 @@ def test_get_me_returns_user_and_role(client: TestClient):
     assert data["user"]["alias"] == "me1"
     assert data["role"] == "member"
     # A freshly created member's claims already agree with the doc's defaults.
+    assert data["user"]["familyId"] == "me-fam"
     assert data["user"]["kind"] == "person"
     assert data["user"]["policy"] == {"out": "people", "in": "people"}
     assert data["user"]["notify"] == {"alerts": True}
@@ -64,6 +68,8 @@ def test_get_me_reports_claims_stale_when_doc_role_changed_and_reissues_claims(
 ):
     uid = "me-stale-1"
     fb_auth.create_user(uid=uid, email=f"{uid}@example.com")
+    users_store.create_user(uid=uid, alias=uid, display_name=uid, family_id="me-fam")
+    fb_auth.set_custom_user_claims(uid, {"role": "member", "fam": "me-fam"})
     # The doc's role changes before the token's claims are reissued; /api/me must reissue them.
     users_store.update_user(uid, role="admin")
 
@@ -73,6 +79,7 @@ def test_get_me_reports_claims_stale_when_doc_role_changed_and_reissues_claims(
 
     # set_claims ran server-side, so the next minted token agrees with the doc.
     refreshed = fb_auth.get_user(uid)
+    assert refreshed.custom_claims == {"role": "admin", "fam": "me-fam"}
 
     resp2 = client.get("/api/me", headers=auth_header(uid))
     assert resp2.json()["claimsStale"] is False
@@ -118,23 +125,49 @@ def test_create_backend_rejects_pager_kind(client: TestClient):
     assert resp.status_code == 400
 
 
+def test_create_backend_kind_sms_is_422(client: TestClient):
     headers = _make_user("me4", "me4")
+    resp = client.post(
         "/api/me/backends",
+        json={"kind": "sms", "config": {"phone": "+15551234567"}},
         headers=headers,
     )
+    assert resp.status_code == 422, resp.text
+    assert [b["kind"] for b in client.get("/api/me/backends", headers=headers).json()] == ["webapp"]
 
 
+def test_list_backends_skips_retired_sms_row(client: TestClient):
+    from app.db.firestore import get_db
+    from app.routing import Routing
 
+    headers = _make_user("me5", "me5")
+    get_db().collection("users").document("me5").collection("backends").document("stale").set(
+        {"kind": "sms", "config": {}}
     )
 
+    resp = client.get("/api/me/backends", headers=headers)
     assert resp.status_code == 200, resp.text
+    assert [b["kind"] for b in resp.json()] == ["webapp"]
+    assert backends_store.get_backend("me5", "stale") is None
+
+    users_store.create_user(uid="sender5", alias="sender5", display_name="Sender5")
+    allow_store.set_edge("sender5", "me5", message=True, locate=False)
+    allow_store.set_edge("me5", "sender5", message=True, locate=False)
+    result = Routing(FakeBrokerClient()).send(
+        sender_uid="sender5",
+        recipient_alias="me5",
         kind="text",
         body="hi",
         origin_backend_kind="webapp",
     )
     assert result.ok
+    assert {d.kind for d in result.messages[0].deliveries.values()} == {"webapp"}
 
 
+def test_verify_unknown_backend_is_404(client: TestClient):
+    headers = _make_user("me9", "me9")
+    resp = client.post("/api/me/backends/nope/verify", json={"code": "123456"}, headers=headers)
+    assert resp.status_code == 404
 
 
 def test_push_token_add_and_remove(client: TestClient):
@@ -174,7 +207,9 @@ def test_directory_union_of_family_edge_peer_and_conversation_external(client: T
     allow_store.set_edge("dir-me", "dir-peer", message=True, locate=False)
 
     # An external the caller has a conversation with.
+    ext = externals_store.get_or_create("dir-fam-a", "+15551234567", "Unknown")
     messages_store.create_message(
+        sender_uid="dir-me", recipient_uid=ext.uid, kind="text", ts=1000, body="hi"
     )
 
     # An unrelated user: different family, no edge, no conversation.
@@ -198,6 +233,10 @@ def test_directory_union_of_family_edge_peer_and_conversation_external(client: T
     assert "dir-peer" in by_uid
     assert by_uid["dir-peer"]["familyId"] == "dir-fam-b"
 
+    assert ext.uid in by_uid
+    assert by_uid[ext.uid]["kind"] == "external"
+    assert by_uid[ext.uid]["familyId"] is None
+    assert by_uid[ext.uid]["phone"] == "+15551234567"
 
     assert "dir-stranger" not in by_uid
 

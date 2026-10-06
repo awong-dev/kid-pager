@@ -130,8 +130,10 @@ def _meta_ref():
 
 def build_participants_and_family_ids(
     uids: list[str], *, transaction: Transaction | None = None
+) -> tuple[dict[str, dict[str, str | None]], list[str]]:
     """`participants` and sorted `familyIds` for member uids; `transaction` carries the reads."""
     users_ref = _users()
+    participants: dict[str, dict[str, str | None]] = {}
     family_ids: set[str] = set()
     for uid in uids:
         ref = users_ref.document(uid)
@@ -144,6 +146,9 @@ def build_participants_and_family_ids(
             "displayName": data.get("displayName", ""),
             "kind": data.get("kind", "person"),
         }
+        if data.get("kind") == "external":
+            # Externals carry their phone so the web does not read it out of the alias.
+            participants[uid]["phone"] = data.get("phone")
         family_id = data.get("familyId")
         if family_id:
             family_ids.add(family_id)

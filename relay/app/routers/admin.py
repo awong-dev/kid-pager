@@ -22,6 +22,7 @@ from app.store import backends as backends_store
 from app.store import contacts as contacts_store
 from app.store import device_secrets as device_secrets_store
 from app.store import devices as devices_store
+from app.store import externals as externals_store
 from app.store import families as families_store
 from app.store import messages as messages_store
 from app.store import rate_limits as rate_limits_store
@@ -31,6 +32,7 @@ from app.store.allow import AllowEdge, EdgeInput
 from app.store.devices import Device
 from app.store.families import Family
 from app.store.settings import RetentionSetting, RetentionSettings
+from app.store.users import User
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_super)])
 
@@ -109,6 +111,18 @@ def create_user(
 
     # an omitted `familyId` defaults to the calling super's own family
     family_id = req.familyId if req.familyId is not None else principal_for(authed).family_id
+    if family_id is None:
+        raise HTTPException(status_code=400, detail="familyId is required")
+
+    # sign-in number only, never an SMS route
+    phone = req.phone
+    if phone:
+        try:
+            phone = externals_store.normalize_phone(phone)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="phone must be a number like +12065550100"
+            ) from exc
 
 
     try:
@@ -116,6 +130,7 @@ def create_user(
             alias=req.alias,
             display_name=req.displayName,
             email=req.email,
+            phone=phone,
             role=req.role,
             family_id=family_id,
         )
@@ -165,6 +180,21 @@ def _patch_user_impl(
     )
     if role is not None or family_id is not None:
         set_claims(uid, user.role, user.familyId)
+    # a `displayName`, `disabled` or `familyId` change alters every book listing this uid
+    name_changed = display_name is not None and display_name != existing.displayName
+    disabled_changed = disabled is not None and disabled != existing.disabled
+    family_changed = family_id is not None and family_id != existing.familyId
+    if name_changed or disabled_changed or family_changed:
+        owners = (
+            book.edge_holders(uid)
+            | book.family_uids(existing.familyId)
+            | book.family_uids(user.familyId)
+            | {uid}
+        )
+        book.bump_and_push(owners, broker, reason="member_patch")
+        book.rederive_sms_contacts(uid, broker)
+    # a displayName change rewrites `participants` in every conversation of this uid
+    if name_changed:
         messages_store.rewrite_participants_for_user(uid)
     return user
 
@@ -243,6 +273,8 @@ def put_allowlist(
         for e in req.entries
     ]
     # snapshot before `replace_all` so the diff is against the pre-request state (PROTOCOL.md §3.7)
+    old_edges = allow_store.list_edges()
+    old_message_sets = _message_sets_by_owner(old_edges)
     try:
         result = allow_store.replace_all(edges, family_id=family)
     except allow_store.LocateCrossFamily as exc:
@@ -259,6 +291,9 @@ def put_allowlist(
         for device in devices_store.list_devices(owner_uid=owner_uid):
             contacts_store.bump_book_version(device.id)
             devcfg.push_book(device.id, broker)
+    # `cfg.sms` is an edge projection: re-derive it for every touched owner
+    for owner_uid in sorted({e.fromUid for e in old_edges} | {e.fromUid for e in result}):
+        book.rederive_sms_contacts(owner_uid, broker)
     return result
 
 
@@ -334,6 +369,12 @@ def _create_device_impl(
     owner_uid = _resolve_uid(req.ownerAlias)
     owner = users_store.get_user(owner_uid)
     default_to_uid = _resolve_uid(req.defaultToAlias) if req.defaultToAlias else None
+    if default_to_uid is not None:
+        default_to = users_store.get_user(default_to_uid)
+        if default_to is not None and default_to.kind == "external":
+            raise HTTPException(
+                status_code=400, detail="the default recipient cannot be an SMS contact"
+            )
     try:
         apn = apn_presets.validate_apn(req.apn)
     except ValueError as exc:
@@ -360,6 +401,8 @@ def _create_device_impl(
     allow_store.recompute_locatable_by_for_owner(owner_uid)
 
     # PROTOCOL.md §3.7: device creation bumps and pushes the new device's book. Best-effort.
+    # seed `cfg.sms` (implied contacts for an open owner)
+    book.rederive_sms_contacts(owner_uid, broker)
 
     # push the broker credential and ACL before handing out a setup code
     host, ca = _bootstrap_host_and_ca(settings)
@@ -581,6 +624,75 @@ def push_ca(
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> dict[str, bool]:
     return _push_ca_impl(device_id, req, broker, settings)
+
+
+class OtaRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
+    cancel: bool | None = None
+
+
+def _load_firmware_index(settings: Settings) -> firmware.FirmwareIndex:
+    try:
+        return firmware.load_index(settings)
+    except firmware.FirmwareNotConfigured:
+        raise HTTPException(status_code=503, detail="OTA not configured") from None
+    except firmware.FirmwareIndexUnavailable:
+        raise HTTPException(status_code=502, detail="firmware index unavailable") from None
+
+
+) -> dict[str, list[dict[str, object]]]:
+    index = _load_firmware_index(settings)
+    img: str | None = None
+    if device is not None:
+        dev = devices_store.get_device(device)
+        if dev is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        img = dev.status.img
+    builds: list[dict[str, object]] = []
+    for b in sorted(index.builds, key=lambda b: b.published, reverse=True):
+        c = firmware.choose(index, b.id16, img)
+    return {"builds": builds}
+
+
+    device_id: str,
+    req: OtaRequest,
+) -> dict[str, object]:
+    if (req.target is None) == (not req.cancel):
+        raise HTTPException(status_code=422, detail="send exactly one of target or cancel")
+    dev = devices_store.get_device(device_id)
+    if dev is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    if not (settings.fw_index_url and settings.fw_bucket_base):
+        raise HTTPException(status_code=503, detail="OTA not configured")
+    if req.cancel:
+        return {"ok": devcfg.cancel_ota(device_id, broker)}
+    assert req.target is not None
+    index = _load_firmware_index(settings)
+    if index.find(req.target) is None:
+        raise HTTPException(status_code=404, detail="no such firmware build")
+    if dev.status.otaCap != 1:
+        raise HTTPException(status_code=409, detail="device does not report ota:1")
+    target_build = index.find(req.target)
+    assert target_build is not None
+    if dev.status.img and dev.status.img.strip().lower()[:16] == target_build.id16:
+        raise HTTPException(status_code=409, detail="already running that build")
+    choice = firmware.choose(index, req.target, dev.status.img)
+    est = firmware.estimate_bytes(choice.obj.osz)
+    ok = devcfg.push_ota(
+        device_id,
+        firmware.build_cfg_ota(choice, settings),
+        broker,
+        job={
+            "target16": req.target,
+            "kind": choice.kind,
+            "osz": choice.obj.osz,
+            "estBytes": est,
+        },
+    )
+
+
 class PutSettingsRequest(BaseModel):
 
 
@@ -615,6 +727,13 @@ def create_family(
 
 @router.patch("/families/{fid}", dependencies=[Depends(require_admin_write_rate_limit)])
 def patch_family(fid: str, req: PatchFamilyRequest) -> Family:
+    name = req.name
+    if name is not None:
+        try:
+            name = families_store.validate_family_name(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
+        return families_store.update_family(fid, name=name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

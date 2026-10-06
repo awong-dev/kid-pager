@@ -19,6 +19,8 @@ from app.location import Location
 from app.logging_config import configure_logging, request_id_var
 from app.routers import (
     admin,
+    battery,
+    book,
     ca,
     conversations,
     dev,
@@ -84,9 +86,11 @@ def create_app(
     app.include_router(admin.router)
     app.include_router(dev.router)
     app.include_router(devices.router)
+    app.include_router(battery.router)
     app.include_router(device_book.router)
     app.include_router(conversations.router)
     app.include_router(family.router)
+    app.include_router(book.router)
     app.include_router(me.router)
     app.include_router(internal.router)
 
