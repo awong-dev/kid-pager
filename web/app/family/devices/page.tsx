@@ -17,8 +17,10 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
+import { useNewestBuild } from "@/lib/firmware";
 import { useDirectory } from "@/lib/directory";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import type { DeviceDoc } from "@/lib/types";
@@ -47,6 +49,7 @@ interface DeviceSetupResponse {
 function FamilyDevicesInner() {
   const { byUid, contacts } = useDirectory();
   const { familyId } = useFamily();
+  const [fwDeviceId, setFwDeviceId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);
@@ -275,6 +278,14 @@ function FamilyDevicesInner() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {fwDeviceId !== null && (
+        <FirmwareUpdateDialog
+          device={devices.find((x) => x.id === fwDeviceId) ?? null}
+          open
+          onClose={() => setFwDeviceId(null)}
+        />
+      )}
 
       <Snackbar
         open={caSuccess !== null}

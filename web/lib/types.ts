@@ -47,8 +47,10 @@ export interface AlertDoc {
   subjectAlias: string;
   peerUid: string | null;
   peerAlias: string | null;
+  peerName: string | null;
   peerPhone: string | null;
   preview: string;
+  heldBody?: string | null;
   convKey: string | null;
   contactRequestKey: string | null;
   decidedAt: Timestamp | null;
@@ -88,6 +90,14 @@ export interface DeviceStatusDoc {
   caFp?: string | null;
   // Seconds until the next GPS attempt is allowed, 0 = now.
   locBackoffS?: number | null;
+  // Running image short id (16 hex), the OTA gate (1 = firmware + rollback bootloader
+  // confirmed), and the job's progress.
+  img?: string | null;
+  otaCap?: number | null;
+  otaTarget?: string | null;
+  otaState?: "wait" | "dl" | "ready" | "inst" | "ok" | "fail" | "rb" | null;
+  otaPct?: number | null;
+  otaErr?: string | null;
   // Audit-queue SMS entries dropped on the pager before upload.
   smsLost?: number | null;
   // Serving cell of the latest `/loc` report that carried one, whether or not its position
@@ -106,6 +116,17 @@ export interface DeviceDoc {
   status: DeviceStatusDoc;
   // Set from the owner's `familyId` at device creation.
   familyId?: string | null;
+  // The pending OTA job stored on push; null after cancel.
+  otaJob?: OtaJob | null;
+}
+
+export interface OtaJob {
+  target16: string;
+  kind: "full" | "delta";
+  osz: number;
+  estBytes: number;
+  by_uid: string;
+  at: number;
 }
 
 export interface LocationFixDoc {
@@ -190,6 +211,7 @@ export interface ConversationDoc {
   alias?: string;
   createdBy?: string;
   // Per-member alias/name snapshot keyed by uid, to name a peer without a directory lookup.
+  participants?: Record<string, { alias: string; displayName: string; kind: UserKind; phone?: string | null }>;
   // Every family with a member in this conversation, for the family-admin read-only view.
   familyIds?: string[];
 }

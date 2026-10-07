@@ -1,7 +1,11 @@
 "use client";
 
+/** "New chat" dialog: search select over the address book; only navigates to `/chat/{alias}`. */
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
+import Alert from "@mui/material/Alert";
+import Autocomplete, { createFilterOptions } from "@mui/material/Autocomplete";
 import Button from "@mui/material/Button";
 import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
@@ -10,11 +14,17 @@ import DialogTitle from "@mui/material/DialogTitle";
 import TextField from "@mui/material/TextField";
 
 import { useAuth } from "@/lib/auth-context";
+import { BOOK_GROUP_ORDER, type BookGroup, bookGroup, useBook } from "@/lib/book";
 
 interface ChatOption {
   /** Route alias: E.164 digits for a number, the person/group alias otherwise. */
   alias: string;
   label: string;
+  group: BookGroup;
+  displayName: string;
+  phone: string | null;
+  /** Admins also see unsendable entries, greyed out. */
+  disabled: boolean;
 }
 
 /** Parses `+`, digits, spaces, dashes and parens as a phone number; a bare 10-digit number is
@@ -39,6 +49,12 @@ export function formatPhoneDigits(digits: string): string {
   return `+${digits}`;
 }
 
+const filter = createFilterOptions<ChatOption>({
+  ignoreCase: true,
+  ignoreAccents: true,
+  stringify: (o) => `${o.label} ${o.displayName} ${o.alias} ${o.phone ?? ""}`,
+});
+
 interface NewChatDialogProps {
   open: boolean;
   onClose: () => void;
@@ -46,18 +62,36 @@ interface NewChatDialogProps {
 
 export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   const router = useRouter();
+  const { data } = useBook();
   const [inputValue, setInputValue] = useState("");
+  const [value, setValue] = useState<ChatOption | string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
+  const entries = useMemo(() => data?.entries ?? [], [data]);
   const options = useMemo<ChatOption[]>(() => {
     const rows: ChatOption[] = [];
+    for (const e of entries) {
+      if (!e.sendable && !isFamilyAdmin) continue;
       rows.push({
+        alias: e.alias,
+        group: bookGroup(e),
+        displayName: e.displayName,
+        phone: e.phone ?? null,
+        disabled: !e.sendable,
       });
     }
+    rows.sort(
+      (a, b) =>
+        BOOK_GROUP_ORDER.indexOf(a.group) - BOOK_GROUP_ORDER.indexOf(b.group) || a.label.localeCompare(b.label)
+    );
     return rows;
 
+  const bookEmpty = data !== null && !entries.some((e) => e.sendable);
 
   function reset() {
     setInputValue("");
+    setValue(null);
+    setNotice(null);
   }
 
   function handleClose() {
@@ -71,23 +105,77 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
     router.push(`/chat/${encodeURIComponent(alias)}`);
   }
 
+  // Admin free text: an alias typed with or without its leading `@`
+  // navigates the same way; a phone-shaped value by its E.164 digits.
+  function handleSubmit(text: string) {
+    const trimmed = text.trim();
     if (!trimmed) return;
+    if (parsePhoneDigits(trimmed) !== null) {
+      setNotice("Numbers are texted from the pager. Add one under Family → Contacts.");
+      return;
+    }
+    go(trimmed.replace(/^@/, ""));
   }
+
+  function open_() {
+    if (value && typeof value !== "string") go(value.alias);
+    else handleSubmit(typeof value === "string" ? value : inputValue);
+  }
+
+  const canOpen = value !== null || (isFamilyAdmin && inputValue.trim() !== "");
 
   return (
       <DialogTitle>New chat</DialogTitle>
       <DialogContent>
+        {bookEmpty && (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            Your address book is empty. Ask a family admin to approve people for you.{" "}
+            <Link href="/settings/book">Address book</Link>
+          </Alert>
+        )}
+        <Autocomplete<ChatOption, false, false, boolean>
+          freeSolo={isFamilyAdmin}
           autoHighlight
+          openOnFocus
+          options={options}
+          value={value}
           groupBy={(o) => o.group}
           getOptionLabel={(o) => (typeof o === "string" ? o : o.label)}
+          getOptionDisabled={(o) => typeof o !== "string" && o.disabled}
+          isOptionEqualToValue={(a, b) =>
+            typeof a !== "string" && typeof b !== "string" ? a.alias === b.alias : a === b
+          }
+          noOptionsText="No one in your address book matches"
           inputValue={inputValue}
+          onInputChange={(_, v) => {
+            setInputValue(v);
+            setNotice(null);
           }}
+          onChange={(_, v) => {
+            setValue(v);
+            if (!v) return;
+            if (typeof v === "string") handleSubmit(v);
+            else go(v.alias);
+          }}
+          filterOptions={filter}
           renderInput={(params) => (
+            <TextField
+              {...params}
+              autoFocus
+              margin="dense"
+              label={isFamilyAdmin ? "Name or @alias" : "Search your address book"}
+            />
           )}
         />
+        {notice && (
+          <Alert severity="info" sx={{ mt: 1 }}>
+            {notice}
+          </Alert>
+        )}
       </DialogContent>
       <DialogActions>
         <Button onClick={handleClose}>Cancel</Button>
+        <Button variant="contained" disabled={!canOpen} onClick={open_}>
           Open
         </Button>
       </DialogActions>

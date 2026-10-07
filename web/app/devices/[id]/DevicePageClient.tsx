@@ -1,5 +1,6 @@
 "use client";
 
+/** `/devices/[id]`: battery card, SMS contacts and audit log (`/api/devices/{id}/sms-contacts`,
  * `.../sms-log?limit=100&before=<epoch s>`). The id comes from `usePathname()`. */
 
 import { usePathname, useRouter } from "next/navigation";
@@ -24,8 +25,13 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 
 import AppShell from "@/components/AppShell";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
+import FirmwareChip from "@/components/FirmwareChip";
+import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
+import BatteryCard from "@/components/BatteryCard";
 import { ApiError, api } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
+import { useNewestBuild } from "@/lib/firmware";
 import { useDirectory } from "@/lib/directory";
 import {
   type SmsContact,
@@ -56,9 +62,64 @@ function formatLogTs(epochS: number): string {
   });
 }
 
+function LogRow({ e }: { e: SmsLogEntry }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const bad = e.malformed === true;
+  return (
+    <TableRow
+      sx={{
+        bgcolor: bad
+          ? "warning.light"
+          : e.st === "blocked"
+            ? "warning.light"
+            : e.st === "failed"
+              ? "error.light"
+              : undefined,
+      }}
+    >
+      <TableCell>{formatLogTs(e.smsTs || e.ts)}</TableCell>
+      <TableCell>{e.dir ? dirArrow(e.dir) : "—"}</TableCell>
+      <TableCell>{e.name ?? e.peer ?? "—"}</TableCell>
+      <TableCell>
+        {bad && <Chip size="small" label="malformed" color="error" sx={{ mr: 0.5 }} />}
+        {e.st ? <Chip size="small" label={e.st} color={statusColor(e.st)} /> : !bad && "—"}
+      </TableCell>
+      <TableCell sx={{ maxWidth: 240, wordBreak: "break-word" }}>
+        {bad ? (
+          <>
+            <Typography component="span" variant="body2" sx={{ fontStyle: "italic" }}>
+              {e.reason ?? "—"}
+            </Typography>
+            {e.rawHex && (
+              <>
+                {" "}
+                <Button size="small" sx={{ minWidth: 0, p: 0, textTransform: "none" }} onClick={() => setShowRaw((v) => !v)}>
+                  raw
+                </Button>
+                {showRaw && (
+                  <Typography
+                    component="div"
+                    variant="caption"
+                    sx={{ fontFamily: "monospace", wordBreak: "break-all" }}
+                  >
+                    {e.rawHex}
+                  </Typography>
+                )}
+              </>
+            )}
+          </>
+        ) : (
+          (e.body ?? "—")
+        )}
+      </TableCell>
+    </TableRow>
+  );
+}
+
 function DeviceInner() {
   const id = useDeviceId();
   const router = useRouter();
+  const [fwOpen, setFwOpen] = useState(false);
 
   const [contacts, setContacts] = useState<SmsContact[] | null>(null);
   const [pending, setPending] = useState(false);
@@ -136,12 +197,22 @@ function DeviceInner() {
 
       {deviceError && <Alert severity="warning">{deviceError}</Alert>}
 
+      {device && (
+            <Button size="small" onClick={() => setFwOpen(true)}>
+              Update firmware…
+            </Button>
+          )}
+        </Stack>
+      )}
+
       {smsLost > 0 && (
         <Alert severity="warning">
           {smsLost} SMS log {smsLost === 1 ? "entry was" : "entries were"} lost on the pager before
           they could be uploaded.
         </Alert>
       )}
+
+      {id && id !== "_" && <BatteryCard deviceId={id} />}
 
       <Card variant="outlined">
         <CardContent>
@@ -191,6 +262,13 @@ function DeviceInner() {
 
       <Card variant="outlined">
         <CardContent>
+            <Typography variant="h6" sx={{ flexGrow: 1 }}>
+              SMS log
+            </Typography>
+            <Button size="small" onClick={() => void fetchLog(undefined)}>
+              Refresh
+            </Button>
+          </Stack>
           {logError && (
             <Alert severity="error" sx={{ mb: 2 }}>
               {logError}
@@ -214,6 +292,7 @@ function DeviceInner() {
                 </TableHead>
                 <TableBody>
                   {log.map((e) => (
+                    <LogRow key={e.id} e={e} />
                   ))}
                 </TableBody>
               </Table>

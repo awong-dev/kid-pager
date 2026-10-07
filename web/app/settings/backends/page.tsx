@@ -95,6 +95,7 @@ function BackendsInner() {
 
       <Box>
         <Alert severity="info">
+          Google Chat backends stay disabled until linked.
         </Alert>
       </Box>
     </Stack>

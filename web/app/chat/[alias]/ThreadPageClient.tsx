@@ -24,6 +24,8 @@ import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
+import { familyQuery, useFamily } from "@/lib/family-context";
+import type { SmsLogEntry, SmsLogResponse } from "@/lib/smsContacts";
 
 const PAGE_SIZE_STEP = 50;
 // within this distance of the bottom counts as at-bottom
@@ -70,8 +72,44 @@ function useAliasFromPath(): string | null {
   }, [pathname]);
 }
 
+/** SMS audit rows (capped ~200 per device) for one contact's number across the viewer's devices. */
+async function loadModemRows(peerDigits: string, isStaff: boolean): Promise<SmsLogEntry[]> {
+    const ids = new Set<string>();
+    const sources = ["/devices"];
+    if (isStaff) sources.push(`/family/devices${familyQuery()}`);
+    for (const src of sources) {
+      try {
+        const list = await api.get<{ id: string }[]>(src);
+        for (const d of list) ids.add(d.id);
+      } catch {
+        // a source the viewer can't use contributes no devices
+      }
+    }
+    const rows: SmsLogEntry[] = [];
+    for (const id of ids) {
+      let before: number | undefined;
+      let perDevice = 0;
+      while (perDevice < 200) {
+        const qs = new URLSearchParams({ limit: "100" });
+        if (before !== undefined) qs.set("before", String(before));
+        try {
+          const resp = await api.get<SmsLogResponse>(`/devices/${encodeURIComponent(id)}/sms-log?${qs.toString()}`);
+          const mine = resp.entries.filter((e) => (e.peer ?? "").replace(/\D/g, "") === peerDigits);
+          rows.push(...mine);
+          perDevice += resp.entries.length;
+          if (resp.entries.length < 100) break;
+          before = resp.entries[resp.entries.length - 1]!.ts;
+        } catch {
+          break;
+        }
+      }
+    }
+  return rows;
+}
+
 function ThreadInner({ alias }: { alias: string }) {
   const { familyId } = useFamily();
+  const { aliasToUid, learn, groupByAlias, byUid } = useDirectory();
   const router = useRouter();
   const peerUid = aliasToUid(alias);
   // DM and group aliases are disjoint server-side: at most one of `peerUid`/`group` is set.
@@ -95,6 +133,32 @@ function ThreadInner({ alias }: { alias: string }) {
   // scrollHeight just before "Load older" grows the list, for the scroll-position correction
   const prevScrollHeightRef = useRef<number | null>(null);
   const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
+
+  // SMS-contact threads also show the pager modem's audit rows
+  // (`GET /api/devices/{id}/sms-log`) for every device the viewer can see.
+  const peerEntry = peerUid ? byUid(peerUid) : undefined;
+  const isExternal = peerEntry?.kind === "external";
+  const peerDigits = (peerEntry?.phone ?? "").replace(/\D/g, "");
+  const isStaff = me ? me.role !== "member" : false;
+  const [modemRows, setModemRows] = useState<SmsLogEntry[]>([]);
+  const fetchModemRows = async () => {
+    if (!isExternal || !peerDigits) return;
+    setModemRows(await loadModemRows(peerDigits, isStaff));
+  };
+  useEffect(() => {
+    if (!isExternal || !peerDigits) return;
+    let cancelled = false;
+    const load = () =>
+      void loadModemRows(peerDigits, isStaff).then((rows) => {
+        if (!cancelled) setModemRows(rows);
+      });
+    load();
+    window.addEventListener("focus", load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", load);
+    };
+  }, [isExternal, peerDigits, isStaff]);
 
   const convKey = group ? group.convKey : me && peerUid ? [me.uid, peerUid].sort().join("_") : null;
 
@@ -266,6 +330,16 @@ function ThreadInner({ alias }: { alias: string }) {
 
       {!peerUid && !group && <Alert severity="info">No conversation with @{alias} yet</Alert>}
 
+      {isExternal && (
+          <Alert severity="info" sx={{ flexGrow: 1 }}>
+            Texts with SMS contacts go through the pager&apos;s modem.
+          </Alert>
+          <Button size="small" onClick={() => void fetchModemRows()}>
+            Refresh
+          </Button>
+        </Stack>
+      )}
+
       <MessageList
         messages={messages}
         meUid={me?.uid ?? null}
@@ -283,6 +357,7 @@ function ThreadInner({ alias }: { alias: string }) {
         onScroll={handleScroll}
         showNewMessagesChip={showNewMessagesChip}
         onJumpToBottom={() => scrollToBottom(reducedMotion ? "auto" : "smooth")}
+        modemRows={modemRows}
       />
 
       <Stack direction="row" spacing={1} sx={{ alignItems: "flex-end" }}>
@@ -310,6 +385,12 @@ function ThreadInner({ alias }: { alias: string }) {
         </Button>
       </Stack>
       {sendError && <Alert severity="error">{sendError}</Alert>}
+      {peerDeviceKnownNone && !group && peerUid !== me?.uid && (
+        <Alert severity="info">
+          @{alias} has no pager. Messages go only to their other backends (e.g. web app) and show
+          as &quot;sent&quot; until read there.
+        </Alert>
+      )}
 
       <Snackbar
         open={snack !== null}

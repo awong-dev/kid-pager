@@ -9,6 +9,7 @@ import {
   type ReactNode,
   createContext,
   useContext,
+  useLayoutEffect,
   useMemo,
   useState,
 } from "react";
@@ -71,6 +72,9 @@ export function FamilyProvider({ children }: { children: ReactNode }) {
 
   const familyId = isSuper ? (selected ?? me?.familyId ?? null) : (me?.familyId ?? null);
 
+  // Layout effect, not passive: children's mount effects (the first `/api/family/*` fetch)
+  // run before this provider's passive effect and would miss `?family=`.
+  useLayoutEffect(() => {
     currentScope = { familyId, canSwitch: isSuper };
   }, [familyId, isSuper]);
 

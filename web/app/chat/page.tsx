@@ -53,6 +53,11 @@ interface FamilyRow {
   lastMessageAt: ConversationDoc["lastMessageAt"];
 }
 
+/** An external's number as digits (no `+`); its alias is a hash, so only `phone` carries it. */
+function externalDigits(phone: string | null | undefined): string | undefined {
+  return phone ? phone.replace(/^\+/, "") : undefined;
+}
+
 function ChatListInner() {
   const { me, isFamilyAdmin } = useAuth();
   const { familyId } = useFamily();
@@ -84,6 +89,7 @@ function ChatListInner() {
         const alias = participant?.alias ?? directoryEntry?.alias;
         if (!alias) return [];
         const kind = participant?.kind ?? directoryEntry?.kind;
+        const phone = kind === "external" ? externalDigits(participant?.phone ?? directoryEntry?.phone) : undefined;
       }),
     [conversations, byUid]
   );
@@ -107,6 +113,10 @@ function ChatListInner() {
         const peerEntry = peerUid ? participants[peerUid] : undefined;
         return {
           convKey: c.convKey,
+          phone:
+            peerEntry?.kind === "external"
+              ? externalDigits(peerEntry.phone ?? (peerUid ? byUid(peerUid)?.phone : undefined))
+              : undefined,
           lastPreview: c.lastPreview,
           lastMessageAt: c.lastMessageAt,
         };

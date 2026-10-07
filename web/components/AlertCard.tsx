@@ -21,6 +21,7 @@ import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
 import PersonAddIcon from "@mui/icons-material/PersonAdd";
 import SmsIcon from "@mui/icons-material/Sms";
 
+import { formatPhoneDigits } from "@/components/NewChatDialog";
 import { ApiError, api } from "@/lib/api";
 import { familyQuery } from "@/lib/family-context";
 import type { AlertDoc } from "@/lib/types";
@@ -69,6 +70,11 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
   const [smsOpen, setSmsOpen] = useState(false);
   const [smsName, setSmsName] = useState("");
 
+  // 409 name collision on a contact_request approve: ask for another name.
+  const [nameOpen, setNameOpen] = useState(false);
+  const [nameValue, setNameValue] = useState("");
+  const [nameConflict, setNameConflict] = useState<string | null>(null);
+
   const handled = alert.status !== "open";
 
   async function post(action: "approve" | "block" | "dismiss", body: unknown) {
@@ -76,7 +82,21 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
     setError(null);
     try {
       setSmsOpen(false);
+      setNameOpen(false);
+      setNameConflict(null);
     } catch (err) {
+      const detail = err instanceof ApiError ? String(err.detail ?? err.message) : `Failed to ${action}`;
+      if (err instanceof ApiError && err.status === 409 && action === "approve") {
+          setNameConflict(detail);
+          setNameOpen(true);
+        } else if (alert.kind === "sms_unknown") {
+          setNameConflict(detail);
+        } else {
+          setError(detail);
+        }
+      } else {
+        setError(detail);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -85,9 +105,11 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
   function openSmsApprove() {
     setError(null);
     setSmsName("");
+    setNameConflict(null);
     setSmsOpen(true);
   }
 
+  const isSms = alert.peerPhone != null;
 
   return (
     <Card variant="outlined">
@@ -128,6 +150,22 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
 
         {alert.kind === "contact_request" && (
           <>
+            {isSms ? (
+              <>
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                  Approve: @{alert.subjectAlias}&apos;s pager can text this number.
+                </Typography>
+              </>
+            ) : (
+              <>
+                <Typography variant="body1">
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                  Approve: @{alert.subjectAlias} can message @{alert.peerAlias}.
+                </Typography>
+              </>
+            )}
           </>
         )}
 
@@ -166,7 +204,12 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
               </Button>
             </>
           )}
+            <Button size="small" variant="contained" onClick={() => void post("approve", {})} disabled={submitting}>
               Approve
+            </Button>
+          )}
+            <Button size="small" color="warning" onClick={() => void post("block", {})} disabled={submitting}>
+              Block
             </Button>
           )}
           <Button size="small" onClick={() => void post("dismiss", {})} disabled={submitting}>
@@ -177,6 +220,11 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
 
         <DialogTitle>Approve {alert.peerPhone ?? "number"}</DialogTitle>
         <DialogContent>
+          {nameConflict && smsOpen && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {nameConflict}
+            </Alert>
+          )}
           <TextField
             autoFocus
             label="Name"
@@ -198,6 +246,34 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
         </DialogActions>
       </Dialog>
 
+        <DialogTitle>Choose another name</DialogTitle>
+        <DialogContent>
+          {nameConflict && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {nameConflict}
+            </Alert>
+          )}
+          <TextField
+            autoFocus
+            label="Name"
+            value={nameValue}
+            onChange={(e) => setNameValue(e.target.value)}
+            fullWidth
+            sx={{ mt: 1 }}
+            helperText="Must be unique in the family; the pager shows the first 16 characters."
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setNameOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={submitting || nameValue.trim().length === 0}
+            onClick={() => void post("approve", { name: nameValue.trim() })}
+          >
+            Approve
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Card>
   );
 }

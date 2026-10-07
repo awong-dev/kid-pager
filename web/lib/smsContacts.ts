@@ -16,6 +16,17 @@ export type SmsStatus = "sent" | "failed" | "recv" | "blocked";
 export interface SmsLogEntry {
   id: string;
   ts: number;
+  smsTs?: number | null;
+  // Malformed audit uploads (relay flags them): best-effort fields may be
+  // null, `body` is null and `reason`/`rawHex` explain what arrived.
+  dir: SmsDirection | null;
+  peer: string | null;
+  name?: string | null;
+  st: SmsStatus | null;
+  body: string | null;
+  malformed?: boolean;
+  reason?: string | null;
+  rawHex?: string | null;
 }
 
 export interface SmsLogResponse {
@@ -79,6 +90,8 @@ export function validateContacts(contacts: SmsContact[]): string[] {
 }
 
 /** Direction arrow for the SMS log table. */
+export function dirArrow(dir: SmsDirection | null): string {
+  if (dir === null) return "—";
   return dir === "out" ? "→" : "←";
 }
 

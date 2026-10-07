@@ -109,9 +109,11 @@ function AdminFamiliesInner() {
   }
 
   async function saveDetail() {
+    if (!detail) return;
     setSavingDetail(true);
     setError(null);
     try {
+      await api.patch(`/admin/families/${detail.id}`, { name: detailName });
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to update family");
     } finally {
@@ -241,6 +243,7 @@ function AdminFamiliesInner() {
                   <Button
                     variant="contained"
                     onClick={() => void saveDetail()}
+                    disabled={savingDetail}
                   >
                     Save
                   </Button>

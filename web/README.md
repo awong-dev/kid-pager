@@ -214,6 +214,7 @@ incognito window) to act as two different people at once where noted.
     click it -> confirm a `location requested` marker appears in the thread,
     and (once the simulated device answers a `loc` fix) a location card with
     lat/lon and "Open in Google Maps"/"Open in Apple Maps" links.
+11. **Backends**: `/settings/backends` → Add Google Chat → the row appears disabled until linked.
 12. **Contact requests and address book**: `/admin/contacts`
     shows pending requests from all devices. With the student device running
     (`tools/e2e_v2.py address_book`, or `pager_client.py` REPL `contactreq`
@@ -254,7 +255,20 @@ incognito window) to act as two different people at once where noted.
 21. **Location page scoping**: family admin sees all family devices on the map and can
     Locate now; the other family's devices never appear, including for super until the switcher
     is changed; a member sees only own and granted devices.
+22. **Policy and approved editors in the member drawer**: change a member's policy to Open; every family contact appears in `devices/{id}.smsContacts`; switch back
+    to People and only contacts picked in Approved remain.
 23. **New chat dialog**: member on `people` types an unrelated alias, sends, sees "Your
+    family admin has limited who you can message."; typing a phone number shows 'Numbers are texted
+    from the pager…' and does not navigate.
 24. **Family Contacts page**: an external created through the member drawer appears;
+    renaming it changes the name shown on `/chat`; adding a second contact with the same name (any case) shows the 409 message; Delete removes it from
+    every member's pager list.
+25. **Alerts page and badge**: a device `sms_log` `in` from an unlisted number (Python test pager
+    `sms in <phone> <text>`) raises one `sms_unknown` card; Approve with a name creates the contact and puts it on that
+    member's pager; Block adds the number to the family's blocked list; a `contact_req` card approves into an SMS
+    contact or a link. On the device page, the SMS log card (Refresh button) lists every text newest first; a
+    malformed audit upload (bad `sms_log` payload from the pager) shows a red "malformed" chip, its reason in italics,
+    "—" for unknown fields, and a "raw" toggle revealing the hex. A chat with an SMS contact interleaves the pager's modem texts for that number as bubbles (out = right, in = left,
+    "modem" chip, status, malformed rows with reason/raw); Refresh or window focus reloads them.
 
 `npm run build && npx tsc --noEmit && npm run lint` should all be clean.

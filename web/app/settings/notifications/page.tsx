@@ -3,6 +3,7 @@
 /** `/settings/notifications`: browser push via `registerForPush()` (Web Push or FCM), test button,
  * and a family-admin "Family alerts" switch (`PATCH /api/me {notify: {alerts}}`). */
 
+import { useEffect, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import FormControlLabel from "@mui/material/FormControlLabel";
@@ -26,6 +27,7 @@ function NotificationsInner() {
   const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() =>
     notificationPermission()
   );
+  const [hasToken, setHasToken] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +35,46 @@ function NotificationsInner() {
   const [alertsEnabled, setAlertsEnabled] = useState(() => me?.notify.alerts ?? true);
   const [alertsSaving, setAlertsSaving] = useState(false);
   const [alertsError, setAlertsError] = useState<string | null>(null);
+
+  // Keep `permission` live: the user can change it in browser site settings
+  // while this page is open.
+  useEffect(() => {
+    const refresh = () => setPermission(notificationPermission());
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+    window.addEventListener("focus", refresh);
+    let status: PermissionStatus | null = null;
+    let cancelled = false;
+    try {
+      navigator.permissions
+        ?.query({ name: "notifications" })
+        .then((s) => {
+          if (cancelled) return;
+          status = s;
+          s.onchange = refresh;
+        })
+        .catch(() => {});
+    } catch {
+      // Browsers that throw on this permission name: events above suffice.
+    }
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", refresh);
+      window.removeEventListener("focus", refresh);
+      if (status) status.onchange = null;
+    };
+  }, []);
+
+  async function handleTest() {
+    setError(null);
+    try {
+      await showLocalTestNotification();
+    } catch (err) {
+      setError(
+        `Could not show the test notification: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
 
   async function handleAlertsToggle(next: boolean) {
     const previous = alertsEnabled;
@@ -58,13 +100,18 @@ function NotificationsInner() {
     try {
       setPermission(notificationPermission());
         setError(
+          notificationPermission() === "denied"
+            ? "Notifications are blocked for this site in the browser's site settings."
+            : "This browser does not support web push (see the iOS note below)."
         );
         return;
       }
+      setHasToken(true);
       setStatus("Notifications enabled for this browser.");
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to enable notifications");
     } finally {
+      setPermission(notificationPermission());
       setBusy(false);
     }
   }
@@ -97,6 +144,11 @@ function NotificationsInner() {
         </>
       )}
 
+      {permission === "granted" && !hasToken && (
+        <Alert severity="info">
+          Permission is granted. Press Enable notifications to register this browser.
+        </Alert>
+      )}
       {status && <Alert severity="success">{status}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
 
@@ -106,6 +158,7 @@ function NotificationsInner() {
         <Button
           variant="outlined"
           disabled={permission !== "granted"}
+          onClick={() => void handleTest()}
         >
           Send test notification
         </Button>

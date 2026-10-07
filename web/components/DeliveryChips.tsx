@@ -28,6 +28,26 @@ function stateTimeMs(delivery: DeliveryDoc, state: DeliveryState): number | null
   return null;
 }
 
+const WHERE: Record<string, string> = {
+  pager: "pager",
+  webapp: "app",
+  gchat: "Google Chat",
+};
+
+const LABELS: Record<string, Partial<Record<DeliveryState, string>>> = {
+  pager: { queued: "waiting for pager", sent: "sent to pager", shown: "on pager", read: "read on pager" },
+  webapp: { queued: "waiting", sent: "sent to app", shown: "shown in app", read: "read in app" },
+  gchat: { queued: "waiting", sent: "sent to Google Chat", shown: "sent to Google Chat", read: "read in Google Chat" },
+};
+
+/** Chip text saying where a delivery went; unknown kinds fall back to `kind: state`. */
+  const where = WHERE[kind];
+  if (!where) return `${kind}: ${state}`;
+  if (state === "expired") return "expired";
+  if (state === "fulfilled") return "location received";
+  return LABELS[kind]?.[state] ?? `${kind}: ${state}`;
+}
+
 /** Per-backend delivery-state chips read from the message's embedded `deliveries` map. */
   const entries = Object.entries(message.deliveries);
   if (entries.length === 0) return null;

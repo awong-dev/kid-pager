@@ -2,6 +2,7 @@
 
 /** `/admin/users`: create (alias, name, email/phone, role), disable, delete via the users API. */
 
+import Link from "next/link";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
@@ -155,8 +156,14 @@ function AdminUsersInner() {
               fullWidth
             />
             <TextField
+              label="Sign-in phone (+1XXXXXXXXXX)"
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
+              helperText={
+                <>
+                  <Link href="/family/contacts">Contacts</Link>. Email or phone is required.
+                </>
+              }
               fullWidth
             />
             <TextField

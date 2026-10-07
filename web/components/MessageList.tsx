@@ -12,11 +12,19 @@ import Typography from "@mui/material/Typography";
 import LocationOnIcon from "@mui/icons-material/LocationOn";
 
 import DeliveryChips from "@/components/DeliveryChips";
+import SmsLogBubble from "@/components/SmsLogBubble";
+import type { SmsLogEntry } from "@/lib/smsContacts";
 import { formatClock, isLocReqExpired } from "@/lib/time";
 import type { MessageDoc } from "@/lib/types";
 
 export interface MessageRow extends MessageDoc {
   id: string;
+}
+
+/** Side is decided by origin: a device and its owner's browser share one `senderUid`, so
+ * `originBackendKind === "pager"` is never "mine". */
+function isFromPager(m: MessageDoc): boolean {
+  return m.originBackendKind === "pager";
 }
 
 // `loc_req` and `kind='loc'` messages render as one small link to `/location`; the read-only
@@ -72,10 +80,12 @@ function MessageBubble({
   message,
   mine,
   isGroup,
+  meUid,
 }: {
   message: MessageRow;
   mine: boolean;
   isGroup: boolean;
+  meUid: string | null;
 }) {
   const atMs = (message.ts ?? 0) * 1000;
   return (
@@ -83,6 +93,12 @@ function MessageBubble({
       {isGroup && message.senderAlias && (
         <Typography variant="caption" color="text.secondary" sx={{ px: 0.5 }}>
           {message.senderAlias}
+          {isFromPager(message) ? " (pager)" : ""}
+        </Typography>
+      )}
+      {!isGroup && isFromPager(message) && message.senderUid === meUid && (
+        <Typography variant="caption" color="text.secondary" sx={{ px: 0.5 }}>
+          your pager
         </Typography>
       )}
       <Box
@@ -120,6 +136,8 @@ export interface MessageListProps {
   onScroll: (event: UIEvent<HTMLDivElement>) => void;
   showNewMessagesChip: boolean;
   onJumpToBottom: () => void;
+  /** Pager-modem SMS audit rows to interleave by time (SMS-contact threads). */
+  modemRows?: SmsLogEntry[];
 }
 
 export default function MessageList({
@@ -133,7 +151,12 @@ export default function MessageList({
   onScroll,
   showNewMessagesChip,
   onJumpToBottom,
+  modemRows,
 }: MessageListProps) {
+  const items = [
+    ...messages.map((m) => ({ ts: m.ts ?? 0, m, e: null as SmsLogEntry | null })),
+    ...(modemRows ?? []).map((e) => ({ ts: e.smsTs || e.ts, m: null as MessageRow | null, e })),
+  ].sort((a, b) => a.ts - b.ts);
   return (
     // `position: relative` is on this wrapper, not the scrolling Box, so the chip does not scroll
     // with the content; `minHeight: 0` lets the inner `overflowY: auto` box do the scrolling.
@@ -146,6 +169,9 @@ export default function MessageList({
             </Button>
           </Stack>
         )}
+        {items.map(({ m, e }) => {
+          if (!m) return <SmsLogBubble key={`sms-${e!.id}`} entry={e!} />;
+          const mine = m.senderUid === meUid && !isFromPager(m);
           if (m.kind === "loc_req") {
             return <LocReqRow key={m.id} message={m} mine={mine} alias={locationAlias} />;
           }

@@ -17,10 +17,12 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { useNewestBuild } from "@/lib/firmware";
 import type { DeviceDoc, UserDoc } from "@/lib/types";
 
 import SetupCodePanel, { type SetupCodeResult } from "./SetupCodePanel";
@@ -54,6 +56,7 @@ function DevicesInner() {
   const [form, setForm] = useState(emptyForm);
   const [setupResult, setSetupResult] = useState<SetupCodeResult | null>(null);
   const [caConfirm, setCaConfirm] = useState<CaConfirmState | null>(null);
+  const [fwDeviceId, setFwDeviceId] = useState<string | null>(null);
   const [caBusy, setCaBusy] = useState(false);
   const [caError, setCaError] = useState<string | null>(null);
   const [caSuccess, setCaSuccess] = useState<string | null>(null);
@@ -312,6 +315,14 @@ function DevicesInner() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {fwDeviceId !== null && (
+        <FirmwareUpdateDialog
+          device={devices.find((x) => x.id === fwDeviceId) ?? null}
+          open
+          onClose={() => setFwDeviceId(null)}
+        />
+      )}
 
       <Snackbar
         open={caSuccess !== null}

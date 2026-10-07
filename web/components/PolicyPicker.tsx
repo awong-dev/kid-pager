@@ -1,5 +1,6 @@
 "use client";
 
+/** Outbound/Inbound radio pickers for a member's conversation policy, with its own Save. */
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -24,6 +25,7 @@ export default function PolicyPicker({
 }: {
   uid: string;
   policy: PolicyDoc;
+  onSaved?: (policy: PolicyDoc) => void;
 }) {
   const [out, setOut] = useState(policy.out);
   const [inbound, setInbound] = useState(policy.in);
@@ -37,6 +39,7 @@ export default function PolicyPicker({
       await api.patch(`/family/members/${uid}${familyQuery()}`, {
         policy: { out, in: inbound },
       });
+      onSaved?.({ ...policy, out, in: inbound });
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to save policy");
     } finally {
@@ -51,6 +54,7 @@ export default function PolicyPicker({
       <FormControl>
         <FormLabel>Outbound</FormLabel>
         <RadioGroup value={out} onChange={(e) => setOut(e.target.value)}>
+          {OUTBOUND_POLICIES.filter((o) => !o.hidden || o.code === out).map((o) => (
             <FormControlLabel
               key={o.code}
               value={o.code}
@@ -71,6 +75,7 @@ export default function PolicyPicker({
       <FormControl>
         <FormLabel>Inbound</FormLabel>
         <RadioGroup value={inbound} onChange={(e) => setInbound(e.target.value)}>
+          {INBOUND_POLICIES.filter((o) => !o.hidden || o.code === inbound).map((o) => (
             <FormControlLabel
               key={o.code}
               value={o.code}
@@ -87,6 +92,11 @@ export default function PolicyPicker({
           ))}
         </RadioGroup>
       </FormControl>
+
+      <Typography variant="body2" color="text.secondary">
+        Contacts: Open puts every family contact on the member&apos;s pager; otherwise only the contacts
+        approved for them (Approved → Contacts). The relay itself never sends SMS.
+      </Typography>
 
       <Button variant="contained" onClick={() => void save()} disabled={busy} sx={{ alignSelf: "flex-start" }}>
         Save policy
