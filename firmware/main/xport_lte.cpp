@@ -281,6 +281,7 @@ void pager_mqtt_event_handler(WMMQTTEventType event, const WMMQTTEventData *data
         break;
 
     case WALTER_MODEM_MQTT_EVENT_MESSAGE:
+        net_note_radio_event();
         // RTS interlock: without this flag modes_run() could light-sleep and deassert RTS mid
         // mqttReceive() response; it ORs net_modem_busy() into its skip_sleep condition.
         s_handler_busy = true;
@@ -501,6 +502,7 @@ static void lte_service_session(void)
             ESP_LOGI(TAG, "liveness ping got no SUBACK in 30s: re-sending once (idle %llds) "
                           "before declaring the session dead",
                      (long long) ((now - s_last_uplink_us) / 1000000));
+            net_note_radio_event();
             s_resub_sent_us = now;
             lte_resub_hold_note_sent(now);
             s_resub_second_try = true;
@@ -547,6 +549,7 @@ static void lte_service_session(void)
                  (long long) idle_s, resume_repair ? " (resume repair)" : "");
         return;
     }
+    net_note_radio_event();
     s_resub_sent_us = now;
     lte_resub_hold_note_sent(now);
     s_resub_wait = true;

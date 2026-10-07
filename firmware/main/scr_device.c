@@ -8,6 +8,9 @@
 #include "lock.h"
 #include "msg.h"
 #include "book.h"
+#include "net.h"
+#include "ota.h"
+#include "disp.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +19,10 @@
 
 typedef enum {
     MROW_TEXTSIZE,
+    MROW_ROTATE,
+    MROW_AIRPLANE, /* NVS net/airplane, takes effect at next boot */
+    MROW_REBOOT,
+    MROW_TUNE,     /* carrier only (board_has_piezo()) */
     MROW_PASSCODE,
     MROW_AUTOLOCK,
     MROW_CARRIER,
@@ -43,6 +50,12 @@ static pw_modal_t s_pw_modal = PW_MODAL_NONE;
 static char s_pw_buf[LOCK_PASSCODE_MAX + 1];
 static size_t s_pw_len = 0;
 static bool s_pw_allow_off = false;
+
+/* 1 while an update is ready (extra first row "Install now"); menu indices are offset by it. */
+static int device_extra_rows(void)
+{
+    return ota_install_ready() ? 1 : 0;
+}
 
 static void device_on_event(ui_evt_t evt)
 {
@@ -169,11 +182,30 @@ static void device_on_key(input_key_t key)
         }
         break;
     case INPUT_KEY_ENTER:
+        if (device_extra_rows() == 1 && s_sel == 0) {
+            // Power effect: none now; ota_service() reboots into the new image on its next call.
+            ota_install_now();
+            ui_show_toast("installing update");
+            break;
+        }
         case MROW_RESYNC:
             ui_show_toast(modes_publish_status_now() ? "re-sync requested" : "not connected");
             break;
         case MROW_TEXTSIZE:
             ui_toggle_text_size();
+            break;
+        case MROW_ROTATE:
+            // Power effect: one NVS write plus a ~2-4 s full panel refresh (disp_set_flip() does
+            // not refresh by itself).
+            disp_set_flip(!disp_get_flip());
+            disp_full_refresh();
+            break;
+        case MROW_AIRPLANE:
+            // Power effect: one NVS write; the modem is held in reset from the next boot on.
+            net_set_airplane(!net_airplane_stored());
+            break;
+        case MROW_REBOOT:
+            esp_restart();
             break;
         case MROW_PASSCODE:
             s_pw_len = 0;
@@ -249,6 +281,7 @@ static void device_render_confirm(void)
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL, "enter confirm  esc cancel");
 }
 
+// A new passcode is shown in clear; the current-passcode prompt is masked.
 static void device_render_pw(void)
 {
     int y = UI_BODY_TOP + 2;
@@ -263,7 +296,9 @@ static void device_render_pw(void)
     size_t i = 0;
     mask[i++] = '>';
     mask[i++] = ' ';
+    bool show_clear = (s_pw_modal == PW_MODAL_NEW);
     for (size_t j = 0; j < s_pw_len; j++) {
+        mask[i++] = show_clear ? s_pw_buf[j] : '*';
     }
     mask[i++] = '_';
     mask[i] = '\0';
@@ -295,6 +330,14 @@ static void device_render_normal(void)
     snprintf(lines[n], DEVICE_LINE_LEN, "session %s  book v%u", modes_get_session_id(),
              (unsigned) book_get_bv());
     selectable[n++] = false;
+    {
+        ota_status_t os;
+        ota_get_status(&os);
+        char ut[40];
+        ota_ui_text(os.have_job ? os.state : OTA_ST_NONE, os.err, os.pct, ut, sizeof(ut));
+        snprintf(lines[n], DEVICE_LINE_LEN, "Update: %s", ut);
+        selectable[n++] = false;
+    }
     snprintf(lines[n], DEVICE_LINE_LEN, "counters memfull %u  drops %u  resets %u",
              (unsigned) modes_get_memfull_count(), (unsigned) modes_get_oversize_drop_count(),
              (unsigned) modes_get_modem_resets());
@@ -302,10 +345,21 @@ static void device_render_normal(void)
     selectable[n++] = false;
 
     int menu_start = n;
+    if (device_extra_rows() == 1) {
+        snprintf(lines[n], DEVICE_LINE_LEN, "Install update now");
+        selectable[n++] = true;
+    }
+    }
     snprintf(lines[n], DEVICE_LINE_LEN, "Re-sync address book");
     selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Text size: %s",
              ui_text_size() == GFX_FONT_LARGE ? "large" : "normal");
+    selectable[n++] = true;
+    snprintf(lines[n], DEVICE_LINE_LEN, "Rotate display: %s", disp_get_flip() ? "on" : "off");
+    selectable[n++] = true;
+    snprintf(lines[n], DEVICE_LINE_LEN, "Airplane mode: %s (reboot)", net_airplane_stored() ? "on" : "off");
+    selectable[n++] = true;
+    snprintf(lines[n], DEVICE_LINE_LEN, "Reboot");
     selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Passcode: %s", lock_is_set() ? "set" : "not set");
     selectable[n++] = true;

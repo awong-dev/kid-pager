@@ -8,6 +8,7 @@ ESP-IDF 5.x project for the Walter device (ESP32-S3 + Sequans LTE-M modem). The 
 | Part | Role | Interface / power |
 |---|---|---|
 | Walter module (DPTechnics) | ESP32-S3-WROOM-1-N16R2 + Sequans GM02SP LTE-M modem + GNSS | — |
+| Adafruit eInk Breakout Friend, Orient Display AES128296A00-2.9ENRS panel (SSD1680-compatible, 296×128) | E-paper display | SPI via the GPIO matrix, 4 MHz: SCK IO2, MISO IO42, MOSI IO41, ECS IO40, D/C IO39, RST IO13, BUSY IO11; SRCS IO38 held high (SRAM unused); SDCS not wired. ENA IO12 is the Friend's regulator enable (active-high, pulled up on the Friend): low = panel unpowered. Friend VIN from the power board's always-on "3V" rail, not Walter VIN or Walter 3V3-OUT. |
 
 There is no wake button; IO8 (header pin 23) is unused on the breadboard build.
 
@@ -18,13 +19,27 @@ is the input side.
 
 ```
                                         ┌─────── USB-C ───────┐
+                  (unused)  RESET   1 ──┤                     ├── 28  VIN      ◄── power board SYS (4.5V) out
+                  (unused)  IO43    3 ──┤                     ├── 26  3V3-OUT  ──► CardKB VCC (switched by IO0)
+       CardKB supply gate  IO0     4 ──┤                     ├── 25  IO10     ◄─► CardKB SDA
+                Friend ENA  IO12    5 ──┤                     ├── 24  IO9      ──► CardKB SCL
+                Friend ECS  IO40   10 ──┤                     ├── 19  IO15     (unused)
+               Friend MOSI  IO41   11 ──┤                     ├── 18  IO7      (unused)
                                         └────────┤ SIM ├────────┘
 
+   Off-board wires:  power board 3V ──► Friend VIN, LIS3DH VIN (always on)
+                     all GNDs to Walter GND; no capacitors on the distribution board
 ```
 
 Per-peripheral view of the same wiring:
 
+| eInk Friend pin | Walter pin | | CardKB (Grove) | Walter pin | | LIS3DH breakout | Walter pin |
 |---|---|---|---|---|---|---|---|
+| VIN | power board 3V (off-board, always on) | | VCC | 26 3V3-OUT | | VIN | power board 3V (off-board, always on) |
+| GND | 27 GND | | GND | 27 GND | | GND | 27 GND |
+| MOSI | 11 IO41 | | | | | SDO/SA0 | open (addr 0x18) |
+| ECS | 10 IO40 | | | | | | |
+| D/C | 9 IO39 | | | | | | |
 | SRCS | 8 IO38 | | | | | | |
 | SDCS | — | | | | | | |
 | RST | 7 IO13 | | | | | | |
@@ -36,6 +51,19 @@ UART0 and unused (the console is USB Serial/JTAG).
 
 ### Power domains
 
+- **Power board always-on "3V".** The Adafruit 6092 power board's buck output feeds the eInk
+  Friend's VIN and the LIS3DH breakout's VIN directly, off-board, never gated by any Walter GPIO.
+  Neither loses power across an ESP32 reset or any light sleep; `accel_init()` still re-programs
+  the LIS3DH every boot. The board's "4.5V" (SYS) output feeds Walter VIN itself.
+- **Walter 3V3-OUT (header pin 26, switched by IO0) and the Friend's ENA (IO12): two gates, one
+  rail.** `rail.c`'s `rail_on()`/`rail_off()` drive both together: IO0 switches the CardKB's VCC,
+  ENA switches the Friend's MIC5225-3.3 regulator, which powers the panel only. Both are off
+  outside the attentive window; the CardKB reboots on every rail-on (hence ui.c's boot guard) and
+  the panel RAM is restored from the shadow frame by `disp_note_power_loss()`. Before dropping
+  either gate the firmware drives the CardKB SDA/SCL and the display SPI pads low so the ESP32
+  never back-feeds the unpowered parts.
+- **USB power.** Walter ties USB-C VBUS to VIN, so VIN is 5 V on USB (in place of the power
+  board's SYS output).
 
 ## Device behaviour contract
 
@@ -46,6 +74,11 @@ device-local behaviour the protocol doc does not specify.
 - **Power**: the device sleeps most of the day. In **sleep mode** the modem uses eDRX (target
   20.48 s cycle) and the ESP32 light-sleeps; delivery within ~30 s is acceptable. In **active
   mode** the modem stays connected and messages must show within 5 s.
+- **Modes**: boot in sleep mode. Enter active mode on an incoming message or a shake plus a key;
+  leave it after 10 minutes with no keyboard activity. The 10-minute timeout runs from mode
+- **Display orientation**: `disp_flip` (NVS, default off; console `flip on|off|status`, or the
+  Device screen's "Rotate display" row) 180-degree-rotates the whole 296x128 image at blit time,
+  so every screen/partial/toast reads upside down together; it is not a per-screen setting.
 - **Message bodies** are at most 160 characters.
 
 ## Dependencies

@@ -505,6 +505,40 @@ static void icon_crash(int x, int y)
     }
 }
 
+// Sleep indicator: big Z with a small z at its upper right.
+static void icon_sleep(int x, int y)
+{
+    static const char *const zz[12] = {
+        "........zzzz", ".........zz.", "........zzzz", "............",
+        "..ZZZZZZZ...", "......ZZ....", ".....ZZ.....", "....ZZ......",
+        "...ZZ.......", "..ZZZZZZZ...", "............", "............",
+    };
+    for (int r = 0; r < 12; r++) {
+        for (int c = 0; c < 12; c++) {
+            if (zz[r][c] != '.') {
+                gfx_set_pixel(x + c, y + r, true);
+            }
+        }
+    }
+}
+
+// 12x12 plane silhouette, nose up.
+static void icon_airplane(int x, int y)
+{
+    static const char *const plane[12] = {
+        ".....XX.....", ".....XX.....", "....XXXX....", "....XXXX....",
+        "..XXXXXXXX..", "XXXXXXXXXXXX", "XXXXXXXXXXXX", "....XXXX....",
+        "....XXXX....", "...XXXXXX...", "..XXX..XXX..", "............",
+    };
+    for (int r = 0; r < 12; r++) {
+        for (int c = 0; c < 12; c++) {
+            if (plane[r][c] == 'X') {
+                gfx_set_pixel(x + c, y + r, true);
+            }
+        }
+    }
+}
+
 void gfx_icon(int x, int y, gfx_icon_t id)
 {
     switch (id) {
@@ -596,6 +630,12 @@ void gfx_icon(int x, int y, gfx_icon_t id)
         break;
     case GFX_ICON_CRASH:
         icon_crash(x, y);
+        break;
+    case GFX_ICON_SLEEP:
+        icon_sleep(x, y);
+        break;
+    case GFX_ICON_AIRPLANE:
+        icon_airplane(x, y);
         break;
     default:
         gfx_rect(x, y, GFX_ICON_W, GFX_ICON_H);

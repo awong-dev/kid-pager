@@ -34,6 +34,7 @@ input_key_t input_decode_key(uint8_t byte)
 #include "pins.h"
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,8 @@ static const char *TAG = "input";
 #define PAGER_BTN_DEBOUNCE_MS 30u
 #define PAGER_BTN_STUCK_MS 5000u /* ~5 s in BTN_HELD */
 
+/* Hot keyboard window opened by a shake from sleep. */
+#define PAGER_UI_HOT_S 15
 
 
 typedef enum {
@@ -55,15 +58,19 @@ typedef enum {
 } btn_state_t;
 
 static btn_state_t s_btn_state = BTN_IDLE;
+#if PAGER_WAKE_BUTTON_ENABLED
 static int64_t s_btn_t0_us = 0;           /* press start (debounce resolved) */
 static int64_t s_btn_held_t0_us = 0;      /* BTN_HELD entry, for the BTN_STUCK cutoff */
 static int64_t s_btn_debounce_start_us = 0;
+#endif
 
 static int64_t s_awake_until_us = 0;
 
 static StaticQueue_t s_queue_buf;
 static uint8_t s_queue_storage[INPUT_QUEUE_DEPTH * sizeof(input_event_t)];
 static QueueHandle_t s_queue;
+
+static int64_t s_hot_until_us;
 
 static void arm_awake_window(int64_t now_us)
 {
@@ -77,11 +84,14 @@ static void push_event(input_event_t evt)
     }
 }
 
+/* Button short/long/stuck FSM; level != 0 is pressed (active-high). A held button returns every ext1
  * level wake at once, so BTN_STUCK drops the fast poll and net_sleep() stays withheld. */
+#if PAGER_WAKE_BUTTON_ENABLED
 static void button_fsm_step(int level, int64_t now_us)
 {
     switch (s_btn_state) {
     case BTN_IDLE:
+        if (level != 0) {
             if (s_btn_debounce_start_us == 0) {
                 s_btn_debounce_start_us = now_us;
             } else if ((now_us - s_btn_debounce_start_us) >=
@@ -98,6 +108,7 @@ static void button_fsm_step(int level, int64_t now_us)
         break;
 
     case BTN_DOWN:
+        if (level == 0) {
             /* Released before the long-press threshold: short press. */
             arm_awake_window(now_us);
             push_event((input_event_t) { .type = INPUT_EVT_BTN_SHORT });
@@ -112,6 +123,7 @@ static void button_fsm_step(int level, int64_t now_us)
         break;
 
     case BTN_HELD:
+        if (level == 0) {
             s_btn_state = BTN_IDLE;
         } else if ((now_us - s_btn_held_t0_us) >= (int64_t) PAGER_BTN_STUCK_MS * 1000) {
             ESP_LOGI(TAG, "button held >=%us since long-press fired; entering BTN_STUCK "
@@ -122,21 +134,31 @@ static void button_fsm_step(int level, int64_t now_us)
         break;
 
     case BTN_STUCK:
+        if (level == 0) {
             ESP_LOGI(TAG, "button released after BTN_STUCK");
             s_btn_state = BTN_IDLE;
         }
         break;
     }
 }
+#endif /* PAGER_WAKE_BUTTON_ENABLED */
 
 void input_init(void)
 {
+    /* IDF latches an RTC pad HOLD on ext1 pads before light sleep and never releases it (S3); it
+     * survives resets, freezes the input and ignores gpio_config(), so release it first. */
+#if PAGER_WAKE_BUTTON_ENABLED
+    rtc_gpio_hold_dis((gpio_num_t) PAGER_PIN_BUTTON);
+
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << PAGER_PIN_BUTTON,
         .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE, /* active high */
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+#endif /* PAGER_WAKE_BUTTON_ENABLED */
 
     s_queue = xQueueCreateStatic(INPUT_QUEUE_DEPTH, sizeof(input_event_t), s_queue_storage,
                                   &s_queue_buf);
@@ -144,11 +166,18 @@ void input_init(void)
 
 void input_poll(void)
 {
+#if PAGER_WAKE_BUTTON_ENABLED
     int64_t now_us = esp_timer_get_time();
     button_fsm_step(gpio_get_level((gpio_num_t) PAGER_PIN_BUTTON), now_us);
+#endif
 }
 
+void input_note_button_wake(int64_t now_us)
 {
+#if !PAGER_WAKE_BUTTON_ENABLED
+    (void) now_us;
+    return;
+#else
     /* Merge into a press the FSM already tracks instead of seeding a second BTN_DOWN. */
     if (s_btn_state != BTN_IDLE) {
         return;
@@ -158,6 +187,23 @@ void input_poll(void)
     s_btn_debounce_start_us = 0;
     arm_awake_window(now_us);
     push_event((input_event_t) { .type = INPUT_EVT_BTN_DOWN });
+#endif
+}
+
+// A shake from sleep opens only the short hot window and draws nothing.
+void input_note_shake_wake(int64_t now_us)
+{
+    if (s_btn_state != BTN_IDLE) {
+        return;
+    }
+    if (input_awake()) {
+        arm_awake_window(now_us);
+        return;
+    }
+}
+
+bool input_hot(void)
+{
 }
 
 void input_feed_key(uint8_t byte)
@@ -166,6 +212,7 @@ void input_feed_key(uint8_t byte)
     if (key.type == INPUT_KEY_NONE) {
         return;
     }
+    s_hot_until_us = 0; /* the full awake window supersedes the hot one */
     arm_awake_window(esp_timer_get_time());
     push_event((input_event_t) { .type = INPUT_EVT_KEY, .key = key });
 }
@@ -209,6 +256,7 @@ bool input_button_busy(void)
 
 bool input_button_stuck(void)
 {
+    return PAGER_WAKE_BUTTON_ENABLED && s_btn_state == BTN_STUCK;
 }
 
 #endif /* ESP_PLATFORM */

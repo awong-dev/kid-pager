@@ -22,6 +22,7 @@ extern "C" {
 #define LOC_MOTION_WINDOW_S 180u  /* 3 min trailing window for the motion classifier */
 #define LOC_MOTION_SUSTAIN_S 60u  /* interrupts must span at least this long inside the window */
 
+#define LOC_BATTERY_FLOOR_MV 3550 /* no GNSS attempt below this */
 #define LOC_FIX_CONFIDENCE_MAX 100.0 /* vendor demo threshold */
 
 /* `batt_mv` sentinel for "no reading yet"; loc_battery_ok() passes it. Pass this constant exactly. */
@@ -281,6 +282,9 @@ void loc_bind(loc_rtc_t *rtc, auth_rtc_t *auth_rtc, loc_rtc_lock_fn lock, loc_rt
 
 /* Probes the LIS3DH and wires cell-change/GNSS events; call after ui_init(). Failures only log. */
 void loc_init(void);
+
+/* GNSS receiver configuration (needs the modem): call after net_init(); skipped in airplane. */
+void loc_gnss_config(void);
 
 /* `loc_req` intercept (docs/PROTOCOL.md §3.2, §13); true if handled, false to fall through. */
 bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len);

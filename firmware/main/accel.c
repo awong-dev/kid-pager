@@ -16,6 +16,50 @@ bool accel_edge_wanted(int64_t now_us, int64_t last_reported_us, int64_t refract
     return elapsed_us >= refractory_us;
 }
 
+accel_shake_verdict_t accel_shake_step(accel_shake_t *s, const accel_shake_cfg_t *c, int64_t now_us, bool ia2)
+{
+    // (a)
+    if (s->cooldown_until_us - now_us > (int64_t) c->cooldown_ms * 1000) {
+        s->cooldown_until_us = 0;
+    }
+    if (s->holdoff_until_us - now_us > (int64_t) c->holdoff_ms * 1000) {
+        s->holdoff_until_us = 0;
+    }
+    if (s->n && now_us < s->last_us) {
+        s->n = 0;
+        return ACCEL_SHAKE_IDLE;
+    }
+    // (b)
+    if (s->n > 0 && now_us - s->last_us > (int64_t) c->gap_ms * 1000) {
+        s->out_n = s->n;
+        s->out_span_ms = (uint32_t) ((s->last_us - s->first_us) / 1000);
+        s->n = 0;
+        s->holdoff_until_us = now_us + (int64_t) c->holdoff_ms * 1000;
+        return ACCEL_SHAKE_REJECTED;
+    }
+    // (c)
+    if (now_us < s->cooldown_until_us || now_us < s->holdoff_until_us) {
+        return ACCEL_SHAKE_IDLE;
+    }
+    // (d)
+    if (ia2) {
+        if (s->n == 0) {
+            s->first_us = now_us;
+        }
+        s->n++;
+        s->last_us = now_us;
+        if (s->n >= c->n_min && now_us - s->first_us >= (int64_t) c->span_ms * 1000) {
+            s->out_n = s->n;
+            s->out_span_ms = (uint32_t) ((now_us - s->first_us) / 1000);
+            s->n = 0;
+            s->cooldown_until_us = now_us + (int64_t) c->cooldown_ms * 1000;
+            return ACCEL_SHAKE_FIRED;
+        }
+    }
+    // (e)
+    return s->n > 0 ? ACCEL_SHAKE_PENDING : ACCEL_SHAKE_IDLE;
+}
+
 #ifdef ESP_PLATFORM
 
 #include <string.h>
@@ -43,11 +87,35 @@ static const char *TAG = "accel";
 #define LIS3DH_REG_INT1_SRC 0x31
 #define LIS3DH_REG_INT1_THS 0x32
 #define LIS3DH_REG_INT1_DURATION 0x33
+#define LIS3DH_REG_INT2_CFG 0x34
+#define LIS3DH_REG_INT2_SRC 0x35
+#define LIS3DH_REG_INT2_THS 0x36
+#define LIS3DH_REG_INT2_DURATION 0x37
+
+// ODR 25 Hz, low-power, XYZ on
+#define LIS3DH_CTRL_REG1_25HZ_LOWPOWER 0x3F
+// high-pass filter routed to both generators
+#define LIS3DH_CTRL_REG2_HPF_INT12 0x03
+// generator 1 to INT1
 #define LIS3DH_CTRL_REG3_I1_IA1 0x40
+#define LIS3DH_CTRL_REG3_I1_IA2 0x20
+// +-4 g
+#define LIS3DH_CTRL_REG4_4G 0x10
+// latch both interrupts until SRC is read
+#define LIS3DH_CTRL_REG5_LATCH_INT12 0x0A
+// any axis, high events only (low events are true at rest)
 #define LIS3DH_INT1_CFG_ANY_HIGH 0x2A
+#define LIS3DH_INT2_CFG_ANY_HIGH 0x2A
+// 1 LSB = 32 mg at +-4 g (256 mg)
+#define LIS3DH_INT1_THS_DEFAULT 0x08
+// 1 LSB = 32 mg at +-4 g (384 mg)
+#define LIS3DH_INT2_THS_DEFAULT 0x0C
+// no hardware debounce
 #define LIS3DH_INT1_DURATION_DEFAULT 0x00
+#define LIS3DH_INT2_DURATION_DEFAULT 0x00
 
 #define LIS3DH_INT1_SRC_IA 0x40
+#define LIS3DH_INT2_SRC_IA 0x40
 
 static bool s_present = false;
 
@@ -55,6 +123,21 @@ static bool s_present = false;
 static int64_t s_refractory_us = (int64_t) ACCEL_REFRACTORY_S * 1000000;
 static int64_t s_last_reported_us = 0;
 static uint32_t s_edges_reported = 0;
+static int64_t s_refr_until_us = 0;
+
+static accel_shake_t s_shake;
+static accel_shake_cfg_t s_shake_cfg = {
+    .n_min = ACCEL_SHAKE_N,
+    .gap_ms = ACCEL_SHAKE_GAP_MS,
+    .span_ms = ACCEL_SHAKE_SPAN_MS,
+    .cooldown_ms = ACCEL_SHAKE_COOLDOWN_MS,
+    .holdoff_ms = ACCEL_SHAKE_HOLDOFF_MS,
+};
+static bool s_shake_enabled = true;
+static uint32_t s_shake_candidates = 0;
+static uint32_t s_shake_rejected = 0;
+static uint32_t s_shake_fired = 0;
+static uint8_t s_ctrl3 = 0;
 
 // Own bus; battery-powered breakout, so never torn down. Internal pull-ups on as backup.
 static void accel_bus_init(void)
@@ -78,9 +161,16 @@ static bool reg_write(uint8_t reg, uint8_t val)
     uint8_t buf[2] = { reg, val };
 }
 
+static esp_err_t s_last_err = ESP_OK; // for acceltest triage
+
 static bool reg_read(uint8_t reg, uint8_t *out)
 {
+    s_last_err = i2c_master_write_read_device(I2C_NUM_1, PAGER_I2C_ADDR_LIS3DH, &reg, 1, out, 1,
+                                              pdMS_TO_TICKS(50));
+    return s_last_err == ESP_OK;
 }
+
+esp_err_t accel_debug_last_err(void) { return s_last_err; }
 
 // auto-increment (bit 0x80)
 static bool reg_read_multi(uint8_t reg, uint8_t *out, size_t n)
@@ -92,9 +182,18 @@ static bool reg_read_multi(uint8_t reg, uint8_t *out, size_t n)
 static bool configure_and_arm(uint8_t who)
 {
     bool ok = true;
+    const uint8_t ctrl3 = LIS3DH_CTRL_REG3_I1_IA1 | LIS3DH_CTRL_REG3_I1_IA2;
+    ok &= reg_write(LIS3DH_REG_CTRL_REG1, LIS3DH_CTRL_REG1_25HZ_LOWPOWER);
+    ok &= reg_write(LIS3DH_REG_CTRL_REG4, LIS3DH_CTRL_REG4_4G);
+    ok &= reg_write(LIS3DH_REG_CTRL_REG2, LIS3DH_CTRL_REG2_HPF_INT12);
     ok &= reg_write(LIS3DH_REG_INT1_THS, LIS3DH_INT1_THS_DEFAULT);
     ok &= reg_write(LIS3DH_REG_INT1_DURATION, LIS3DH_INT1_DURATION_DEFAULT);
     ok &= reg_write(LIS3DH_REG_INT1_CFG, LIS3DH_INT1_CFG_ANY_HIGH);
+    ok &= reg_write(LIS3DH_REG_INT2_THS, LIS3DH_INT2_THS_DEFAULT);
+    ok &= reg_write(LIS3DH_REG_INT2_DURATION, LIS3DH_INT2_DURATION_DEFAULT);
+    ok &= reg_write(LIS3DH_REG_INT2_CFG, LIS3DH_INT2_CFG_ANY_HIGH);
+    ok &= reg_write(LIS3DH_REG_CTRL_REG5, LIS3DH_CTRL_REG5_LATCH_INT12);
+    ok &= reg_write(LIS3DH_REG_CTRL_REG3, ctrl3);
     if (!ok) {
         ESP_LOGI(TAG, "LIS3DH found (WHO_AM_I=0x%02x) but configuration failed partway through - "
                       "motion trigger disabled, running without it",
@@ -103,7 +202,14 @@ static bool configure_and_arm(uint8_t who)
         return false;
     }
 
+    // drop any stale latch
+    uint8_t stale = 0;
+    reg_read(LIS3DH_REG_INT1_SRC, &stale);
+    reg_read(LIS3DH_REG_INT2_SRC, &stale);
+    s_ctrl3 = ctrl3;
+
     s_present = true;
+                  "INT2 shake THS=1152 mg, CTRL_REG3=0x60",
     return true;
 }
 
@@ -116,22 +222,68 @@ static bool configure_and_arm(uint8_t who)
     }
 }
 
+bool accel_poll(void)
 {
     if (!s_present) {
+        return false;
     }
     uint8_t src = 0;
         if (accel_edge_wanted(now_us, s_last_reported_us, s_refractory_us)) {
             s_last_reported_us = now_us;
             s_edges_reported++;
             loc_on_motion_event();
+            // refractory is applied at the sensor, so IA2 can still wake
             if (s_refractory_us > 0) {
+                s_refr_until_us = now_us + s_refractory_us;
             }
         }
     }
+
+    uint8_t src2 = 0;
+    bool was_idle = (s_shake.n == 0);
+    bool fired = false;
+    accel_shake_verdict_t v = accel_shake_step(&s_shake, &s_shake_cfg, now_us, ia2);
+    if (was_idle && s_shake.n == 1) {
+        s_shake_candidates++;
     }
+    if (v == ACCEL_SHAKE_FIRED) {
+        ESP_LOGI(TAG, "intentional shake (n=%u in %u ms)", (unsigned) s_shake.out_n,
+                 (unsigned) s_shake.out_span_ms);
+        s_shake_fired++;
+        fired = true;
+    } else if (v == ACCEL_SHAKE_REJECTED) {
+        ESP_LOGI(TAG, "shake candidate rejected (n=%u in %u ms), IA2 off pin %u s",
+                 (unsigned) s_shake.out_n, (unsigned) s_shake.out_span_ms,
+                 (unsigned) (s_shake_cfg.holdoff_ms / 1000));
+        s_shake_rejected++;
+    }
+
+    uint8_t want3 = (now_us >= s_refr_until_us ? LIS3DH_CTRL_REG3_I1_IA1 : 0) |
+                    ((s_shake_enabled && now_us >= s_shake.holdoff_until_us) ? LIS3DH_CTRL_REG3_I1_IA2 : 0);
+        s_ctrl3 = want3;
+    }
+    return fired;
+}
+
+bool accel_shake_pending(void)
+{
+    return s_present && s_shake.n > 0;
 }
 
 // mg per LSB for the CTRL_REG4 FS bits: +-2/4/8/16 g -> 16/32/62/186 mg
+static uint32_t lsb_mg_for_ctrl4(uint8_t ctrl4)
+{
+    static const uint8_t lsb[4] = { 16, 32, 62, 186 };
+    return lsb[(ctrl4 >> 4) & 3];
+}
+
+static uint32_t current_lsb_mg(void)
+{
+    uint8_t c4 = 0;
+    reg_read(LIS3DH_REG_CTRL_REG4, &c4);
+    return lsb_mg_for_ctrl4(c4);
+}
+
 bool accel_debug_status(accel_debug_status_t *out, bool *out_newly_configured)
 {
     memset(out, 0, sizeof(*out));
@@ -162,12 +314,30 @@ bool accel_debug_status(accel_debug_status_t *out, bool *out_newly_configured)
     reg_read(LIS3DH_REG_INT1_THS, &out->int1_ths);
     reg_read(LIS3DH_REG_INT1_DURATION, &out->int1_duration);
     reg_read(LIS3DH_REG_INT1_SRC, &out->int1_src);
+    reg_read(LIS3DH_REG_INT2_CFG, &out->int2_cfg);
+    reg_read(LIS3DH_REG_INT2_THS, &out->int2_ths);
+    reg_read(LIS3DH_REG_INT2_DURATION, &out->int2_duration);
+    reg_read(LIS3DH_REG_INT2_SRC, &out->int2_src);
+    uint32_t lsb = lsb_mg_for_ctrl4(out->ctrl_reg4);
+    out->ths_mg = (uint32_t) out->int1_ths * lsb;
+    out->ths2_mg = (uint32_t) out->int2_ths * lsb;
+    out->shake_enabled = s_shake_enabled;
+    out->shake_n = s_shake_cfg.n_min;
+    out->shake_gap_ms = s_shake_cfg.gap_ms;
+    out->shake_span_ms = s_shake_cfg.span_ms;
+    out->shake_cooldown_ms = s_shake_cfg.cooldown_ms;
+    out->shake_holdoff_ms = s_shake_cfg.holdoff_ms;
+    out->shake_candidates = s_shake_candidates;
+    out->shake_rejected = s_shake_rejected;
+    out->shake_fired = s_shake_fired;
     out->refractory_us = s_refractory_us;
     out->edges_reported = s_edges_reported;
     out->ext1_wakes = net_get_ext1_wakes();
     return true;
 }
 
+bool accel_debug_sample(int16_t *x_mg, int16_t *y_mg, int16_t *z_mg, uint8_t *int1_src,
+                        uint8_t *int2_src)
 {
     if (!s_present) {
         return false;
@@ -178,13 +348,34 @@ bool accel_debug_status(accel_debug_status_t *out, bool *out_newly_configured)
     }
     uint8_t src = 0;
     reg_read(LIS3DH_REG_INT1_SRC, &src); // best-effort
+    uint8_t src2 = 0;
+    reg_read(LIS3DH_REG_INT2_SRC, &src2);
+    uint32_t lsb = current_lsb_mg();
 
     // LPen=1: 8-bit result left-justified in the high byte
     int16_t raw_x = (int16_t) ((uint16_t) buf[0] | ((uint16_t) buf[1] << 8));
     int16_t raw_y = (int16_t) ((uint16_t) buf[2] | ((uint16_t) buf[3] << 8));
     int16_t raw_z = (int16_t) ((uint16_t) buf[4] | ((uint16_t) buf[5] << 8));
+    *x_mg = (int16_t) ((raw_x >> 8) * (int) lsb);
+    *y_mg = (int16_t) ((raw_y >> 8) * (int) lsb);
+    *z_mg = (int16_t) ((raw_z >> 8) * (int) lsb);
     *int1_src = src;
+    *int2_src = src2;
     return true;
+}
+
+uint32_t accel_debug_sample_period_ms(void)
+{
+    uint8_t c1 = 0;
+    reg_read(LIS3DH_REG_CTRL_REG1, &c1);
+    switch (c1 >> 4) {
+    case 1: return 1000;
+    case 2: return 100;
+    case 3: return 40;
+    case 4: return 20;
+    case 5: return 10;
+    default: return 100;
+    }
 }
 
 bool accel_debug_set_ths(uint8_t ths, uint8_t *readback)
@@ -201,6 +392,50 @@ bool accel_debug_set_dur(uint8_t dur, uint8_t *readback)
         return false;
     }
     return reg_read(LIS3DH_REG_INT1_DURATION, readback);
+}
+
+bool accel_debug_set_ths2(uint8_t ths, uint8_t *readback)
+{
+    if (!s_present || !reg_write(LIS3DH_REG_INT2_THS, ths)) {
+        return false;
+    }
+    return reg_read(LIS3DH_REG_INT2_THS, readback);
+}
+
+bool accel_debug_set_dur2(uint8_t dur, uint8_t *readback)
+{
+    if (!s_present || !reg_write(LIS3DH_REG_INT2_DURATION, dur)) {
+        return false;
+    }
+    return reg_read(LIS3DH_REG_INT2_DURATION, readback);
+}
+
+void accel_debug_set_shake(bool enabled)
+{
+    s_shake_enabled = enabled;
+    s_shake.n = 0;
+    s_shake.holdoff_until_us = 0;
+}
+
+void accel_debug_set_shake_cfg(uint8_t n, uint16_t gap_ms, uint16_t span_ms, uint32_t holdoff_s)
+{
+    s_shake_cfg.n_min = n;
+    s_shake_cfg.gap_ms = gap_ms;
+    s_shake_cfg.span_ms = span_ms;
+    s_shake_cfg.holdoff_ms = holdoff_s * 1000;
+    s_shake.n = 0;
+    s_shake.holdoff_until_us = 0;
+}
+
+bool accel_debug_set_cfg(uint8_t ctrl1, uint8_t ctrl4)
+{
+    if (!s_present || !reg_write(LIS3DH_REG_CTRL_REG1, ctrl1) ||
+        !reg_write(LIS3DH_REG_CTRL_REG4, ctrl4)) {
+        return false;
+    }
+    uint8_t r1 = 0, r4 = 0;
+    return reg_read(LIS3DH_REG_CTRL_REG1, &r1) && reg_read(LIS3DH_REG_CTRL_REG4, &r4) &&
+           r1 == ctrl1 && r4 == ctrl4;
 }
 
 void accel_debug_set_refractory_s(uint32_t seconds)

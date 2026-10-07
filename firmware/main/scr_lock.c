@@ -97,6 +97,11 @@ static void try_unlock(void)
 static void lock_on_key(input_key_t key)
 {
     if (s_state == LOCK_UI_IDLE) {
+        // the first character typed opens entry and counts as its first digit
+        if (key.type != INPUT_KEY_CHAR) {
+            return;
+        }
+        scr_lock_start_entry();
     }
     switch (key.type) {
     case INPUT_KEY_CHAR:

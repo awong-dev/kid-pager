@@ -29,6 +29,9 @@ bool cbor_w_map_key(cbor_w_t *w, uint32_t key, uint32_t n);
 // Key, then an array header; items follow unkeyed.
 bool cbor_w_array(cbor_w_t *w, uint32_t key, uint32_t n);
 
+// One bare unsigned int, an array item (e.g. `bs`, PROTOCOL.md §10 key 68).
+bool cbor_w_uint_item(cbor_w_t *w, uint64_t u);
+
 // Key (major 0) then value.
 bool cbor_w_uint(cbor_w_t *w, uint32_t key, uint64_t u);
 // `v` must be negative; false otherwise.

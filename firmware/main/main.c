@@ -14,12 +14,21 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "soc/gpio_reg.h"
+#include "soc/io_mux_reg.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc_io_reg.h"
 #include "driver/i2c.h"
 
 #include <stdio.h>
 
 #include "accel.h"
+#include "battstat.h"
+#include "cafetch.h"
 #include "catrust.h"
+#include "mbedtls/sha256.h"
+#include "ota.h"
 #include "flightrec.h"
 #include "ident.h"
 #include "watchdog.h"
@@ -30,6 +39,7 @@
 #include "loc.h"
 #include "lock.h"
 #include "modes.h"
+#include "refreshpol.h"
 #include "net.h"
 #include "pins.h"
 #include "rail.h"
@@ -336,6 +346,107 @@ static int cmd_railcycle(int argc, char **argv)
 }
 
 // Debug build only: dumps IO MUX, RTC IO, pad hold and GPIO_IN state for IO8.
+static int cmd_padinfo(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    uint32_t rtc = REG_READ(RTC_IO_TOUCH_PAD8_REG);
+    uint32_t hold = REG_READ(RTC_CNTL_PAD_HOLD_REG);
+    uint32_t mux = REG_READ(IO_MUX_GPIO8_REG);
+    uint32_t in = REG_READ(GPIO_IN_REG);
+    printf("padinfo IO8: gpio_get_level=%d rtc_gpio_get_level=%u GPIO_IN.bit8=%u\n",
+           gpio_get_level((gpio_num_t) 8), (unsigned) rtc_gpio_get_level((gpio_num_t) 8),
+           (unsigned) ((in >> 8) & 1u));
+    printf("  RTC_IO_TOUCH_PAD8=0x%08x rtc_mux_sel=%u rtc_fun_ie=%u rue=%u rde=%u rtc_fun_sel=%u\n",
+           (unsigned) rtc, (unsigned) !!(rtc & RTC_IO_TOUCH_PAD8_MUX_SEL),
+           (unsigned) !!(rtc & RTC_IO_TOUCH_PAD8_FUN_IE), (unsigned) !!(rtc & RTC_IO_TOUCH_PAD8_RUE),
+           (unsigned) !!(rtc & RTC_IO_TOUCH_PAD8_RDE),
+           (unsigned) ((rtc >> RTC_IO_TOUCH_PAD8_FUN_SEL_S) & 3u));
+    printf("  RTC_CNTL_PAD_HOLD=0x%08x pad8_hold=%u\n", (unsigned) hold,
+           (unsigned) !!(hold & RTC_CNTL_TOUCH_PAD8_HOLD));
+    printf("  IO_MUX_GPIO8=0x%08x mcu_sel=%u fun_ie=%u fun_pu=%u fun_pd=%u slp_sel=%u\n",
+           (unsigned) mux, (unsigned) ((mux >> MCU_SEL_S) & 7u), (unsigned) !!(mux & FUN_IE),
+           (unsigned) !!(mux & FUN_PU), (unsigned) !!(mux & FUN_PD), (unsigned) !!(mux & SLP_SEL));
+    gpio_dump_io_configuration(stdout, 1ULL << 8);
+    return 0;
+}
+
+// Debug build only: forces IO8 back to a digital input with pull-down and dumps it again.
+static int cmd_padfix(int argc, char **argv)
+{
+    rtc_gpio_hold_dis((gpio_num_t) 8);
+    rtc_gpio_deinit((gpio_num_t) 8);
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << 8,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    printf("padfix: hold_dis + rtc_gpio_deinit + gpio_config(input, pull-down) applied to IO8\n");
+    return cmd_padinfo(argc, argv);
+}
+
+// `refresh [floor N|ceil N|idle S|gap MS|psmin N|status]` tunes the refresh policy; knobs persist
+// to NVS "disp".
+static int cmd_refresh(int argc, char **argv)
+{
+    refreshpol_t *p = refreshpol_global();
+    if (argc >= 3) {
+        int v = atoi(argv[2]);
+        if (v < 0) {
+            printf("refresh: value must be >= 0\n");
+            return 1;
+        }
+        if (strcmp(argv[1], "floor") == 0) p->floor = (uint32_t) v;
+        else if (strcmp(argv[1], "ceil") == 0) p->ceiling = (uint32_t) v;
+        else if (strcmp(argv[1], "idle") == 0) p->idle_s = (uint32_t) v;
+        else if (strcmp(argv[1], "gap") == 0) p->gap_ms = (uint32_t) v;
+        else if (strcmp(argv[1], "psmin") == 0) p->presleep_min = (uint32_t) v;
+        else {
+            printf("usage: refresh [floor N|ceil N|idle S|gap MS|psmin N|status]\n");
+            return 1;
+        }
+        refreshpol_save_nvs();
+    } else if (argc == 2 && strcmp(argv[1], "status") != 0) {
+        printf("usage: refresh [floor N|ceil N|idle S|gap MS|psmin N|status]\n");
+        return 1;
+    }
+    printf("refresh: dirty=%u floor=%u ceil=%u idle=%us gap=%ums psmin=%u\n", (unsigned) p->dirty,
+           (unsigned) p->floor, (unsigned) p->ceiling, (unsigned) p->idle_s, (unsigned) p->gap_ms,
+           (unsigned) p->presleep_min);
+    return 0;
+}
+
+static int cmd_gpio(int argc, char **argv)
+{
+    if (argc < 2) {
+        return 1;
+    }
+    int n = atoi(argv[1]);
+    if (n < 0 || n > 48) {
+        printf("gpio: pin out of range\n");
+        return 1;
+    }
+    printf("gpio %d: level=%d\n", n, gpio_get_level((gpio_num_t) n));
+    if (argc >= 4 && strcmp(argv[2], "sample") == 0) {
+        int ms = atoi(argv[3]);
+        if (ms < 10) ms = 10;
+        if (ms > 5000) ms = 5000;
+        int hi = 0, lo = 0, trans = 0, last = -1;
+        for (int t = 0; t < ms; t += 10) {
+            int l = gpio_get_level((gpio_num_t) n);
+            if (l) hi++; else lo++;
+            if (last >= 0 && l != last) trans++;
+            last = l;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        printf("gpio %d: %d ms sampled: high=%d low=%d transitions=%d\n", n, ms, hi, lo, trans);
+    }
+    return 0;
+}
+
 // Debug build only: `btn [long]` simulates a button press through input.c's queue.
 static int cmd_btn(int argc, char **argv)
 {
@@ -548,10 +659,16 @@ static int cmd_key(int argc, char **argv)
     return 0;
 }
 
+// `i2cscan`: probe every 7-bit address on the keyboard bus (IO10/IO9) and
 // print who ACKs. Bench aid: tells wiring faults from a dead keyboard.
 static int cmd_i2cscan(int argc, char **argv)
 {
     bool swap = (argc >= 2) && (strcmp(argv[1], "swap") == 0);
+    // `i2cscan accel` scans the LIS3DH's bus (I2C_NUM_1).
+    bool accel = (argc >= 2) && (strcmp(argv[1], "accel") == 0);
+    i2c_port_t port = accel ? I2C_NUM_1 : I2C_NUM_0;
+    int sda = accel ? PAGER_PIN_ACCEL_SDA : (swap ? PAGER_PIN_KB_SCL : PAGER_PIN_KB_SDA);
+    int scl = accel ? PAGER_PIN_ACCEL_SCL : (swap ? PAGER_PIN_KB_SDA : PAGER_PIN_KB_SCL);
     if (swap) {
         i2c_driver_delete(I2C_NUM_0);
         i2c_config_t conf = {
@@ -571,6 +688,7 @@ static int cmd_i2cscan(int argc, char **argv)
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (uint8_t) ((a << 1) | I2C_MASTER_WRITE), true);
         i2c_master_stop(cmd);
+        esp_err_t err = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(20));
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
             printf("i2cscan: device at 0x%02x%s\n", a,
@@ -767,6 +885,81 @@ static int cmd_cafetch(int argc, char **argv)
     return ok ? 0 : 1;
 }
 
+// `otafetch <url> <size>` streams the object into a hash-and-count sink (no flash writes), resuming
+// with Range like ota.c. Blocks this console task for up to 900 s.
+typedef struct {
+    mbedtls_sha256_context sha;
+    size_t n;
+} otafetch_sink_t;
+
+static bool otafetch_sink(void *arg, const uint8_t *data, size_t len)
+{
+    otafetch_sink_t *s = (otafetch_sink_t *) arg;
+    mbedtls_sha256_update(&s->sha, data, len);
+    s->n += len;
+    return true;
+}
+
+static int cmd_otafetch(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: otafetch <url> <size>\n");
+        return 1;
+    }
+    size_t total = (size_t) strtoul(argv[2], NULL, 10);
+    if (total == 0) {
+        printf("otafetch: size must be > 0\n");
+        return 1;
+    }
+    if (cafetch_in_progress() || ota_transfer_active()) {
+        printf("otafetch: a fetch is already in progress\n");
+        return 1;
+    }
+    net_mqtt_status_t before = { 0 }, after = { 0 };
+    net_get_mqtt_status(&before);
+    otafetch_sink_t s;
+    mbedtls_sha256_init(&s.sha);
+    mbedtls_sha256_starts(&s.sha, 0);
+    s.n = 0;
+    int shorts = 0, resumes = 0;
+    bool ok = false;
+    int64_t t0 = esp_timer_get_time();
+    for (;;) {
+        if (!cafetch_begin_stream(argv[1], s.n, total - s.n, otafetch_sink, &s)) {
+            break;
+        }
+        cafetch_status_t st;
+        while ((st = cafetch_poll(esp_timer_get_time())) == CAFETCH_PENDING) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (st == CAFETCH_OK) {
+            cafetch_end();
+            ok = (s.n == total);
+            break;
+        }
+        bool transport = false, was_short = false;
+        cafetch_fail_info(NULL, NULL, &transport, &was_short);
+        cafetch_end();
+        if (was_short) {
+            shorts++;
+        }
+        if (!transport || s.n >= total || ++resumes > 20) {
+            break;
+        }
+    }
+    uint32_t ms = (uint32_t) ((esp_timer_get_time() - t0) / 1000);
+    uint8_t h[32];
+    mbedtls_sha256_finish(&s.sha, h);
+    mbedtls_sha256_free(&s.sha);
+    net_get_mqtt_status(&after);
+    printf("otafetch: %s bytes=%u elapsed_ms=%u B/s=%u short=%d resumes=%d sha16=%02x%02x%02x%02x%02x%02x%02x%02x "
+           "mqtt_survived=%d\n",
+           ok ? "OK" : "FAILED", (unsigned) s.n, (unsigned) ms, (unsigned) (ms ? (uint64_t) s.n * 1000u / ms : 0),
+           shorts, resumes, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+           (int) (before.mqtt_connected && after.mqtt_connected));
+    return ok ? 0 : 1;
+}
+
 // `smstest <number> <text>` sends one SMS bypassing the allow-list; blocks this console task for the
 // AT+CMGS round trip and still writes an audit entry.
 static int cmd_smstest(int argc, char **argv)
@@ -794,8 +987,17 @@ static int cmd_smslist(int argc, char **argv)
 // `acceltest`: LIS3DH register dump and tuning via accel_debug_*(); every form re-probes WHO_AM_I.
 // `acceltest samples 600` blocks this console task for ~60 s (one sample per ODR period).
 static const char *ACCELTEST_USAGE =
+    "acceltest                 -- WHO_AM_I, CTRL_REG1-5, INT1/INT2 CFG/THS/DURATION/SRC, THS in mg, "
+    "the shake settings and counters, the refractory setting, edges reported, and ext1 wake count\n"
+    "acceltest samples <n>     -- n (1..600) live x/y/z samples paced at the current ODR, plus "
+    "INT1_SRC/INT2_SRC when an IA bit is set\n"
     "acceltest ths <0-127>     -- write INT1_THS, echo the read-back\n"
     "acceltest dur <0-127>     -- write INT1_DURATION, echo the read-back\n"
+    "acceltest ths2 <0-127>    -- write INT2_THS, echo the read-back\n"
+    "acceltest dur2 <0-127>    -- write INT2_DURATION, echo the read-back\n"
+    "acceltest shake on|off    -- shake-to-wake on (default) or off (IA2 off the pin, classifier idle)\n"
+    "acceltest shake <n 1-50> <gap_ms 20-2000> <span_ms 0-5000> <holdoff_s 0-600> -- classifier settings\n"
+    "acceltest cfg <ctrl1> <ctrl4> -- write CTRL_REG1 and CTRL_REG4 (0-255, hex ok, e.g. 0x2F 0x00)\n"
 
 static int cmd_acceltest(int argc, char **argv)
 {
@@ -808,6 +1010,7 @@ static int cmd_acceltest(int argc, char **argv)
 
     if (argc == 1) {
         if (!present) {
+            printf("acceltest: not present (WHO_AM_I read: %s)\n", esp_err_to_name(accel_debug_last_err()));
             return 1;
         }
         printf("acceltest: present=1 WHO_AM_I=0x%02x\n", (unsigned) st.who_am_i);
@@ -819,6 +1022,16 @@ static int cmd_acceltest(int argc, char **argv)
                "INT1_SRC=0x%02x\n",
                (unsigned) st.int1_cfg, (unsigned) st.int1_ths, (unsigned) st.ths_mg,
                (unsigned) st.int1_duration, (unsigned) st.int1_src);
+        printf("acceltest: INT2_CFG=0x%02x INT2_THS=0x%02x (%u mg) INT2_DURATION=0x%02x "
+               "INT2_SRC=0x%02x\n",
+               (unsigned) st.int2_cfg, (unsigned) st.int2_ths, (unsigned) st.ths2_mg,
+               (unsigned) st.int2_duration, (unsigned) st.int2_src);
+        printf("acceltest: shake=%s n=%u gap=%ums span=%ums holdoff=%us candidates=%u rejected=%u "
+               "fired=%u\n",
+               st.shake_enabled ? "on" : "off", (unsigned) st.shake_n, (unsigned) st.shake_gap_ms,
+               (unsigned) st.shake_span_ms, (unsigned) (st.shake_holdoff_ms / 1000),
+               (unsigned) st.shake_candidates, (unsigned) st.shake_rejected,
+               (unsigned) st.shake_fired);
         printf("acceltest: refractory=%llds edges_reported=%u ext1_wakes=%u\n",
                (long long) (st.refractory_us / 1000000), (unsigned) st.edges_reported,
                (unsigned) st.ext1_wakes);
@@ -837,15 +1050,23 @@ static int cmd_acceltest(int argc, char **argv)
             return 1;
         }
         if (!present) {
+            printf("acceltest: not present (WHO_AM_I read: %s)\n", esp_err_to_name(accel_debug_last_err()));
             return 1;
         }
+        uint32_t period_ms = accel_debug_sample_period_ms();
         for (long i = 0; i < n; i++) {
             int16_t x_mg = 0, y_mg = 0, z_mg = 0;
+            uint8_t src = 0, src2 = 0;
+            if (!accel_debug_sample(&x_mg, &y_mg, &z_mg, &src, &src2)) {
                 printf("acceltest: sample %ld: I2C read failed\n", i);
             } else {
                 printf("acceltest: x=%d y=%d z=%d mg\n", (int) x_mg, (int) y_mg, (int) z_mg);
+                if ((src & 0x40) || (src2 & 0x40)) { // IA
+                    printf("acceltest: INT1_SRC=0x%02x INT2_SRC=0x%02x\n", (unsigned) src,
+                           (unsigned) src2);
                 }
             }
+            vTaskDelay(pdMS_TO_TICKS(period_ms)); // one sample per ODR period
         }
         return 0;
     }
@@ -891,6 +1112,88 @@ static int cmd_acceltest(int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(argv[1], "ths2") == 0 || strcmp(argv[1], "dur2") == 0) {
+        bool is_ths = argv[1][0] == 't';
+        if (argc != 3) {
+            printf("usage: acceltest %s <0-127>\n", argv[1]);
+            return 1;
+        }
+        char *end = NULL;
+        long v = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || v < 0 || v > 127) {
+            printf("acceltest: %s must be 0..127\n", argv[1]);
+            return 1;
+        }
+        uint8_t readback = 0;
+        if (!(is_ths ? accel_debug_set_ths2((uint8_t) v, &readback)
+                     : accel_debug_set_dur2((uint8_t) v, &readback))) {
+            printf("acceltest: not present, or the write failed\n");
+            return 1;
+        }
+        if (is_ths) {
+            accel_debug_status_t st2;
+            accel_debug_status(&st2, NULL);
+            printf("acceltest: INT2_THS=0x%02x (%u mg)\n", (unsigned) readback,
+                   (unsigned) st2.ths2_mg);
+        } else {
+            printf("acceltest: INT2_DURATION=0x%02x\n", (unsigned) readback);
+        }
+        return 0;
+    }
+
+    if (strcmp(argv[1], "shake") == 0) {
+        if (argc == 3 && (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "off") == 0)) {
+            bool on = argv[2][1] == 'n';
+            accel_debug_set_shake(on);
+            printf("acceltest: shake=%s\n", on ? "on" : "off");
+            return 0;
+        }
+        if (argc != 6) {
+            printf("usage: acceltest shake on|off | acceltest shake <n 1-50> <gap_ms 20-2000> "
+                   "<span_ms 0-5000> <holdoff_s 0-600>\n");
+            return 1;
+        }
+        long vals[4];
+        for (int k = 0; k < 4; k++) {
+            char *end = NULL;
+            vals[k] = strtol(argv[2 + k], &end, 10);
+            if (!end || *end != '\0') {
+                printf("acceltest: shake arguments must be numbers\n");
+                return 1;
+            }
+        }
+        if (vals[0] < 1 || vals[0] > 50 || vals[1] < 20 || vals[1] > 2000 || vals[2] < 0 ||
+            vals[2] > 5000 || vals[3] < 0 || vals[3] > 600) {
+            printf("acceltest: n 1-50, gap_ms 20-2000, span_ms 0-5000, holdoff_s 0-600\n");
+            return 1;
+        }
+        accel_debug_set_shake_cfg((uint8_t) vals[0], (uint16_t) vals[1], (uint16_t) vals[2],
+                                  (uint32_t) vals[3]);
+        printf("acceltest: shake n=%ld gap=%ldms span=%ldms holdoff=%lds\n", vals[0], vals[1],
+               vals[2], vals[3]);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "cfg") == 0) {
+        if (argc != 4) {
+            printf("usage: acceltest cfg <ctrl1> <ctrl4>\n");
+            return 1;
+        }
+        char *e1 = NULL, *e4 = NULL;
+        long c1 = strtol(argv[2], &e1, 0);
+        long c4 = strtol(argv[3], &e4, 0);
+        if (!e1 || *e1 != '\0' || !e4 || *e4 != '\0' || c1 < 0 || c1 > 255 || c4 < 0 || c4 > 255) {
+            printf("acceltest: ctrl1 and ctrl4 must be 0..255 (hex ok)\n");
+            return 1;
+        }
+        if (!accel_debug_set_cfg((uint8_t) c1, (uint8_t) c4)) {
+            printf("acceltest: not present, the write failed, or the read-back differs\n");
+            return 1;
+        }
+        printf("acceltest: CTRL_REG1=0x%02x CTRL_REG4=0x%02x\n", (unsigned) c1, (unsigned) c4);
+        return 0;
+    }
+
     if (strcmp(argv[1], "refr") == 0) {
         if (argc != 3) {
             printf("usage: acceltest refr <seconds>\n");
@@ -923,6 +1226,9 @@ static const char *DISPTEST_USAGE =
     "disptest                     -- same as `disptest info`\n"
     "disptest info                -- print again-mode, partial count, disp_dirty_rows()\n"
     "disptest again <0|1>         -- set the partial-write-again A/B flag\n"
+    "disptest lut [0|1]           -- show/set (persisted) the host-written partial LUT A/B flag (0x32 "
+    "WF_PARTIAL_2IN9 + 0x22=0xCF vs. today's 0x22=0xFF)\n"
+    "disptest tp0a [N]            -- show/set (persisted, 1..31) host LUT group-0 phase-A frames (default 7)\n"
     "disptest bars                -- paint the baseline pattern and FULL refresh\n"
     "disptest step <n>            -- invert the 8px screen column at x=n*8 (full height), then "
     "ONE partial refresh; n must be 0..(GFX_SCREEN_W/8 - 1)\n"
@@ -965,6 +1271,9 @@ static void disptest_step(int n)
 static int cmd_disptest(int argc, char **argv)
 {
     if (argc < 2 || strcmp(argv[1], "info") == 0) {
+        printf("disptest: again=%d lut=%d partial_count=%u dirty_rows=%d\n",
+               (int) disp_partial_write_again(), (int) disp_get_partial_lut(),
+               (unsigned) disp_partial_count(), disp_dirty_rows());
         return 0;
     }
     if (strcmp(argv[1], "again") == 0) {
@@ -974,6 +1283,34 @@ static int cmd_disptest(int argc, char **argv)
         }
         disp_set_partial_write_again(strcmp(argv[2], "1") == 0);
         printf("disptest: again=%d\n", (int) disp_partial_write_again());
+        return 0;
+    }
+    if (strcmp(argv[1], "lut") == 0) {
+        if (argc == 2) {
+            printf("disptest: lut=%d (%s)\n", (int) disp_get_partial_lut(),
+                   disp_get_partial_lut() ? "host LUT" : "OTP");
+            return 0;
+        }
+        if (argc != 3 || (strcmp(argv[2], "0") != 0 && strcmp(argv[2], "1") != 0)) {
+            printf("usage: disptest lut [0|1]\n");
+            return 1;
+        }
+        disp_set_partial_lut(strcmp(argv[2], "1") == 0);
+        printf("disptest: lut=%d\n", (int) disp_get_partial_lut());
+        return 0;
+    }
+    if (strcmp(argv[1], "tp0a") == 0) {
+        if (argc == 2) {
+            printf("disptest: tp0a=%u\n", (unsigned) disp_get_lut_tp0a());
+            return 0;
+        }
+        char *end = NULL;
+        long v = argc == 3 ? strtol(argv[2], &end, 10) : 0;
+        if (argc != 3 || *end != '\0' || v < 1 || v > 31 || !disp_set_lut_tp0a((uint8_t) v)) {
+            printf("usage: disptest tp0a [1..31]\n");
+            return 1;
+        }
+        printf("disptest: tp0a=%u\n", (unsigned) disp_get_lut_tp0a());
         return 0;
     }
     if (strcmp(argv[1], "bars") == 0) {
@@ -1091,6 +1428,59 @@ static int cmd_disptest(int argc, char **argv)
     return 1;
 }
 
+// `flip on|off|status` persists a 180-degree display rotation (NVS disp_flip); on/off force one
+// full refresh.
+static int cmd_flip(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "status") == 0) {
+        printf("flip: %s\n", disp_get_flip() ? "on" : "off");
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0)) {
+        bool on = strcmp(argv[1], "on") == 0;
+        disp_set_flip(on);
+        disp_full_refresh(); // power effect: ~2-4 s panel refresh
+        printf("flip: %s (full refresh done)\n", on ? "on" : "off");
+        return 0;
+    }
+    printf("usage: flip on|off|status\n");
+    return 1;
+}
+
+static int cmd_airplane(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "status") == 0) {
+        printf("airplane: stored %s, this boot %s\n", net_airplane_stored() ? "on" : "off",
+               net_airplane() ? "on" : "off");
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0)) {
+        net_set_airplane(strcmp(argv[1], "on") == 0); // power effect: one NVS write; applies at next boot
+        printf("airplane: %s (takes effect at the next boot)\n", net_airplane_stored() ? "on" : "off");
+        return 0;
+    }
+    printf("usage: airplane on|off|status\n");
+    return 1;
+}
+
+// `battstat` prints the live battery-stats window; `battstat reboot` then hard-resets to check that
+// the RTC_NOINIT window survives.
+static int cmd_battstat(int argc, char **argv)
+{
+    if (argc > 2 || (argc == 2 && strcmp(argv[1], "reboot") != 0)) {
+        printf("usage: battstat [reboot]\n");
+        return 1;
+    }
+    char line[320];
+    battstat_format(line, sizeof(line));
+    printf("%s\n", line);
+    if (argc == 2) {
+        fflush(stdout);
+        watchdog_hard_reset(); // power effect: reboots the ESP32; the modem keeps its state
+    }
+    return 0;
+}
+
 static void start_normal_console(void)
 {
     esp_console_repl_t *repl = NULL;
@@ -1192,8 +1582,40 @@ static void start_normal_console(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&railcycle_cmd));
 
+    const esp_console_cmd_t gpio_cmd = {
+        .command = "gpio",
+        .help = "gpio <n> [sample <ms>] -- read a pad level (and poll it) without reconfiguring it",
+        .hint = NULL,
+        .func = &cmd_gpio,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&gpio_cmd));
+
+    const esp_console_cmd_t refresh_cmd = {
+        .command = "refresh",
+        .help = "refresh [floor N|ceil N|idle S|gap MS|psmin N|status] -- full-refresh policy knobs (persist to NVS)",
+        .hint = NULL,
+        .func = &cmd_refresh,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&refresh_cmd));
+
+    const esp_console_cmd_t padinfo_cmd = {
+        .command = "padinfo",
+        .help = "padinfo -- dump IO8's IO MUX / RTC IO / hold registers and both level readers",
+        .hint = NULL,
+        .func = &cmd_padinfo,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&padinfo_cmd));
+    const esp_console_cmd_t padfix_cmd = {
+        .command = "padfix",
+        .help = "padfix -- IO8: hold off, digital mux, input+pull-down, then padinfo",
+        .hint = NULL,
+        .func = &cmd_padfix,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&padfix_cmd));
+
     const esp_console_cmd_t btn_cmd = {
         .command = "btn",
+        .help = "btn [long] -- push a simulated IO8 button press (BTN_DOWN + BTN_SHORT, or "
                  "BTN_LONG with `long`) through input.c's real event queue, same path a "
                  "physical press takes downstream; needed to reach scr_lock.c's passcode entry "
                  "from the console",
@@ -1292,6 +1714,15 @@ static void start_normal_console(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cafetch_cmd));
 
+    const esp_console_cmd_t otafetch_cmd = {
+        .command = "otafetch",
+        .help = "otafetch <url> <size> -- stream an OTA object into a hash+count sink (no flash writes): "
+                "bytes, B/s, short reads, resumes, sha16",
+        .hint = NULL,
+        .func = &cmd_otafetch,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&otafetch_cmd));
+
     const esp_console_cmd_t smstest_cmd = {
         .command = "smstest",
         .help = "smstest <number> <text> -- send one SMS bypassing the allow-list",
@@ -1310,6 +1741,7 @@ static void start_normal_console(void)
 
     const esp_console_cmd_t acceltest_cmd = {
         .command = "acceltest",
+        .help = "acceltest [samples <n>|ths|dur|ths2|dur2 <0-127>|shake on|off|<n> <gap> <span> <holdoff_s>|cfg <c1> <c4>|refr <seconds>] -- LIS3DH "
                  "register/sample dump and runtime tuning; run "
                  "`acceltest` with no args for the full usage",
         .hint = NULL,
@@ -1319,6 +1751,8 @@ static void start_normal_console(void)
 
     const esp_console_cmd_t disptest_cmd = {
         .command = "disptest",
+        .help = "disptest [info|again <0|1>|lut [0|1]|bars|step <n>|seq [n0] [n1] [ms]|full|"
+                 "swreset] -- "
                  "deterministic e-paper partial-refresh bench harness; "
                  "run `disptest` with no args for the full usage. NOTE: do not use `wake` or "
                  "`key` while this is running -- the UI render task would repaint over the test "
@@ -1328,6 +1762,32 @@ static void start_normal_console(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&disptest_cmd));
 
+    const esp_console_cmd_t flip_cmd = {
+        .command = "flip",
+        .help = "flip on|off|status -- persist and apply a 180-degree display rotation (NVS "
+                 "disp_flip) so the pager can be read upside down; `on`/`off` force one full "
+                 "refresh immediately",
+        .hint = NULL,
+        .func = &cmd_flip,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&flip_cmd));
+    const esp_console_cmd_t airplane_cmd = {
+        .command = "airplane",
+        .help = "airplane on|off|status -- NVS net/airplane: hold the modem in reset and skip all "
+                "network bring-up; takes effect at the next boot",
+        .hint = NULL,
+        .func = &cmd_airplane,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&airplane_cmd));
+    const esp_console_cmd_t battstat_cmd = {
+        .command = "battstat",
+        .help = "battstat [reboot] -- live battery-stats window: dt vs sl+aw and "
+                "per-wake awake ms; `reboot` hard-resets afterwards to check the window survives",
+        .hint = NULL,
+        .func = &cmd_battstat,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&battstat_cmd));
+
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     ESP_LOGD(TAG, "debug console REPL started in normal mode (PAGER_DEBUG_NO_LIGHT_SLEEP)");
 }
@@ -1336,6 +1796,12 @@ static void start_normal_console(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "school_pager boot");
+#ifdef PAGER_OTA_TEST_ABORT
+    // Bench-only rollback test image: panic before anything could mark this slot valid.
+    ESP_LOGE(TAG, "PAGER_OTA_TEST_ABORT build: aborting on purpose so the bootloader rolls back");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    abort();
+#endif
 
     // Fixed local timezone for every on-glass HH:MM; the network clock carries no TZ.
     setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
@@ -1402,6 +1868,7 @@ void app_main(void)
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
     // Started before modes_boot() so the console task exists for the device's life.
     start_normal_console();
+    esp_log_level_set("ui", ESP_LOG_DEBUG); // raw CardKB bytes
 #endif
 
     // modes_boot() picks cold boot vs. reset recovery by validating the RTC struct (docs/PROTOCOL.md

@@ -16,12 +16,15 @@ typedef struct {
 
 #define GPIO_MODE_INPUT 1
 #define GPIO_PULLUP_ENABLE 1
+#define GPIO_PULLUP_DISABLE 0
+#define GPIO_PULLDOWN_ENABLE 1
 #define GPIO_PULLDOWN_DISABLE 0
 #define GPIO_INTR_DISABLE 0
 
 void gpio_config(const gpio_config_t *cfg);
 int gpio_get_level(gpio_num_t pin);
 
+/* Test-only: sets the level gpio_get_level() returns (default 0 = released, active-high). */
 void idf_stub_set_button_level(int level);
 
 #endif

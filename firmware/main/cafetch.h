@@ -29,6 +29,8 @@ bool cafetch_build_request(const char *host, const char *path, char *out, size_t
                            size_t *out_len);
 
 // Stream-mode body sink; return false to abort.
+typedef bool (*cafetch_sink_fn)(void *arg, const uint8_t *data, size_t len);
+
 typedef enum {
     CAFETCH_PHASE_STATUS_LINE = 0,
     CAFETCH_PHASE_HEADER_LINE,
@@ -62,9 +64,23 @@ typedef struct {
     bool err_oversize;   /* body or declared Content-Length > CAFETCH_BODY_MAX */
     bool err_malformed;  /* bad status line, headers or chunk framing */
     bool err_non200;     /* status != 200 (redirects included) */
+    bool err_sink;       /* stream mode: the sink returned false */
+    bool err_short;      /* stream mode: a socket read came back short */
+
+    // Stream mode: body bytes go to the sink, not body[].
+    cafetch_sink_fn sink;
+    void *sink_arg;
+    size_t max_body;     /* cap on this response's body */
+    size_t range_start;  /* >0: a 206 whose Content-Range starts here is required */
+    bool have_content_range;
+    size_t content_range_start;
 } cafetch_parser_t;
 
 void cafetch_parser_init(cafetch_parser_t *p);
+
+// Switches to stream mode. range_start > 0 accepts only a 206 starting there; 0 accepts only 200.
+void cafetch_parser_set_stream(cafetch_parser_t *p, cafetch_sink_fn sink, void *arg,
+                               size_t max_body, size_t range_start);
 
 // Feeds more bytes in any split; false once the phase is ERROR.
 bool cafetch_parser_feed(cafetch_parser_t *p, const uint8_t *data, size_t len);
@@ -80,6 +96,14 @@ bool cafetch_validate_body(const uint8_t *body, size_t body_len, const uint8_t e
 
 // Opens the socket and sends the GET (`extra_hdrs` NULL for none). False if it cannot start or busy.
 bool cafetch_begin_ex(const char *url, const char *extra_hdrs);
+
+// Like cafetch_begin_ex(), body to `sink`; timeouts 30 s idle / 900 s total.
+// Power effect: one TLS handshake, then the radio stays up for the transfer.
+bool cafetch_begin_stream(const char *url, size_t range_start, size_t max_body, cafetch_sink_fn sink,
+                          void *arg);
+
+// After CAFETCH_FAILED: status, bytes delivered, whether a Range resume is worthwhile, short read.
+void cafetch_fail_info(int *status, size_t *body_len, bool *transport, bool *short_read);
 
 bool cafetch_begin(const char *url);
 

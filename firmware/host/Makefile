@@ -79,11 +79,13 @@ $(BUILD)/test_setup: $(BUILD)/setup.o $(BUILD)/cbor.o $(BUILD)/test_setup.o
 
 # test_input builds input.c with -DESP_PLATFORM against idf_stub.c.
 $(BUILD)/input.o: $(MAIN_SRC)/input.c $(MAIN_SRC)/input.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM -DPAGER_WAKE_BUTTON_ENABLED=1 $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ $(MAIN_SRC)/input.c
 
 $(BUILD)/idf_stub.o: idf_stub.c | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ idf_stub.c
 
 $(BUILD)/test_input.o: test_input.c $(MAIN_SRC)/input.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM -DPAGER_WAKE_BUTTON_ENABLED=1 $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ test_input.c
 
 $(BUILD)/test_input: $(BUILD)/input.o $(BUILD)/idf_stub.o $(BUILD)/test_input.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/input.o $(BUILD)/idf_stub.o $(BUILD)/test_input.o
@@ -131,6 +133,34 @@ $(BUILD)/catrust.o: $(MAIN_SRC)/catrust.c $(MAIN_SRC)/catrust.h $(MAIN_SRC)/cbor
 
 $(BUILD)/test_catrust.o: test_catrust.c $(MAIN_SRC)/catrust.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_catrust.c
+
+# test_otapipe: vendored detools and miniz tinfl; $$OTA_FIXTURES / $$OTA_IMAGES select
+# real-artifact cases, which print SKIP when absent.
+DETOOLS_DEFS := -DDETOOLS_CONFIG_FILE_IO=0 -DDETOOLS_CONFIG_COMPRESSION_LZMA=0 -DDETOOLS_CONFIG_COMPRESSION_CRLE=0 -DDETOOLS_CONFIG_COMPRESSION_HEATSHRINK=0
+OTA_INCLUDES := -I../components/detools -Ithird_party/miniz
+
+$(BUILD)/detools.o: ../components/detools/detools.c ../components/detools/detools.h | $(BUILD)
+	$(CC) $(CFLAGS) $(DETOOLS_DEFS) -I../components/detools -c -o $@ ../components/detools/detools.c
+
+$(BUILD)/miniz_tinfl.o: third_party/miniz/miniz_tinfl.c | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party/miniz -c -o $@ third_party/miniz/miniz_tinfl.c
+
+$(BUILD)/otapipe.o: $(MAIN_SRC)/otapipe.c $(MAIN_SRC)/otapipe.h | $(BUILD)
+	$(CC) $(CFLAGS) $(DETOOLS_DEFS) $(INCLUDES) $(OTA_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/otapipe.c
+
+$(BUILD)/test_otapipe.o: test_otapipe.c $(MAIN_SRC)/otapipe.h | $(BUILD)
+	$(CC) $(CFLAGS) $(DETOOLS_DEFS) $(INCLUDES) $(OTA_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ test_otapipe.c
+
+$(BUILD)/test_otapipe: $(BUILD)/otapipe.o $(BUILD)/detools.o $(BUILD)/miniz_tinfl.o $(BUILD)/test_otapipe.o
+	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS) -lz
+
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/ota.c
+
+$(BUILD)/test_ota.o: test_ota.c $(MAIN_SRC)/ota.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_ota.c
+
+$(BUILD)/test_ota: $(BUILD)/ota.o $(BUILD)/cbor.o $(BUILD)/test_ota.o
+	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD)/test_catrust: $(BUILD)/catrust.o $(BUILD)/cbor.o $(BUILD)/test_catrust.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/catrust.o $(BUILD)/cbor.o $(BUILD)/test_catrust.o
@@ -268,3 +298,30 @@ $(BUILD)/test_clock.o: test_clock.c $(MAIN_SRC)/clockfmt.h | $(BUILD)
 
 $(BUILD)/test_clock: $(BUILD)/clockfmt.o $(BUILD)/test_clock.o
 	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD)/disp_flip.o: $(MAIN_SRC)/disp_flip.c $(MAIN_SRC)/disp_flip.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/disp_flip.c
+
+$(BUILD)/test_disp_flip.o: test_disp_flip.c $(MAIN_SRC)/disp_flip.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_disp_flip.c
+
+$(BUILD)/test_disp_flip: $(BUILD)/disp_flip.o $(BUILD)/test_disp_flip.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD)/battstat.o: $(MAIN_SRC)/battstat.c $(MAIN_SRC)/battstat.h $(MAIN_SRC)/cbor.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/battstat.c
+
+$(BUILD)/test_battstat.o: test_battstat.c $(MAIN_SRC)/battstat.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_battstat.c
+
+$(BUILD)/test_battstat: $(BUILD)/battstat.o $(BUILD)/cbor.o $(BUILD)/test_battstat.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/battstat.o $(BUILD)/cbor.o $(BUILD)/test_battstat.o
+
+$(BUILD)/refreshpol.o: $(MAIN_SRC)/refreshpol.c $(MAIN_SRC)/refreshpol.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/refreshpol.c
+
+$(BUILD)/test_refreshpol.o: test_refreshpol.c $(MAIN_SRC)/refreshpol.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_refreshpol.c
+
+$(BUILD)/test_refreshpol: $(BUILD)/refreshpol.o $(BUILD)/test_refreshpol.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/refreshpol.o $(BUILD)/test_refreshpol.o

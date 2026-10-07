@@ -2293,6 +2293,12 @@ typedef struct {
    * @brief The number of bytes received.
    */
   uint16_t bytesReceived;
+
+  /**
+   * @brief PAGER PATCH: 1.22 -- the byte count the modem announced in the +SQNSRECV header.
+   * `bytesReceived < bytesClaimed` means the payload parser lost bytes (PATCHES.md 1.7).
+   */
+  uint16_t bytesClaimed;
 } WalterModemSocketResponse;
 
 #endif

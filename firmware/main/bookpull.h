@@ -36,6 +36,10 @@ typedef enum {
 // Classifies an HTTP status (§14.7); status 0 means a cafetch-layer failure.
 bookpull_http_outcome_t bookpull_classify_http(int http_status);
 
+#define BOOKPULL_SELF_RETRY_MAX 3 /* failed attempts per nudge before waiting for the relay */
+// True if the nudge should be re-queued: 409 always, DROP never, others while failures < max.
+bool bookpull_should_requeue(bookpull_http_outcome_t outcome, uint8_t failures);
+
 #ifdef ESP_PLATFORM
 
 typedef void (*bookpull_lock_fn)(void);

@@ -18,6 +18,8 @@ void scr_greeting_set_status(const char *status)
     snprintf(s_status, sizeof(s_status), "%s", status);
 }
 
+const char *scr_greeting_get_status(void) { return s_status; }
+
 static void render(void)
 {
     const char *text = s_status[0] != '\0' ? s_status : "booting";

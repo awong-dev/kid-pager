@@ -11,6 +11,7 @@
 #define CFG_KEY_LOCK 0
 #define CFG_KEY_CA 1
 #define CFG_KEY_SMS 2
+#define CFG_KEY_OTA 4
 
 // Skips one value and reports its [start,len) span so callers get the raw sub-map bytes.
 static bool skip_capture(cbor_r_t *r, size_t *off, size_t *len)
@@ -52,6 +53,12 @@ static bool parse_cfg_submap(cbor_r_t *r, cfg_dispatch_t *out)
                 return false;
             }
             out->have_sms = true;
+            break;
+        case CFG_KEY_OTA:
+            if (!skip_capture(r, &out->ota_off, &out->ota_len)) {
+                return false;
+            }
+            out->have_ota = true;
             break;
         default:
             // unknown cfg keys are skipped, not malformed
@@ -130,6 +137,7 @@ bool cfg_parse(const uint8_t *buf, uint16_t len, bool sig_pair_present, cfg_disp
 #include "ident.h"
 #include "lock.h"
 #include "msg.h"
+#include "ota.h"
 #include "sms.h"
 
 bool cfg_ingest_cbor(const uint8_t *buf, uint16_t len)
@@ -149,6 +157,10 @@ bool cfg_ingest_cbor(const uint8_t *buf, uint16_t len)
     if (d.have_sms) {
         // applied and acked immediately
         sms_apply_cfg_submap(buf + d.sms_off, (uint16_t) d.sms_len, d.id);
+    }
+    if (d.have_ota) {
+        // acks on accept or reject; the download runs from ota_service()
+        ota_apply_cfg_submap(buf + d.ota_off, (uint16_t) d.ota_len, d.id);
     }
 
     return true;

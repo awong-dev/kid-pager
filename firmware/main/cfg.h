@@ -27,6 +27,9 @@ typedef struct {
     bool have_sms;
     size_t sms_off, sms_len;
 
+    // `ota`=4
+    bool have_ota;
+    size_t ota_off, ota_len;
 } cfg_dispatch_t;
 
 // Decodes a verified /down envelope (`sig_pair_present`: trailing sig pair already trimmed).

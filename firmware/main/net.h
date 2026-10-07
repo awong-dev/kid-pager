@@ -31,6 +31,17 @@ typedef struct {
 /* Cold-boot modem bring-up through attach and mqttConfig; repeatable after net_recover_modem(). */
 bool net_init(void);
 
+/* Airplane mode: NVS "net"/"airplane", read at boot; net_set_airplane() applies next boot. */
+void net_airplane_init(void);
+bool net_airplane(void);
+void net_set_airplane(bool on);
+bool net_airplane_stored(void); /* the NVS value, i.e. what the next boot will use */
+/* Holds the modem's reset line (IO45) low through light sleep; no AT-issuing call works. */
+void net_airplane_hold_modem(void);
+
+/* Boot progress ("connecting", "registering", ...); weak no-op here, ui.c overrides it. */
+void net_boot_progress_hook(const char *status);
+
 /* Configures TLS profile 3 with validation off for the bootstrap hop; profile 2 is untouched. */
 bool net_tls_profile_bootstrap(void);
 
@@ -62,6 +73,7 @@ bool net_ca_fetch_open(const char *host, uint16_t port);
 bool net_ca_fetch_send(const uint8_t *buf, uint16_t len);
 
 /* Non-blocking: reads one `+SQNSRING` (<=1500 B) or reports the close; false if neither. */
+bool net_ca_fetch_poll(uint8_t *buf, size_t cap, uint16_t *out_len, bool *out_closed, bool *out_short);
 
 /* Best-effort AT+SQNSH on the cafetch socket. */
 void net_ca_fetch_close(void);
@@ -315,6 +327,10 @@ void net_enable_accel_wake(void);
 
 /* net_sleep() returns woken by the LIS3DH pin (ext1) since boot. */
 uint32_t net_get_ext1_wakes(void);
+
+/* Radio events since boot (publishes, liveness pings, inbound messages); any task may note one. */
+uint32_t net_get_radio_events(void);
+void net_note_radio_event(void);
 
 /* SMS. main/sms.c is the only caller. */
 

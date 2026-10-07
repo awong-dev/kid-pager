@@ -160,12 +160,18 @@ static void test_motion_classifier(void)
 
 static void test_battery_floor(void)
 {
+    CHECK(!loc_battery_ok(LOC_BATTERY_FLOOR_MV - 1), "one mV below the floor must fail");
+    CHECK(loc_battery_ok(LOC_BATTERY_FLOOR_MV), "exactly the floor must pass");
+    CHECK(loc_battery_ok(4200), "4200mV must pass the floor");
 
     loc_policy_t p;
     loc_policy_init(&p);
+    loc_decision_t d = loc_on_request(&p, 0, LOC_BATTERY_FLOOR_MV - 1, "l_lowbatt");
     CHECK(d == LOC_ANSWER_CACHED, "a request below the battery floor must never start GNSS");
 }
 
+/* modes.c passes LOC_BATTERY_UNKNOWN_MV when no reading exists yet: it must always pass the floor
+ * and never be confused with an ordinary low reading. */
 static void test_battery_unknown_sentinel(void)
 {
     CHECK(loc_battery_ok(LOC_BATTERY_UNKNOWN_MV), "an unknown battery reading must pass the floor");

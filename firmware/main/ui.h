@@ -49,6 +49,11 @@ void scr_greeting_set_mode(scr_greeting_mode_t mode);
 
 /* Status text drawn on the greeting screen; NULL or "" falls back to "booting". */
 void scr_greeting_set_status(const char *status);
+const char *scr_greeting_get_status(void);
+
+/* If the greeting is on top and `text` differs, sets it and paints a partial. Modes task only.
+ * Power effect: one partial refresh, ~0.3-0.8 s. */
+void ui_boot_status(const char *text);
 extern const ui_screen_t g_scr_greeting;
 
 /* Marks every visible down message in the open chat read. Not called from the incoming-message
@@ -111,12 +116,24 @@ uint32_t ui_rail_lazy_on_count(void);
  * ui_on_awake_lapse()). Power effect: ~0.3-0.8 s; a cheap no-op if the display is dead. */
 void ui_render(void);
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+/* Wall-clock cost of the last ui_render() paint and refresh, us. */
+void ui_debug_render_times(int64_t *paint_us, int64_t *refresh_us);
+#endif
+
+/* First render after boot: consumes disp_init()'s forced-full priming. Called once from
  * modes_boot(). Power effect: ~2-4 s (full refresh). */
 void ui_render_boot(void);
 
 /* Called when the UI-awake window lapses: lets the refresh policy send a due full refresh.
  * Power effect: ~0.3-0.8 s partial, ~2-4 s if a full refresh is due. */
 void ui_on_awake_lapse(void);
+
+/* The next ui_render() is a whole-screen change (screen switch, message sent). */
+void ui_mark_transition(void);
+/* Sleep-entry render: a full refresh if the policy's dirty count > 0. Power effect: ~3 s panel
+ * drive when full. */
+void ui_render_presleep(void);
 
 /* Routes one key to the top screen and clears the boot crash indicator. Does not render. */
 void ui_dispatch_key(input_key_t key);

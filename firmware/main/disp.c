@@ -1,7 +1,10 @@
 /* SSD1680 e-paper transport (docs/PROTOCOL.md §6). */
 #include "disp.h"
+#include "disp_flip.h"
 #include "gfx.h"
+#include "refreshpol.h"
 #include "pins.h"
+#include "wf_partial_2in9.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "flightrec.h"
 
@@ -42,6 +46,7 @@ static uint32_t s_cnt_partial = 0;
 static uint32_t s_cnt_forced_full = 0;
 
 // Last refreshes, oldest first. kind: F full, P partial, U partial upgraded to full.
+// tag: 1 full, 2 partial, 4 completed via the BUSY-timeout retry, 0 other.
 #define DISP_REFRESH_RING_LEN 8
 typedef struct {
     uint32_t ms;
@@ -78,6 +83,95 @@ static uint32_t s_busy_timeout_count = 0;
 static bool s_force_full = false;
 
 static bool s_partial_write_again = true;
+
+// Host-written LUT mode: 0x12 wipes any loaded LUT, so it is sent before every partial.
+#define DISP_NVS_KEY_LUT "lut"
+static bool s_partial_use_lut = true;
+
+void disp_set_partial_lut(bool on)
+{
+    s_partial_use_lut = on;
+    nvs_handle_t h;
+    if (nvs_open("disp", NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "disp lut NVS open failed; not persisted this boot");
+        return;
+    }
+    nvs_set_u8(h, DISP_NVS_KEY_LUT, (uint8_t) on);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void disp_load_lut(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("disp", NVS_READONLY, &h) != ESP_OK) {
+        return; // never set; stays default true
+    }
+    uint8_t v = 1;
+    if (nvs_get_u8(h, DISP_NVS_KEY_LUT, &v) == ESP_OK) {
+        s_partial_use_lut = (v != 0);
+    }
+    nvs_close(h);
+}
+
+bool disp_get_partial_lut(void) { return s_partial_use_lut; }
+
+// LUT byte 60 is group 0 TP0A (5 VS LUTs x 12 bytes, then group 0's first byte): changed-pixel
+// drive frames. The table value is 10.
+#define DISP_LUT_TP0A_IDX 60
+#define DISP_NVS_KEY_TP0A "tp0a"
+static uint8_t s_lut_tp0a = PAGER_LUT_TP0A;
+
+static void disp_load_tp0a(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("disp", NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    uint8_t v = 0;
+    if (nvs_get_u8(h, DISP_NVS_KEY_TP0A, &v) == ESP_OK && v >= 1 && v <= 31) {
+        s_lut_tp0a = v;
+    }
+    nvs_close(h);
+}
+
+uint8_t disp_get_lut_tp0a(void) { return s_lut_tp0a; }
+
+bool disp_set_lut_tp0a(uint8_t n)
+{
+    if (n < 1 || n > 31) {
+        return false;
+    }
+    s_lut_tp0a = n;
+    nvs_handle_t h;
+    if (nvs_open("disp", NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "disp tp0a NVS open failed; not persisted this boot");
+        return true;
+    }
+    nvs_set_u8(h, DISP_NVS_KEY_TP0A, n);
+    nvs_commit(h);
+    nvs_close(h);
+    return true;
+}
+
+#define DISP_NVS_NAMESPACE "disp"
+#define DISP_NVS_KEY_FLIP "flip"
+static bool s_disp_flip = false;
+
+static void disp_load_flip(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(DISP_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return; // never set yet; stays false (normal orientation)
+    }
+    uint8_t v = 0;
+    if (nvs_get_u8(h, DISP_NVS_KEY_FLIP, &v) == ESP_OK) {
+        s_disp_flip = (v != 0);
+    }
+    nvs_close(h);
+}
+
+bool disp_get_flip(void) { return s_disp_flip; }
 
 /* Serializes every public refresh entry point. */
 static SemaphoreHandle_t s_mutex;
@@ -210,6 +304,49 @@ static void disp_send_data(const uint8_t *data, size_t len)
 
 static void disp_send_data1(uint8_t b) { disp_send_data(&b, 1); }
 
+// Splits a write into GFX_FB_ROW_BYTES chunks (bus max_transfer_sz; the non-DMA FIFO limit is 64
+// bytes). `data` may be in flash because the bus is non-DMA.
+static void disp_send_data_chunked(const uint8_t *data, size_t len)
+{
+    while (len > 0) {
+        size_t n = len < GFX_FB_ROW_BYTES ? len : GFX_FB_ROW_BYTES;
+        disp_send_data(data, n);
+        data += n;
+        len -= n;
+    }
+}
+
+// Persists the setting; does not refresh. The caller must full-refresh to avoid a torn frame.
+void disp_set_flip(bool on)
+{
+    disp_lock();
+    s_disp_flip = on;
+    disp_unlock();
+    nvs_handle_t h;
+    if (nvs_open(DISP_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "disp_flip NVS open failed; new orientation not persisted this boot");
+        return;
+    }
+    nvs_set_u8(h, DISP_NVS_KEY_FLIP, (uint8_t) on);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Sends native rows win_first..win_last of src (source space) to the current RAM window,
+// reordered when flipped; the only place flip is applied.
+static void disp_send_fb_rows(const uint8_t src[][GFX_FB_ROW_BYTES], int win_first, int win_last)
+{
+    for (int r = win_first; r <= win_last; r++) {
+        if (!s_disp_flip) {
+            disp_send_data(src[r], GFX_FB_ROW_BYTES);
+        } else {
+            uint8_t tmp[GFX_FB_ROW_BYTES];
+            disp_flip_row(src[disp_flip_src_row(r, GFX_FB_ROWS)], tmp, GFX_FB_ROW_BYTES);
+            disp_send_data(tmp, GFX_FB_ROW_BYTES);
+        }
+    }
+}
+
 static void disp_power_on(void)
 {
     // Power effect: enables the panel regulator (ENA, active-high).
@@ -340,10 +477,13 @@ static void full_refresh_locked(uint8_t tag, bool upgraded)
         memcpy(s_fb_snap[r], gfx_fb_native_row(r), GFX_FB_ROW_BYTES);
     }
 
+    // disp_send_fb_rows() applies the flip; the full window (0..295) is a mirror fixed point.
     disp_set_ram_window(0, 295);
     disp_send_cmd(0x24);
+    disp_send_fb_rows(s_fb_snap, 0, GFX_FB_ROWS - 1);
     disp_set_ram_window(0, 295); // rule 1
     disp_send_cmd(0x26);
+    disp_send_fb_rows(s_fb_snap, 0, GFX_FB_ROWS - 1);
     disp_send_cmd(0x3C);
     disp_send_data1(0x05);
     disp_send_cmd(0x22);
@@ -370,6 +510,7 @@ static void full_refresh_locked(uint8_t tag, bool upgraded)
         memcpy(s_fb_old[r], s_fb_snap[r], GFX_FB_ROW_BYTES);
     }
     s_partial_count = 0;
+    refreshpol_note_full(); // logs reason + dirty, resets the policy's dirty counter
     // Any completed full refresh satisfies a pending forced full.
     s_force_full = false;
 
@@ -432,9 +573,33 @@ static void partial_refresh_locked(uint8_t tag)
         memcpy(s_fb_snap[r], gfx_fb_native_row(r), GFX_FB_ROW_BYTES);
     }
 
+    // With flip, the programmed window is the mirror of the source window; mirror after the
+    // alignment widening so it stays 8-row aligned.
+    int win_first = first, win_last = last;
+    if (s_disp_flip) {
+        disp_flip_mirror_window(first, last, GFX_FB_ROWS, &win_first, &win_last);
     }
+
+    disp_set_ram_window((uint16_t) win_first, (uint16_t) win_last);
+    disp_send_cmd(0x24);
+    disp_send_fb_rows(s_fb_snap, win_first, win_last);
     disp_send_cmd(0x3C);
     disp_send_data1(0x80); // HiZ border for partial, PROTOCOL.md §6
+    // The 0x12 in disp_pre_refresh_reset() wiped any loaded LUT, so it is re-sent every partial.
+    if (s_partial_use_lut) {
+        disp_send_cmd(0x32);
+        uint8_t lut[WF_PARTIAL_2IN9_LUT_LEN];
+        memcpy(lut, WF_PARTIAL_2IN9, sizeof lut);
+        lut[DISP_LUT_TP0A_IDX] = s_lut_tp0a;
+        disp_send_data_chunked(lut, sizeof lut);
+        disp_send_cmd(0x22);
+        disp_send_data1(0xCF); // load LUT from host write (vs. 0xFF = OTP/MCU default)
+        ESP_LOGI(TAG, "partial: lut mode (host-written WF_PARTIAL_2IN9, 0x22=0xCF)");
+    } else {
+        disp_send_cmd(0x22);
+        disp_send_data1(0xFF); // load LUT from OTP
+        ESP_LOGI(TAG, "partial: otp mode (no host LUT)");
+    }
     disp_send_cmd(0x20);
     // Update in flight: fixed-wait fallback if BUSY never asserts.
     disp_set_busy_tag("partial refresh update");
@@ -451,7 +616,9 @@ static void partial_refresh_locked(uint8_t tag)
     }
 
     // Re-sync the old RAM plane and the shadow to exactly what was sent.
+    disp_set_ram_window((uint16_t) win_first, (uint16_t) win_last);
     disp_send_cmd(0x26);
+    disp_send_fb_rows(s_fb_snap, win_first, win_last);
     for (int r = first; r <= last; r++) {
         memcpy(s_fb_old[r], s_fb_snap[r], GFX_FB_ROW_BYTES);
     }
@@ -459,10 +626,13 @@ static void partial_refresh_locked(uint8_t tag)
     // Updates toggle which RAM plane 0x24/0x26 address, so also write the image to the 0x24 plane
     // (after 0x26 above); otherwise adjacent-band partials garble.
     if (s_partial_write_again) {
+        disp_set_ram_window((uint16_t) win_first, (uint16_t) win_last);
         disp_send_cmd(0x24);
+        disp_send_fb_rows(s_fb_snap, win_first, win_last);
     }
 
     s_partial_count++;
+    refreshpol_note_partial();
 
     s_cnt_partial++;
     disp_refresh_ring_push('P', tag);
@@ -523,10 +693,13 @@ static bool restore_ram_planes_locked(void)
         }
     }
 
+    // Restore both planes in the orientation the glass shows (same flip flag as the last refresh).
     disp_set_ram_window(0, 295);
     disp_send_cmd(0x24);
+    disp_send_fb_rows(s_fb_old, 0, GFX_FB_ROWS - 1);
     disp_set_ram_window(0, 295); // rule 1
     disp_send_cmd(0x26);
+    disp_send_fb_rows(s_fb_old, 0, GFX_FB_ROWS - 1);
     return true;
 }
 
@@ -595,6 +768,9 @@ bool disp_init(void)
     if (s_mutex == NULL) {
         s_mutex = xSemaphoreCreateMutex();
     }
+    disp_load_lut();
+    disp_load_tp0a();
+    disp_load_flip();
     disp_gpio_init();
     if (!s_spi_ready) {
         s_spi_ready = disp_spi_init();
@@ -656,6 +832,13 @@ void disp_full_refresh(void)
 {
     disp_lock();
     full_refresh_locked(1, false); // tag 1
+    disp_unlock();
+}
+
+void disp_request_full(void)
+{
+    disp_lock();
+    s_force_full = true;
     disp_unlock();
 }
 

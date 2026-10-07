@@ -46,6 +46,7 @@ typedef struct {
     input_key_t key; /* valid iff type == INPUT_EVT_KEY */
 } input_event_t;
 
+/* Button GPIO (input, pull-down, active-high) and the static event queue; call before modes_run(). */
 void input_init(void);
 
 /* Steps the button FSM; resolved events arm the awake window and queue. Power effect: a GPIO read. */
@@ -72,6 +73,14 @@ bool input_button_busy(void);
 /* True once a held button passed PAGER_BTN_STUCK_MS; poll coarsely, no light sleep (level wake). */
 bool input_button_stuck(void);
 
+/* Seeds BTN_DOWN for the ext1 wake press at now_us; no-op unless BTN_IDLE. Power effect: none. */
+void input_note_button_wake(int64_t now_us);
+
+/* Shake wake: re-arms the awake window, else opens the 15 s hot window with no event (~0.2 mAh). */
+void input_note_shake_wake(int64_t now_us);
+
+/* True while the hot window is open: 100 ms keyboard cadence, no light sleep, nothing drawn. */
+bool input_hot(void);
 
 #endif /* ESP_PLATFORM */
 

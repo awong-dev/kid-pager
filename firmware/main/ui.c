@@ -6,6 +6,7 @@
 #include "modes.h"
 #include "net.h"
 #include "disp.h"
+#include "refreshpol.h"
 #include "gfx.h"
 #include "lock.h"
 #include "catrust.h"
@@ -28,8 +29,13 @@ static const char *TAG = "ui";
 static const ui_screen_t *s_stack[UI_STACK_DEPTH];
 static int s_depth = 0;
 
+static bool s_transition_pending = false;
+
+void ui_mark_transition(void) { s_transition_pending = true; }
+
 static void fire_enter(const ui_screen_t *scr)
 {
+    s_transition_pending = true; // every stack op is a whole-screen change
     if (scr && scr->on_event) {
         scr->on_event(UI_EVT_ENTER);
     }
@@ -180,8 +186,13 @@ static int bars_from_rssi_dbm(int dbm)
     return 0;
 }
 
+// LiPo discharge thresholds, mV.
 static int segs_from_batt_mv(int mv)
 {
+    if (mv >= 4000) return 4;
+    if (mv >= 3850) return 3;
+    if (mv >= 3700) return 2;
+    if (mv >= 3550) return 1;
     return 0;
 }
 
@@ -244,6 +255,9 @@ static void draw_status_bar(void)
     net_mqtt_status_t st;
     net_get_mqtt_status(&st);
     int mqtt_x = bars_x - GFX_ICON_W - UI_STATUS_ICON_GAP;
+    // airplane mode takes the link slot
+    gfx_icon(mqtt_x, 0, net_airplane() ? GFX_ICON_AIRPLANE
+                        : (st.mqtt_connected ? GFX_ICON_LINK_OK : GFX_ICON_LINK_X));
 
     // TLS padlock: closed while pinned, broken while broken, nothing while unpinned
     int tls_x = mqtt_x - GFX_ICON_W - UI_STATUS_ICON_GAP;
@@ -263,6 +277,15 @@ static void draw_status_bar(void)
     if (s_crash_indicator) {
         int crash_x = tls_x - GFX_ICON_W - UI_STATUS_ICON_GAP;
         gfx_icon(crash_x, 0, GFX_ICON_CRASH);
+    }
+
+    // sleep icon left of the group; dropped if it would run into the left-hand text
+    if (modes_sleep_indicator()) {
+        int group_x = s_crash_indicator ? tls_x - GFX_ICON_W - UI_STATUS_ICON_GAP : tls_x;
+        int sl_x = group_x - UI_STATUS_ICON_GAP - GFX_ICON_W;
+        if (sl_x > gfx_text_width(GFX_FONT_NORMAL, buf) + UI_STATUS_ICON_GAP) {
+            gfx_icon(sl_x, 0, GFX_ICON_SLEEP);
+        }
     }
 
     gfx_hline(0, GFX_SCREEN_W - 1, UI_STATUS_H);
@@ -288,6 +311,21 @@ void ui_ensure_powered(void)
     }
 }
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+static int64_t s_dbg_paint_us = 0;
+static int64_t s_dbg_refresh_us = 0;
+
+void ui_debug_render_times(int64_t *paint_us, int64_t *refresh_us)
+{
+    if (paint_us) {
+        *paint_us = s_dbg_paint_us;
+    }
+    if (refresh_us) {
+        *refresh_us = s_dbg_refresh_us;
+    }
+}
+#endif
+
 static void paint_frame(void)
 {
     if (s_depth == 0) {
@@ -304,20 +342,62 @@ static void paint_frame(void)
 void ui_render(void)
 {
     ui_ensure_powered();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    int64_t dbg_t0 = esp_timer_get_time();
+#endif
     paint_frame();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    int64_t dbg_t1 = esp_timer_get_time();
+    s_dbg_paint_us = dbg_t1 - dbg_t0;
+#endif
     // A whole-screen transition above the policy FLOOR is a full refresh; everything else is a
     // partial, so no full refresh happens on the inbound-message path.
+    bool transition = s_transition_pending;
+    s_transition_pending = false;
+    if (transition && refreshpol_poll(true, false)) {
+        disp_full_refresh(); // power effect: ~2-4 s full instead of a partial
+    } else {
+        disp_partial_refresh(); // power effect: ~0.3-0.8 s; no-op if nothing changed
+    }
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    s_dbg_refresh_us = esp_timer_get_time() - dbg_t1;
+#endif
+}
+
+// The sleep-entry frame is a full refresh if anything is dirty.
+void ui_render_presleep(void)
+{
+    if (refreshpol_poll(false, true)) {
+        paint_frame();
+        s_transition_pending = false;
+        disp_full_refresh(); // power effect: ~2-4 s full, once per sleep entry
+    } else {
+        ui_render();
+    }
 }
 
 void ui_render_boot(void)
 {
     paint_frame();
+    // disp_init() primes a forced full refresh that disp_partial_refresh() honours on its first
+    // call
+    if (refreshpol_poll(false, false)) {
+        disp_full_refresh();
+    } else {
+        disp_partial_refresh(); // power effect: ~2-4 s (forced full on this first call)
+    }
 }
 
 // Repaints the top screen; the refresh policy decides partial or full.
 void ui_on_awake_lapse(void)
 {
     paint_frame();
+    s_transition_pending = false;
+    if (refreshpol_poll(false, false)) {
+        disp_full_refresh(); // power effect: ~2-4 s full
+    } else {
+        disp_partial_refresh(); // power effect: ~0.3-0.8 s partial
+    }
 }
 
 void ui_dispatch_key(input_key_t key)
@@ -385,6 +465,7 @@ bool ui_incoming(const char *from, bool was_asleep)
 
     // no scr_chat_mark_visible_read() here: this path acks `shown`, not `read`
     bool was_greeting = (top == &g_scr_greeting);
+    bool switched = (top != &g_scr_chat); // whole-screen change
     if (top == &g_scr_greeting) {
         // replace rather than push, so popping Chat lands on Home
         ui_replace(&g_scr_chat);
@@ -403,9 +484,12 @@ bool ui_incoming(const char *from, bool was_asleep)
         // a partial over the large greeting text leaves it ghosted, so this one gets a full
         // refresh; power effect: ~2-4 s instead of ~0.3-0.8 s
         disp_full_refresh();
+    } else if (switched && refreshpol_poll(true, false)) {
+        disp_full_refresh(); // whole-screen change above the policy FLOOR
     } else {
         disp_partial_refresh();
     }
+    s_transition_pending = false;
     return true;
 }
 
@@ -514,6 +598,21 @@ uint32_t ui_kb_bus_release_count(void) { return s_kb_bus_releases; }
     }
 }
 
+void ui_boot_status(const char *text)
+{
+    if (!text || ui_top() != &g_scr_greeting || strcmp(text, scr_greeting_get_status()) == 0) {
+        return;
+    }
+    scr_greeting_set_status(text);
+    ui_render(); // power effect: one partial refresh, ~0.3-0.8 s
+}
+
+// Strong definition of net.h's weak hook; net.cpp calls it only from the modes task.
+void net_boot_progress_hook(const char *status)
+{
+    ui_boot_status(status);
+}
+
 // Upper bound on the wait in disp_pre_write_gate_hook().
 #define PAGER_UI_PUBLISH_QUIET_MAX_WAIT_MS 1500
 
@@ -534,8 +633,15 @@ void disp_pre_write_gate_hook(void)
 }
 
 // ui_init() is idempotent: repeating i2c_driver_install() or the gfx asset mmap is undefined.
+static bool s_ui_inited = false;
+static bool s_ui_init_result = false;
+
 bool ui_init(void)
 {
+    if (s_ui_inited) {
+        return s_ui_init_result;
+    }
+    s_ui_inited = true;
     i2c_kb_init();
     gfx_clear();
 #ifdef ESP_PLATFORM
@@ -546,4 +652,6 @@ bool ui_init(void)
     load_text_size();
     s_depth = 0;
     ui_go_home(); // the stack exists even if disp_init() fails
+    s_ui_init_result = disp_init();
+    return s_ui_init_result;
 }

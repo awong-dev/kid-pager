@@ -21,6 +21,11 @@ int modes_get_batt_mv(void);
 // True while the 120 s attentive window is open (wider than the 30 s UI-awake window).
 bool modes_in_use(void);
 
+// True while the loop is in the normal-cadence (20 s) sleep stretch; ui.c draws "zz".
+bool modes_sleep_indicator(void);
+// ext1 wakes counted during the last sleep stretch (0 if none); ui.c draws "w<n>".
+uint32_t modes_last_sleep_ext1_wakes(void);
+
 // Microseconds since the last key/button/ext1 event.
 int64_t modes_debug_last_input_age_us(void);
 

@@ -9,6 +9,8 @@
 #include "disp.h"
 #include "flightrec.h"
 #include "pins.h"
+#include "battstat.h"
+#include "refreshpol.h"
 #include "rail.h"
 
 #include "input.h"
@@ -24,6 +26,8 @@
 #include "catrust.h"
 
 #include "book.h"
+#include "ota.h"
+#include "cafetch.h"
 #include "bookpull.h"
 
 #include "accel.h"
@@ -43,6 +47,7 @@
 
 #include "driver/gpio.h"
 #include "esp_attr.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_rom_crc.h"
@@ -71,6 +76,7 @@ static const char *TAG = "modes";
 // Awake time with RTS asserted after each timer wake. The modem holds URCs while RTS is deasserted
 // and does not hand them over within 50 ms.
 #define PAGER_POST_WAKE_YIELD_MS 200u
+// Yield after an EXT1 (input) wake: the UI-awake window keeps RTS asserted, so the probe wait is
 // skipped.
 #define PAGER_INPUT_WAKE_YIELD_MS 40u
 // Bound on the extra awake time that keeps RTS asserted until the drain probe is answered.
@@ -90,6 +96,20 @@ static int64_t s_probe_wait_total_us = 0, s_probe_wait_max_us = 0;
 #define PAGER_STATUS_HEARTBEAT_S 3600u         // §5.4(d)
 #define PAGER_CHECKCOMM_EVERY_N_WAKES 60u      // modem health check cadence
 #define PAGER_MODEM_RESET_MIN_INTERVAL_US ((int64_t) 10 * 60 * 1000000) // reset rate limit
+// `fw` status field: the app descriptor version, truncated to 16 characters.
+static const char *fw_version_str(void)
+{
+    static char s_fw[17];
+    if (s_fw[0] == '\0') {
+        const esp_app_desc_t *d = esp_app_get_description();
+        strncpy(s_fw, d ? d->version : "?", sizeof(s_fw) - 1);
+        s_fw[sizeof(s_fw) - 1] = '\0';
+        if (s_fw[0] == '\0') {
+            s_fw[0] = '?';
+        }
+    }
+    return s_fw;
+}
 
 // Loop polling period while input_button_busy() is true; fine enough for input.c's debounce and
 // hold timing.
@@ -169,12 +189,36 @@ static void rtc_unlock(void) { xSemaphoreGive(s_rtc_mutex); }
 static bool s_was_mqtt_connected = false;
 static bool s_ui_awake_prev = false; // edge-detects input_awake()
 
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+// Debug builds only: awake-loop timing, RAM-only. Previous-iteration timestamp at the marked point
+// in modes_run(); the first iteration after an awake edge reports the whole sleep period.
+static int64_t s_dbg_looptime_prev_us = 0;
+static int64_t s_dbg_looptime_last_log_us = 0;
+#endif
+
 // esp_timer_get_time() of the last key, button or ext1 event; RAM-only. Starts outside the window so
 // "no input yet" does not read as attentive at boot.
 static int64_t s_last_input_us = -(int64_t) (PAGER_ATTENTIVE_S + 1) * 1000000;
 // Edge-detects the attentive/normal cadence transition.
 static bool s_attentive_prev = false;
 
+// Sleep indicator: the status bar shows "zz" in the normal sleep cadence and, on the next awake
+// stretch, the ext1 wakes counted meanwhile.
+static bool s_sleep_shown = false;
+static uint32_t s_sleep_entry_ext1 = 0;
+static uint32_t s_last_sleep_ext1_wakes = 0;
+
+bool modes_sleep_indicator(void)
+{
+    return s_sleep_shown;
+}
+
+uint32_t modes_last_sleep_ext1_wakes(void)
+{
+    return s_last_sleep_ext1_wakes;
+}
+
+// Per-MQTT-session counter within this boot (/status key 50); RAM-only.
 static uint32_t s_mqtt_link_counter = 0;
 
 // mqttConnect() can wedge with neither CONNECTED nor DISCONNECTED firing: s_connect_attempt_us is
@@ -321,6 +365,14 @@ static void on_auth_epoch_wrap(void)
 #define STK_BPULL 58           // book-pull capability gate: present (1) when supported
 // Previous boot's stalled-command breadcrumb (watchdog_last_stall_cmd()), omitted when empty.
 #define STK_STALLCMD 59
+// docs/PROTOCOL.md §5.1 keys 62-67: running image id and OTA job. Display only, except `img` (the
+// relay's delta-vs-full choice) and `ota` (the capability gate).
+#define STK_IMG 62     // 16 hex chars of the running image id; always present once ota_boot() ran
+#define STK_OTA 63     // 1 = cfg.ota supported and a rollback bootloader is confirmed
+#define STK_OTA_T 64   // 16 hex chars of the job target
+#define STK_OTA_ST 65  // wait/dl/ready/inst/ok/fail/rb
+#define STK_OTA_PCT 66 // 0-100
+#define STK_OTA_ERR 67 // short error code, omitted when none
 
 #define PAGER_RSSI_UNSET (-1000) // outside net_get_rssi()'s valid [-113,-51] range
 
@@ -381,6 +433,7 @@ int64_t modes_debug_last_input_age_us(void)
 
 int modes_get_rssi_dbm(void) { return (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : -113; }
 bool modes_batt_mv_known(void) { return s_last_batt_mv != 0; }
+const char *modes_get_fw_version(void) { return fw_version_str(); }
 const char *modes_get_session_id(void) { return g_rtc.session_id; }
 uint32_t modes_get_memfull_count(void) { return g_rtc.mqtt_memfull_count; }
 uint32_t modes_get_oversize_drop_count(void) { return g_rtc.oversize_drop_count; }
@@ -390,6 +443,9 @@ uint32_t modes_get_modem_resets(void) { return g_rtc.modem_resets; }
 // set. `bv` is 0 until a book has been applied.
 // Window snapshot encoded by the last build_status_cbor(); committed on a successful publish. Loop
 // task only.
+static bs_snap_t s_bs_snap;
+static bool s_bs_have = false;
+
 static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const char *state)
 {
     int64_t ts = approx_epoch();
@@ -416,6 +472,26 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     if (have_stall_cmd) {
         nfields += 1; // key 59, omitted when empty
     }
+    // OTA fields: img when known, the ota gate, and the job fields while a job exists.
+    ota_status_t ost;
+    ota_get_status(&ost);
+    bool have_ota_err = ost.have_job && ost.err != OTA_ERR_NONE;
+    if (ost.img[0] != '\0') {
+        nfields += 1;
+    }
+    if (ost.gate) {
+        nfields += 1;
+    }
+    if (ost.have_job) {
+        nfields += 3; // ota_t, ota_st, ota_pct
+        nfields += have_ota_err ? 1 : 0;
+    }
+    // Key 68 `bs`, once the window holds at least 1 s; committed by publish_status_online() on success.
+    battstat_snapshot(&s_bs_snap);
+    s_bs_have = s_bs_snap.dt >= 1;
+    if (s_bs_have) {
+        nfields += 1;
+    }
     if (signed_env) {
         nfields += 1; // bpull
         nfields += 2; // n (written below) + sig (appended by auth_sign())
@@ -430,6 +506,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_int(&w, STK_RSSI, rssi_dbm);
     cbor_w_tstr(&w, STK_SESSION, g_rtc.session_id, strlen(g_rtc.session_id));
     cbor_w_uint(&w, STK_TS, (uint64_t) ts);
+    cbor_w_tstr(&w, STK_FW, fw_version_str(), strlen(fw_version_str()));
     cbor_w_uint(&w, STK_BV, book_get_bv());
     cbor_w_uint(&w, STK_LOC_PERIOD_S, loc_get_period_s()); // always 0, periodic fixes parked
     cbor_w_uint(&w, STK_LOC_MIN_S, loc_get_min_s());        // the 10-minute trigger floor
@@ -452,6 +529,30 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
         cbor_w_tstr(&w, STK_STALLCMD, stall_cmd, strlen(stall_cmd));
     }
 
+    // OTA state from ota.c RAM.
+    if (ost.img[0] != '\0') {
+        cbor_w_tstr(&w, STK_IMG, ost.img, strlen(ost.img));
+    }
+    if (ost.gate) {
+        cbor_w_uint(&w, STK_OTA, 1);
+    }
+    if (ost.have_job) {
+        const char *ost_st = ota_state_str(ost.state);
+        cbor_w_tstr(&w, STK_OTA_T, ost.target, strlen(ost.target));
+        cbor_w_tstr(&w, STK_OTA_ST, ost_st, strlen(ost_st));
+        cbor_w_uint(&w, STK_OTA_PCT, ost.pct);
+        if (have_ota_err) {
+            const char *ost_err = ota_err_str(ost.err);
+            cbor_w_tstr(&w, STK_OTA_ERR, ost_err, strlen(ost_err));
+        }
+        if (ost.state == OTA_ST_OK || ost.state == OTA_ST_RB) {
+            ota_status_included();
+        }
+    }
+
+    if (s_bs_have) {
+        battstat_encode(&w, &s_bs_snap);
+    }
 
     // `bpull: 1` only when signing is on (the relay nudges only hmac devices); never sent as 0.
     if (signed_env) {
@@ -487,6 +588,11 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     return true;
 }
 
+#define PAGER_STATUS_PUBLISH_DEFER_MAX_MS 30000
+// Set by set_mode() (event task or loop task), consumed by modes_run().
+static volatile bool s_status_publish_pending = false;
+static volatile int64_t s_status_publish_pending_since_us = 0;
+
 static void publish_status_online(void)
 {
     size_t len = 0;
@@ -501,6 +607,13 @@ static void publish_status_online(void)
         g_rtc.status_pub_count++;
         g_rtc.last_status_epoch = approx_epoch();
         rtc_unlock();
+        if (s_bs_have) {
+            battstat_commit(&s_bs_snap); // window carried: subtract it, sq++
+            s_bs_have = false;
+        }
+        ESP_LOGI(TAG, "published /status online (mode=%s, %u B)",
+                 g_rtc.mode == (uint8_t) PAGER_MODE_ACTIVE ? "active" : "sleep", (unsigned) len);
+        ota_on_status_published(true); // rollback confirmation + end-of-job bookkeeping
     } else {
         ESP_LOGI(TAG, "publish /status online failed");
     }
@@ -564,7 +677,12 @@ static void set_mode(pager_mode_t new_mode, pager_mode_reason_t reason)
     // docs/PROTOCOL.md §5.4(b): publish on every mode change, if the session is usable.
     net_mqtt_status_t st;
     net_get_mqtt_status(&st);
+    // Deferred: the loop sends it after the render so the render never queues behind the publish.
     if (st.mqtt_connected) {
+        if (!s_status_publish_pending) {
+            s_status_publish_pending_since_us = esp_timer_get_time();
+            s_status_publish_pending = true;
+        }
     }
     // No render here: this runs on the event task and the loop task; renders go through
     // modes_run() via render_pending.
@@ -1325,6 +1443,9 @@ void modes_boot(void)
     ESP_LOGI(TAG, "pager_rtc_t size = %u bytes (of the 1184-byte budget left "
                   "after walter-modem's own ~7003 bytes, PROTOCOL.md §9.1)",
              (unsigned) sizeof(g_rtc));
+    battstat_init(); // RTC_NOINIT window: kept across software/panic/watchdog resets, zeroed after power-on
+    ESP_LOGI(TAG, "battstat_rtc_t size = %u bytes (RTC_NOINIT, outside pager_rtc_t)",
+             (unsigned) sizeof(battstat_rtc_t));
 
     msg_bind_rtc(&g_rtc.msg, rtc_lock, rtc_unlock, rtc_save);
     msg_init(was_valid);
@@ -1349,16 +1470,41 @@ void modes_boot(void)
     // Must run before net_set_msg_cb(): a nudge could arrive as soon as MQTT subscribes.
     bookpull_bind(rtc_lock, rtc_unlock);
 
+    // Same cross-task mutex for the cfg.ota handoff.
+    ota_bind(rtc_lock, rtc_unlock);
+
+    net_airplane_init(); // power effect: one NVS read; net_airplane() is a RAM read from here on
+
     input_init(); // power effect: GPIO config + static queue alloc only
 
+    refreshpol_load_nvs(); // NVS "disp" floor/ceil/idle/gap overrides; no power effect
     if (!ui_init()) {
         ESP_LOGI(TAG, "display init failed; continuing headless (network/replies/acks unaffected)");
     } else {
+        // The glass says "booting" at once; net_boot_progress_hook() updates the splash until "boot
+        // complete" swaps in the real screen. Updates run on this task only.
+        scr_greeting_set_status("booting");
+        ui_push(&g_scr_greeting);
+        ui_render_boot(); // first frame; disp_init() primes the cadence counter to force a full refresh
     }
+
+    // Running image id (a flash SHA over the image, a few tens of ms), rollback state and the previous
+    // update outcome; after the first frame.
+    ota_boot();
 
     net_set_msg_cb(on_incoming_message);
 
+    // loc.c's RTC route hint and the accelerometer come up before the ~100 s modem attach; accel_init()
+    // installs its own I2C_NUM_1 bus and fails open if the chip is absent.
+    loc_bind(&g_rtc.loc, &g_rtc.auth, rtc_lock, rtc_unlock, rtc_save, on_auth_epoch_wrap);
+    loc_init();
+
     watchdog_kick(WD_NET_INIT);
+    if (net_airplane()) {
+        // Power effect: IO45 (modem reset) held low; modem in reset for the whole boot.
+        ui_boot_status("airplane");
+        net_airplane_hold_modem();
+    } else if (!net_init()) {
         ESP_LOGI(TAG, "net_init() failed at boot; will retry from the wake loop");
         rtc_lock();
         g_rtc.attach_fail_cycles++;
@@ -1374,6 +1520,10 @@ void modes_boot(void)
         }
     }
 
+    // The GNSS configuration needs the modem; skipped in airplane mode.
+    if (!net_airplane()) {
+        loc_gnss_config();
+    }
 
     // The coverage policy starts inactive.
     coverage_policy_init(&s_coverage);
@@ -1381,11 +1531,27 @@ void modes_boot(void)
     // After net_init(): sms_init() needs the modem, and a SIM that rejects SMS setup disables the
     // feature for this boot. sms.c shares g_rtc.auth (one signed-publish counter) and the mutex.
     sms_bind(&g_rtc.auth, rtc_lock, rtc_unlock, rtc_save, on_auth_epoch_wrap);
+    if (net_airplane()) {
+        // sms_init() would issue AT traffic (net_sms_config()); with the modem
+        // held in reset SMS stays unavailable (s_available == false) all boot.
+        ESP_LOGI(TAG, "airplane mode: SMS init skipped");
+    } else {
+        sms_init();
+    }
 
     rtc_lock();
     g_rtc.mode = (uint8_t) PAGER_MODE_SLEEP; // boot in sleep mode
     rtc_save();
     rtc_unlock();
+
+    // Replace the boot splash with the real screen (partial).
+    if (ui_top() == &g_scr_greeting) {
+        ui_pop();
+        if (lock_is_locked()) {
+            ui_push(&g_scr_lock);
+        }
+        ui_render();
+    }
 
     ESP_LOGI(TAG, "boot complete, entering sleep mode");
 }
@@ -1412,6 +1578,28 @@ static bool attentive_service(void)
     return attentive;
 }
 
+// Highest-priority reason this iteration stayed awake, for awake-time attribution (fetch > modem >
+// ui > hot > attn > timer). Pure reads.
+static bs_cause_t loop_cause(bool attentive, bool btn_busy, bool btn_stuck, bool ui_awake)
+{
+    if (cafetch_in_progress()) {
+        return BS_FETCH;
+    }
+    if (net_modem_busy() || net_connect_in_flight() || net_publish_in_flight() || net_resub_hold()) {
+        return BS_MODEM;
+    }
+    if (ui_awake || btn_busy || btn_stuck) {
+        return BS_UI;
+    }
+    if (input_hot() || accel_shake_pending()) {
+        return BS_HOT;
+    }
+    if (attentive) {
+        return BS_ATTN;
+    }
+    return BS_TIMER;
+}
+
 void modes_run(void)
 {
     uint32_t backoff_index = 0;
@@ -1420,6 +1608,7 @@ void modes_run(void)
     watchdog_loop_begin();
     for (;;) {
         watchdog_kick(WD_LOOP_TOP);
+        battstat_tick(s_mqtt_link_counter, net_airplane() || s_coverage_owns_radio); // charge the previous iteration
         uint32_t interval_ms = (g_rtc.mode == (uint8_t) PAGER_MODE_ACTIVE)
                                     ? PAGER_WAKE_INTERVAL_ACTIVE_MS
                                     : PAGER_WAKE_INTERVAL_SLEEP_MS;
@@ -1474,6 +1663,31 @@ void modes_run(void)
         // A fetch holds the loop awake only while in progress (<= 30 s), not during the cooldown between
         // attempts; net_resub_hold() (<= 3 s) keeps it awake so a liveness re-SUBSCRIBE's SUBACK is seen.
         bool skip_sleep = btn_busy || btn_stuck || ui_awake || net_modem_busy() || net_connect_in_flight() ||
+                           net_publish_in_flight() || bookpull_fetch_in_progress() || net_resub_hold() ||
+                           accel_shake_pending() || input_hot() || ota_transfer_active();
+        // Once per 60 s while the loop has not slept for >= 60 s and no input window is open, name every
+        // term holding it awake.
+        {
+            static int64_t s_awake_since_us = 0;
+            static int64_t s_awake_log_us = 0;
+            int64_t now_us = esp_timer_get_time();
+            if (!skip_sleep) {
+                s_awake_since_us = 0;
+            } else if (s_awake_since_us == 0) {
+                s_awake_since_us = now_us;
+            } else if (now_us - s_awake_since_us >= 60000000LL && now_us - s_awake_log_us >= 60000000LL &&
+                       !ui_awake && !input_hot() && !btn_busy) {
+                s_awake_log_us = now_us;
+                ESP_LOGI(TAG,
+                         "awake %llu s without sleeping: stuck=%d modem_busy=%d connect=%d publish=%d "
+                         "fetch=%d resub=%d shake=%d attentive=%d status_pending=%d",
+                         (unsigned long long) ((now_us - s_awake_since_us) / 1000000),
+                         (int) btn_stuck, (int) net_modem_busy(), (int) net_connect_in_flight(),
+                         (int) net_publish_in_flight(), (int) bookpull_fetch_in_progress(),
+                         (int) net_resub_hold(), (int) accel_shake_pending(), (int) attentive,
+                         (int) s_status_publish_pending);
+            }
+        }
         // pump_blocked keys only on net_modem_busy() (the UART/RTS interlock with the MQTT event handler);
         // UI-awake and connect-in-flight are no reason to withhold a publish. msg_pump() is rate-limited below.
         bool pump_blocked = net_modem_busy();
@@ -1526,7 +1740,21 @@ void modes_run(void)
             }
         }
 #endif
+        // Leaving the normal sleep cadence: stop showing "zz", keep the ext1 wake delta for the first
+        // render.
+        if (s_sleep_shown && (skip_sleep || attentive)) {
+            s_sleep_shown = false;
+            s_last_sleep_ext1_wakes = net_get_ext1_wakes() - s_sleep_entry_ext1;
+        }
         if (!skip_sleep) {
+            // Entering the normal sleep cadence: one partial painting "zz" before rail_off() below.
+            if (!attentive && !s_sleep_shown) {
+                s_sleep_shown = true;
+                s_sleep_entry_ext1 = net_get_ext1_wakes();
+                // Full (not partial) refresh if anything is dirty: this frame sits on the glass for
+                // hours. Power effect: ~3 s panel drive per stretch entry when dirty.
+                ui_render_presleep();
+            }
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
             int64_t st_t0 = esp_timer_get_time();
             int64_t st_rtc0 = (int64_t) esp_clk_rtc_time();
@@ -1545,15 +1773,33 @@ void modes_run(void)
 #endif
             }
             watchdog_kick(WD_SLEEP_ENTER);
+            int64_t bs_t0 = esp_timer_get_time();
+            battstat_note_sleep(esp_timer_get_time() - bs_t0); // time inside light sleep, for `bs.sl`
             // Wake path: the rail comes up here only for real input (an ext1 wake), or lazily via
             // ui_ensure_powered() when a render needs it; a timer wake with nothing to draw leaves it off.
             // wake_is_ext1: any ext1 wake (button or LIS3DH): short yield, no probe wait. wake_is_button:
             // the IO8 bit only, the one input that opens the attentive window.
+            bool wake_is_ext1 = false;
             {
                 esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+                // The button and the LIS3DH motion interrupt share one ext1 mask;
+                // esp_sleep_get_ext1_wakeup_status() tells them apart (button IO8, motion IO16).
+#if PAGER_WAKE_BUTTON_ENABLED
+                bool wake_is_button =
+                    wake_is_ext1 &&
+                    (esp_sleep_get_ext1_wakeup_status() & (1ULL << PAGER_PIN_BUTTON));
+#else
+                const bool wake_is_button = false; // button retired: ext1 = accelerometer only
+#endif
+                // No rail_on() on a motion-only wake: a ~1 s rail pulse never finishes the CardKB's 1.1 s
+                // boot. The rail comes up on a confirmed shake (accel_poll -> ui_ensure_powered()) or IO8.
+                if (wake_is_button) {
                     int64_t wake_now_us = esp_timer_get_time();
                     s_last_input_us = wake_now_us;
                     ui_ensure_powered(); // rule (b): this wake IS real input, bring the rail up now
+                    // ext1 is a level wake, so this edge is the press, but input_poll() samples the pin
+                    // later and a quick press may be released by then: seed the button FSM here.
+                    input_note_button_wake(wake_now_us);
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
                     s_st_rail_on_wakes++;
 #endif
@@ -1610,6 +1856,7 @@ void modes_run(void)
 #endif
             // Only shrinks yield_ms, so a smaller sleeptest override is honoured; an ext1 wake is the one
             // a person is watching.
+            if (wake_is_ext1 && yield_ms > PAGER_INPUT_WAKE_YIELD_MS) {
                 yield_ms = PAGER_INPUT_WAKE_YIELD_MS;
             }
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
@@ -1634,12 +1881,16 @@ void modes_run(void)
 #endif
             assert(yield_ms >= 30); // debug builds only
             // On a lengthened cadence, hold the window open until the probe is answered; after the yield so
+            if (!wake_is_ext1) {
                 wait_for_probe_answer(interval_ms);
             }
+        } else if (btn_busy || accel_shake_pending()) {
+            vTaskDelay(pdMS_TO_TICKS(PAGER_BTN_POLL_MS)); // button FSM debounce/timing granularity / shake chain sampling (accel.c, 25 Hz)
         } else if (btn_stuck) {
             // BTN_STUCK: no short/long resolution left to time, so poll at the sleep-mode interval.
             vTaskDelay(pdMS_TO_TICKS(PAGER_WAKE_INTERVAL_SLEEP_MS));
         } else {
+            // UI awake, hot shake window or busy button: no light sleep; 100 ms period when idle, returns
         }
 
         // If the modem UART still has buffered bytes this wake's drain burst is still arriving: defer
@@ -1655,6 +1906,12 @@ void modes_run(void)
         input_poll(); // power effect: one GPIO read (button FSM step)
 
         bool ui_awake_now = input_awake();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+        // Debug builds: the one marked point `period` is measured from, every iteration.
+        int64_t dbg_now_us = esp_timer_get_time();
+        int64_t dbg_period_us = dbg_now_us - s_dbg_looptime_prev_us;
+        s_dbg_looptime_prev_us = dbg_now_us;
+#endif
         input_event_t ievt;
         while (input_get_event(&ievt)) {
             modes_note_activity(); // any resolved key/button event counts as activity
@@ -1672,6 +1929,9 @@ void modes_run(void)
                 s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
             case INPUT_EVT_KEY:
+                // Stamp the key before dispatch so a transition it causes sees "a key just arrived";
+                // every key is a partial.
+                refreshpol_note_key();
                 ui_dispatch_key(ievt.key);
                 s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
@@ -1700,16 +1960,61 @@ void modes_run(void)
         }
 
         // Keys and buttons render this iteration; an idle iteration's ui_render() is a no-op diff.
+        bool render_now = ui_awake_now;
         // Checked every pass, not just while UI-awake: modes_in_use() is the wider attentive window with
         if (!render_now && ui_clock_due()) {
             render_now = true;
         }
+        // Refresh policy rules 2 and 6: idle gap above FLOOR, or CEILING at the next inter-key gap,
+        // never mid-burst. Power effect: one ~3 s full refresh instead of a partial.
+        if (ui_awake_now && refreshpol_poll(false, false)) {
+            disp_request_full();
+        }
         if (render_now) {
             // Always a partial; cheap when nothing changed.
             ui_render();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            // render_now is always true when ui_awake_now is; the guard excludes the wider
+            // attentive-window clock tick.
+            if (ui_awake_now) {
+                int64_t dbg_paint_us = 0, dbg_refresh_us = 0;
+                ui_debug_render_times(&dbg_paint_us, &dbg_refresh_us);
+                int64_t dbg_render_us = dbg_paint_us + dbg_refresh_us;
+                // The 100 ms cadence delay of the ui_awake path is the other budgeted piece of `period`.
+                int64_t dbg_rest_us = dbg_period_us - dbg_render_us - 100000;
+                if (dbg_rest_us < 0) {
+                    dbg_rest_us = 0;
+                }
+                int64_t dbg_log_now_us = esp_timer_get_time();
+                // Always log the first iteration after the UI-awake edge-in; otherwise once per second.
+                if (ui_awake_edge_in ||
+                    (dbg_log_now_us - s_dbg_looptime_last_log_us) >= 1000000) {
+                    s_dbg_looptime_last_log_us = dbg_log_now_us;
+                    ESP_LOGI(TAG,
+                             (long long) (dbg_period_us / 1000), (long long) (dbg_paint_us / 1000),
+                }
+            }
+#endif
         } else if (ui_awake_edge_out) {
             // The UI-awake window lapsed: a due full refresh may land here.
             ui_on_awake_lapse();
+        }
+
+        // Deferred mode-edge /status publish (set_mode()): after this
+        // iteration's render, and only once the UI is idle, or after the cap.
+        // Power effect: one small MQTT publish on an already-up session.
+        if (s_status_publish_pending) {
+            bool idle = !input_awake() && !input_hot();
+            bool overdue = (esp_timer_get_time() - s_status_publish_pending_since_us) >=
+                           (int64_t) PAGER_STATUS_PUBLISH_DEFER_MAX_MS * 1000;
+            if (idle || overdue) {
+                s_status_publish_pending = false;
+                net_mqtt_status_t pst;
+                net_get_mqtt_status(&pst);
+                if (pst.mqtt_connected) {
+                    publish_status_online();
+                }
+            }
         }
 
         rtc_lock();
@@ -1836,6 +2141,8 @@ void modes_run(void)
             } else {
                 schedule_backoff(&backoff_index, &next_session_retry_us);
             }
+        } else if (!st.mqtt_connected && !net_airplane()) {
+            // Airplane mode: no retry or backoff. Skipped while a CA apply trial owns the session.
             // net_connect_in_flight() prevents a second CONNECT while one is outstanding (+CME ERROR: 4).
             if (!s_ca_apply_suppress && esp_timer_get_time() >= next_session_retry_us &&
                 !net_connect_in_flight()) {
@@ -1882,6 +2189,7 @@ void modes_run(void)
 
         // Modem health check every 60 wake cycles in sleep mode; skipped during a CA apply trial or while
         // the coverage duty cycle keeps the radio dark on purpose (it would force a spurious reset).
+        if (!net_airplane() && !s_ca_apply_suppress && !s_coverage_owns_radio &&
             g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP &&
             (wake_cycle_count % PAGER_CHECKCOMM_EVERY_N_WAKES) == 0) {
             run_modem_health_check();
@@ -1893,6 +2201,10 @@ void modes_run(void)
         ST_MARK(4);
 #endif
         watchdog_kick(WD_LOC);
+        if (accel_poll()) {
+            ui_ensure_powered(); // rail on + panel power-loss note so the first render is a correct partial
+            input_note_shake_wake(esp_timer_get_time());
+        }
         loc_service();
 
         // One bounded SMS state-machine step per iteration; not gated on the MQTT session (SMS works
@@ -1909,10 +2221,35 @@ void modes_run(void)
         ST_MARK(6);
 #endif
         watchdog_kick(WD_CATRUST);
+        // A pending cfg.ca waits out an OTA download (its cafetch_begin() would fail on the shared
+        // single-flight guard).
+        if (!ota_transfer_active()) {
+            catrust_service(&st);
+        }
 
         // One step of the pending-nudge / book-fetch state machine; shares catrust's single-flight
         // cafetch guard.
         bookpull_service();
+
+        // One step of the OTA job (a no-op if none): drain, socket poll, start, verify or install. Power
+        // effect: one TLS socket while a download runs.
+        {
+            ota_env_t oe;
+            memset(&oe, 0, sizeof(oe));
+            oe.airplane = net_airplane();
+            oe.mqtt_usable = st.mqtt_connected;
+            oe.other_fetch = (cafetch_in_progress() && !ota_transfer_active()) || catrust_apply_in_progress();
+            oe.sleep_mode = g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP;
+            oe.rssi = (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : 0;
+            int64_t age_ms = (esp_timer_get_time() - s_last_input_us) / 1000;
+            oe.input_age_ms = age_ms < 0 ? 0 : (age_ms > 0xFFFFFFF0LL ? 0xFFFFFFF0u : (uint32_t) age_ms);
+            oe.now_us = esp_timer_get_time();
+            oe.epoch = (uint32_t) approx_epoch();
+            ota_service(&oe);
+            if (ota_take_status_request() && st.mqtt_connected) {
+                publish_status_online(); // dl start, 50 %, ready, fail, rb
+            }
+        }
 
         maybe_publish_heartbeat();
 

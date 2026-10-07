@@ -12,6 +12,9 @@
 #include "net_connect_guard.h"
 #include "net_probe_guard.h"
 #include "publish_quiet.h"
+extern "C" {
+#include "battstat.h"
+}
 #include "flightrec.h"
 
 #include "WalterModem.h"
@@ -26,10 +29,72 @@
 #include "esp_sleep.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "net";
+
+// Airplane mode (NVS "net"/"airplane", read at boot, applies next boot) holds the modem in reset;
+// AT-issuing entry points then return "not available" via `if (net_airplane())`.
+#define NET_NVS_NAMESPACE "net"
+#define NET_NVS_KEY_AIRPLANE "airplane"
+static bool s_airplane = false;        // value in force this boot
+static bool s_airplane_stored = false; // value in NVS (takes effect at next boot)
+
+// Power effect: none (one NVS read).
+extern "C" void net_airplane_init(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NET_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return; // never set; stays off
+    }
+    uint8_t v = 0;
+    if (nvs_get_u8(h, NET_NVS_KEY_AIRPLANE, &v) == ESP_OK) {
+        s_airplane = (v != 0);
+    }
+    s_airplane_stored = s_airplane;
+    nvs_close(h);
+}
+
+extern "C" bool net_airplane(void)
+{
+    return s_airplane;
+}
+
+extern "C" bool net_airplane_stored(void)
+{
+    return s_airplane_stored;
+}
+
+// Power effect: none now (one NVS write); the next boot holds the modem in reset.
+extern "C" void net_set_airplane(bool on)
+{
+    nvs_handle_t h;
+    if (nvs_open(NET_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGI(TAG, "airplane: NVS open failed; setting not saved");
+        return;
+    }
+    nvs_set_u8(h, NET_NVS_KEY_AIRPLANE, (uint8_t) on);
+    nvs_commit(h);
+    nvs_close(h);
+    s_airplane_stored = on;
+}
+
+// Power effect: modem held in reset. Exception to pins.h's "IO45 is Walter-internal": drives the
+// modem's reset line low and holds it through light sleep.
+extern "C" void net_airplane_hold_modem(void)
+{
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << PAGER_PIN_MODEM_RESET;
+    io.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&io);
+    gpio_set_level((gpio_num_t) PAGER_PIN_MODEM_RESET, 0);
+    gpio_hold_en((gpio_num_t) PAGER_PIN_MODEM_RESET);
+    gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_MODEM_RESET); // keep the level through light sleep
+    ESP_LOGI(TAG, "airplane mode: modem held in reset, no network this boot");
+}
 
 // Diagnostic only; takes an int so it tolerates unknown enum values.
 static const char *walter_state_name(int result)
@@ -102,6 +167,7 @@ static uint8_t s_ca_written_hash[IDENT_CA_HASH_LEN];
 static int64_t s_clock_epoch = 0;    // 0 = no network time yet (§3.5)
 static int64_t s_clock_epoch_us = 0; // esp_timer_get_time() at the moment s_clock_epoch was read
 
+// True once WalterModem::begin() has succeeded; false only across a net_recover_modem() reset.
 static bool s_modem_begun = false;
 
 // The URC drain probe's single-slot in-flight guard.
@@ -332,8 +398,14 @@ void note_registration(bool registered)
 
 bool configure_session(void);
 
+extern "C" __attribute__((weak)) void net_boot_progress_hook(const char *status)
+{
+    (void) status;
+}
+
 static bool net_bringup(int attach_wait_s)
 {
+    net_boot_progress_hook("connecting");
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
     // Debug builds: raw AT TX:/RX: trace, so URCs are visible on the console.
     esp_log_level_set("WalterModem", ESP_LOG_DEBUG);
@@ -408,6 +480,7 @@ static bool net_bringup(int attach_wait_s)
     // Single-attempt wait capped at 300s; modes.c owns the backoff across net_init() calls. On a
     // timeout the radio stays up and the session is configured later from net_session_up().
     bool attached = false;
+    net_boot_progress_hook("registering");
     for (int waited_s = 0; waited_s < attach_wait_s; waited_s++) {
         watchdog_feed();
         WalterModemNetworkRegState st = WalterModem::getNetworkRegState();
@@ -431,6 +504,9 @@ static bool net_bringup(int attach_wait_s)
 
 extern "C" bool net_init(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     s_xport_ops = xport_lte_ops();
     s_session_configured = false;
     net_connect_guard_init(&s_connect_guard);
@@ -497,6 +573,9 @@ bool configure_session(void)
 
 extern "C" bool net_tls_profile_bootstrap(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // No CA is trusted (single-use key from the setup code). Power effect: one AT command, no RRC.
     // The slot must still be named: on GM02SP LR8.2.1.0-61488 an unnamed slot sends a plaintext CONNECT.
     ensure_ca_slot_populated();
@@ -517,6 +596,9 @@ extern "C" bool net_tls_profile_bootstrap(void)
 
 extern "C" bool net_bootstrap_attach(const char *apn)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: as net_init()'s attach phase; no eDRX/PSM/voltage monitor (the session is short).
     if (!WalterModem::begin(PAGER_MODEM_UART)) {
         ESP_LOGI(TAG, "WalterModem::begin() failed (bootstrap)");
@@ -526,6 +608,8 @@ extern "C" bool net_bootstrap_attach(const char *apn)
 
     WalterModem::setMQTTEventHandler(pager_mqtt_event_handler, nullptr);
     WalterModem::setNetworkEventHandler(pager_network_event_handler, nullptr);
+    // The CA fetch needs the socket ring/close events.
+    WalterModem::setSocketEventHandler(pager_socket_event_handler, nullptr);
 
     if (!WalterModem::setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
         ESP_LOGI(TAG, "setOpState(NO_RF) failed (bootstrap)");
@@ -603,6 +687,9 @@ extern "C" bool net_bootstrap_connect(const char *client_id, const char *passwor
 
 extern "C" bool net_write_ca_slot(uint8_t slot, const char *ca_pem)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one NVRAM write on the modem's own storage, no RRC.
     if (!WalterModem::tlsWriteCredential(false, slot, ca_pem)) {
         ESP_LOGI(TAG, "tlsWriteCredential() failed (slot %u)", (unsigned) slot);
@@ -614,12 +701,18 @@ extern "C" bool net_write_ca_slot(uint8_t slot, const char *ca_pem)
 
 extern "C" bool net_write_ca(const char *ca_pem)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Unconditional: runs at most once per device lifetime, so no ca_hash short-circuit.
     return net_write_ca_slot(PAGER_TLS_CA_SLOT, ca_pem);
 }
 
 extern "C" bool net_tls_configure(uint8_t ca_slot, bool validated)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Reconfigures the production profile to name `ca_slot`; a slot is always named. Power effect: one AT command.
     if (!WalterModem::tlsConfigProfile(PAGER_TLS_PROFILE_ID,
                                        validated ? WALTER_MODEM_TLS_VALIDATION_CA
@@ -636,23 +729,49 @@ extern "C" bool net_tls_configure(uint8_t ca_slot, bool validated)
 
 extern "C" bool net_session_up(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return s_xport_ops->up();
 }
 
 extern "C" void net_session_down(void)
 {
+    if (net_airplane()) {
+        return;
+    }
     s_xport_ops->down();
 }
 
 extern "C" bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
 {
+    if (net_airplane()) {
+        return false;
+    }
+    battstat_raise(BS_MODEM); // attribution only
+    bool ok = s_xport_ops->publish(topic, buf, len, qos);
+    if (ok) {
+        net_note_radio_event();
+    }
+    return ok;
 }
 
 {
+    if (net_airplane()) {
+        return false;
+    }
+    battstat_raise(BS_MODEM); // attribution only
+    if (ok) {
+        net_note_radio_event();
+    }
+    return ok;
 }
 
 extern "C" uint32_t net_publish_quiet_wait_ms(uint32_t max_wait_ms)
 {
+    if (net_airplane()) {
+        return 0;
+    }
     return s_xport_ops->publish_quiet_wait_ms(max_wait_ms);
 }
 
@@ -680,6 +799,9 @@ extern "C" void net_dispatch_uplink_window(void)
 
 extern "C" void net_liveness_ping_now(void)
 {
+    if (net_airplane()) {
+        return;
+    }
     if (s_xport_ops->ping_now) {
         s_xport_ops->ping_now();
     }
@@ -689,25 +811,65 @@ extern "C" void net_liveness_ping_now(void)
     }
 
     // Power effect: ESP32 ~1 mA for up to `ms`. Not WalterModem::sleep() (timer-only), so its RTS
+    uint64_t ext1_mask = 0;
+#if PAGER_WAKE_BUTTON_ENABLED
+    ext1_mask |= 1ULL << PAGER_PIN_BUTTON;
+#endif
     if (s_accel_wake_enabled) {
+        ext1_mask |= 1ULL << PAGER_PIN_LIS3DH_INT1;
+    }
+    if (ext1_mask != 0) {
+        esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ANY_HIGH);
     }
     esp_sleep_enable_timer_wakeup((uint64_t) ms * 1000ULL);
 
     // Drive RTS high so the modem is free to sleep, as WalterModem::sleep(_, true) does. Airplane mode
     // has no modem: no RTS/flow-control steps, ext1 + timer wake only.
+    const bool ap = net_airplane();
+    if (!ap) {
+        uart_set_hw_flow_ctrl(PAGER_MODEM_UART, UART_HW_FLOWCTRL_DISABLE, 0);
+        gpio_set_direction((gpio_num_t) CONFIG_WALTER_MODEM_PIN_RTS, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t) CONFIG_WALTER_MODEM_PIN_RTS, 1);
+        // CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND=y makes IDF float every GPIO in light sleep
+        // (sleep_gpio.c:187-199), so the lines above would not hold RTS high; exclude it (no power cost).
+        gpio_sleep_sel_dis((gpio_num_t) CONFIG_WALTER_MODEM_PIN_RTS);
+
+        flightrec_event('S', (int32_t) ms, flightrec_cts_level());
+    }
 
     esp_light_sleep_start();
 
+    // esp_light_sleep_start() latches an RTC pad HOLD on each ext1 pad that the S3 never releases
+    // (gpio_get_level() freezes, reads 1 at 0 V); release it each wake. input_init() clears old holds.
+#if PAGER_WAKE_BUTTON_ENABLED
+    rtc_gpio_hold_dis((gpio_num_t) PAGER_PIN_BUTTON);
+#endif
+
+    // Count ext1 wakes caused by motion, before anything touches the wakeup-cause register; the ext1
+    // status bitmask tells the pins apart.
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 &&
+        (esp_sleep_get_ext1_wakeup_status() & (1ULL << PAGER_PIN_LIS3DH_INT1))) {
         s_ext1_wakes++;
     }
 
     // Restore RTS/CTS flow control. The library's pin constants are file-local to WalterModem.cpp, so
     // the CONFIG_WALTER_MODEM_PIN_* / CONFIG_UART_BUF_THRESHOLD Kconfig macros are used.
+    if (!ap) {
+        uart_set_pin(PAGER_MODEM_UART, CONFIG_WALTER_MODEM_PIN_TX, CONFIG_WALTER_MODEM_PIN_RX,
+                     CONFIG_WALTER_MODEM_PIN_RTS, CONFIG_WALTER_MODEM_PIN_CTS);
+        uart_set_hw_flow_ctrl(PAGER_MODEM_UART, UART_HW_FLOWCTRL_CTS_RTS, CONFIG_UART_BUF_THRESHOLD);
 
+        flightrec_event('W', (int32_t) esp_sleep_get_wakeup_cause(),
+                        (int32_t) net_uart_rx_buffered_bytes());
+        flightrec_event('F', flightrec_cts_level(), 0);
+    }
 }
 
 extern "C" bool net_check(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one AT round trip, no RRC. "Responsive" only: being out of coverage is not a modem
     // fault and must not lead to a modem reset.
     if (!WalterModem::checkComm()) {
@@ -756,6 +918,9 @@ static void probe_cb(const WalterModemRsp *rsp, void *args)
 
 extern "C" bool net_urc_probe(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
         s_probe_skip_down++;
         return false;
     }
@@ -812,6 +977,9 @@ extern "C" bool net_urc_probe_in_flight(void)
 
 extern "C" uint32_t net_uart_rx_buffered_bytes(void)
 {
+    if (net_airplane()) {
+        return 0;
+    }
     // PAGER_MODEM_UART has private linkage in this file, hence this accessor.
     size_t len = 0;
     if (uart_get_buffered_data_len(PAGER_MODEM_UART, &len) != ESP_OK) {
@@ -837,6 +1005,9 @@ extern "C" uint32_t net_unregistered_for_s(void)
 
 extern "C" bool net_recover_modem(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // The only legal caller of reset() outside begin(). Power effect: full modem power cycle and
     // re-attach; modes.c rate-limits it to 1 per 10 min.
     ESP_LOGI(TAG, "modem unresponsive: issuing hard reset + full re-init");
@@ -885,6 +1056,9 @@ extern "C" bool net_get_clock(int64_t *epoch_s)
 
 extern "C" bool net_get_battery_mv(int *batt_mv)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one AT round trip, no RRC. Requires configVoltageMonitor() from net_init().
     WalterModemRsp rsp = {};
     if (!WalterModem::getVoltage(&rsp, NULL, NULL, PAGER_VMON_ATTEMPTS,
@@ -901,6 +1075,9 @@ extern "C" bool net_get_battery_mv(int *batt_mv)
 
 extern "C" bool net_get_rssi(int *dbm)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one AT round trip, no RRC. getRSSI() is AT+CSQ in dBm (-113 + raw*2); raw 99
     // ("not known") converts to +85, outside [-113, -51], and is treated as no reading.
     WalterModemRsp rsp = {};
@@ -922,6 +1099,9 @@ extern "C" bool net_get_rssi(int *dbm)
 
 extern "C" void net_service_session(void)
 {
+    if (net_airplane()) {
+        return;
+    }
         return;
     }
     s_xport_ops->service();
@@ -929,6 +1109,9 @@ extern "C" void net_service_session(void)
 
 extern "C" void net_get_mqtt_status(net_mqtt_status_t *out)
 {
+    if (net_airplane()) {
+        if (out) { memset(out, 0, sizeof(*out)); } return;
+    }
     s_xport_ops->status(out);
 }
 
@@ -944,22 +1127,34 @@ extern "C" void net_ack_session_restart_edge(void)
 
 extern "C" bool net_modem_busy(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return s_xport_ops->modem_busy();
 }
 
 extern "C" bool net_connect_in_flight(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return s_xport_ops->connect_in_flight();
 }
 
 extern "C" bool net_publish_in_flight(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // True while a publish's AT round trip is outstanding and within PUBLISH_SLEEP_HOLD_MAX_US.
     return publish_quiet_gate_hold_sleep(&s_publish_quiet, esp_timer_get_time());
 }
 
 extern "C" bool net_connect_fail_streak_maxed(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return s_xport_ops->connect_fail_streak_maxed();
 }
 
@@ -1014,6 +1209,9 @@ extern "C" uint32_t net_get_resub_swallowed_count(void)
 
 extern "C" bool net_resub_hold(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return lte_resub_hold();
 }
 
@@ -1024,6 +1222,9 @@ extern "C" void net_get_resub_hold_stats(uint32_t *holds, uint32_t *max_hold_ms,
 
 extern "C" bool net_check_sim(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (!WalterModem::begin(PAGER_MODEM_UART)) {
         ESP_LOGI(TAG, "SIM check: WalterModem::begin() failed");
         return false;
@@ -1057,6 +1258,9 @@ extern "C" bool net_check_sim(void)
 // Debug console `at <command>`: sends one raw AT command; the reply shows in the WalterModem trace.
 extern "C" bool net_debug_at(const char *cmd)
 {
+    if (net_airplane()) {
+        return false;
+    }
     return WalterModem::sendCmd(cmd);
 }
 
@@ -1069,6 +1273,9 @@ extern "C" void net_debug_install_trace_hook(void (*fn)(char kind, const uint8_t
 
 extern "C" void net_debug_rts(int mode)
 {
+    if (net_airplane()) {
+        return;
+    }
     switch (mode) {
     case 0:
     case 1:
@@ -1098,6 +1305,9 @@ extern "C" bool net_check_tcp_sized(const char *host, uint16_t port, size_t byte
 
 extern "C" bool net_check_tcp(const char *host, uint16_t port, bool udp, bool tls)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (!net_bootstrap_attach(NULL)) {
         ESP_LOGI(TAG, "nettest: attach failed");
         return false;
@@ -1163,6 +1373,9 @@ extern "C" bool net_check_tcp(const char *host, uint16_t port, bool udp, bool tl
 
 extern "C" bool net_check_mqtt(const char *host, uint16_t port, int tls_mode)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Points the modem's AT+SQNSMQTT* engine at an arbitrary host:port over the bootstrap TLS profile with
     // dummy credentials, so a TLS server under our control can show the ClientHello it sends.
     if (!net_bootstrap_attach(NULL)) {
@@ -1222,6 +1435,9 @@ extern "C" bool net_check_mqtt(const char *host, uint16_t port, int tls_mode)
 
 extern "C" bool net_gnss_config(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one AT command, no RRC; does not power the receiver.
     if (!WalterModem::gnssConfig(WALTER_MODEM_GNSS_SENS_MODE_HIGH,
                                  WALTER_MODEM_GNSS_ACQ_MODE_COLD_WARM_START,
@@ -1234,6 +1450,9 @@ extern "C" bool net_gnss_config(void)
 
 extern "C" bool net_gnss_assistance_due(int32_t *out_seconds_to_update)
 {
+    if (net_airplane()) {
+        return false;
+    }
     WalterModemRsp rsp = {};
     if (!WalterModem::gnssGetAssistanceStatus(&rsp)) {
         ESP_LOGI(TAG, "gnssGetAssistanceStatus() failed");
@@ -1251,6 +1470,9 @@ extern "C" bool net_gnss_assistance_due(int32_t *out_seconds_to_update)
 
 extern "C" bool net_gnss_update_assistance(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     int64_t t0_us = esp_timer_get_time();
     bool ok = WalterModem::gnssUpdateAssistance(WALTER_MODEM_GNSS_ASSISTANCE_TYPE_REALTIME_EPHEMERIS);
     int64_t elapsed_ms = (esp_timer_get_time() - t0_us) / 1000;
@@ -1262,6 +1484,9 @@ extern "C" bool net_gnss_update_assistance(void)
 
 extern "C" bool net_gnss_start_fix(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (!WalterModem::gnssPerformAction(WALTER_MODEM_GNSS_ACTION_GET_SINGLE_FIX)) {
         ESP_LOGI(TAG, "gnssPerformAction(GET_SINGLE_FIX) refused synchronously");
         return false;
@@ -1272,6 +1497,9 @@ extern "C" bool net_gnss_start_fix(void)
 
 extern "C" void net_gnss_cancel(void)
 {
+    if (net_airplane()) {
+        return;
+    }
     if (!WalterModem::gnssPerformAction(WALTER_MODEM_GNSS_ACTION_CANCEL)) {
         ESP_LOGI(TAG, "gnssPerformAction(CANCEL) failed (best-effort)");
     }
@@ -1291,6 +1519,9 @@ extern "C" bool net_gnss_poll_event(net_gnss_event_t *out)
 
 extern "C" bool net_radio_off(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (!WalterModem::setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
         ESP_LOGI(TAG, "setOpState(NO_RF) failed");
         return false;
@@ -1300,6 +1531,9 @@ extern "C" bool net_radio_off(void)
 
 extern "C" bool net_radio_on(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (!WalterModem::setOpState(WALTER_MODEM_OPSTATE_FULL)) {
         ESP_LOGI(TAG, "setOpState(FULL) failed");
         return false;
@@ -1309,6 +1543,9 @@ extern "C" bool net_radio_on(void)
 
 extern "C" bool net_is_attached(void)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Power effect: one AT round trip, no RRC. getNetworkRegState() blocks on AT+CEREG?.
     WalterModemNetworkRegState st = WalterModem::getNetworkRegState();
     return st == WALTER_MODEM_NETWORK_REG_REGISTERED_HOME ||
@@ -1329,6 +1566,9 @@ static bool is_nanp_mcc(uint16_t mcc)
 
 extern "C" bool net_get_cell_info(net_cell_info_t *out)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (s_cell_info_stale) {
         WalterModemRsp rsp = {};
         if (WalterModem::getCellInformation(WALTER_MODEM_SQNMONI_REPORTS_SERVING_CELL, &rsp) &&
@@ -1390,6 +1630,18 @@ extern "C" void net_enable_accel_wake(void)
     net_set_accel_wake(true);
 }
 
+static uint32_t s_radio_events = 0; // since boot; battstat `re`
+
+extern "C" uint32_t net_get_radio_events(void)
+{
+    return __atomic_load_n(&s_radio_events, __ATOMIC_RELAXED);
+}
+
+extern "C" void net_note_radio_event(void)
+{
+    __atomic_add_fetch(&s_radio_events, 1, __ATOMIC_RELAXED);
+}
+
 extern "C" uint32_t net_get_ext1_wakes(void)
 {
     return s_ext1_wakes;
@@ -1397,6 +1649,9 @@ extern "C" uint32_t net_get_ext1_wakes(void)
 
 extern "C" bool net_ca_fetch_open(const char *host, uint16_t port)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // Never leave the CA slot empty before naming it in a TLS profile, even one that never validates.
     ensure_ca_slot_populated();
 
@@ -1430,16 +1685,26 @@ extern "C" bool net_ca_fetch_open(const char *host, uint16_t port)
 
 extern "C" bool net_ca_fetch_send(const uint8_t *buf, uint16_t len)
 {
+    if (net_airplane()) {
+        return false;
+    }
     // socketSend() takes uint8_t* but only reads the buffer.
     return WalterModem::socketSend(PAGER_CA_FETCH_SOCKET_ID, (uint8_t *) (uintptr_t) buf, len);
 }
 
+extern "C" bool net_ca_fetch_poll(uint8_t *buf, size_t cap, uint16_t *out_len, bool *out_closed, bool *out_short)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (out_closed) {
         *out_closed = false;
     }
     if (out_len) {
         *out_len = 0;
+    }
+    if (out_short) {
+        *out_short = false;
     }
 
     // Data first: with `Connection: close` the +SQNSRING and +SQNSH arrive together, so read while a ring
@@ -1449,6 +1714,9 @@ extern "C" bool net_ca_fetch_send(const uint8_t *buf, uint16_t len)
         uint16_t got = 0;
         if (WalterModem::socketReceive(PAGER_CA_FETCH_SOCKET_ID, buf, cap, &rsp)) {
             got = rsp.data.socketResponse.bytesReceived;
+            if (out_short && got < rsp.data.socketResponse.bytesClaimed) {
+                *out_short = true;
+            }
         } else if (!s_ca_fetch_closed) {
             ESP_LOGI(TAG, "cafetch: socketReceive() failed");
         }
@@ -1475,6 +1743,9 @@ extern "C" bool net_ca_fetch_send(const uint8_t *buf, uint16_t len)
 
 extern "C" void net_ca_fetch_close(void)
 {
+    if (net_airplane()) {
+        return;
+    }
     WalterModem::socketClose(PAGER_CA_FETCH_SOCKET_ID); // best-effort; power effect: one AT command
     s_ca_fetch_ring_pending = false;
     s_ca_fetch_closed = false;
@@ -1482,6 +1753,9 @@ extern "C" void net_ca_fetch_close(void)
 
 extern "C" bool net_sms_config(net_sms_config_result_t *out)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (out) {
         out->used_ira = false;
         out->storage_used = -1;
@@ -1507,6 +1781,9 @@ extern "C" bool net_sms_config(net_sms_config_result_t *out)
 
 extern "C" bool net_sms_send(const char *number, const char *text, bool use_ucs2)
 {
+    if (net_airplane()) {
+        return false;
+    }
     WalterModemRsp rsp = {};
     if (!WalterModem::smsSend(number, text, use_ucs2, &rsp)) {
         ESP_LOGI(TAG, "smsSend() failed (result=%s)", walter_state_name(rsp.result));
@@ -1517,6 +1794,9 @@ extern "C" bool net_sms_send(const char *number, const char *text, bool use_ucs2
 
 extern "C" bool net_sms_read(int index, net_sms_read_t *out)
 {
+    if (net_airplane()) {
+        return false;
+    }
     if (out) {
         memset(out, 0, sizeof(*out));
     }
@@ -1543,6 +1823,9 @@ extern "C" bool net_sms_read(int index, net_sms_read_t *out)
 
 extern "C" bool net_sms_delete(int index)
 {
+    if (net_airplane()) {
+        return false;
+    }
     WalterModemRsp rsp = {};
     if (!WalterModem::smsDelete(index, &rsp)) {
         ESP_LOGI(TAG, "smsDelete(%d) failed (result=%s)", index, walter_state_name(rsp.result));

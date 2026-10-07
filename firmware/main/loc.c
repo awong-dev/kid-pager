@@ -973,6 +973,7 @@ bool loc_ingest_req_cbor(const uint8_t *buf, uint16_t len)
     }
 
     // modes_get_batt_mv() returns a placeholder before the first good reading;
+    // modes_batt_mv_known() tells them apart.
     int batt_mv = modes_batt_mv_known() ? modes_get_batt_mv() : LOC_BATTERY_UNKNOWN_MV;
     int64_t now_us = esp_timer_get_time();
 
@@ -1185,6 +1186,10 @@ static void finish_attempt(bool success)
 
 void loc_service(void)
 {
+    // Airplane mode disables every location attempt: no GNSS, no cell lookups, no /loc publishes.
+    if (net_airplane()) {
+        return;
+    }
     // The tracker's scheduling is independent of the attempt phase machine.
     loc_track_poll();
 
@@ -1424,6 +1429,14 @@ void loc_init(void)
 
     ESP_LOGI(TAG, "location ready: loc_min_s=%u loc_period_s=%u battery_floor=%dmV loctrack=%s "
              (unsigned) loc_get_min_s(), (unsigned) loc_get_period_s(), LOC_BATTERY_FLOOR_MV,
+}
+
+// Power effect: one AT command (net_gnss_config()), no RRC of its own.
+void loc_gnss_config(void)
+{
+    if (!net_gnss_config()) {
+        ESP_LOGI(TAG, "gnss config failed at init; location will keep answering from cache/no_fix");
+    }
 }
 
 bool loc_debug_run(uint32_t seconds)

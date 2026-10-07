@@ -334,3 +334,11 @@ ahead of the true time.
 not used because this toolchain's newlib `<time.h>` does not declare it. Pushing and popping `TZ`
 around `mktime()` was rejected because `tzset()` is not thread-safe and this file's tasks are not
 necessarily the application's TZ-owning task.
+
+## 1.22 Socket receive reports the modem's claimed byte count (`src/WalterModem.h`, `src/WalterModem.cpp`)
+
+`WalterModemSocketResponse` gains `bytesClaimed`, set in the `+SQNSRECV` handler from the
+`dataReceived` value in the modem's own header, next to the 1.2 bound. `bytesReceived` is still the
+bytes actually copied, so `bytesReceived < bytesClaimed` is a short copy, which patch 1.7's lost
+final `\n` byte produces on about 1 binary read in 256. A streaming caller can treat it as a
+transport error and resume from the last good offset.

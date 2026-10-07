@@ -41,3 +41,6 @@ CONFIG_SPIRAM_MEMTEST=n
 
 # Compiles ESP_LOGD in (the WalterModem AT trace is ESP_LOGD); the runtime default level stays INFO.
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# A new OTA image must confirm itself (ota.c) or the bootloader returns to the old one.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

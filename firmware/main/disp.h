@@ -26,12 +26,30 @@ void disp_full_refresh(void);
 /* Sends only the changed row band; no-op if nothing changed; full every 20th partial. */
 void disp_partial_refresh(void);
 
+/* Makes the next refresh a full one. */
+void disp_request_full(void);
+
 /* Weak hook run before every refresh with the lock held; ui.c waits for the LTE uplink to go quiet. */
 void disp_pre_write_gate_hook(void);
+
+/* 180-degree rotation, persisted in NVS; call disp_full_refresh() after disp_set_flip(). */
+bool disp_get_flip(void);
+void disp_set_flip(bool on);
 
 /* true also re-writes the new-image plane after a partial (vendor behaviour). */
 void disp_set_partial_write_again(bool on);
 bool disp_partial_write_again(void);
+
+/* true: host WF_PARTIAL_2IN9 LUT (0x32, 0x22=0xCF) per partial, false: OTP. NVS "disp"/"lut" u8. */
+void disp_set_partial_lut(bool on);
+bool disp_get_partial_lut(void);
+
+/* Partial LUT TP0A (byte 60) in frames, NVS "disp"/"tp0a" 1..31; setter false if out of range. */
+#ifndef PAGER_LUT_TP0A
+#define PAGER_LUT_TP0A 7
+#endif
+uint8_t disp_get_lut_tp0a(void);
+bool disp_set_lut_tp0a(uint8_t n);
 
 /* Native rows where the framebuffer differs from the shadow plane. */
 int disp_dirty_rows(void);
