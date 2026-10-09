@@ -76,6 +76,8 @@ ever raised either, so the firmware never notices any of it.
 
 ## The modem's MQTT client and TLS
 
+- **A TLS profile that names no CA slot makes the MQTT client send plaintext.** (This is about the
+  direct path. On the Beam bearer profile 0 is deliberate; see the next section.) With
   `AT+SQNSPCFG=2,2,"",0,,,,` the modem sends an unencrypted MQTT CONNECT, password included, to
   port 8883. The broker waits for a handshake, the modem for a CONNACK, and no event ever fires.
   The generic socket layer does TLS with the same profile, so socket tests do not show it.
@@ -91,6 +93,36 @@ ever raised either, so the firmware never notices any of it.
   modem.
 - Right after attach `AT+CCLK?` can still answer `70/01/01`, which the library reads as 2070. The
   firmware accepts only 2024-2069, retries, and falls back to `ts: 0`.
+
+## The Soracom Beam bearer: profile 0 is plaintext on purpose
+
+**Symptom:** a capture of the pager's MQTT session on port 1883 shows the CONNECT and its password
+in clear text.
+
+**Cause:** the Beam bearer uses `mqttConfig(dev_id, dev_id, pw, 0)`, so the modem sends plain MQTT to
+`beam.soracom.io:1883` and Beam opens the TLS leg to EMQX. The hazard in the TLS section above is
+about the direct path, where profile 2 must name slot 12; that path is unchanged. **Do not add a CA
+slot to profile 0 to "fix" the plaintext.** The forced `beam` override is refused on any carrier
+that is not a Beam preset, because `beam.soracom.io` resolves to carrier-grade NAT space on other
+networks and the password would go to whatever answers there.
+
+**`setPDPAuthParams()` does nothing unless the context's auth was set.** It returns OK early while the
+context's stored `auth_proto` is NONE, which is its starting value, so nothing is sent. The firmware
+sends `AT+CGAUTH=1,1,"user","pass"` raw after `definePDPContext`, before the attach. The modem is
+expected to keep `+CGAUTH` across resets, so a `carrier/auth` flag makes a later non-Soracom boot
+send `AT+CGAUTH=1,0` once. The PAP attach was verified on the bench (`docs/SORACOM_DESIGN.md` §6);
+limitation: the clear-back path is not yet verified.
+
+## Debug logs carry the Beam device password
+
+**Symptom:** none on the device. The password is in a log you are about to share.
+
+**Cause:** the MQTT password is sent in the `AT+SQNSMQTTCFG` line. That line is in the TX trace of every
+debug serial log. On the Beam bearer the CONNECT that carries the password also crosses the carrier
+link in plain text (see above).
+
+**Rule:** never paste a debug log that contains `AT+SQNSMQTTCFG` into a chat, an issue or a doc. Remove
+or redact that line first.
 
 ## The vendored modem library
 
@@ -184,6 +216,7 @@ the URC before sleeping.
 
 ## USB and light sleep
 
+**USB dies in light sleep** and often does not come back afterwards, even across `esp_restart()`; on the bench it stayed dead for hours and needed a physical reset. The debug build's `sleeptest` ends with a reset through the RTC watchdog, which is meant to reset the USB block too; that has not been shown to bring the port back. A single serial capture spanning a restart shows nothing; open the port again afterwards. The port's name changes (`/dev/cu.usbmodem*`): always glob. **A watchdog or panic reset has not brought the USB port back on the bench, and a sleeping release build stayed unreachable until a physical reset (hold BOOT, tap RESET, or power-cycle).** Do not poll the port in a loop; wait for the physical reset. The reset reason, stage and stalled command name travel in `/status` (key 58 `rst`, 59 `stallcmd`) so the relay stores them.
 
 **15-minute hold on exit:** the debug build holds the CPU running for 15 minutes after a `sleeptest` window ends (printing a "still running" reminder every 60 s), so a USB replug can retrieve the flight recorder PSRAM dump with the `flightrec` console command before the next hard reset.
 
@@ -271,6 +304,7 @@ misread as "the leftmost band did not flip". Always start at `seq 0` when judgin
 by eye, and predict the expected black/white bar pattern in advance (e.g. `w b w b w b ...`).
 Read the bars off the glass as a `b w b w ...` list and diff that against the prediction.
 
+## A bridge phone that reboots with a screen lock stays dark
 ## Tools and workflow
 
 **`serial_capture.py` overwrites without warning:**
@@ -282,6 +316,8 @@ esptool's reset handshake and a running `serial_capture.py` cannot share the USB
 port; a collision parks the chip in the ROM bootloader (`boot:0x22 DOWNLOAD`). Recover with a
 solo `esptool.py --after hard_reset chip_id`, then start captures in the same shell line as the
 flash.
+
+**Console `key` injection:** Enter goes on the wire as `key \\n` (esp_console strips one backslash),
 
 **`gcloud logging read` needs `--project example-project`:**
 The shell's default project may be another one; the read then silently returns other services' logs

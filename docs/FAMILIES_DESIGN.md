@@ -42,6 +42,7 @@ the same book, `cfg.sms` and envelopes as before.
    external reaches the pager through `cfg.sms`. An external whose family member has a number also carries an
    `sms` backend row (`kind:"sms", verifiedAt: now, config:{phone}`), per `docs/BRIDGE_PHONE_DESIGN.md`
    decision 3.
+7. **Conversation policy lives on the member, is enforced in `routing.send`, and layers on top of the
    allow-list.** "Approved people" and "approved numbers" *are* the member's outgoing `allow` edges (to users
    and to externals respectively). A policy that says *any* bypasses the edge check for that participant type;
    a policy that says *approved* requires it. A DM from S to R passes only if S's **outbound** policy admits R
@@ -99,6 +100,8 @@ alert to admins. `any` on the inbound picker means the family's *contacts* reach
 does not deliver unknown numbers. Location requests keep today's `locate`-edge rule. Policies do not affect them.
 
 On the numbers column: it decides whether every family contact is implied on the member's pager (`any`) or
+only approved ones. A pager add puts the number in the book whatever the numbers rule. The rule still decides
+whether a send delivers, and the modem list still comes only from `sms_contacts_for`
 (`docs/BOOK_ADD_ANYONE_DESIGN.md` decisions 7 and 12).
 
 Defaults are applied at user creation from role (`member` → `people`/`people`, `admin`/`super` →
@@ -182,6 +185,7 @@ members whose rules-visible set is narrower than the people they talk to.
 | `GET /api/family` | the family doc plus counts |
 | `GET/POST /api/family/members` | list; create person (alias, displayName, email\|phone, role admin\|member) with default policy |
 | `PATCH /api/family/members/{uid}` | `displayName`, `role` (admin↔member), `disabled`, `policy{out,in}` |
+| `PUT /api/family/members/{uid}/approved` | `{people:[{alias, message, locate}], numbers:[phone…]}` rewrites that member's outgoing edges. Refuses `locate` to another family. Removes people not listed, as well as contacts. An unknown number creates an external. Re-derives `devices.smsContacts`, and pushes `cfg.sms` and the book |
 | `GET/POST/PATCH /api/family/contacts` | externals used by this family (`{phone, name}`); PATCH renames |
 | `POST /api/family/groups` | group create, members restricted to own family and edge peers |
 | `GET /api/family/alerts`, `POST /api/family/alerts/{id}/{approve\|block\|dismiss}` | approve = create external if needed, plus edges. Block = mark, and add to `families.blockedNumbers` |
@@ -193,6 +197,9 @@ members whose rules-visible set is narrower than the people they talk to.
 touching that family. It is the only writer of cross-family edges. `/api/admin/contacts/*` moves to
 `/api/family/alerts/*`.
 
+**Conversations.** An E.164 number in a DM resolves to the sender's family contact. Delivery follows
+`docs/BRIDGE_PHONE_DESIGN.md` decision 4. A 403 body carries `reason ∈ {policy_out, policy_in, not_allowed,
+not_member, sms_contact, no_sms_number}` and a message the UI shows verbatim. `POST /api/conversations` (group
 create) moves to `/api/family/groups`. Join (`POST …/members`) requires the joiner to be a family admin of the
 group creator's family, and it no longer writes `locate` edges.
 

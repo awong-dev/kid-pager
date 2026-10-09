@@ -268,6 +268,17 @@ holding either a job or a cancel:
   `ota_err` (§5.1). A newer `cfg.ota` replaces the stored job. In airplane mode the job stays
   parked and costs nothing. Newest only and re-published on an online edge like any `cfg`.
 
+**`cfg.loc` (relay → device, GNSS disable).** *(a module with a damaged GNSS antenna must be able
+to stop powering the receiver while location keeps working from the serving cell;
+`docs/GNSS_DISABLE_DESIGN.md`.)* A sixth `cfg` member, CFG key 5 (§10), a map `{gnss}`:
+- `gnss` (bool): `false` stops the device from ever powering its GNSS receiver; `true` re-enables
+  it. Absent means no change, so `{}` is a legal no-op. Unknown sub-keys are ignored.
+  `false`, every location attempt (on-demand `loc_req` or scheduled) skips GNSS and sends a cell
+  report (§13.2), and the scheduled GNSS-while-moving attempt never starts; `loc_move_s` (§5.1) is
+  still reported as configured. A device that has never received `cfg.loc` behaves as `gnss:true`.
+- Relay: newest only and re-published on an online edge like any `cfg`. The device's current
+  value is reported back as `/status` `gnss` (§5.1).
+
 ### 3.3 Envelope size limit
 
 Worst case, with every field at its maximum and JSON escaping expanding `"` and `\` to two bytes.
@@ -335,6 +346,16 @@ window's typical counters and 399 with every counter at 2³²−1. The JSON form
 bytes, over the limit, so **`bs` is CBOR-only: a device that encodes `/status` as JSON MUST omit
 `bs`** *(the firmware emits `/status` only in CBOR, so this costs nothing today and keeps the
 JSON form legal)*.
+
+*(GNSS disable, stated so the worst case stays a number in this section.)* A maximal
+`/down` `cfg.loc` (`id` 16, `n` at its maximum) is **141 bytes** signed JSON. `/status` `gnss`
+(key 69, §5.1) adds 9 bytes JSON / 3 CBOR, so the every-field online `/status` becomes 568 / 281
+bytes (402 CBOR with `bs` at its maximum); the headroom figures above stand.
+
+*(Soracom bearer, stated so the worst case stays a number in this section.)* `/status`
+`car` (key 70, §5.1) at 24 characters adds 33 bytes JSON (57 if every character were escaped) / 28
+CBOR, so the every-field online `/status` becomes 625 / 309 bytes (430 CBOR with `bs` at its
+maximum); `tls:"proxy"` is shorter than `unpinned`, so it adds nothing. Still within the §3.3 limit.
 
 ### 3.4 Malformed payload handling
 
@@ -648,6 +669,7 @@ broker-generated LWT.
 | `bv` | int | no | 0…2³²-1 | Book version (`DEVICE_PLAN.md` §4.3). Reported so the relay can detect a factory reset or a lost book message and re-publish. |
 | `loc_period_s` | int | no | 0…86400 | The periodic `/loc` interval **the device has chosen** (§13); `0` = periodic location off. *(location tracking, §13.3 item 9: for a device sending `why`-tagged reports it is the **maximum gap** between unsolicited `/loc` while its session is usable, 3600 when tracking is on; reports may come sooner.)* |
 | `loc_min_s` | int | no | 0…86400 | The device's own minimum gap between on-demand fixes (§13.3); default 120. Firmware with the growing backoff of §13.3 reports **600**: the floor it keeps since its last attempt even after a backoff reset. |
+| `tls` | string | no | `unpinned` \| `pinned` \| `broken` \| `proxy` | CA trust state: `unpinned` (no CA in the identity, validation off, by choice, not a fault), `pinned` (CA set, last connect validated), `broken` (CA set, last validated connect failed, running with validation off as a reachability fallback — §13.3's "pages still arrive" rule applies here too). Absent means firmware older than v0.2. `proxy` *(Soracom bearer, `docs/SORACOM_DESIGN.md` §3.4: the pager holds no TLS session on the Beam bearer, so no CA state applies.)*: the session is plain MQTT to Soracom Beam, which terminates TLS to the broker on the pager's behalf (§6.1); `ca_fp` is absent and the device refuses `cfg.ca`. A relay that predates `proxy` must be deployed first (§0). |
 | `ca_fp` | string | no | 16 lowercase hex chars | First 16 hex characters of the SHA-256 of the pinned CA PEM (the same digest carried in the bootstrap bundle's `ca_sha`/a `cfg.ca.sha` push, `V02_DESIGN.md` §4.4). Absent when `tls` is `unpinned` or absent. |
 | `loc_backoff_s` | int | no | 0…86400 | *(§13.3)* Seconds until the device's own growing location-attempt backoff next allows a fresh fix attempt; `0` = an attempt is allowed now. See §13.3's amendment for how this relates to `loc_min_s`. |
 | `sms_lost` | int | no | ≥ 0 | *(§3.6 — device-direct SMS)* Count of `sms_log` audit entries dropped from the device's NVS queue for lack of space; normally 0. |
@@ -664,12 +686,18 @@ broker-generated LWT.
 | `ota_st` | string | no | `wait` \| `dl` \| `ready` \| `inst` \| `ok` \| `fail` \| `rb` | *(OTA)* Job state: waiting for a download window, downloading, verified and waiting to install, installing, done, failed (see `ota_err`), rolled back. Present with `ota_t`. The relay ends its job record on `ok`, `fail` or `rb` for that target; otherwise **display only.** |
 | `ota_pct` | int | no | 0…100 | *(OTA)* Download progress. **Display only.** |
 | `bs` | map | no | sub-map below | *(battery stats, `docs/BATTERY_STATS_DESIGN.md`: the breadboard build has no fuel gauge, so drain is modelled from time spent in each state. The carrier board's gauge is read for the battery level, not for this window.)* The battery-stats window, in every online `/status` once the window holds ≥ 1 s. CBOR only (§3.3). **Display and modelling only.** |
+| `gnss` | int | no | `0` \| `1` | *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`: shows whether a `cfg.loc` push took effect.)* `1` when the device may power its GNSS receiver, `0` when `cfg.loc` (§3.2) has disabled it. Present in every `/status` from firmware that supports `cfg.loc`; absent means firmware that predates the field, which the relay treats as unknown. **Display only.** |
+| `car` | string | no | ≤24 printable ASCII chars | *(Soracom bearer, `docs/SORACOM_DESIGN.md` §3.4: shows which carrier preset, and so which bearer, the device chose from its SIM.)* Label of the carrier preset in force, e.g. `Soracom`, `US Mobile Dark Star`; absent when no preset is in force (carrier default or typed custom APN) and in firmware that predates the field. A relay drops a malformed value alone, treating it as absent. **Display only.** |
 
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
 server-settable would need a `/cfg` topic, which §11 still only reserves. `link` is the one
 exception: the relay does not merely display it, it compares it against the stored value to decide
 whether to re-publish unacked `/down` messages, exactly as it already does for `session` — §5.3.)*
+*(`gnss` is the one server-set location control, because it is an on/off
+hardware-fitness switch for a damaged or unwanted antenna rather than duty-cycle tuning.)* It is
+carried by `kind:"cfg"` (`cfg.loc`, §3.2) like every other device setting, so the `/cfg` topic
+above and is likewise **display only** in `/status`: it reports the state the device applied.
 They are optional, so
 a `/status` without them remains valid, and a relay MUST treat their absence as "unknown", not as `0`.
 **Compatibility (§0):** every field in this table added since the first release is optional. An *older* relay MUST NOT reject a `/status` merely because it carries a field the relay predates (§3.1's "unknown fields MUST be ignored" already covers this). The relay's acceptance of a field MUST be deployed before any firmware that sends it.
@@ -909,6 +937,12 @@ This is the quantitative reason for "never reconnect on a timer". **Checked whet
 exposes TLS session resumption: it does not.** There is no session-ticket or session-id parameter
 in v1.5.0's public TLS API, so a reconnect is a full ~5 kB handshake every time. This does not
 threaten the data constraint but it is the dominant energy cost.
+
+*(On the Soracom bearer, the handshake leaves the pager, so the model's dominant term shrinks.)*
+On the Beam bearer (§6.1) a reconnect is a plain MQTT connect and no record carries §7.1's +29 B
+TLS framing; §7.2's "TLS reconnect" row and the +TLS column do not apply to the radio leg. The
+revised totals and costs are in `docs/SORACOM_EVAL.md` (summary table and "Why the data drops");
+they are estimates until §7.4's measurement is repeated on a Soracom SIM.
 
 **SMS budget: device-direct SMS is in scope (see §3.6).** The pager's own modem may send
 and receive SMS directly, to a **parent-managed allow-list of phone numbers**, as a delivery path
@@ -1404,6 +1438,8 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 66 | `ota_pct` | uint, 0…100 | `/status` (OTA, §5.1 — download progress, optional) |
 | 67 | `ota_err` | tstr, ≤8 B | `/status` (OTA, §5.1 — failure or rejection code, optional) |
 | 68 | `bs` | map | `/status` (battery stats, `docs/BATTERY_STATS_DESIGN.md`; optional, CBOR only, §3.3) |
+| 69 | `gnss` | uint 0/1 | `/status` (GNSS disable, §5.1 — `cfg.loc` effective state, optional; `docs/GNSS_DISABLE_DESIGN.md`) |
+| 70 | `car` | tstr, ≤24 B | `/status` (Soracom bearer, §5.1 — carrier preset label, optional, display only; `docs/SORACOM_DESIGN.md` §3.4) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1431,6 +1467,10 @@ book parser.)*
 (uint), `url=2` (tstr, `https://`), `osz=3` (uint), `osha=4` (bstr(32)), `fmt=5` (uint, `0` full,
 `1` delta), `base=6` (bstr(32), delta only), `psz=7` (uint, delta only), `cancel=8` (bool; a map
 line above so that line's existing allocation reads unchanged.)*
+
+`loc=5` (map inside `/down` `cfg`, `docs/GNSS_DISABLE_DESIGN.md`, §3.2): `gnss=0` (bool; absent
+means no change). Unknown sub-keys are ignored. *(Listed apart, like `ota=4`; this is `cfg`'s own namespace, distinct from key 8 `loc` in
+the `/loc` envelope.)*
 
 `bs` map (inside `/status`, key 68 above, §5.1): `sq=0, dt=1, sl=2, aw=3` (array of 6 uint)`,
 sub-keys are ignored.

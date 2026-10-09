@@ -13,6 +13,8 @@ screen, the pager acknowledges it, and replies typed on the pager reach the web 
 pager that is asleep is delivered. Pagers can use an ordinary data SIM or a Soracom SIM, which is
 carried through Soracom Beam (`docs/SORACOM_DESIGN.md`).
 
+Status: prototype. `docs/HARDWARE_TESTING.md` lists what has been seen on hardware, and
+`docs/ROADMAP.md` lists what is still missing.
 
 **Start with [`docs/OVERVIEW.md`](docs/OVERVIEW.md)**, then
 [`docs/GOTCHAS.md`](docs/GOTCHAS.md). [`docs/README.md`](docs/README.md) indexes the rest.

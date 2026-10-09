@@ -373,6 +373,7 @@ touching the device at all.
 
 ### 4.7 Budget lines
 PROTOCOL.md §7.2/§7.3 carry a `/loc` line, and §11 of this document tracks the GNSS power cost. The
+relay has no SMS backend; the modem's own allow-listed SMS is budgeted in PROTOCOL.md §7.3.
 
 ### 4.8 The relay is not an MQTT client
 The relay's *role* is what PROTOCOL.md describes, but its *transport* is the broker's rule engine

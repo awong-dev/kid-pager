@@ -26,18 +26,28 @@ esptool.py --chip esp32s3 write_flash 0x11000 assets.bin      # fonts (tools/mka
 esptool.py --chip esp32s3 erase_region 0x9000 0x6000          # wipe settings -> Setup mode
 ```
 
+A release build in light sleep has no USB port, so nothing can be flashed until the board is reset
+by hand (hold BOOT, tap RESET, or power-cycle). If `ls /dev/cu.usbmodem*` comes back empty, wait for
+the physical reset rather than polling the port.
+
 ## Console commands
 
+Setup mode has `setup`, `carrier` and `bearer`; on the debug build it also has `nettest`, `mqtttest`
+and `at`. Outside Setup mode the debug build has all of these.
 
 | Command | Does |
 |---|---|
 | `setup <code>` | Provision from a setup code |
+| `carrier` / `carrier <n>` / `carrier custom <apn>` | Show or set the APN choice. 0 = automatic. Prints `sim: imsi=… gid1=… iccid=…`, `bearer:`, `pdp auth:` and `detected:` |
+| `bearer [auto\|direct\|beam]` | Override the bearer (NVS `carrier/bearer`), read at boot. `beam` is honoured only when the preset in force is a Beam carrier (Soracom). `auto` clears the override |
 | `nettest <host> <port> [udp\|tls\|<bytes>]` | Debug build only. Socket-layer probe. With a byte count: a padded HTTP GET, then waits for a reply. Re-attaches first, which disturbs a live session |
+| `mqtttest <host> <port> [ca\|noneca\|emptyca\|plain]` | Debug build only. Points the modem's own MQTT client at any host. `emptyca` deletes the certificate in slot 12 first. `plain` uses TLS profile 0, the Beam shape (plaintext). Other modes are not meaningful while the bearer is `beam` |
 | `cafetch <https url> <sha256 hex>` | The CA fetch over a second TLS socket, without applying it. Reports whether the MQTT session survived |
 | `gnsstest <seconds>` | One location attempt, bypassing the backoff and the battery floor |
 | `smstest <number> <text>`, `smslist` | Send one SMS bypassing the allow-list; show the list and the audit queue |
 | `sleeptest <minutes> [yield_ms] [interval_ms]` | Light-sleep window with optional overrides; records pages, session loss, timing; saves to NVS then resets. `sleeptest` alone prints the saved report. `yield_ms` is `0` or 30..10000, `interval_ms` is `0` or 200..60000; `0` (or omitting the argument) keeps the build default, so `sleeptest 6 0 0` and `sleeptest 6` are the same run |
 | `coverage` | Debug the no-coverage radio duty cycle (deregister with `at AT+COPS=2`, recover with `at AT+COPS=0`) |
+| `at <command>` | One raw AT command; the reply shows in the trace. Accepts `at +CIMI` or `at AT+CIMI`. Setup mode has it on the debug build only |
 | `acceltest [samples <n>\|ths <0-127>\|dur <0-127>\|refr <seconds>]` | LIS3DH register/sample dump and runtime tuning. Re-probes WHO_AM_I every call, so wiring the chip needs no reboot. `acceltest` alone prints registers, THS in mg, the refractory setting, edges reported and ext1 wake count |
 | `flip on\|off\|status` | Persist and apply a 180-degree display rotation (NVS `disp_flip`) so the pager can be read upside down; `on`/`off` force one full refresh immediately |
 
@@ -64,6 +74,8 @@ runs — the UI render task would repaint over the test pattern. Commands:
 |---|---|
 | `disptest` or `disptest info` | Print refresh mode, partial count, and dirty rows. Run again to re-read. |
 | `disptest again <0\|1>` | `0` deliberately reproduces the two-plane bug (see GOTCHAS.md); `1` is the corrected code. |
+| `disptest lut <0\|1>` | A/B for the "no partial waveform in OTP" hypothesis on the Orient AES128296A00-2.9ENRS panel. `0` = the OTP partial waveform (partial command stream with 0x22=0xFF); it bleaches the panel on the glass, so it is for A/B only. `1` = also sends 0x32 + the 153-byte `WF_PARTIAL_2IN9` LUT (`firmware/main/wf_partial_2in9.h`, copied from `docs/reference/wf_partial_2in9.h`) before 0x20, and 0x22=0xCF instead of 0xFF. `1` is the default (NVS `disp`/`lut`, absent = 1, so the setting persists). The per-partial log line says which mode ran. |
+| `disptest tp0a [N]` | Show or set the host LUT's TP0A frame count (NVS `disp`/`tp0a`, default 7, down from the reference table's 10 to reduce keystroke latency). Raise it (8 or 9) if changed pixels look faint. |
 | `disptest bars` | Paint 8-pixel wide full-height stripes (black / white / black / ...) with a FULL refresh. Establishes a baseline pattern. |
 | `disptest step <n>` | Invert the 8-pixel screen column at x=n*8, trigger ONE partial refresh, wait for BUSY. |
 | `disptest seq [n0] [n1] [ms]` | Step through columns n0 to n1 inclusive, ms apart (defaults: 2 12 1500). Watch for band flipping; verify pattern matches prediction. |
@@ -94,10 +106,13 @@ never publish).
 
 ### Accelerometer (LIS3DH) bench wiring
 
+Adafruit LIS3DH breakout, on its own I2C bus (`I2C_NUM_1`); pins as defined in `pins.h`:
 
+- SDA -> IO17 (Walter pin 21), SCL -> IO18 (Walter pin 22). Not the CardKB's bus (IO10/IO9).
 - Address 0x18 (SDO/SA0 open or tied low). If SDO/SA0 is pulled high instead, the chip answers
   at 0x19 and `i2cscan` shows 0x19, not 0x18. `accel_init()` looks only at 0x18 and will report
   "not found" until either the wiring or `PAGER_I2C_ADDR_LIS3DH` (`pins.h`) changes.
+- INT1 -> IO16 (Walter pin 20, `PAGER_PIN_LIS3DH_INT1`), push-pull, active high, 3.3 V logic, no
   external pull-up needed. It is an RTC GPIO, armed as the ext1 light-sleep wake.
 - Power: breakout VIN from the power board's 3V terminal, always on.
 
@@ -108,9 +123,16 @@ other bus, so its presence check is the boot log's `LIS3DH found (WHO_AM_I=0x33)
 
 ### Power board (Adafruit 6092)
 
+SYS terminal (bq25185 4.2 V regulator) → Walter VIN (4.5 V on USB, battery voltage minus protection
+FET, BUVLO at 3.0 V). 3V terminal (TLV62569 3.3 V buck, 35 µA quiescent) → LIS3DH and eInk Friend VIN
+(always on). Walter IO0 (3V3-OUT, switched) → CardKB only. The wake button is not fitted, so ext1
+wakes on LIS3DH INT1 alone. The board's green 3.3 V LED is removed. Passive distribution carries no
+capacitors; the TLV62569 wants 10–47 µF total, already satisfied on the 6092.
 
 ## Verified on hardware
 
+Debug build and release build results from the v0.2 and v1.1 bench runs, against the production
+relay and broker. Google Fi (T-Mobile) and AT&T reseller SIMs, and a Soracom SIM.
 
 - Setup from a typed code; restart into the normal session; no reset loop.
 - MQTT over TLS 1.2 with a pinned CA; signed CBOR in both directions.
@@ -137,6 +159,8 @@ other bus, so its presence check is the boot log's `LIS3DH found (WHO_AM_I=0x33)
 - A page delivered during real light sleep with a 150 ms wake window (35 s and 136 s after sending).
 - CardKB keyboard: every printable key, Enter (0x0d), Esc and the four arrows (0xb4-0xb7) decode as
   the host test predicts; a key wakes the UI within one wake cycle; a typed reply publishes within
+  50 ms of Enter. `i2cscan [swap]` finds the keyboard; `wake` and `key <text>` drive the UI from the
+  console (see the console key injection notes below).
 - Display partial refresh with the two-plane fix: after `disptest again 1`, `bars` and `seq 0 12 1500`,
   all 13 adjacent 8-row bands are correct and the pattern reads `w b w b w b w b w b w b w` as predicted.
 - Display register-loss fix: `disptest bars` → `disptest swreset` → `disptest bars` → `disptest seq 0 3
@@ -169,4 +193,9 @@ In the order worth testing:
 6. `gnsstest` outdoors: which radio route the modem accepts (in-place or `CFUN=4` window), time to fix
    cold and hot, and re-attach time. Record numbers for tuning attempt and backoff budgets.
 7. **Modem SMS**: on one SIM line an earlier attempt failed with `AT+CMGS` returning `OK` with
+   `+CMGS: -2147483648` (no message reference) and nothing arriving. Re-check on the current line
+   phone has not been run on the bench: texts from listed and unlisted numbers are still to test.
+8. The accelerometer on the current pins (SDA IO17, SCL IO18, INT1 IO16) has not been bench-tested
+   since the rewire. The shake threshold was calibrated on the earlier pins.
 
+Registration took about two minutes at the bench location on AT&T, and a second or two on T-Mobile.

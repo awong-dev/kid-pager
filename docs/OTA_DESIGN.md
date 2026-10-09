@@ -6,6 +6,18 @@ it, and boots it with rollback protection. The relay decides when to offer an up
 but is not in the byte path. "Measured" figures were taken from the release image; "estimate" means
 not measured, with the assumption stated.
 
+## Implementation status
+
+- Implemented: `firmware/main/ota.c` and `firmware/main/otapipe.c`; relay `push_ota` and `cancel_ota`
+  in `relay/app/devcfg.py`, with the index reader in `relay/app/firmware.py`; the web Devices
+  "Update firmware" dialog (`web/components/FirmwareUpdateDialog.tsx`); `tools/fwpub.py`; the public
+  bucket with index `fw/index.json` (`https://storage.googleapis.com/<bucket>/fw/index.json`).
+- Verified on hardware: a delta OTA and a full OTA each reached `ota_st ok`, and an image that aborts
+  at boot came back `rb`.
+- Precondition (D8): each pager needs one USB flash of bootloader, partition table, otadata and app
+  before its first OTA.
+- Per-item status for the bench list is in §7.
+
 ## 1. Decisions
 
 | # | Decision |
@@ -135,3 +147,15 @@ publishes, about 1 KB per OTA. A boot status carrying the new `img` means `ok`.
 ## 7. Bench checks
 
 1. **Storage reachability**: a direct `cafetch` of a probe object from the bucket on the debug console.
+   Done in effect: full and delta OTAs reached `ready` through the direct storage path (D3).
+2. **Newline-loss defect**: run `otafetch` with a null sink on a 64 KB object made only of `0x0A`
+   bytes, and count short-copy events. Then run it on the real 339 KB `full.z` and log B/s; that
+   replaces the 4 KB/s assumption. Open: not recorded. Vendor patch 1.22 (short-copy detection with
+   Range resume) is in the vendored tree.
+3. **Current trace** of one full and one delta OTA, to compare against the 2.9 and 0.5 mAh estimates.
+   Open.
+4. **Rollback**: done. An image that aborts at boot (`PAGER_OTA_TEST_ABORT`) came back `rb`, and a good
+   image reached `ota_st ok` and was confirmed. The `esp_ota_mark_app_valid_cancel_rollback` log line is
+   expected but not yet quoted in a capture.
+5. **Airplane**: push `cfg.ota` while in airplane mode. Expect no socket opened and `ota_st` to stay
+   `wait`. Waived; not run.

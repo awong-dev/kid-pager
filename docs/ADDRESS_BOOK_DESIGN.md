@@ -85,6 +85,8 @@ for a book sync periodically.
     Family / People / Groups, `getOptionLabel={o => typeof o === 'string' ? o : o.label}`,
     `filterOptions={createFilterOptions({stringify: o => `${o.label} ${o.displayName} ${o.alias}`})}`,
     with no phone option. SMS contacts are not chat targets. The exception: when the signed-in user has
+    an `smsNumber`, New chat also lists sendable externals (phone shown) as a separate group after
+    People and Groups. `isOptionEqualToValue` compares by alias.
 
 ## Failure modes and recovery
 | failure | effect | recovery |

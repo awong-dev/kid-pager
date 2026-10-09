@@ -25,9 +25,22 @@
 - [BATTERY_STATS_DESIGN.md](BATTERY_STATS_DESIGN.md): on-device state-time counters and the modelled drain shown in the web app.
 - [BOOK_ADD_ANYONE_DESIGN.md](BOOK_ADD_ANYONE_DESIGN.md): adding any number to the address book at once; delivery is decided by policy.
 - [BRIDGE_HEALTH_DESIGN.md](BRIDGE_HEALTH_DESIGN.md): system notices, bridge liveness, subscribed link checks, SMS balance and top-ups.
+- [BRIDGE_PHONE_DESIGN.md](BRIDGE_PHONE_DESIGN.md): a headless Android phone that carries a member's SMS, Google Voice, Google Chat and WhatsApp through the relay.
+- [BRIDGE_RECEIPT_DESIGN.md](BRIDGE_RECEIPT_DESIGN.md): delivery receipts from the bridge phone, shown on the pager.
+- [BRIDGE_WHATSAPP_LID_DESIGN.md](BRIDGE_WHATSAPP_LID_DESIGN.md): WhatsApp direct messages keyed by conversation id (LID or phone JID).
+- [CARRIER_V02_FIRMWARE_DESIGN.md](CARRIER_V02_FIRMWARE_DESIGN.md): carrier v0.2 firmware: board autodetection and drivers for the carrier board's peripherals.
+- [CHAT_UI_DESIGN.md](CHAT_UI_DESIGN.md): pager chat UI and address-book use: all chats, new chat, new group from the book.
+- [CONTACT_REQ_DESIGN.md](CONTACT_REQ_DESIGN.md): contact requests from the pager, SMS contacts per family, and family rename.
+- [FAMILY_EXPORT_DESIGN.md](FAMILY_EXPORT_DESIGN.md): moving a family between servers: the export file, freeze, import rules, per-pager setup codes.
 - [FEDERATION_DESIGN.md](FEDERATION_DESIGN.md): relay-to-relay messaging between families: peering, shared people, outbox and receipts.
 - [GNSS_DISABLE_DESIGN.md](GNSS_DISABLE_DESIGN.md): per-device `cfg.loc.gnss` setting that stops the pager from powering the GNSS receiver.
 - [GROUP_CHAT_DESIGN.md](GROUP_CHAT_DESIGN.md): group chat basics: conversation store, routing, the sender on the pager, web UI.
 - [HOMESERVER_DESIGN.md](HOMESERVER_DESIGN.md): the home deployment: nginx, Mosquitto and one relay image under docker compose.
 - [HOOKS_DESIGN.md](HOOKS_DESIGN.md): message hooks: where filters and processors run, verdicts, failure handling, callback API.
+
+## Evaluations and root-cause analyses
+
+- [CORES_EVAL.md](CORES_EVAL.md): whether network work moves to a worker task and whether the UI runs on CPU1.
+- [TWILIO_EVAL.md](TWILIO_EVAL.md): relay-side SMS through Twilio: the evaluation.
+- [RCA_SLEEP_PAGE_LOSS.md](RCA_SLEEP_PAGE_LOSS.md): root-cause analysis of pages lost while the pager light-sleeps.
 

@@ -15,6 +15,7 @@ rail, no keyboard.
 
 ## Decisions
 
+**D1. Two LIS3DH interrupt generators, both routed to the one wired pin (INT1 to IO16; earlier hardware used IO6).**
 Generator 1 is motion. Generator 2 is the shake candidate (INT2_* registers routed with
 CTRL_REG3 `I1_IA2`). INT2 is not wired, and the pin stays the single shared ext1 bit.
 

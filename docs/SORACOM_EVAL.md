@@ -1,5 +1,8 @@
 # Evaluation: Soracom as the LTE provider, with Beam or Funk
 
+Outcome: the Beam option was chosen and built, and verified on the bench. It is described in
+[SORACOM_DESIGN.md](SORACOM_DESIGN.md). The broker-free UDP trial in the Recommendation section was not
+run. Prices are Soracom's published "Global" USD list prices, read from
 <https://developers.soracom.io/en/docs/reference/fees/>; re-check before buying. Traffic figures are
 this project's own, `PROTOCOL.md` §7.
 
