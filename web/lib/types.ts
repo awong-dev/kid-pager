@@ -26,6 +26,7 @@ export interface UserDoc {
   kind: UserKind;
   policy: PolicyDoc;
   notify: { alerts: boolean };
+  smsNumber?: string | null;
 }
 
 /** `families/{fid}.settings`. */
@@ -37,6 +38,7 @@ export interface FamilyDoc {
 }
 
 // A family admin's inbox of things needing a decision. `chat_unknown`: a bridged Google Chat
+// conversation nobody subscribed. `hook_down`: a hook failed three calls running (super only).
 export type AlertStatus = "open" | "handled" | "dismissed";
 
 export interface AlertDoc {
@@ -51,12 +53,26 @@ export interface AlertDoc {
   peerPhone: string | null;
   preview: string;
   heldBody?: string | null;
+  // Texts held for an unknown number.
+  heldCount?: number;
+  updatedAt?: Timestamp | null;
+  // `chat_unknown` only: `convRef` is what the Subscribe/Ignore routes take.
+  bridgeId?: string;
+  conversationId?: string;
+  convRef?: string;
+  convTitle?: string;
+  isGroup?: boolean;
+  people?: string[];
+  source?: BridgeSource;
   convKey: string | null;
   contactRequestKey: string | null;
   decidedAt: Timestamp | null;
   decidedBy: string | null;
 }
 
+// Which app on the bridge phone an event or a send belongs to.
+
+export type BackendKind = "pager" | "webapp" | "gchat" | "sms" | "bridge";
 
 export interface BackendDoc {
   kind: BackendKind;
@@ -74,6 +90,7 @@ export interface AllowEdgeDoc {
   familyIds?: string[];
 }
 
+export type TlsState = "unpinned" | "pinned" | "broken" | "proxy";
 
 export interface DeviceStatusDoc {
   state: string | null;
@@ -90,6 +107,8 @@ export interface DeviceStatusDoc {
   caFp?: string | null;
   // Seconds until the next GPS attempt is allowed, 0 = now.
   locBackoffS?: number | null;
+  // 1 = GNSS enabled, 0 = disabled by cfg.
+  gnss?: number | null;
   // Running image short id (16 hex), the OTA gate (1 = firmware + rollback bootloader
   // confirmed), and the job's progress.
   img?: string | null;
@@ -100,6 +119,8 @@ export interface DeviceStatusDoc {
   otaErr?: string | null;
   // Audit-queue SMS entries dropped on the pager before upload.
   smsLost?: number | null;
+  // Carrier label (e.g. "Soracom").
+  car?: string | null;
   // Serving cell of the latest `/loc` report that carried one, whether or not its position
   // resolved; only `ts` is mirrored.
   lastCell?: { ts: number } | null;
@@ -223,3 +244,64 @@ export interface ConversationDoc {
 
 // A loc_req never `fulfilled` expires 15 minutes after creation (derived; docs/PROTOCOL.md §13.4).
 export const LOC_REQ_TTL_MS = 15 * 60 * 1000;
+
+// Bridge phones are server-only, so these are API response shapes; times are ISO-8601 strings.
+
+export interface BridgeStatus {
+  battery?: number | null;
+  listenerBound?: boolean;
+  smsDefault?: boolean;
+  accessibility?: boolean;
+  accounts?: string[];
+  simNumber?: string | null;
+  voiceNumber?: string | null;
+  tier2Count?: number;
+  version?: string | null;
+  error?: string | null;
+  unpaired?: boolean;
+}
+
+export interface BridgeRow {
+  id: string;
+  ownerUid: string;
+  label: string;
+  pairedAt: ApiTime;
+  lastSeenAt: ApiTime;
+  simNumber: string | null;
+  status: BridgeStatus;
+  createdAt: ApiTime;
+}
+
+export type BridgeConversationStatus = "seen" | "subscribed" | "ignored" | "paused";
+
+export interface BridgeConversationRow {
+  // sha256(conversationId)[:16] -- what every conversation route takes.
+  ref: string;
+  conversationId: string;
+  isGroup: boolean;
+  link: string | null;
+  people: string[];
+  lastPreview: string;
+  lastAt: ApiTime;
+  firstSeenAt: ApiTime;
+  heldCount: number;
+  status: BridgeConversationStatus;
+  uid: string | null;
+  convKey: string | null;
+  pagerName: string | null;
+  customName: boolean;
+  alertId: string | null;
+}
+
+export interface ChatTabOut {
+  seen: BridgeConversationRow[];
+}
+
+export interface SubscribeRequest {
+  pagerName: string;
+  canReply: boolean;
+  roster: RosterEntry[];
+}
+
+export interface SubscribeResult {
+}

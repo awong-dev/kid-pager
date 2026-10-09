@@ -25,6 +25,7 @@ import { useDirectory } from "@/lib/directory";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import type { DeviceDoc } from "@/lib/types";
 
+import BridgePhonesSection from "@/components/BridgePhonesSection";
 import SetupCodePanel, { type SetupCodeResult } from "../../admin/devices/SetupCodePanel";
 
 // `POST /api/family/devices/{id}/ca` with `{"action":"push"|"unpin"}`.
@@ -237,6 +238,13 @@ function FamilyDevicesInner() {
           onClose={() => setSetupResult(null)}
         />
       )}
+
+      <BridgePhonesSection
+        familyId={familyId}
+        members={familyMembers
+          .filter((c) => byUid(c.uid)?.kind === "person")
+          .map((c) => ({ uid: c.uid, alias: c.alias, displayName: c.displayName }))}
+      />
 
         <DialogTitle>
           {caConfirm?.action === "push" ? "Push CA certificate" : "Un-pin CA certificate"}

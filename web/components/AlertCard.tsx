@@ -3,6 +3,7 @@
 /** One alert row; actions call `POST /api/family/alerts/{id}/{approve|block|dismiss}`. */
 
 import { useState } from "react";
+import Collapse from "@mui/material/Collapse";
 import Link from "next/link";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
@@ -18,13 +19,34 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
+import ForumIcon from "@mui/icons-material/Forum";
 import PersonAddIcon from "@mui/icons-material/PersonAdd";
 import SmsIcon from "@mui/icons-material/Sms";
 
+import ChatSubscribeDialog from "@/components/ChatSubscribeDialog";
 import { formatPhoneDigits } from "@/components/NewChatDialog";
 import { ApiError, api } from "@/lib/api";
 import { familyQuery } from "@/lib/family-context";
 import type { AlertDoc } from "@/lib/types";
+
+/** One row of `GET /api/family/alerts/{id}/held`. */
+interface HeldText {
+  id: string;
+  body: string;
+  // epoch seconds, epoch ms or an ISO string
+  receivedAt: number | string | null;
+}
+
+interface ApproveResult {
+  delivered?: number;
+  undelivered?: number;
+}
+
+function formatReceived(v: HeldText["receivedAt"]): string {
+  if (v === null || v === undefined) return "";
+  const ms = typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
+  return Number.isNaN(ms) ? "" : new Date(ms).toLocaleString();
+}
 
 export interface AlertRow extends AlertDoc {
   id: string;
@@ -49,6 +71,8 @@ function kindIcon(kind: AlertDoc["kind"]) {
       return <ChatBubbleOutlineIcon fontSize="small" />;
     case "contact_request":
       return <PersonAddIcon fontSize="small" />;
+    case "chat_unknown":
+      return <ForumIcon fontSize="small" />;
   }
 }
 
@@ -59,6 +83,7 @@ function kindIcon(kind: AlertDoc["kind"]) {
       return "New conversation";
     case "contact_request":
       return "Contact request";
+    case "chat_unknown":
   }
 }
 
@@ -75,12 +100,56 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
   const [nameValue, setNameValue] = useState("");
   const [nameConflict, setNameConflict] = useState<string | null>(null);
 
+  // held-text expander and approve outcome (`sms_unknown`)
+  const [heldOpen, setHeldOpen] = useState(false);
+  const [heldList, setHeldList] = useState<HeldText[] | null>(null);
+  const [heldError, setHeldError] = useState<string | null>(null);
+  const [result, setResult] = useState<ApproveResult | null>(null);
+
+  const heldCount = alert.kind === "sms_unknown" ? (alert.heldCount ?? 0) : 0;
+  const hasHeld = heldCount > 0;
+
+  async function toggleHeld() {
+    const next = !heldOpen;
+    setHeldOpen(next);
+    if (!next) return;
+    setHeldError(null);
+    try {
+      const resp = await api.get<{ held: HeldText[] }>(`/family/alerts/${alert.id}/held${familyQuery()}`);
+      setHeldList(resp.held);
+    } catch (err) {
+      setHeldError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to load messages");
+    }
+  }
+
   const handled = alert.status !== "open";
+
+  // chat_unknown: Subscribe opens the dialog, whose endpoint decides the alert
+  const [subscribeOpen, setSubscribeOpen] = useState(false);
+  const [chatResult, setChatResult] = useState<string | null>(null);
+  const chatPeople = alert.people ?? [];
+  const chatWaiting = alert.heldCount ?? 0;
+  const chatReady = Boolean(alert.bridgeId && alert.convRef);
+
+  async function ignoreChatAlert() {
+    if (!alert.bridgeId || !alert.convRef) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await ignoreChat(alert.bridgeId, alert.convRef);
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to ignore");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   async function post(action: "approve" | "block" | "dismiss", body: unknown) {
     setSubmitting(true);
     setError(null);
     try {
+      const resp = await api.post<ApproveResult | null>(`/family/alerts/${alert.id}/${action}${familyQuery()}`, body);
+      if (action === "approve" && alert.kind === "sms_unknown" && hasHeld) setResult(resp ?? {});
       setSmsOpen(false);
       setNameOpen(false);
       setNameConflict(null);
@@ -129,11 +198,56 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
         {alert.kind === "sms_unknown" && (
           <>
             <Typography variant="body1">
+              {hasHeld
+                ? `to @${alert.subjectAlias} · ${formatPhoneDigits((alert.peerPhone ?? "").replace(/^\+/, ""))}`
+                : `${alert.peerPhone ?? "Unknown number"} → @${alert.subjectAlias}`}
             </Typography>
             {alert.preview && (
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 &quot;{alert.preview}&quot;
               </Typography>
+            )}
+            {hasHeld && (
+              <>
+                <Button size="small" onClick={() => void toggleHeld()} sx={{ mt: 0.5, px: 0 }}>
+                  {heldCount} {heldCount === 1 ? "message" : "messages"} waiting {heldOpen ? "▴" : "▾"}
+                </Button>
+                <Collapse in={heldOpen} unmountOnExit>
+                  {heldError && <Alert severity="error">{heldError}</Alert>}
+                  {heldList === null && !heldError && (
+                    <Typography variant="caption" color="text.secondary">
+                      Loading…
+                    </Typography>
+                  )}
+                  <Stack spacing={1} sx={{ mt: 0.5 }}>
+                    {heldList?.map((h) => (
+                      <div key={h.id}>
+                          <Typography variant="caption" color="text.secondary">
+                            {formatReceived(h.receivedAt)}
+                          </Typography>
+                          {h.status !== "held" && (
+                          )}
+                        </Stack>
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                          {h.body}
+                        </Typography>
+                      </div>
+                    ))}
+                  </Stack>
+                </Collapse>
+              </>
+            )}
+            {hasHeld && !handled && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                Block: no more texts from this number reach @{alert.subjectAlias}; the waiting messages are
+                discarded. Dismiss: the waiting messages are discarded.
+              </Typography>
+            )}
+            {result && (
+              <Alert severity={result.undelivered ? "warning" : "success"} sx={{ mt: 1 }}>
+                Delivered {result.delivered ?? 0}
+                {result.undelivered ? `; ${result.undelivered} could not be delivered` : ""}
+              </Alert>
             )}
           </>
         )}
@@ -165,6 +279,39 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
                   Approve: @{alert.subjectAlias} can message @{alert.peerAlias}.
                 </Typography>
               </>
+            )}
+          </>
+        )}
+
+        {alert.kind === "chat_unknown" && (
+          <>
+            <Typography variant="body1">
+              {alert.convTitle || "Untitled conversation"} → @{alert.subjectAlias}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {alert.isGroup ? `Group (${chatPeople.length} ${chatPeople.length === 1 ? "person" : "people"} seen)` : "Direct message"}
+            </Typography>
+            {chatPeople.length > 0 && (
+              <Stack direction="row" spacing={0.5} useFlexGap sx={{ mt: 0.5, flexWrap: "wrap" }}>
+                {chatPeople.map((p) => (
+                  <Chip key={p} size="small" variant="outlined" label={p} />
+                ))}
+              </Stack>
+            )}
+            {alert.preview && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                &quot;{alert.preview}&quot;
+              </Typography>
+            )}
+            {chatWaiting > 0 && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                {chatWaiting} {chatWaiting === 1 ? "message" : "messages"} waiting
+              </Typography>
+            )}
+            {chatResult && (
+              <Alert severity="success" sx={{ mt: 1 }}>
+                {chatResult}
+              </Alert>
             )}
           </>
         )}
@@ -208,6 +355,16 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
               Approve
             </Button>
           )}
+          {alert.kind === "chat_unknown" && (
+            <>
+              <Button size="small" variant="contained" disabled={submitting || !chatReady} onClick={() => setSubscribeOpen(true)}>
+                Subscribe
+              </Button>
+              <Button size="small" disabled={submitting || !chatReady} onClick={() => void ignoreChatAlert()}>
+                Ignore
+              </Button>
+            </>
+          )}
             <Button size="small" color="warning" onClick={() => void post("block", {})} disabled={submitting}>
               Block
             </Button>
@@ -216,6 +373,27 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             Dismiss
           </Button>
         </CardActions>
+      )}
+
+      {alert.kind === "chat_unknown" && alert.bridgeId && alert.convRef && (
+        <ChatSubscribeDialog
+          ownerUid={alert.subjectUid}
+          target={
+            subscribeOpen
+              ? {
+                  bridgeId: alert.bridgeId,
+                  ref: alert.convRef,
+                  title: alert.convTitle ?? "",
+                  isGroup: alert.isGroup ?? false,
+                  people: chatPeople,
+                }
+              : null
+          }
+          onClose={() => setSubscribeOpen(false)}
+          onSubscribed={(res, name) => {
+            setSubscribeOpen(false);
+          }}
+        />
       )}
 
         <DialogTitle>Approve {alert.peerPhone ?? "number"}</DialogTitle>
@@ -232,6 +410,11 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             onChange={(e) => setSmsName(e.target.value)}
             fullWidth
             sx={{ mt: 1 }}
+            helperText={
+              hasHeld
+                ? `@${alert.subjectAlias} can text this number from their pager, and the ${heldCount} waiting ${heldCount === 1 ? "message is" : "messages are"} delivered now.`
+                : `Adds it to @${alert.subjectAlias}'s pager SMS list.`
+            }
           />
         </DialogContent>
         <DialogActions>

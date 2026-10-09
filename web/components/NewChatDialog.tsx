@@ -12,6 +12,7 @@ import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import TextField from "@mui/material/TextField";
+import PhoneIcon from "@mui/icons-material/Phone";
 
 import { useAuth } from "@/lib/auth-context";
 import { BOOK_GROUP_ORDER, type BookGroup, bookGroup, useBook } from "@/lib/book";
@@ -25,6 +26,7 @@ interface ChatOption {
   phone: string | null;
   /** Admins also see unsendable entries, greyed out. */
   disabled: boolean;
+  external: boolean;
 }
 
 /** Parses `+`, digits, spaces, dashes and parens as a phone number; a bare 10-digit number is
@@ -62,6 +64,9 @@ interface NewChatDialogProps {
 
 export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   const router = useRouter();
+  const { isFamilyAdmin, me } = useAuth();
+  // Live, so an admin setting the number takes effect without a reload.
+  const meUid = me?.uid;
   const { data } = useBook();
   const [inputValue, setInputValue] = useState("");
   const [value, setValue] = useState<ChatOption | string | null>(null);
@@ -71,13 +76,18 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   const options = useMemo<ChatOption[]>(() => {
     const rows: ChatOption[] = [];
     for (const e of entries) {
+      // SMS contacts are chat targets only through the user's relay number.
+      // A bridged Google Chat contact (`chat` set) needs no relay number.
+      if (e.kind === "external" && !e.chat && (!hasSmsNumber || !e.sendable)) continue;
       if (!e.sendable && !isFamilyAdmin) continue;
       rows.push({
         alias: e.alias,
+        label: e.kind === "external" && e.phone ? `${e.label} · ${formatPhoneDigits(e.phone.replace(/^\+/, ""))}` : e.label,
         group: bookGroup(e),
         displayName: e.displayName,
         phone: e.phone ?? null,
         disabled: !e.sendable,
+        external: e.kind === "external",
       });
     }
     rows.sort(
@@ -85,6 +95,7 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
         BOOK_GROUP_ORDER.indexOf(a.group) - BOOK_GROUP_ORDER.indexOf(b.group) || a.label.localeCompare(b.label)
     );
     return rows;
+  }, [entries, isFamilyAdmin, hasSmsNumber]);
 
   const bookEmpty = data !== null && !entries.some((e) => e.sendable);
 
@@ -158,6 +169,15 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
             else go(v.alias);
           }}
           filterOptions={filter}
+          renderOption={(props, o) => {
+            const { key, ...rest } = props;
+            return (
+              <li key={key} {...rest}>
+                {o.external && o.phone && <PhoneIcon fontSize="small" sx={{ mr: 1 }} />}
+                {o.label}
+              </li>
+            );
+          }}
           renderInput={(params) => (
             <TextField
               {...params}

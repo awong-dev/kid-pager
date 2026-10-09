@@ -2,6 +2,7 @@
 
 import type { TlsState } from "./types";
 
+export type TrustChipVariant = "pinned" | "broken" | "unpinned" | "proxy";
 
 export interface TrustChipInfo {
   variant: TrustChipVariant;
@@ -33,6 +34,15 @@ export function trustChipInfo(
       label: "Server not verified",
       tooltip: BROKEN_TOOLTIP,
       color: "warning",
+    };
+  }
+  if (tls === "proxy") {
+    return {
+      variant: "proxy",
+      label: "via Beam",
+      tooltip:
+        "TLS is terminated by Soracom Beam; the pager speaks plain MQTT to beam.soracom.io",
+      color: "default",
     };
   }
   if (tls === "unpinned") {

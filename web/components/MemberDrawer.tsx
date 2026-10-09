@@ -2,6 +2,7 @@
 
 /** Row-click drawer on `/family/people`: Profile, Policy and Approved sections. */
 
+import Link from "next/link";
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
@@ -94,6 +95,11 @@ function MemberProfileForm({
 
       <Typography variant="subtitle2">Policy</Typography>
       <PolicyPicker uid={member.uid} policy={member.policy} onSaved={(p) => setSavedOut(p.out)} />
+
+      <Divider />
+
+      <Button component={Link} href={`/family/chat?uid=${encodeURIComponent(member.uid)}`} variant="outlined">
+      </Button>
 
       <Divider />
 

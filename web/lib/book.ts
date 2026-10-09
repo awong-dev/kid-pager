@@ -16,6 +16,7 @@ export interface BookEntry {
   nick: string | null;
   label: string;
   phone?: string | null;
+  // Set on a bridged Google Chat / Voice / WhatsApp contact (`t:"chat"` on the pager).
   inFamily: boolean;
   sendable: boolean;
   reason?: string | null;
@@ -120,6 +121,10 @@ export function reasonText(reason?: string | null): string {
       return "Blocked by their inbound policy";
     case "sms_contact":
       return "SMS contacts can only be texted from a pager";
+    case "no_sms_number":
+      return "needs an SMS number";
+    case "no_bridge":
+      return "Bridge phone not set up";
     case "not_allowed":
       return "Not approved";
     default:

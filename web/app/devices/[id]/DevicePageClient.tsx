@@ -29,6 +29,7 @@ import FirmwareChip from "@/components/FirmwareChip";
 import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
 import BatteryCard from "@/components/BatteryCard";
+import GnssPanel from "@/components/GnssPanel";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useNewestBuild } from "@/lib/firmware";
@@ -193,6 +194,7 @@ function DeviceInner() {
           <ArrowBackIcon fontSize="small" />
         </IconButton>
         <DeviceTrustChip tls={device?.status?.tls} caFp={device?.status?.caFp} />
+        {device?.status?.car && <Chip size="small" variant="outlined" label={device.status.car} />}
       </Stack>
 
       {deviceError && <Alert severity="warning">{deviceError}</Alert>}
@@ -212,6 +214,8 @@ function DeviceInner() {
         </Alert>
       )}
 
+      {id && id !== "_" && <GnssPanel deviceId={id} />}
+
       {id && id !== "_" && <BatteryCard deviceId={id} />}
 
       <Card variant="outlined">
@@ -219,6 +223,11 @@ function DeviceInner() {
           <Typography variant="h6" gutterBottom>
             SMS contacts
           </Typography>
+          {device?.status?.tls === "proxy" && (
+            <Typography variant="body2" sx={{ mb: 1 }}>
+              Device SMS unavailable on this carrier; relay SMS still works
+            </Typography>
+          )}
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             The pager can text only these numbers, and only they can text it. Every text in either
             direction is recorded below. Managed from People &rarr; @{ownerAlias ?? "..."} &rarr;
