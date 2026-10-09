@@ -354,6 +354,8 @@ static void on_auth_epoch_wrap(void)
 #define STK_LOC_PERIOD_S 27
 #define STK_LOC_MIN_S 28
 #define STK_LOC_BACKOFF_S 43
+#define STK_CAR 70 // carrier preset label (<= 24 B)
+#define STK_GNSS 69 // cfg.loc.gnss as applied (0/1)
 #define STK_LOC_MOVE_S 61 // `locmove` tunable (0 = GNSS-while-moving off)
 #define STK_TLS 39           // "unpinned"/"pinned"/"broken"/"proxy"
 #define STK_CA_FP 42         // absent when unpinned
@@ -459,7 +461,13 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
 
     // `tls` is always present; `ca_fp` only when a CA is pinned (PINNED or BROKEN). Over the Beam
     // bearer TLS ends at Beam ("proxy").
+    const char *tls_str = via_beam ? "proxy" : catrust_state_name(catrust_get_state());
     char ca_fp[17];
+    bool have_ca_fp = !via_beam && catrust_get_ca_fp(ca_fp);
+    // key 70 `car`: preset label, <= 24 printable ASCII, absent when no preset is in force.
+    char car[25];
+    snprintf(car, sizeof(car), "%s", net_carrier_label());
+    const bool have_car = car[0] != '\0';
 
     // Previous boot's stalled-command breadcrumb, "" when none.
     const char *stall_cmd = watchdog_last_stall_cmd();
@@ -468,6 +476,9 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     uint32_t nfields = 8 + 3 + 1 + 1 + 1 + 1 + 3 + 1; // fixed fields; optional ones are added below
     if (have_ca_fp) {
         nfields += 1;
+    }
+    if (have_car) {
+        nfields += 1; // key 70 car
     }
     if (have_stall_cmd) {
         nfields += 1; // key 59, omitted when empty
@@ -512,6 +523,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_uint(&w, STK_LOC_MIN_S, loc_get_min_s());        // the 10-minute trigger floor
     cbor_w_uint(&w, STK_LOC_BACKOFF_S, loc_get_backoff_remaining_s());
     cbor_w_uint(&w, STK_LOC_MOVE_S, loc_get_move_gnss_s());
+    cbor_w_uint(&w, STK_GNSS, loc_gnss_enabled() ? 1 : 0);
     cbor_w_tstr(&w, STK_TLS, tls_str, strlen(tls_str));
     if (have_ca_fp) {
         cbor_w_tstr(&w, STK_CA_FP, ca_fp, strlen(ca_fp));
@@ -550,6 +562,9 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
         }
     }
 
+    if (have_car) {
+        cbor_w_tstr(&w, STK_CAR, car, strlen(car));
+    }
     if (s_bs_have) {
         battstat_encode(&w, &s_bs_snap);
     }

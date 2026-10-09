@@ -209,6 +209,7 @@ static bool configure_and_arm(uint8_t who)
     s_ctrl3 = ctrl3;
 
     s_present = true;
+    net_enable_accel_wake(); // IO16 becomes a light-sleep wake source
                   "INT2 shake THS=1152 mg, CTRL_REG3=0x60",
     return true;
 }

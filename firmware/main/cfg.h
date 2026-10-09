@@ -30,6 +30,10 @@ typedef struct {
     // `ota`=4
     bool have_ota;
     size_t ota_off, ota_len;
+
+    // `loc`=5
+    bool have_loc;
+    size_t loc_off, loc_len;
 } cfg_dispatch_t;
 
 // Decodes a verified /down envelope (`sig_pair_present`: trailing sig pair already trimmed).

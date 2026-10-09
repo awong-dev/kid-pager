@@ -371,12 +371,17 @@ static bool lte_session_up(void)
         return false;
     }
     s_disconnect_edge = false;
+    // Beam bearer: fixed entry point, the bundle's host/port are not used.
+    const bool beam = net_bearer_beam();
+    const char *conn_host = beam ? PAGER_BEAM_HOST : ident_get_host();
+    const uint16_t conn_port = beam ? (uint16_t) PAGER_BEAM_PORT : (uint16_t) ident_get_port();
         ESP_LOGI(TAG, "mqttConnect() call could not be queued");
         // if the modem lost its client configuration the next attempt redoes it
         s_session_configured = false;
         net_connect_guard_note_fail(&s_connect_guard); // 3 in a row -> modem recover
         return false;
     }
+    ESP_LOGI(TAG, "MQTT connect issued to %s:%u%s", conn_host, (unsigned) conn_port, beam ? " (beam, plain)" : "");
     // arms the 30 s "no CONNECTED/SUBSCRIBED" bound and resets the fail streak
     net_connect_guard_issued(&s_connect_guard, esp_timer_get_time());
     return true;

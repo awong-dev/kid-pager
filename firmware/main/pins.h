@@ -3,6 +3,7 @@
 // Walter-internal, never touch: IO14/IO21/IO45/IO46/IO47/IO48 (modem), IO19/IO20 (USB), IO3 (strap).
 
 // Breadboard: the display Friend and CardKB/LIS3DH sit on the Walter headers, powered from an
+// always-on "3V" rail. board.c detects the carrier PCB (LIS3DH WHO_AM_I), which reuses IO12/38/42/8.
 
 #ifndef PINS_H
 #define PINS_H
@@ -25,6 +26,9 @@
 #define PAGER_PIN_DISP_MISO 42  // Friend SRAM MISO, unused
 #define PAGER_PIN_DISP_SCK 2
 
+// Wake button: no hardware (IO8 is free on the breadboard). With the flag at 0 nothing
+// configures, polls or arms IO8.
+#define PAGER_PIN_BUTTON 8
 #ifndef PAGER_WAKE_BUTTON_ENABLED
 #define PAGER_WAKE_BUTTON_ENABLED 0
 #endif
@@ -36,9 +40,14 @@
 #define PAGER_I2C_ADDR_CARDKB 0x5F
 
 // Motion: LIS3DH breakout (I2C addr 0x18) on its own bus, I2C_NUM_1, always-on rail (survives
+// rail_off() and light sleep); a shared bus would let its pull-ups feed the unpowered CardKB.
 
 // INT1 is an RTC GPIO (S3 RTC pads are IO0-IO21): the only ext1 light-sleep wake, push-pull
+// active-high, 3.3 V logic.
+#define PAGER_PIN_LIS3DH_INT1 16
 #define PAGER_I2C_ADDR_LIS3DH 0x18
+#define PAGER_PIN_ACCEL_SDA 17
+#define PAGER_PIN_ACCEL_SCL 18
 
 // LTE_WAKE0: a modem input, unused except by debug-build `wake0` instrumentation. Left as an
 // input with no pull otherwise.

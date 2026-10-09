@@ -228,6 +228,18 @@ const char *net_get_device_id(void);
 /* SIM presence check for the pre-provisioning screen; brings the modem up itself, no attach. */
 bool net_check_sim(void);
 
+/* Soracom Beam's plain-MQTT entry point. */
+#define PAGER_BEAM_HOST "beam.soracom.io"
+#define PAGER_BEAM_PORT 1883
+
+/* True when the session reaches the broker through Beam (plain MQTT, TLS profile 0). */
+bool net_bearer_beam(void);
+/* Label of the carrier preset in force from the last attach ("" if none). */
+const char *net_carrier_label(void);
+
+/* IMSI, EF_GID1 (hex) and ICCID for the `carrier` console; "" if the SIM has none. */
+bool net_sim_identity(char *imsi, size_t imsi_cap, char *gid1_hex, size_t gid_cap, char *iccid, size_t iccid_cap);
+
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
 /* Attaches, dials a plain socket (UDP if `udp`) and polls up to 10s for SOCKET_STATE_OPENED. */
 bool net_check_tcp(const char *host, uint16_t port, bool udp, bool tls);

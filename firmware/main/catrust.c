@@ -290,6 +290,16 @@ void catrust_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id)
         return;
     }
 
+    if (net_bearer_beam()) {
+        // A Beam trial would "validate" a CA over a plaintext hop: refused, acked `shown`
+        // (the protocol has no failure ack).
+        ESP_LOGI(TAG, "cfg.ca refused on the Beam bearer (TLS is terminated by Beam), id=%s", id ? id : "");
+        if (id && id[0] != '\0') {
+            msg_mark_shown(id);
+        }
+        return;
+    }
+
     s_lock();
     s_pending_present = true;
     s_pending_unpin = cfg.unpin;

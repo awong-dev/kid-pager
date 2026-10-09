@@ -268,6 +268,14 @@ void loc_track_gnss_attempt_done(loc_track_t *t, bool success);
 /* min(base_budget_s, 60 - assist_elapsed_s), floored at 0 (LOC_WEB_REQUEST_BOUND_S). */
 uint32_t loc_web_gnss_budget_s(uint32_t base_budget_s, uint32_t assist_elapsed_s);
 
+typedef struct {
+    bool have_gnss;
+    bool gnss;
+} loc_cfg_t;
+
+/* Parses the `cfg.loc` sub-map `{gnss: bool}`; false if it is not a map or `gnss` is not a bool. */
+bool loc_parse_cfg_submap(const uint8_t *buf, uint16_t len, loc_cfg_t *out);
+
 #ifdef ESP_PLATFORM
 #include "auth.h"
 
@@ -282,6 +290,13 @@ void loc_bind(loc_rtc_t *rtc, auth_rtc_t *auth_rtc, loc_rtc_lock_fn lock, loc_rt
 
 /* Probes the LIS3DH and wires cell-change/GNSS events; call after ui_init(). Failures only log. */
 void loc_init(void);
+
+/* GNSS enable flag, NVS "loc"/"gnss" (u8, absent = enabled); when false no net_gnss_*() runs. */
+bool loc_gnss_enabled(void);
+bool loc_set_gnss_enabled(bool enabled);
+
+/* Applies a `cfg.loc` sub-map and acks `shown`; a malformed one is dropped without an ack. */
+void loc_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id);
 
 /* GNSS receiver configuration (needs the modem): call after net_init(); skipped in airplane. */
 void loc_gnss_config(void);

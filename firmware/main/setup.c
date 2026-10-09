@@ -666,6 +666,10 @@ bool setup_run(const char *code)
 
     // The pointer is fetched over the bootstrap attach, with the bootstrap MQTT session still up;
     // the fetched PEM overwrites any inline ca.
+    if (ca_ptr.have_ptr && net_bearer_beam()) {
+        // Beam terminates TLS, so a CA pointer is meaningless; the identity is stored unpinned.
+        ESP_LOGI(TAG, "SETUP CA fetch skipped: Beam bearer terminates TLS (ca_url dropped)");
+    } else if (ca_ptr.have_ptr) {
         static char fetched_pem[CAFETCH_PEM_MAX];
         size_t fetched_len = 0;
         int http_status = 0;
