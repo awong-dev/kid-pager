@@ -15,6 +15,8 @@ from google.cloud.firestore import Transaction
 from app import policy as policy_module
 from app.db.firestore import get_db, run_transaction
 from app.store import allow as allow_store
+from app.store import bridge_conversations as bridge_conversations_store
+from app.store import bridges as bridges_store
 from app.store import contacts as contacts_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
@@ -46,6 +48,8 @@ class BookEntry:
     # externals only: whether this contact is within the pager's `cfg.sms` cap (the first
     # `devices_store.MAX_SMS_CONTACTS` by name).
     onPager: bool | None = None
+    # `{source}` on an external that is a subscribed Google Chat / Voice DM.
+    chat: dict | None = None
 
     @property
     def label(self) -> str:
@@ -125,6 +129,13 @@ def rederive_sms_contacts(owner_uid: str, broker: BrokerClient) -> None:
     owner = users_store.get_user(owner_uid)
     if owner is None or owner.familyId is None:
         return
+    # An owner with a relay number reaches every SMS contact through `c[]`; the modem list
+    # is empty.
+    contacts = (
+        []
+        if owner.smsNumber
+        else sms_contacts_for(owner)[: devices_store.MAX_SMS_CONTACTS]
+    )
     sms_contacts = [
         SmsContact(name=truncate_sms_name(u.displayName), phone=u.phone or "") for u in contacts
     ]
@@ -132,6 +143,10 @@ def rederive_sms_contacts(owner_uid: str, broker: BrokerClient) -> None:
     for device in devices:
         devices_store.set_sms_contacts(device.id, sms_contacts)
         devcfg.push_sms_contacts(device.id, [c.model_dump() for c in sms_contacts], broker)
+    if owner.smsNumber:
+        # The contacts are in this owner's `c[]`: every trigger that re-derives the list also
+        # changes the book.
+        bump_and_push({owner_uid}, broker, reason="sms_contacts")
     implied = sum(
         1
         for u in contacts
@@ -153,6 +168,21 @@ def rederive_family_sms_contacts(family_id: str, broker: BrokerClient) -> None:
             rederive_sms_contacts(user.uid, broker)
 
 
+def bridge_peer_reason(
+    owner_uid: str, bridge_id: str, conversation_id: str, can_reply: bool
+) -> str | None:
+    """Why a Chat conversation cannot be written to: `no_bridge`, `paused`, `not_allowed`."""
+    bridge = bridges_store.get(bridge_id)
+    if bridge is None or not bridge.paired or bridge.ownerUid != owner_uid:
+        return "no_bridge"
+    row = bridge_conversations_store.get(bridge_id, conversation_id)
+    if row is not None and row.status == "paused":
+        return "paused"
+    if not can_reply:
+        return "not_allowed"
+    return None
+
+
 def entries_for(owner_uid: str) -> list[BookEntry]:
     """Same-family persons, out-edge peers and groups; `sendable`/`reason` from `policy.check`."""
     owner = users_store.get_user(owner_uid)
@@ -167,6 +197,7 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
     denied_in = {e.fromUid for e in all_edges if e.toUid == owner_uid and not e.message}
 
     sms_contacts = sms_contacts_for(owner)
+    chat_contacts: list[User] = []
     peers: dict[str, tuple[User, bool]] = {}
     if owner.familyId is not None:
         for user in users_store.list_users():
@@ -181,6 +212,17 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
         if uid == owner_uid or uid in peers:
             continue
         user = users_store.get_user(uid)
+        if user is None or user.disabled:
+            continue
+        if user.kind == "external":
+            # Chat and fed contacts are listed from out-edges; SMS contacts come from
+            # `sms_contacts_for`; a group's external is represented by the group entry.
+            if (
+                user.chat
+                and user.ownerFamilyId == owner.familyId
+                and not user.chat.get("isGroup")
+            ):
+                chat_contacts.append(user)
             continue
         peers[uid] = (user, same_family_persons(owner, user))
 
@@ -204,6 +246,19 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
             )
         )
     # Externals come only from `sms_contacts_for`; with a relay number `sendable` follows the
+    # routing policy gate, without one they are the modem's.
+        if not owner.smsNumber:
+            sendable, reason = False, "no_sms_number"
+        else:
+            has_out = allow_store.get_edge(owner_uid, contact.uid)
+            has_in = allow_store.get_edge(contact.uid, owner_uid)
+            reason = policy_module.check(
+                owner,
+                contact,
+                bool(has_out and has_out.message),
+                bool(has_in and has_in.message),
+            )
+            sendable = reason is None
         entries.append(
             BookEntry(
                 uid=contact.uid,
@@ -213,11 +268,47 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
                 nick=nicks.get(contact.uid),
                 phone=contact.phone,
                 inFamily=False,
+                sendable=sendable,
+                reason=reason,
+            )
+        )
+    for contact in chat_contacts:
+        chat = contact.chat or {}
+        reason = policy_module.check(owner, contact, True, False)
+        if reason is None:
+            reason = bridge_peer_reason(
+                owner_uid,
+                str(chat.get("bridgeId") or ""),
+                str(chat.get("conversationId") or ""),
+                chat.get("canReply") is not False,
+            )
+        entries.append(
+            BookEntry(
+                uid=contact.uid,
+                alias=contact.alias,
+                kind="external",
+                displayName=contact.displayName,
+                nick=nicks.get(contact.uid),
+                phone=None,
+                inFamily=False,
+                sendable=reason is None,
+                reason=reason,
+                chat={"source": chat.get("source")},
             )
         )
     for conv in conversations_store.list_groups_for_member(owner_uid):
         if conv.alias is None:
             continue
+        group_reason: str | None = None
+        if conv.bridge is not None:
+            other = next((u for u in conv.uids if u != owner_uid), None)
+            ext = users_store.get_user(other) if other else None
+            group_reason = bridge_peer_reason(
+                owner_uid,
+                str(conv.bridge.get("bridgeId") or ""),
+                str(conv.bridge.get("conversationId") or ""),
+                ext is not None and (ext.chat or {}).get("canReply") is not False,
+            )
         entries.append(
             BookEntry(
                 uid=None,
@@ -227,6 +318,8 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
                 nick=None,
                 phone=None,
                 inFamily=False,
+                sendable=group_reason is None,
+                reason=group_reason,
             )
         )
     return entries

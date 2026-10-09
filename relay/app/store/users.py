@@ -68,6 +68,18 @@ class User(BaseModel):
     notify: Notify = Field(default_factory=Notify)
     disabled: bool = False
     createdAt: datetime | None = None
+    smsNumber: str | None = None
+    # Set on an external standing for a subscribed Google Chat conversation: `{bridgeId,
+    # conversationId, source, link, isGroup, title, canReply}`.
+    chat: dict | None = None
+
+
+class SmsNumberTaken(Exception):
+    """`smsNumbers/{e164}` is held by another uid (`holder_uid`)."""
+
+    def __init__(self, holder_uid: str) -> None:
+        super().__init__(f"sms number already assigned to {holder_uid!r}")
+        self.holder_uid = holder_uid
 
 
 class AliasTaken(Exception):
@@ -102,6 +114,7 @@ def create_user(
     family_id: str | None = None,
     kind: Kind = "person",
     owner_family_id: str | None = None,
+    chat: dict | None = None,
 ) -> User:
     """Creates the user and alias atomically (`AliasTaken` if taken); policy defaults by `role`."""
     _validate_alias(alias)
@@ -130,6 +143,7 @@ def create_user(
                 "notify": {"alerts": True},
                 "disabled": False,
                 "createdAt": SERVER_TIMESTAMP,
+                **({"chat": chat} if chat is not None else {}),
             },
         )
 
@@ -140,6 +154,8 @@ def create_user(
 
     # Every non-external user gets an implicit webapp backend, outside the uid/alias transaction
     # so a failed backend write does not roll back the user. An external's only backend is `sms`.
+    if kind == "person":
+        backends_store.create_backend(uid, kind="webapp", config={}, enabled=True)
 
     fetched = get_user(uid)
     assert fetched is not None
@@ -211,6 +227,52 @@ def update_user(
     return fetched
 
 
+def _sms_numbers():
+    return get_db().collection("smsNumbers")
+
+
+def get_uid_for_sms_number(e164: str) -> str | None:
+    """The uid `smsNumbers/{e164}` names, or `None`."""
+    snap = _sms_numbers().document(e164).get()
+    if not snap.exists:
+        return None
+    return (snap.to_dict() or {}).get("uid")
+
+
+def _free_sms_index(e164: str, uid: str) -> None:
+    ref = _sms_numbers().document(e164)
+    snap = ref.get()
+    if snap.exists and (snap.to_dict() or {}).get("uid") == uid:
+        ref.delete()
+
+
+def set_sms_number(uid: str, e164: str | None) -> User:
+    """Sets or clears `smsNumber`, reserving the index first; `SmsNumberTaken` if held."""
+    user = get_user(uid)
+    if user is None:
+        raise KeyError(f"no such user: {uid!r}")
+    old = user.smsNumber
+    # Known race, accepted at family volume: two admins assigning the same
+    # number in the same second can both pass the reservation below.
+    if e164 is not None:
+        ref = _sms_numbers().document(e164)
+        try:
+            ref.create({"uid": uid})
+        except AlreadyExists:
+            holder = (ref.get().to_dict() or {}).get("uid")
+            if holder != uid:
+                holder_user = get_user(holder) if holder else None
+                if holder_user is not None and holder_user.smsNumber == e164:
+                    raise SmsNumberTaken(holder) from None
+                ref.set({"uid": uid})
+    get_db().collection("users").document(uid).update({"smsNumber": e164})
+    if old is not None and old != e164:
+        _free_sms_index(old, uid)
+    fetched = get_user(uid)
+    assert fetched is not None
+    return fetched
+
+
 def delete_user(uid: str) -> None:
     """Deletes `users/{uid}` and its alias; no cascade to backends, devices, messages or edges."""
     db = get_db()
@@ -225,5 +287,7 @@ def delete_user(uid: str) -> None:
             transaction.delete(user_ref)
 
         run_transaction(_txn)
+        if user.smsNumber:
+            _free_sms_index(user.smsNumber, uid)
     else:
         user_ref.delete()

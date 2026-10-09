@@ -223,6 +223,7 @@ class StatusEnvelope(BaseModel):
     loc_period_s: int | None = None
     loc_min_s: int | None = None
     # CA trust state (optional): trust state and the first 16 hex chars of the pinned CA's SHA-256.
+    tls: Literal["unpinned", "pinned", "broken", "proxy"] | None = None
     ca_fp: str | None = None
     # Seconds until the device's own backoff next allows an attempt, 0 = now (optional); the bound
     # is generous so a backoff retune is not rejected.
@@ -244,6 +245,11 @@ class StatusEnvelope(BaseModel):
     bpull: int | None = None
     # GNSS-while-moving interval in seconds, 0 = off (display only; docs/PROTOCOL.md §13.3).
     loc_move_s: int | None = None
+    # 1 = GNSS enabled, 0 = disabled by `cfg.loc.gnss`; display only. Other values drop to `None`.
+    gnss: int | None = None
+    # Carrier name the pager detected (key 70), display only; over-long or non-printable values
+    # drop to `None`.
+    car: str | None = None
     # OTA fields (keys 62-67), display only except `img`/`ota` (the relay's delta choice and push
     # gate); a malformed value drops to `None` (`_drop_bad_ota_field`).
     img: str | None = None
@@ -300,6 +306,18 @@ class StatusEnvelope(BaseModel):
         if value is not None and not (0 <= value <= 65535):
             raise ValueError("abn out of range")
         return value
+
+    @field_validator("gnss")
+    @classmethod
+    def _check_gnss(cls, value: int | None) -> int | None:
+        return value if value in (0, 1) else None
+
+    @field_validator("car")
+    @classmethod
+    def _check_car(cls, value: str | None) -> str | None:
+        if value is None or (len(value) <= 24 and value.isprintable() and value.isascii()):
+            return value
+        return None
 
     @field_validator("bpull")
     @classmethod

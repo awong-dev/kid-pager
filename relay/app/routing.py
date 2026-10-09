@@ -14,6 +14,7 @@ from app.broker import BrokerClient
 from app.ids import new_id
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import bridges as bridges_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
@@ -21,12 +22,21 @@ from app.store import users as users_store
 from app.store.backends import Backend as BackendRow
 from app.store.conversations import Conversation
 from app.store.messages import Delivery, Message, MessageKind
+from app.store.users import User
 
 logger = logging.getLogger("relay.routing")
 
 # `sms_contact`: both sides external, or a contact that is disabled or in another family.
 # `no_sms_number`: an external/person pair where the person has no smsNumber.
 RejectReason = Literal[
+    "unknown_alias",
+    "not_allowed",
+    "not_member",
+    "policy_out",
+    "policy_in",
+    "sms_contact",
+    "no_sms_number",
+    "no_bridge",
 ]
 
 
@@ -70,6 +80,7 @@ class Routing:
         wire_id: str | None = None,
         device_id: str | None = None,
         ts: int | None = None,
+        sender_alias: str | None = None,
     ) -> SendResult:
         ts = ts if ts is not None else int(time.time())
 
@@ -86,17 +97,23 @@ class Routing:
                     origin_backend_id=origin_backend_id,
                     wire_id=wire_id,
                     ts=ts,
+                    sender_alias=sender_alias,
                 )
 
         candidates, rejected = self._candidate_recipients(sender_uid, recipient_alias, device_id)
 
         for recipient_uid in candidates:
+            sms_reason = self._sms_route_reject(sender_uid, recipient_uid)
+            if sms_reason is not None:
                 logger.warning(
+                    "SECURITY sender %s cannot reach sms peer %s (alias=%r) reason=%s",
                     sender_uid,
                     recipient_uid,
                     recipient_alias,
+                    sms_reason,
                 )
                 rejected.append(
+                    RejectedRecipient(alias=recipient_alias, uid=recipient_uid, reason=sms_reason)
                 )
                 continue
             reason = self._policy_reject_reason(sender_uid, recipient_uid)
@@ -153,6 +170,8 @@ class Routing:
             device = devices_store.get_device(device_id)
             if device is not None:
                 default_uid = device.defaultToUid
+        if default_uid is not None and _is_external(default_uid):
+            default_uid = None
         if default_uid is not None:
             return [default_uid], []
         broadcast = [
@@ -161,6 +180,36 @@ class Routing:
         return broadcast, []
 
 
+        """`sms_contact` for external-to-external; an external/person pair needs a smsNumber."""
+        sender = users_store.get_user(sender_uid)
+        recipient = users_store.get_user(recipient_uid)
+        sender_ext = sender is not None and sender.kind == "external"
+        recipient_ext = recipient is not None and recipient.kind == "external"
+        if sender_ext and recipient_ext:
+            return "sms_contact"
+        if sender_ext or recipient_ext:
+            person = recipient if sender_ext else sender
+            ext = sender if sender_ext else recipient
+            assert ext is not None
+            # A contact belongs to one family and must be live.
+            if ext.disabled or person is None or ext.ownerFamilyId != person.familyId:
+                return "sms_contact"
+            if bridge_row is not None:
+                return self._bridge_route_reject(ext, person, bridge_row, outbound=recipient_ext)
+            if not person.smsNumber:
+                return "no_sms_number"
+        return None
+
+    def _bridge_route_reject(
+        self, ext: User, person: User, bridge_row: BackendRow, *, outbound: bool
+    ) -> RejectReason | None:
+        """A bridge external pairs only with its bridge's paired owner; read-only blocks sends."""
+        bridge = bridges_store.get(str(bridge_row.config.get("bridgeId") or ""))
+        if bridge is None or not bridge.paired or bridge.ownerUid != person.uid:
+            return "no_bridge"
+        if outbound and (ext.chat or {}).get("canReply") is False:
+            return "not_allowed"
+        return None
 
 
     def _policy_reject_reason(self, sender_uid: str, recipient_uid: str) -> RejectReason | None:
@@ -189,6 +238,7 @@ class Routing:
         origin_backend_id: str | None,
         wire_id: str | None,
         ts: int,
+        sender_alias: str | None = None,
     ) -> SendResult:
         if sender_uid not in group.uids:
             logger.warning(
@@ -204,6 +254,9 @@ class Routing:
                 ],
             )
 
+        if sender_alias is None:
+            sender = users_store.get_user(sender_uid)
+            sender_alias = sender.alias if sender is not None else sender_uid
 
         seq = messages_store.allocate_seq()
         # A device-originated send reuses its wire_id as groupMsgId so a redelivery repairs the
@@ -215,8 +268,25 @@ class Routing:
         sender_is_external = _is_external(sender_uid)
         for recipient_uid in sorted(uid for uid in group.uids if uid != sender_uid):
             # SMS contacts never join a relay group; a stale member is skipped. A bridge external
+            # may send or receive, and every pair with an external runs the route check first.
+            recipient_is_external = _is_external(recipient_uid)
+            if (sender_is_external and not sender_is_bridge) or (
+            ):
                 logger.debug("skipping sms contact in group %s fan-out", group.convKey)
                 continue
+            if sender_is_external or recipient_is_external:
+                if route_reason is not None:
+                    logger.warning(
+                        "SECURITY sender %s cannot reach bridge peer %s (group=%s) reason=%s",
+                        sender_uid,
+                        recipient_uid,
+                        group.convKey,
+                        route_reason,
+                    )
+                    rejected.append(
+                        RejectedRecipient(alias=group.alias, uid=recipient_uid, reason=route_reason)
+                    )
+                    continue
             reason = self._policy_reject_reason(sender_uid, recipient_uid)
             if reason is not None:
                 logger.warning(
@@ -245,6 +315,21 @@ class Routing:
             return False
         # Via _deliver_one so retries get the same attempts/failed bookkeeping.
         self._deliver_one(msg, bid, delivery, backend_row)
+        return True
+
+    def redeliver(self, msg: Message, bid: str) -> bool:
+        """Re-runs delivery `bid` of any backend kind; False if the delivery or backend is gone."""
+        # Re-read: an earlier attempt may have sent it (a second deliver() would text twice).
+        fresh = messages_store.get_message(msg.id)
+        delivery = fresh.deliveries.get(bid) if fresh is not None else None
+        if fresh is None or delivery is None or delivery.state != "queued":
+            return False
+        backend_row = backends_store.get_backend(msg.recipientUid, bid)
+        if backend_row is None:
+            return False
+        if self._registry.get(backend_row.kind) is None:
+            return False
+        self._deliver_one(fresh, bid, delivery, backend_row)
         return True
 
 

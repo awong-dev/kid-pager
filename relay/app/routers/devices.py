@@ -80,6 +80,50 @@ def put_sms_contacts(
     raise HTTPException(
         status_code=405, detail="Managed from People → Approved numbers"
     )
+
+
+class GnssConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    en: bool
+
+
+class GnssConfigResponse(BaseModel):
+    en: bool
+    pending: bool
+    # Last `/status` `gnss` (0/1); None = never reported / older firmware.
+    reported: int | None = None
+
+
+def _gnss_response(device_id: str, device: Device) -> GnssConfigResponse:
+    return GnssConfigResponse(
+        en=devices_store.get_gnss_enabled(device_id),
+        pending=devcfg.loc_pending(device_id),
+        reported=device.status.gnss,
+    )
+
+
+@router.get("/{device_id}/gnss")
+def get_gnss(
+    device_id: str, authed: Annotated[AuthedUser, Depends(require_user)]
+) -> GnssConfigResponse:
+    device = _require_owner_or_admin(device_id, authed)
+    return _gnss_response(device_id, device)
+
+
+@router.put("/{device_id}/gnss")
+def put_gnss(
+    device_id: str,
+    req: GnssConfig,
+    authed: Annotated[AuthedUser, Depends(require_user)],
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+) -> GnssConfigResponse:
+    device = _require_owner_or_admin(device_id, authed)
+    devices_store.set_gnss_enabled(device_id, req.en)
+    devcfg.push_loc(device_id, gnss=req.en, broker=broker)
+    return _gnss_response(device_id, device)
+
+
 class SmsLogEntryOut(BaseModel):
     id: str
     ts: int

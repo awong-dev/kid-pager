@@ -27,6 +27,12 @@ PRESETS: list[ApnPreset] = [
         apn="ereseller",
         note="Required: with the carrier default, TLS never connects on this SIM.",
     ),
+    ApnPreset(
+        id="soracom",
+        label="Soracom (Air for Cellular)",
+        apn="soracom.io",
+        note="The pager authenticates PAP/CHAP itself (user sora).",
+    ),
 ]
 
 

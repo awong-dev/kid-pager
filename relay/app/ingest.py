@@ -40,6 +40,9 @@ logger = logging.getLogger("relay.ingest")
 # PROTOCOL.md §4.2 case 3: the one exception to "never auto-reply on MQTT".
 UNKNOWN_RECIPIENT_BODY = "unknown recipient"
 
+NO_SMS_NUMBER_BODY = "sms not set up; ask your admin"
+NO_BRIDGE_BODY = "bridge not set up; ask your admin"
+
 
 
 def bad_number_body(name: str) -> str:
@@ -618,6 +621,9 @@ class Ingest:
         )
             # docs/PROTOCOL.md §4.2 case 3: an unknown or disallowed explicit `to` gets exactly one
             # `system` down reply, never stored as a message, one per offending up message.
+            body = (
+            )
+            self._send_system_reply(device.id, body, cause_id=env.id)
 
     def _send_system_reply(self, device_id: str, body: str, *, cause_id: str) -> None:
         # The reply's `id` is derived from the offending up message's id (docs/PROTOCOL.md §4.2);
@@ -675,6 +681,8 @@ class Ingest:
             caFp=env.ca_fp,
             locBackoffS=env.loc_backoff_s,
             locMoveS=env.loc_move_s,
+            gnss=env.gnss,
+            car=env.car,
             smsLost=env.sms_lost,
             link=env.link,
             rst=env.rst,

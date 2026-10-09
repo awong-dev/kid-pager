@@ -47,6 +47,8 @@ _PENDING_CFG_FIELD = "pendingCfg"
 _PENDING_CFG_CA_FIELD = "pendingCfgCa"
 # `cfg.sms` has its own pending slot, for the same reason.
 _PENDING_CFG_SMS_FIELD = "pendingCfgSms"
+# `cfg.loc` has its own pending slot.
+_PENDING_CFG_LOC_FIELD = "pendingCfgLoc"
 # `cfg.ota` (job or cancel) has its own slot; a newer push (including a cancel) replaces the
 # older one.
 _PENDING_CFG_OTA_FIELD = "pendingCfgOta"
@@ -56,6 +58,7 @@ _ALL_PENDING_FIELDS = (
     _PENDING_CFG_FIELD,
     _PENDING_CFG_CA_FIELD,
     _PENDING_CFG_SMS_FIELD,
+    _PENDING_CFG_LOC_FIELD,
     _PENDING_CFG_OTA_FIELD,
 )
 
@@ -102,6 +105,13 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
         {
             "a": e.alias,
             "n": e.label[:_BOOK_NAME_MAX_CODEPOINTS],
+            "t": (
+                "grp"
+                if e.kind == "group"
+                else ("chat" if e.chat else "sms")
+                if e.kind == "external"
+                else _contact_type_hint(e.uid)  # type: ignore[arg-type]
+            ),
         }
         for e in book.entries_for(owner_uid)
     ]
@@ -394,6 +404,31 @@ def push_sms_contacts(
     return broker.publish_down(device_id, obj)
 
 
+def push_loc(device_id: str, *, gnss: bool, broker: BrokerClient) -> bool:
+    """`/down cfg.loc = {gnss}`, under its own pending slot (`_PENDING_CFG_LOC_FIELD`)."""
+    if devices_store.get_device(device_id) is None:
+        logger.warning("push_loc: no such device %s", device_id)
+        return False
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "cfg",
+        "cfg": {"loc": {"gnss": gnss}},
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    _set_pending(device_id, _PENDING_CFG_LOC_FIELD, obj)
+    return broker.publish_down(device_id, obj)
+
+
+def loc_pending(device_id: str) -> bool:
+    """True iff this device has a pushed `cfg.loc` not yet acked `shown`."""
+    snap = _devices().document(device_id).get()
+    if not snap.exists:
+        return False
+    pending = (snap.to_dict() or {}).get(_PENDING_CFG_LOC_FIELD)
+    return isinstance(pending, dict) and not pending.get("acked", False)
 
 
 def sms_pending(device_id: str) -> bool:

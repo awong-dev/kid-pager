@@ -225,6 +225,8 @@ def test_approve_sms_unknown_creates_external_edge_and_rederives_sms_contacts(
         f"/api/family/alerts/{alert_id}/approve", json={"name": "Aunt Sue"}, headers=headers
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["alert"]["status"] == "handled"
+    assert resp.json()["delivered"] == 0 and resp.json()["undelivered"] == 0
 
     ext_uid, _alias = externals_store.contact_ids(family.id, "+19995551234")
     assert users_store.get_user(ext_uid) is not None
@@ -362,6 +364,7 @@ def test_dismiss_marks_alert_dismissed(client: TestClient):
     raw_kinds = [
         snap.to_dict()["kind"]
     ]
+    assert raw_kinds == ["sms"]
 
 
 def _backdate_alert(family_id: str, alert_id: str, days_ago: int) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from app.backends.webapp import FCMClient, NullFCMClient
 from app.backends.webapp import push_alert as _push_alert
 from app.store import alerts as alerts_store
+from app.store import held_chat as held_chat_store
+from app.store import held_sms as held_sms_store
 from app.store import users as users_store
 from app.store.users import User
 
@@ -88,6 +90,43 @@ def sms_unknown(family_id: str, phone: str, target_uid: str | None, body: str) -
     return create(family_id, alert)
 
 
+def sms_held_upsert(family_id: str, target: User, phone: str, body: str) -> str:
+    """One open `sms_unknown` alert per `(family, person, number)`; later texts update it."""
+    count = held_sms_store.count_held(family_id, phone, target.uid)
+    preview = body[:PREVIEW_MAX_CHARS]
+    push_body = f"{phone} \u2192 @{target.alias}: {body}"
+    existing = alerts_store.find_open(family_id, "sms_unknown", target.uid, phone)
+    if existing is not None:
+        alerts_store.update_fields(
+            family_id, existing.id, {"preview": preview, "heldCount": count}
+        )
+        alert_id = existing.id
+        pushed = {**existing.model_dump(), "preview": preview}
+        _push_alert(
+            family_id, {**pushed, "id": alert_id, "pushBody": push_body}, fcm_client=_fcm_client
+        )
+        return alert_id
+    alert = _base_alert("sms_unknown")
+    alert.update(
+        {
+            "status": "open",
+            "subjectUid": target.uid,
+            "subjectAlias": target.alias,
+            "peerPhone": phone,
+            "preview": preview,
+            "heldBody": None,
+            "heldCount": count,
+            "updatedAt": None,
+            "pushBody": push_body,
+        }
+    )
+    # `pushBody` is push-only: stored alerts do not carry it.
+    stored = {k: v for k, v in alert.items() if k != "pushBody"}
+    alert_id = alerts_store.create(family_id, stored)
+    _push_alert(family_id, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return alert_id
+
+
     alert = _base_alert("contact_request")
     alert.update(
         {
@@ -96,3 +135,48 @@ def sms_unknown(family_id: str, phone: str, target_uid: str | None, body: str) -
             "subjectAlias": owner.alias,
         }
     )
+
+
+def chat_held_upsert(family_id: str, target: User, row, body: str, sender_name: str) -> str:
+    """One open `chat_unknown` alert per `(bridge, conversation)`; later texts update it."""
+    count = held_chat_store.count_held(row.id)
+    preview = body[:PREVIEW_MAX_CHARS]
+    title = row.title or "a conversation"
+    fields = {
+        "preview": preview,
+        "heldCount": count,
+        "people": list(row.people),
+        "convTitle": row.title,
+        "isGroup": row.isGroup,
+    }
+    existing = alerts_store.find_open(
+        family_id, "chat_unknown", target.uid, None, bridge_conv=(row.bridgeId, row.conversationId)
+    )
+    if existing is not None:
+        alerts_store.update_fields(family_id, existing.id, fields)
+        pushed = {**existing.model_dump(), **fields}
+        _push_alert(
+            family_id,
+            {**pushed, "id": existing.id, "pushBody": push_body},
+            fcm_client=_fcm_client,
+        )
+        return existing.id
+    alert = _base_alert("chat_unknown")
+    alert.update(
+        {
+            "status": "open",
+            "subjectUid": target.uid,
+            "subjectAlias": target.alias,
+            **fields,
+            "bridgeId": row.bridgeId,
+            "conversationId": row.conversationId,
+            "convRef": row.ref,
+            "source": row.source,
+            "updatedAt": None,
+        }
+    )
+    alert_id = alerts_store.create(family_id, alert)
+    _push_alert(
+        family_id, {**alert, "id": alert_id, "pushBody": push_body}, fcm_client=_fcm_client
+    )
+    return alert_id

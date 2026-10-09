@@ -124,6 +124,9 @@ service cloud.firestore {
     match /settings/{s} {
     }
 
+    // `bridges` (+ `outbox`), `bridgePairCodes`, `bridgeConversations` and `heldChat` are
+    // server-only (token hashes, FCM tokens, chat text): no match block, default-deny.
+
     // Clients never write; role/family are custom claims set by the relay.
     match /{document=**} {
       allow write: if false;

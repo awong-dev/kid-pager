@@ -6,6 +6,7 @@ Member, group and device writes reuse the `app/routers/admin.py` implementations
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -20,6 +21,7 @@ from app.db.firestore import get_db
 from app.ingest import Ingest
 from app.routers import admin as admin_router
 from app.routers import conversations as conversations_router
+from app.routing import Routing
 from app.store import alerts as alerts_store
 from app.store import allow as allow_store
 from app.store import contacts as contacts_store
@@ -27,6 +29,7 @@ from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import externals as externals_store
 from app.store import families as families_store
+from app.store import held_sms as held_sms_store
 from app.store import rate_limits as rate_limits_store
 from app.store import users as users_store
 from app.store.alerts import Alert
@@ -393,6 +396,8 @@ def _require_family_member(uid: str, family_id: str) -> User:
     return member
 
 
+def _approved_out(uid: str, family_id: str) -> ApprovedOut:
+    """The member's outgoing edges as the web lists them (shared by GET and PUT)."""
     people: list[ApprovedPerson] = []
     contacts: list[ApprovedContact] = []
     for edge in allow_store.list_edges():
@@ -402,6 +407,8 @@ def _require_family_member(uid: str, family_id: str) -> User:
         if peer is None:
             continue
         if peer.kind == "external":
+            # a Google Chat subscription edge is managed under Google Chat
+            if peer.ownerFamilyId == family_id and not peer.chat:
                 contacts.append(ApprovedContact(uid=peer.uid, message=edge.message))
         else:
             people.append(
@@ -410,6 +417,13 @@ def _require_family_member(uid: str, family_id: str) -> User:
     people.sort(key=lambda p: p.alias)
     contacts.sort(key=lambda c: c.uid)
     return ApprovedOut(people=people, contacts=contacts)
+
+
+@router.get("/members/{uid}/approved")
+def get_approved(uid: str, scope: FamilyScope) -> ApprovedOut:
+    _, family_id = scope
+    _require_family_member(uid, family_id)
+    return _approved_out(uid, family_id)
 
 
 @router.put("/members/{uid}/approved", dependencies=[Depends(require_family_write_rate_limit)])
@@ -443,27 +457,46 @@ def put_approved(
             contact is None
             or contact.kind != "external"
             or contact.ownerFamilyId != family_id
+            or contact.chat
         ):
             raise HTTPException(status_code=404, detail=f"no such contact: {c.uid}")
 
     for peer_uid, p in resolved_people:
         allow_store.set_edge(uid, peer_uid, message=p.message, locate=p.locate)
+    people_changed = bool(resolved_people)
 
+    # Full replacement: any outgoing edge of `uid` not listed is deleted, person or external.
+    kept_people_uids = {peer_uid for peer_uid, _ in resolved_people}
     kept_contact_uids = {c.uid for c in req.contacts}
+    peers: dict[str, User | None] = {}
     for edge in allow_store.list_edges():
         if edge.fromUid != uid:
             continue
+        if edge.toUid not in peers:
+            peers[edge.toUid] = users_store.get_user(edge.toUid)
+        peer = peers[edge.toUid]
+        if peer is None:
+            continue
+        if peer.kind == "external":
+            if peer.chat:
+                continue  # the subscribe edge belongs to Google Chat, not this editor
+            if edge.toUid not in kept_contact_uids:
+                allow_store.delete_edge(uid, edge.toUid)
+        elif edge.toUid not in kept_people_uids:
             allow_store.delete_edge(uid, edge.toUid)
+            people_changed = True
 
     for c in req.contacts:
         allow_store.set_edge(uid, c.uid, message=c.message, locate=False)
 
     rederive_family_sms_contacts(family_id, broker)
+    if people_changed:
         # `c[]` projects the member's people edges; bump then push for every device `uid` owns
         for device in devices_store.list_devices(owner_uid=uid):
             contacts_store.bump_book_version(device.id)
             devcfg.push_book(device.id, broker)
 
+    return _approved_out(uid, family_id)
 
 
 class ContactOut(BaseModel):
@@ -509,6 +542,7 @@ def _list_contacts(family_id: str) -> list[ContactOut]:
             impliedFor=sorted(set(implying) - has_edge.get(ext.uid, set())),
         )
         for ext in externals_store.list_family_contacts(family_id)
+        if not ext.chat
     ]
     out.sort(key=lambda c: c.displayName.casefold())
     return out
@@ -622,11 +656,22 @@ class ApproveAlertRequest(BaseModel):
     alias: str | None = None
 
 
+class AlertDecision(BaseModel):
+    """The decided `sms_unknown` alert plus how many held texts were delivered / left held."""
+
+    alert: Alert
+    delivered: int = 0
+    undelivered: int = 0
+
+
 def _approve_sms_unknown(
     alert: Alert,
     req: ApproveAlertRequest,
     family_id: str,
     broker: BrokerClient,
+    routing: Routing,
+) -> tuple[int, int]:
+    """Steps (a)-(e) in order, each idempotent so a retry finishes; returns `(delivered, undelivered)`."""
     if not req.name:
         raise HTTPException(status_code=400, detail="name is required")
     if alert.peerPhone is None:
@@ -643,15 +688,52 @@ def _approve_sms_unknown(
     if target is None or target.familyId != family_id:
         raise HTTPException(status_code=403, detail="target is not a member of this family")
 
+    # (a) nothing is written if the member's inbound policy refuses numbers.
+    if held and policy_module.rule(target.policy.in_, "external") == "none":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"@{target.alias}'s inbound policy does not allow numbers; "
+                "change it under People"
+            ),
+        )
+
+    # (b) the contact.
     try:
         external = externals_store.get_or_create(family_id, alert.peerPhone, req.name)
     except externals_store.ContactNameTaken as exc:
         raise _name_taken(family_id, exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # (c) the edge.
     allow_store.set_edge(target_uid, external.uid, message=True, locate=False)
     allow_store.recompute_locatable_by_for_owner(external.uid)
+    # (d) the contact reaches the family's pagers; the member's book changes.
     rederive_family_sms_contacts(family_id, broker)
+    book.bump_and_push({target_uid}, broker, reason="sms_approve")
+
+    # (e) the backlog, oldest first.
+    delivered = undelivered = 0
+    bid = externals_store.ensure_sms_backend(external)
+    for row in held:
+            continue
+        result = routing.send(
+            sender_uid=external.uid,
+            recipient_alias=target.alias,
+            kind="text",
+            body=pager_text,
+            origin_backend_kind="sms",
+            origin_backend_id=bid,
+            wire_id=row.id,
+            ts=int(row.receivedAt.timestamp()),
+        )
+        if result.rejected:
+            undelivered += 1
+            continue
+        # a deduplicated send (empty `messages`) was delivered earlier
+        held_sms_store.set_status([row.id], "delivered")
+        delivered += 1
+    return delivered, undelivered
 
 
 def _approve_new_conversation(alert: Alert) -> None:
@@ -667,18 +749,56 @@ def _approve_new_conversation(alert: Alert) -> None:
     book.bump_and_push({owner.uid}, broker, reason="contact_approve")
 
 
+class HeldTextOut(BaseModel):
+    id: str
+    body: str
+    receivedAt: datetime
+    status: str
+
+
+class HeldTextsOut(BaseModel):
+    held: list[HeldTextOut]
+
+
+@router.get("/alerts/{alert_id}/held")
+def list_alert_held(alert_id: str, scope: FamilyScope) -> HeldTextsOut:
+    """The texts behind an `sms_unknown` alert, oldest first, every status."""
+    _, family_id = scope
+    alert = alerts_store.get(family_id, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="no such alert")
+    if alert.kind != "sms_unknown" or alert.peerPhone is None or alert.subjectUid is None:
+        return HeldTextsOut(held=[])
+    rows = held_sms_store.list_held(family_id, alert.peerPhone, alert.subjectUid, status=None)
+    return HeldTextsOut(
+        held=[
+            HeldTextOut(id=r.id, body=r.body, receivedAt=r.receivedAt, status=r.status)
+            for r in rows
+        ]
+    )
+
+
 @router.post("/alerts/{alert_id}/approve", dependencies=[Depends(require_family_write_rate_limit)])
 def approve_alert(
     alert_id: str,
     req: ApproveAlertRequest,
     scope: FamilyScope,
     broker: Annotated[BrokerClient, Depends(get_broker)],
+    routing: Annotated[Routing, Depends(conversations_router.get_routing)],
+) -> Alert | AlertDecision:
     principal, family_id = scope
     alert = _require_open_family_alert(alert_id, family_id)
 
     if alert.kind == "sms_unknown":
+        delivered, undelivered = _approve_sms_unknown(alert, req, family_id, broker, routing)
+        decided = alerts_store.decide(family_id, alert_id, "handled", principal.uid)
+        return AlertDecision(alert=decided, delivered=delivered, undelivered=undelivered)
     elif alert.kind == "new_conversation":
         _approve_new_conversation(alert)
+    elif alert.kind == "chat_unknown":
+        raise HTTPException(
+            status_code=400, detail="subscribe this conversation under People \u2192 Google Chat"
+        )
     else:  # "contact_request"
 
     return alerts_store.decide(family_id, alert_id, "handled", principal.uid)
@@ -701,6 +821,17 @@ def _reject_linked_contact_request(
     devcfg.push_book(request.deviceId, broker)
 
 
+def _mark_held(family_id: str, alert: Alert, status: held_sms_store.HeldStatus) -> None:
+    """Set `status` on the alert's still-`held` texts; block covers every family member."""
+    if alert.peerPhone is None:
+        return
+    to_uid = None if status == "blocked" else alert.subjectUid
+    if status != "blocked" and to_uid is None:
+        return
+    rows = held_sms_store.list_held(family_id, alert.peerPhone, to_uid, status="held")
+    held_sms_store.set_status([r.id for r in rows], status)
+
+
 @router.post("/alerts/{alert_id}/block", dependencies=[Depends(require_family_write_rate_limit)])
 def block_alert(
     alert_id: str,
@@ -710,8 +841,22 @@ def block_alert(
     """Add the alert's `peerPhone` to `families.blockedNumbers` (no-op if it has none)."""
     principal, family_id = scope
     alert = _require_open_family_alert(alert_id, family_id)
+    if alert.kind == "chat_unknown":
+        raise HTTPException(
+            status_code=400, detail="use Ignore for a Google Chat conversation"
+        )
     if alert.peerPhone is not None:
         families_store.add_blocked_number(family_id, alert.peerPhone)
+        if alert.kind == "sms_unknown":
+            _mark_held(family_id, alert, "blocked")
+            # decide every other open alert for this number
+            for other in alerts_store.list_alerts(family_id, "open"):
+                if (
+                    other.id != alert.id
+                    and other.kind == "sms_unknown"
+                    and other.peerPhone == alert.peerPhone
+                ):
+                    alerts_store.decide(family_id, other.id, "handled", principal.uid)
     _reject_linked_contact_request(alert, "blocked", principal.uid, broker)
     return alerts_store.decide(family_id, alert_id, "handled", principal.uid)
 
@@ -725,4 +870,8 @@ def dismiss_alert(
     principal, family_id = scope
     alert = _require_open_family_alert(alert_id, family_id)
     _reject_linked_contact_request(alert, "dismissed", principal.uid, broker)
+    if alert.kind == "sms_unknown":
+        _mark_held(family_id, alert, "dismissed")
+    if alert.kind == "chat_unknown" and alert.bridgeId and alert.conversationId:
+        )
     return alerts_store.decide(family_id, alert_id, "dismissed", principal.uid)

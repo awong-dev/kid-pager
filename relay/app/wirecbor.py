@@ -94,6 +94,10 @@ KEYMAP: dict[str, int] = {
     "ota_err": 67,
     # `/status` battery-stats sub-map.
     "bs": 68,
+    # `/status` GNSS-enabled flag (uint 0/1).
+    "gnss": 69,
+    # `/status` carrier name (tstr <= 24).
+    "car": 70,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
@@ -142,6 +146,9 @@ _REVERSE_SMS_CONTACT = {v: k for k, v in SMS_CONTACT_KEYMAP.items()}
 _REVERSE_CFG = {v: k for k, v in CFG_KEYMAP.items()}
 _REVERSE_CELL = {v: k for k, v in CELL_KEYMAP.items()}
 _REVERSE_OTA = {v: k for k, v in OTA_KEYMAP.items()}
+# `cfg.loc = {gnss}`, `gnss` is a bool.
+CFG_LOC_KEYMAP: dict[str, int] = {"gnss": 0}
+_REVERSE_CFG_LOC = {v: k for k, v in CFG_LOC_KEYMAP.items()}
 
 
 def _ota_to_int(v: dict[str, Any]) -> dict[int, Any]:
@@ -196,6 +203,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
                 ]
             elif k == "ota" and isinstance(v, dict):
                 out[CFG_KEYMAP["ota"]] = _ota_to_int(v)
+            elif k == "loc" and isinstance(v, dict):
+                out[CFG_KEYMAP["loc"]] = {CFG_LOC_KEYMAP[lk]: lv for lk, lv in v.items()}
             else:
                 # §3.2: unknown members of cfg are ignored: a future member passes through under
                 # its JSON name.
@@ -229,6 +238,9 @@ def _value_to_names(name: str, value: Any) -> Any:
                 ]
             elif k == CFG_KEYMAP["ota"] and isinstance(v, dict):
                 out["ota"] = _ota_to_names(v)
+            elif k == CFG_KEYMAP["loc"] and isinstance(v, dict):
+                # Unknown sub-keys are ignored.
+                out["loc"] = {_REVERSE_CFG_LOC[lk]: lv for lk, lv in v.items() if lk in _REVERSE_CFG_LOC}
             else:
                 out[_REVERSE_CFG.get(k, k)] = v
         return out

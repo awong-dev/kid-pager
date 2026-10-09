@@ -29,6 +29,12 @@ def rule(policy_code: str, peer_kind: PeerKind) -> Rule:
     return people_rule if peer_kind == "person" else numbers_rule
 
 
+def _peer_kind(user: _UserLike) -> PeerKind:
+    """Externals standing for a Chat subscription or a federated person count as people."""
+        return "person"
+    return user.kind  # type: ignore[return-value]
+
+
 class _PolicyLike(Protocol):
     out: str
     in_: str
@@ -47,12 +53,14 @@ def check(
     `has_edge_out`/`has_edge_in` are the `allow` edges sender->recipient and recipient->sender.
     """
     if sender.kind != "external":
+        out_rule = rule(sender.policy.out, _peer_kind(recipient))
         if out_rule == "none":
             return "policy_out"
         if out_rule == "approved" and not has_edge_out:
             return "not_allowed"
 
     if recipient.kind != "external":
+        in_rule = rule(recipient.policy.in_, _peer_kind(sender))
         if in_rule == "none":
             return "policy_in"
         if in_rule == "approved" and not has_edge_in:

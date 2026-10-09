@@ -65,11 +65,13 @@ class WebappBackend:
 
 
 ALERT_URL = "/family/alerts"
+PUSH_BODY_MAX_CHARS = 300
 
 _ALERT_TITLES = {
     "new_conversation": lambda a: f"New chat: @{a['subjectAlias']} ↔ @{a.get('peerAlias')}",
     "sms_unknown": lambda a: f"Text from an unknown number for @{a['subjectAlias']}",
     "contact_request": lambda a: f"Contact request from @{a['subjectAlias']}'s pager",
+    "chat_unknown": lambda a: f"Google Chat for @{a['subjectAlias']}: {a.get('convTitle') or 'a conversation'}",
 }
 
 
@@ -83,6 +85,12 @@ def push_alert(family_id: str, alert: dict, fcm_client: FCMClient | None = None)
         "alertKind": str(alert["kind"]),
         "id": str(alert["id"]),
         "title": title_fn(alert),
+        # `pushBody` (held texts) carries the sender and the text; push-only, never stored.
+        "body": (
+            alert["pushBody"][:PUSH_BODY_MAX_CHARS]
+            if alert.get("pushBody")
+            else (alert.get("preview") or "")[:PREVIEW_MAX_CHARS]
+        ),
         "url": ALERT_URL,
     }
         try:

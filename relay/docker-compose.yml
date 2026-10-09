@@ -31,6 +31,8 @@ services:
         condition: service_healthy
       firebase:
         condition: service_healthy
+      bridge-sim:
+        condition: service_started
     # required: false -- some Docker Compose versions resolve every service's env_file even for
     # `down`, which fails when relay/.env is absent.
     env_file:
@@ -42,6 +44,7 @@ services:
       FIREBASE_AUTH_EMULATOR_HOST: firebase:9099
       GOOGLE_CLOUD_PROJECT: demo-pager
       DEV_MODE: "1"
+      PUBLIC_BASE_URL: http://localhost:8000
       # Raised rate limits for tools/e2e_v2.py's many admin writes; test-only, never for deployment.
       RATE_LIMIT_BACKEND_CREATE_LIMIT: "1000"
       RATE_LIMIT_ADMIN_WRITE_LIMIT: "1000"
@@ -71,6 +74,20 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+    networks:
+      - pager-net
+
+  # Stand-in for the headless bridge phone, with a control plane on :8020 (tools/bridge_sim.py).
+  bridge-sim:
+    build:
+      context: ../tools
+      dockerfile: mocks/bridge_sim.Dockerfile
+    environment:
+      RELAY_URL: http://relay:8000
+      BRIDGE_SIM_SIM_NUMBER: "+15550007777"
+      BRIDGE_SIM_HEARTBEAT_S: "30"
+    ports:
+      - "8020:8020"
     networks:
       - pager-net
 

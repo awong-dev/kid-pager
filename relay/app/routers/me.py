@@ -216,6 +216,10 @@ def create_backend(
     authed: Annotated[AuthedUser, Depends(require_backend_create_rate_limit)],
     registry: Annotated[dict[str, BackendImpl], Depends(get_backend_registry)],
 ) -> Backend:
+    if req.kind in ("sms", "bridge"):
+        raise HTTPException(
+            status_code=422, detail=f"{req.kind} backends are managed by the relay, not self-service"
+        )
     if req.kind == "pager":
         # a pager backend's `config.deviceId` must name a device the user owns: admin-provisioned
         raise HTTPException(status_code=400, detail="pager backends are admin-provisioned")

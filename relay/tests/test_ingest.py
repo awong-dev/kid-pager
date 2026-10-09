@@ -979,6 +979,7 @@ def test_status_bv_behind_renudges_same_id(monkeypatch):
     assert "url" in books2[0]
 
 
+def test_up_message_to_external_alias_without_relay_number_gets_one_sms_not_set_up_reply():
     """The relay never texts an SMS contact (the pager does, from `cfg.sms`):
     an `up` addressed to one takes the §4.2 case-3 path -- one derived-id
     `unknown recipient` reply, nothing stored, even with an explicit edge."""
@@ -1008,6 +1009,8 @@ def test_status_bv_behind_renudges_same_id(monkeypatch):
     ingest.handle_up(up_topic("pgr-v2-ext"), payload)  # at-least-once redelivery
 
     sent = [json.loads(p.payload) for p in broker.published]
+    # The student has no relay SMS number.
+    assert [m["body"] for m in sent] == ["sms not set up; ask your admin"] * 2
     assert all(m["from"] == "system" for m in sent)
     assert sent[0]["id"] == sent[1]["id"]
     assert list(get_db().collection("messages").stream()) == []

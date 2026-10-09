@@ -516,6 +516,7 @@ def _make_contact(family_id: str, phone: str = "+12065550100", name: str = "Gran
     return externals_store.get_or_create(family_id, phone, name)
 
 
+def test_dm_to_external_without_sender_number_is_rejected_no_sms_number(
     routing: Routing, caplog
 ):
     fam = families_store.create_family(name="F", created_by="root").id
@@ -538,10 +539,47 @@ def _make_contact(family_id: str, phone: str = "+12065550100", name: str = "Gran
 
     assert result.messages == []
     assert result.rejected == [
+        RejectedRecipient(alias=ext.alias, uid=ext.uid, reason="no_sms_number")
     ]
     assert list(get_db().collection("messages").stream()) == []
     assert list(get_db().collection("conversations").stream()) == []
     assert alerts_store.list_alerts(fam, "all") == []
+    assert any("cannot reach sms peer" in rec.message for rec in caplog.records)
+
+
+def test_external_to_external_is_rejected_sms_contact(routing: Routing):
+    fam = families_store.create_family(name="F", created_by="root").id
+    a = _make_contact(fam, "+12065550100", "A")
+    b = _make_contact(fam, "+12065550101", "B")
+    result = routing.send(
+        sender_uid=a.uid,
+        recipient_alias=b.alias,
+        kind="text",
+        body="hi",
+        origin_backend_kind="sms",
+    )
+    assert result.messages == []
+    assert [r.reason for r in result.rejected] == ["sms_contact"]
+
+
+    fam = families_store.create_family(name="F", created_by="root").id
+    _make_user("alice", "alice", family_id=fam)
+    get_db().collection("users").document("alice").update(
+        {"policy": {"out": "open", "in": "any"}}
+    )
+    users_store.set_sms_number("alice", "+12065550777")
+    ext = _make_contact(fam)
+
+    result = routing.send(
+        sender_uid="alice",
+        recipient_alias=ext.alias,
+        kind="text",
+        body="hi gran",
+        origin_backend_kind="webapp",
+    )
+
+    assert result.rejected == []
+    (msg,) = result.messages
 
 
 def test_broadcast_skips_externals(routing: Routing):

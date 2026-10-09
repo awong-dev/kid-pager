@@ -29,7 +29,15 @@ def _backends(uid: str):
 
 
 def create_backend(
+    uid: str,
+    *,
+    kind: BackendKind,
+    config: dict | None = None,
+    enabled: bool = True,
+    bid: str | None = None,
 ) -> Backend:
+    """`bid` pins the document id (idempotent `set`); default is a random one."""
+    bid = bid or uuid.uuid4().hex[:12]
     ref = _backends(uid).document(bid)
     ref.set(
         {
@@ -43,6 +51,25 @@ def create_backend(
     return fetched
 
 
+def _owner_is_external(uid: str) -> bool:
+    snap = get_db().collection("users").document(uid).get()
+    return snap.exists and (snap.to_dict() or {}).get("kind") == "external"
+
+
+
+
+def _live_kind(uid: str, bid: str, data: dict, external: bool | None = None) -> bool:
+    kind = data.get("kind")
+    if kind not in get_args(BackendKind):
+        logger.warning("skipping backend %s/%s of retired kind %r", uid, bid, kind)
+        return False
+    if kind in _EXTERNAL_ONLY_KINDS:
+        if external is None:
+            external = _owner_is_external(uid)
+        if not external:
+            logger.warning("skipping %s backend %s/%s on a non-external owner", kind, uid, bid)
+            return False
+    return True
 
 
 def get_backend(uid: str, bid: str) -> Backend | None:
@@ -57,10 +84,19 @@ def get_backend(uid: str, bid: str) -> Backend | None:
 
 def list_backends(uid: str) -> list[Backend]:
     out: list[Backend] = []
+    external: bool | None = None  # looked up at most once, only if an sms row is seen
     for snap in _backends(uid).stream():
         data = snap.to_dict() or {}
+        if data.get("kind") in _EXTERNAL_ONLY_KINDS and external is None:
+            external = _owner_is_external(uid)
+        if _live_kind(uid, snap.id, data, external):
             out.append(Backend.model_validate({"id": snap.id, **data}))
     return out
+
+
+def has_kind(uid: str, kind: str) -> bool:
+    """True when `uid` has a live backend row of `kind`."""
+    return any(b.kind == kind for b in list_backends(uid))
 
 
 def update_backend(

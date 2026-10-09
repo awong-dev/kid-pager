@@ -154,6 +154,9 @@ Google account. One account-level step is needed before a real deployment can us
   (provisioned by `infra/`, ADC, no separate secret) the `chat.bot` scope / "Chat Bot" role so
   outbound `spaces.messages.create` sends work.
 
+### Bridge phones
+
+
 ## CLI Tools
 
 For sending messages via the relay API and driving a simulated device +

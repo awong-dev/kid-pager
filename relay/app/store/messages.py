@@ -98,6 +98,10 @@ class Conversation(BaseModel):
     # Written on conversation create; rewritten on group join/leave and a `displayName` change.
     familyIds: list[str] = []
     participants: dict[str, Participant] = {}
+    # A group bridged to a Google Chat space: `{bridgeId, conversationId, source, link}`, plus the
+    # `{nick: person name}` roster that becomes the wire's `sndr`.
+    bridge: dict | None = None
+    roster: dict[str, str] = {}
 
 
 def conv_key(uid_a: str, uid_b: str) -> str:
@@ -114,6 +118,11 @@ def _messages():
 
 def _wire_ids():
     return get_db().collection("wireIds")
+
+
+def wire_id_exists(wire_id: str, recipient_uid: str) -> bool:
+    """Whether `wireIds/{wire_id}_{recipient_uid}` exists."""
+    return _wire_ids().document(f"{wire_id}_{recipient_uid}").get().exists
 
 
 def _conversations():
@@ -367,6 +376,27 @@ def find_delivery_by_kind(msg: Message, kind: str) -> str | None:
         if delivery and delivery.get("state") == "queued":
             transaction.update(ref, {f"deliveries.{backend_id}.state": "sent"})
 
+
+
+def mark_delivery_failed_if_queued(
+    msg_id: str, backend_id: str, *, error: str | None = None
+    """`queued` -> `failed` for a delivery that can never succeed; stores `error`; True if moved."""
+    ref = _messages().document(msg_id)
+
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+        delivery = ((snap.to_dict() or {}).get("deliveries") or {}).get(backend_id)
+        if delivery and delivery.get("state") == "queued":
+            updates: dict[str, object] = {f"deliveries.{backend_id}.state": "failed"}
+            if error is not None:
+                updates[f"deliveries.{backend_id}.error"] = error
+            transaction.update(ref, updates)
+
+
+
+def set_delivery_external_id(msg_id: str, backend_id: str, external_id: str) -> None:
+    """Records the provider-side id of a delivery without touching its state."""
+    _messages().document(msg_id).update({f"deliveries.{backend_id}.externalId": external_id})
 
 
 def apply_delivery_ack(

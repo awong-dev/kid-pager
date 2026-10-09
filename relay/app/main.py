@@ -21,12 +21,14 @@ from app.routers import (
     admin,
     battery,
     book,
+    bridge,
     ca,
     conversations,
     dev,
     device_book,
     devices,
     family,
+    family_bridges,
     internal,
     me,
     webhooks,
@@ -82,6 +84,7 @@ def create_app(
         return response
 
     app.include_router(webhooks.router)
+    app.include_router(bridge.router)
     app.include_router(ca.router)
     app.include_router(admin.router)
     app.include_router(dev.router)
@@ -90,6 +93,7 @@ def create_app(
     app.include_router(device_book.router)
     app.include_router(conversations.router)
     app.include_router(family.router)
+    app.include_router(family_bridges.router)
     app.include_router(book.router)
     app.include_router(me.router)
     app.include_router(internal.router)

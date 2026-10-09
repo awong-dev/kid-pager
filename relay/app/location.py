@@ -52,7 +52,9 @@ DWELL_MAX_AGE_S = 24 * 60 * 60
 # On heavy contention for one device's `locReqs` doc the client's transactional retries can be
 # exhausted (`ValueError`); the loser then joins the winner's request: `_join_after_contention`
 # re-reads `req_ref` up to 10 times with full-jitter delays (0.05..1.0 s).
+CONTENTION_REREAD_ATTEMPTS = 10
 CONTENTION_REREAD_BASE_DELAY_S = 0.05
+CONTENTION_REREAD_MAX_DELAY_S = 1.0
 
 
 def loc_req_ttl_s() -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import UTC, datetime, timedelta
 
 from google.cloud.firestore import (
     Client,
@@ -17,6 +18,8 @@ from google.cloud.firestore import (
 
 from app.db.firestore import get_db
 from app.routing import Routing
+from app.store import bridge_outbox
+from app.store import bridges as bridges_store
 from app.store import devices as devices_store
 from app.store import messages as messages_store
 from app.store import settings as settings_store
@@ -24,11 +27,23 @@ from app.tasks import TaskQueue, build_task_queue
 
 logger = logging.getLogger("relay.jobs")
 
+BRIDGE_OFFLINE_AFTER = timedelta(hours=24)
+BRIDGE_ACKED_RETENTION = timedelta(days=7)
+
+
 @dataclass(frozen=True, slots=True)
 class TickResult:
     devicesChecked: int
     retriesAttempted: int
     locReqsCleared: int = 0
+    bridgeOutboxFailed: int = 0
+
+
+def _fail_stale_bridge_outbox() -> int:
+    """A `pending` outbox row older than 24 h on any bridge fails `bridge_offline`, with its delivery."""
+    cutoff = datetime.now(UTC) - BRIDGE_OFFLINE_AFTER
+    failed = 0
+    return failed
 
 
     task_queue = task_queue if task_queue is not None else build_task_queue()
@@ -56,8 +71,10 @@ class TickResult:
             )
 
     loc_reqs_cleared = location.clear_stale_loc_reqs()
+    bridge_rows_failed = _fail_stale_bridge_outbox()
 
     return TickResult(
+        bridgeOutboxFailed=bridge_rows_failed,
         devicesChecked=devices_checked,
         retriesAttempted=retries_attempted,
         locReqsCleared=loc_reqs_cleared,
@@ -192,6 +209,10 @@ class SweepResult:
     gchatLinkCodesDeleted: int = 0
     alertsDeleted: int = 0
     batteryDeleted: int = 0
+    heldSmsDeleted: int = 0
+    bridgePairCodesDeleted: int = 0
+    bridgeOutboxDeleted: int = 0
+    heldChatDeleted: int = 0
 
 
 def sweep() -> SweepResult:
@@ -232,6 +253,23 @@ def sweep() -> SweepResult:
         batch_size,
     )
 
+    # Held inbound texts live for the message retention window (by `receivedAt`).
+    held_sms_deleted = _sweep_by_created_at(
+        lambda: db.collection("heldSms"), msg_cutoff, batch_size, created_at_field="receivedAt"
+    )
+
+    held_chat_deleted = _sweep_by_created_at(
+        lambda: db.collection("heldChat"), msg_cutoff, batch_size, created_at_field="receivedAt"
+    )
+
+    # Expired pairing codes.
+    bridge_codes_deleted = 0
+    for code in bridges_store.list_expired_pair_codes(datetime.now(UTC)):
+        bridges_store.delete_pair_code(code)
+        bridge_codes_deleted += 1
+
+    outbox_deleted = bridge_outbox.delete_acked_before(datetime.now(UTC) - BRIDGE_ACKED_RETENTION)
+
     )
         messagesDeleted=messages_deleted,
         wireIdsDeleted=wire_ids_deleted,
@@ -240,4 +278,8 @@ def sweep() -> SweepResult:
         gchatLinkCodesDeleted=gchat_link_codes_deleted,
         alertsDeleted=alerts_deleted,
         batteryDeleted=battery_deleted,
+        heldSmsDeleted=held_sms_deleted,
+        bridgePairCodesDeleted=bridge_codes_deleted,
+        bridgeOutboxDeleted=outbox_deleted,
+        heldChatDeleted=held_chat_deleted,
     )

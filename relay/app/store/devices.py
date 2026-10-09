@@ -55,12 +55,17 @@ class DeviceStatus(BaseModel):
     locPeriodS: int | None = None
     locMinS: int | None = None
     # Trust state and the pinned CA's short fingerprint.
+    tls: Literal["unpinned", "pinned", "broken", "proxy"] | None = None
     caFp: str | None = None
     # The device's own reported location backoff.
     locBackoffS: int | None = None
     # GNSS-while-moving interval (s) reported while tracking is on, 0/absent = off; display only
     # (docs/PROTOCOL.md §13.3).
     locMoveS: int | None = None
+    # Last `/status` `gnss` (0/1).
+    gnss: int | None = None
+    # Last `/status` `car` (carrier name).
+    car: str | None = None
     # Device SMS audit-queue drop counter.
     smsLost: int | None = None
     # MQTT-session generation within the current boot; a changed `link` triggers the online-edge
@@ -182,6 +187,9 @@ class Device(BaseModel):
     pendingCfg: PendingPush | None = None
     pendingCfgCa: PendingPush | None = None
     pendingCfgSms: PendingPush | None = None
+    pendingCfgLoc: PendingPush | None = None
+    # Desired GNSS state, pushed as `cfg.loc.gnss`. Not a secret; default enabled.
+    gnss_enabled: bool = True
 
 
 def _devices():
@@ -262,6 +270,18 @@ def set_sms_contacts(device_id: str, contacts: list[SmsContact]) -> None:
     _devices().document(device_id).set(
         {"smsContacts": [c.model_dump() for c in contacts]}, merge=True
     )
+
+
+def get_gnss_enabled(device_id: str) -> bool:
+    """`True` when absent or device unknown."""
+    snap = _devices().document(device_id).get()
+    if not snap.exists:
+        return True
+    return bool((snap.to_dict() or {}).get("gnss_enabled", True))
+
+
+def set_gnss_enabled(device_id: str, enabled: bool) -> None:
+    _devices().document(device_id).set({"gnss_enabled": enabled}, merge=True)
 
 
 def set_apn(device_id: str, apn: str | None) -> None:

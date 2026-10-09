@@ -39,6 +39,8 @@ class BookEntryOut(BaseModel):
     sendable: bool
     reason: str | None = None
     onPager: bool
+    # `{source}` for a Google Chat / Voice contact.
+    chat: dict | None = None
 
 
 class BookOut(BaseModel):
@@ -94,7 +96,9 @@ def _view(owner_uid: str) -> BookOut:
             inFamily=e.inFamily,
             sendable=e.sendable,
             reason=e.reason,
+            chat=e.chat,
             onPager=bool(e.onPager)
+            if e.kind == "external" and not e.chat
             else (e.sendable and e.alias in on_pager),
         )
         for e in entries
