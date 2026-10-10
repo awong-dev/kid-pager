@@ -23,6 +23,21 @@ class MmsReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "mms"
         const val ACTION_DOWNLOADED = "app.kidpager.bridge.MMS_DOWNLOADED"
+
+        fun event(from: String, pdu: MmsPdu.Pdu, tsMillis: Long): BridgeEvent {
+            val phone = PhoneNumbers.normalize(from) ?: from
+            val text = pdu.text
+            val attachments = pdu.attachments
+            return BridgeEvent(
+                id = NotificationMapper.eventId("mms:$phone", tsMillis, text + attachments.size).replaceFirst("n_", "m_"),
+                source = Targets.SOURCE_SMS,
+                conversation = Conversation(id = phone, isGroup = false),
+                sender = Sender(name = phone, phone = phone),
+                text = Bounds.cp(text, Bounds.TEXT_CP),
+                ts = tsMillis / 1000,
+                attachments = attachments.ifEmpty { null },
+            )
+        }
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -64,6 +79,10 @@ class MmsReceiver : BroadcastReceiver() {
         val pdu = try { MmsPdu.parse(f.readBytes()) } catch (e: Exception) { Log.e(TAG, "bad retrieve pdu", e); f.delete(); return }
         f.delete()
         val from = pdu.from ?: intent.getStringExtra("from") ?: run { Log.w(TAG, "no sender"); return }
+        val e = event(from, pdu, System.currentTimeMillis())
+        Log.i(TAG, "in from=${Log.redact(e.sender.phone)} len=${e.text.length} attachments=${e.attachments?.map { it.kind } ?: emptyList<String>()}")
+        val result = goAsync()
+        EventQueue.enqueueAsync(context, listOf(e)) { result.finish() }
     }
 }
 

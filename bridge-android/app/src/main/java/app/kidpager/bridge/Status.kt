@@ -27,6 +27,7 @@ object Status {
         val accounts: List<String>,
         val simNumber: String?,
         val voiceNumber: String?,
+        val whatsappInstalled: Boolean,
         val version: String,
         val fcm: Boolean,
         val pollSec: Int,
@@ -35,7 +36,10 @@ object Status {
             sms = simNumber != null && smsDefault,
             gchat = listenerBound,
             gvoice = voiceNumber != null,
+            whatsapp = whatsapp,
         )
+
+        val whatsapp get() = whatsappInstalled && listenerBound
 
         fun toJson(): JsonObject = buildJsonObject {
             put("battery", battery)
@@ -45,6 +49,7 @@ object Status {
             put("accounts", buildJsonArray { accounts.forEach { add(kotlinx.serialization.json.JsonPrimitive(it)) } })
             if (simNumber != null) put("simNumber", simNumber)
             if (voiceNumber != null) put("voiceNumber", voiceNumber)
+            put("whatsapp", whatsapp)
             put("version", version)
             put("fcm", fcm)
             put("pollSec", pollSec)
@@ -60,6 +65,7 @@ object Status {
         accounts = accounts(ctx),
         simNumber = simNumber(ctx),
         voiceNumber = Prefs.voiceNumber(ctx)?.let { PhoneNumbers.normalize(it) },
+        whatsappInstalled = whatsappPackage(ctx) != null,
         version = BuildConfig.VERSION_NAME,
         fcm = BuildConfig.FCM,
         pollSec = Prefs.pollIntervalSec(ctx),
@@ -83,6 +89,11 @@ object Status {
         val short = "${ctx.packageName}/.${BridgeAccessibilityService::class.java.simpleName}"
         return enabled.split(':').any { it.equals(me, true) || it.equals(short, true) }
     }
+
+    fun whatsappPackage(ctx: Context): String? =
+        listOf(Targets.WHATSAPP_PKG, Targets.WHATSAPP_BUSINESS_PKG).firstOrNull { pkg ->
+            try { ctx.packageManager.getPackageInfo(pkg, 0); true } catch (e: PackageManager.NameNotFoundException) { false }
+        }
 
     fun batteryExempt(ctx: Context): Boolean =
         (ctx.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).isIgnoringBatteryOptimizations(ctx.packageName)
@@ -118,6 +129,7 @@ object Status {
     }
 
     fun describe(s: Snapshot): String = buildString {
+        append("battery ${s.battery}%  listener ${s.listenerBound}  smsDefault ${s.smsDefault}  a11y ${s.accessibility}  whatsapp ${s.whatsapp}\n")
         append("accounts ${s.accounts}  sim ${Log.redact(s.simNumber)}  voice ${Log.redact(s.voiceNumber)}  fcm ${s.fcm}  poll ${s.pollSec}s")
     }
 }

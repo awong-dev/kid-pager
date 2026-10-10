@@ -27,6 +27,9 @@ object Prefs {
         }
     }
 
+    /** Defaults to the Gradle property RELAY_URL the app was built with. */
+    fun relayUrl(ctx: Context): String =
+        get(ctx).getString("relayUrl", null)?.ifBlank { null } ?: BuildConfig.DEFAULT_RELAY_URL.trimEnd('/')
     fun setRelayUrl(ctx: Context, url: String) = get(ctx).edit().putString("relayUrl", url.trimEnd('/')).apply()
 
     fun token(ctx: Context): String? = get(ctx).getString("token", null)

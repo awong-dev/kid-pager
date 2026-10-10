@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Spools events in Room and posts them to `POST /bridge/events` in batches; a row is deleted
+ * only after the relay answers 2xx, or rejects the payload itself with a 4xx.
  */
 object EventQueue {
     private const val TAG = "events"
@@ -31,6 +32,20 @@ object EventQueue {
         }
         start(ctx)
         kicks.trySend(Unit)
+    }
+
+    /** For callers on the main thread, where Room refuses the insert. */
+    fun enqueueAsync(ctx: Context, events: List<BridgeEvent>, onDone: () -> Unit = {}) {
+        val app = ctx.applicationContext
+        scope.launch {
+            try {
+                enqueue(app, events)
+            } catch (e: Exception) {
+                Log.e(TAG, "spool failed", e)
+            } finally {
+                onDone()
+            }
+        }
     }
 
     fun start(ctx: Context) {
@@ -62,6 +77,17 @@ object EventQueue {
                     for (r in resp.results) Log.i(TAG, "relay ${r.id} outcome=${r.outcome}")
                     backoff = 2_000L
                 } catch (e: RelayClient.Unauthorized) {
+                    break
+                } catch (e: RelayClient.HttpError) {
+                    if (e.code in 400..499 && e.code != 429) {
+                        Log.w(TAG, "relay rejected batch of ${rows.size} (HTTP ${e.code}: ${e.reason()}); dropping ids=${rows.map { it.eventId }}")
+                        db.pendingEvents().delete(rows.map { it.rowId })
+                        continue
+                    }
+                    Log.w(TAG, "batch of ${rows.size} failed (HTTP ${e.code}); retry in ${backoff / 1000}s")
+                    delay(backoff)
+                    backoff = (backoff * 2).coerceAtMost(300_000L)
+                    kicks.trySend(Unit)
                     break
                 } catch (e: Exception) {
                     Log.w(TAG, "batch of ${rows.size} failed (${e.message}); retry in ${backoff / 1000}s")

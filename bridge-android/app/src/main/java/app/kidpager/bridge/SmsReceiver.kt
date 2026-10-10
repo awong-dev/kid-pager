@@ -32,5 +32,7 @@ class SmsReceiver : BroadcastReceiver() {
         val ts = msgs[0].timestampMillis
         val e = event(from, body, ts)
         Log.i(TAG, "in from=${Log.redact(e.sender.phone)} len=${body.length} parts=${msgs.size}")
+        val result = goAsync()
+        EventQueue.enqueueAsync(context, listOf(e)) { result.finish() }
     }
 }

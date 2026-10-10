@@ -20,14 +20,19 @@ object ReplyCache {
     }
 
     private val byConversation = HashMap<String, Entry>()
+    /** `source|phone` -> conversation id, for a Voice send that carries only `to.phone`. */
+    private val byPhone = HashMap<String, String>()
 
     @Synchronized fun size() = byConversation.size
 
     @Synchronized
+    fun clear() { byConversation.clear(); byPhone.clear() }
 
     @Synchronized
+    fun rememberPhone(source: String, phone: String, conversationId: String) { byPhone["$source|$phone"] = conversationId }
 
     @Synchronized
+    fun conversationForPhone(source: String, phone: String): String? = byPhone["$source|$phone"]
 
     @Synchronized
     fun has(conversationId: String) = byConversation.containsKey(conversationId)

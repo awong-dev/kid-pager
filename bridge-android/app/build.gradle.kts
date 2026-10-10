@@ -7,6 +7,8 @@ plugins {
 }
 
 val hasGoogleServices = file("google-services.json").exists()
+// The setup screen's default relay URL: -PRELAY_URL=https://... or gradle.properties.
+val relayUrl = (project.findProperty("RELAY_URL") as String?)?.trim()?.ifEmpty { null } ?: "https://relay.example.com"
 if (hasGoogleServices) {
     apply(plugin = "com.google.gms.google-services")
 }
@@ -22,6 +24,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         buildConfigField("boolean", "FCM", hasGoogleServices.toString())
+        buildConfigField("String", "DEFAULT_RELAY_URL", "\"$relayUrl\"")
     }
 
     buildTypes {

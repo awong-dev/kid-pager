@@ -14,6 +14,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Tier 2 send: opens a conversation in the chat app's own UI, types the text, taps Send and
+ * checks that the text appears in the thread. Also reads a conversation's title and senders.
  */
 class BridgeAccessibilityService : AccessibilityService() {
     companion object {
@@ -22,6 +23,7 @@ class BridgeAccessibilityService : AccessibilityService() {
             private set
         private val mutex = Mutex()
         private const val POLL_MS = 400L
+        private const val SEARCH_TIER2_TIMEOUT_MS = 30_000L
     }
 
     data class Inspected(val conversationId: String, val title: String?, val isGroup: Boolean, val people: List<String>)
@@ -36,17 +38,50 @@ class BridgeAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {}
     override fun onDestroy() { instance = null; super.onDestroy() }
 
+    /** Null on success, else the ack reason (`no_link`, `app_missing`, `ui_changed`, `unverified`, `timeout`). */
     suspend fun sendViaUi(link: String, text: String): String? = mutex.withLock {
         val pkg = Targets.packageForLink(link) ?: return "no_link"
         val r: String = withTimeoutOrNull(Targets.TIER2_TIMEOUT_MS) {
             try {
                 if (!open(link, pkg)) return@withTimeoutOrNull "app_missing"
+            } finally {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+        } ?: "timeout"
+        Log.i(TAG, "tier2 send $r pkg=${pkg.substringAfterLast('.')}")
+        return if (r == "ok") null else r
+    }
+
+    /** Finds a chat with no deep link (a WhatsApp group) through the chat-list search, then sends. */
+    suspend fun sendViaSearch(pkg: String, title: String, text: String): String? = mutex.withLock {
+        val want = title.trim()
+        val r: String = withTimeoutOrNull(SEARCH_TIER2_TIMEOUT_MS) {
+            try {
+                val launch = packageManager.getLaunchIntentForPackage(pkg) ?: return@withTimeoutOrNull "app_missing"
+                startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
+                waitFor(Targets.OPEN_TIMEOUT_MS) { root -> root.takeIf { it.packageName == pkg } }
                     ?: return@withTimeoutOrNull "ui_changed"
+                delay(500)
+                val search = waitFor(3_000) { root -> findFirst(root) { isWaSearch(it) } }
+                    ?: run { Log.w(TAG, "search button not found"); return@withTimeoutOrNull "ui_changed" }
+                if (!clickUp(search)) { Log.w(TAG, "search not clickable"); return@withTimeoutOrNull "ui_changed" }
+                val field = waitFor(3_000) { root -> findFirst(root) { isComposer(it) } }
+                    ?: run { Log.w(TAG, "search field not found"); return@withTimeoutOrNull "ui_changed" }
+                if (!setText(field, want)) return@withTimeoutOrNull "ui_changed"
+                val row = waitFor(Targets.SEARCH_TIMEOUT_MS) { root ->
+                    findFirst(root) { isWaRow(it, want) && idHas(it, Targets.WA_ROW_NAME_ID_HINTS) }
+                        ?: findFirst(root) { isWaRow(it, want) }
+                } ?: run { Log.w(TAG, "no chat row matches the title"); return@withTimeoutOrNull "no_match" }
+                if (!clickUp(row)) { Log.w(TAG, "row not clickable"); return@withTimeoutOrNull "ui_changed" }
+                // Excludes the search box, which is also editable and still holds the title.
+                composeAndSend(text) { n ->
+                    isComposer(n) && (idHas(n, Targets.WA_COMPOSER_ID_HINTS) || n.text?.toString()?.trim() != want)
                 }
             } finally {
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
         } ?: "timeout"
+        Log.i(TAG, "tier2 search-send $r pkg=${pkg.substringAfterLast('.')}")
         return if (r == "ok") null else r
     }
 
@@ -74,6 +109,35 @@ class BridgeAccessibilityService : AccessibilityService() {
     }
 
     /** Returns "ok" or an ack reason. */
+        delay(300)
+        val needle = text.take(60)
+        val shown = waitFor(Targets.VERIFY_TIMEOUT_MS) { root ->
+            findFirst(root) { !it.isEditable && it.text?.toString()?.contains(needle) == true }
+        }
+        return if (shown == null) "unverified" else "ok"
+    }
+
+    private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+        Log.w(TAG, "set text refused")
+        return false
+    }
+
+    private fun open(link: String, pkg: String): Boolean {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        // WhatsApp Business handles the same links when the consumer app is absent.
+        val candidates = if (pkg == Targets.WHATSAPP_PKG) listOf(pkg, Targets.WHATSAPP_BUSINESS_PKG) else listOf(pkg)
+        for (p in candidates) {
+            try {
+                startActivity(Intent(intent).setPackage(p))
+                return true
+            } catch (e: ActivityNotFoundException) {
+                Log.w(TAG, "no activity for $p")
+            }
+        }
+        return false
     }
 
     private suspend fun <T> waitFor(ms: Long, probe: (AccessibilityNodeInfo) -> T?): T? {
@@ -93,6 +157,15 @@ class BridgeAccessibilityService : AccessibilityService() {
         val desc = n.contentDescription?.toString()?.trim()
         val txt = n.text?.toString()?.trim()
     }
+
+    private fun isWaSearch(n: AccessibilityNodeInfo): Boolean {
+        if (!n.isVisibleToUser || n.isEditable) return false
+        val desc = n.contentDescription?.toString()?.trim()
+        return idHas(n, Targets.WA_SEARCH_ID_HINTS) || (desc != null && Targets.WA_SEARCH_DESC.matches(desc))
+    }
+
+    private fun isWaRow(n: AccessibilityNodeInfo, want: String): Boolean =
+        n.isVisibleToUser && !n.isEditable && n.text?.toString()?.trim().equals(want, ignoreCase = true)
 
 
     private fun clickUp(n: AccessibilityNodeInfo): Boolean {

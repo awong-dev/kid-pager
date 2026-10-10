@@ -19,6 +19,14 @@ import java.util.concurrent.TimeUnit
  * token; a 401 clears the token, so the phone must be paired again.
  */
 class RelayClient(private val ctx: Context) {
+    /** [detail] is the relay's `{"detail": "..."}` text; null when `detail` is not a string. */
+    class HttpError(val code: Int, val body: String) : IOException("HTTP $code: ${body.take(200)}") {
+        val detail: String? by lazy {
+            try { (WireJson.parseToJsonElement(body) as? JsonObject)?.get("detail")?.let { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content } }
+            catch (e: Exception) { null }
+        }
+        fun reason(): String = detail ?: body.take(120)
+    }
     class Unauthorized : IOException("401 unauthorized")
 
     companion object {
@@ -36,6 +44,7 @@ class RelayClient(private val ctx: Context) {
     private fun base(): String = Prefs.relayUrl(ctx)
 
     @Serializable
+    data class Caps(val sms: Boolean, val gchat: Boolean, val gvoice: Boolean, val whatsapp: Boolean = false)
 
     @Serializable
     data class PairRequest(
@@ -60,6 +69,7 @@ class RelayClient(private val ctx: Context) {
 
     /** `title` is the only handle the UI send path has for a WhatsApp group. */
     @Serializable
+    data class OutboxTo(val phone: String? = null, val conversationId: String? = null, val link: String? = null, val title: String? = null)
 
     @Serializable
     data class OutboxItem(

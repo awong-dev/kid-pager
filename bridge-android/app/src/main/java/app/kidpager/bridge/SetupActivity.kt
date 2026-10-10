@@ -86,6 +86,8 @@ class SetupActivity : AppCompatActivity() {
         b.smsState.text = "Default SMS app: ${if (s.smsDefault) "YES" else "NO"}"
         b.batteryState.text = "Battery optimisation exempt: ${if (Status.batteryExempt(this)) "YES" else "NO"} (${s.battery}%)"
         b.accessibilityState.text = "Accessibility service: ${if (s.accessibility) "ON" else "OFF"}"
+        b.whatsappState.text = "WhatsApp: installed ${if (s.whatsappInstalled) "YES" else "NO"}, bridged ${if (s.whatsapp) "YES" else "NO (needs notification access)"}"
+        b.capsState.text = "caps: sms=${s.caps.sms} gchat=${s.caps.gchat} gvoice=${s.caps.gvoice} whatsapp=${s.caps.whatsapp}  fcm=${s.fcm}  accounts=${s.accounts.size}"
     }
 
     private fun pair() {
@@ -114,6 +116,13 @@ class SetupActivity : AppCompatActivity() {
                     "paired as ${r.bridgeId}"
                 } catch (e: RelayClient.HttpError) {
                     Log.w("setup", "pair failed ${e.code}: ${e.body.take(120)}")
+                    when (e.code) {
+                        404 -> "code expired or already used"
+                        429 -> "too many attempts; wait a minute"
+                        409 -> e.detail ?: "pair rejected: ${e.body.take(80)}"
+                        422 -> "relay rejected a field: ${e.reason().take(80)}"
+                        else -> e.detail?.let { "pair failed: $it" } ?: "pair failed: HTTP ${e.code}"
+                    }
                 } catch (e: Exception) {
                     Log.e("setup", "pair failed", e)
                     "pair failed: ${e.message}"
