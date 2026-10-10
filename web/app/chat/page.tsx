@@ -30,11 +30,13 @@ import AppShell from "@/components/AppShell";
 import NewChatDialog from "@/components/NewChatDialog";
 import NewGroupDialog from "@/components/NewGroupDialog";
 import RequireAuth from "@/components/RequireAuth";
+import { deviceName } from "@/lib/devices";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
 import { formatRelativeAge, tsToMillis } from "@/lib/time";
+import { peerLabel } from "@/lib/names";
 import type { ConversationDoc, DeviceDoc } from "@/lib/types";
 
 interface ConversationRow extends ConversationDoc {
@@ -90,6 +92,8 @@ function ChatListInner() {
         if (!alias) return [];
         const kind = participant?.kind ?? directoryEntry?.kind;
         const phone = kind === "external" ? externalDigits(participant?.phone ?? directoryEntry?.phone) : undefined;
+        const displayName = participant?.displayName || directoryEntry?.displayName;
+        return [{ ...c, label: peerLabel({ alias, displayName, kind }), routeAlias: alias, phone }];
       }),
     [conversations, byUid]
   );
@@ -111,8 +115,15 @@ function ChatListInner() {
         const peerUid = c.uids.find((u) => u !== kidUid);
         const kidAlias = (kidUid && (participants[kidUid]?.alias ?? byUid(kidUid)?.alias)) ?? "?";
         const peerEntry = peerUid ? participants[peerUid] : undefined;
+        const peerDir = peerUid ? byUid(peerUid) : undefined;
+        const peerText = peerLabel({
+          alias: peerEntry?.alias ?? peerDir?.alias ?? "?",
+          displayName: peerEntry?.displayName || peerDir?.displayName,
+          kind: peerEntry?.kind ?? peerDir?.kind,
+        });
         return {
           convKey: c.convKey,
+          label: `@${kidAlias} ↔ ${peerText}`,
           phone:
             peerEntry?.kind === "external"
               ? externalDigits(peerEntry.phone ?? (peerUid ? byUid(peerUid)?.phone : undefined))
@@ -153,10 +164,12 @@ function ChatListInner() {
       {device && (
         <Card variant="outlined">
           <CardContent>
+            <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
               {device.status.state === "online" ? (
               ) : (
               )}
               <Typography variant="body1">
+                Your pager ({deviceName(device)}): {device.status.state ?? "unknown"}
               </Typography>
               {device.status.battMv != null && (
                 <Chip
@@ -183,6 +196,7 @@ function ChatListInner() {
 
       {tab === "mine" ? (
         <>
+          <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
             <Button variant="contained" onClick={() => setNewChatOpen(true)}>
               New chat
             </Button>
@@ -214,6 +228,7 @@ function ChatListInner() {
                   disablePadding
                   divider
                   secondaryAction={
+                    isGroup && !c.bridge ? (
                       <IconButton edge="end" aria-label={`leave ${c.label}`} onClick={() => void leaveGroup(c)}>
                         <LogoutIcon fontSize="small" />
                       </IconButton>
@@ -223,9 +238,11 @@ function ChatListInner() {
                   <ListItemButton onClick={() => openConversation(c.routeAlias)}>
                     <ListItemText
                       primary={
+                        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
                           {isGroup && <GroupsIcon fontSize="small" color="action" />}
                           {c.phone && <PhoneIcon fontSize="small" color="action" />}
                           <Typography sx={{ fontWeight: unread > 0 ? 700 : 400 }}>
+                            {c.label}
                           </Typography>
                           {unread > 0 && <Badge color="primary" badgeContent={unread} />}
                         </Stack>
@@ -264,6 +281,7 @@ function ChatListInner() {
                   <VisibilityIcon fontSize="small" color="action" sx={{ mr: 1.5 }} />
                   <ListItemText
                     primary={
+                      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
                         {r.phone && <PhoneIcon fontSize="small" color="action" />}
                         <Typography>{r.label}</Typography>
                       </Stack>

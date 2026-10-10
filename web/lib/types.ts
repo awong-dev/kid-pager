@@ -26,6 +26,7 @@ export interface UserDoc {
   kind: UserKind;
   policy: PolicyDoc;
   notify: { alerts: boolean };
+  // Set by the user's bridge phone (SIM or Google Voice number, E.164). Read-only.
   smsNumber?: string | null;
 }
 
@@ -71,6 +72,7 @@ export interface AlertDoc {
 }
 
 // Which app on the bridge phone an event or a send belongs to.
+export type BridgeSource = "sms" | "gchat" | "gvoice" | "whatsapp";
 
 export type BackendKind = "pager" | "webapp" | "gchat" | "sms" | "bridge";
 
@@ -146,6 +148,7 @@ export interface OtaJob {
   kind: "full" | "delta";
   osz: number;
   estBytes: number;
+  onDemand?: boolean;
   by_uid: string;
   at: number;
 }
@@ -231,6 +234,8 @@ export interface ConversationDoc {
   name?: string;
   alias?: string;
   createdBy?: string;
+  // Set on a group bridged to a Google Chat space; its member routes return 409, so no leave.
+  bridge?: { bridgeId: string; conversationId: string; source: string; link?: string | null } | null;
   // Per-member alias/name snapshot keyed by uid, to name a peer without a directory lookup.
   participants?: Record<string, { alias: string; displayName: string; kind: UserKind; phone?: string | null }>;
   // Every family with a member in this conversation, for the family-admin read-only view.
@@ -246,6 +251,7 @@ export interface ConversationDoc {
 export const LOC_REQ_TTL_MS = 15 * 60 * 1000;
 
 // Bridge phones are server-only, so these are API response shapes; times are ISO-8601 strings.
+export type ApiTime = string | null;
 
 export interface BridgeStatus {
   battery?: number | null;
@@ -264,26 +270,41 @@ export interface BridgeStatus {
 export interface BridgeRow {
   id: string;
   ownerUid: string;
+  ownerAlias: string | null;
+  ownerName: string | null;
   label: string;
+  paired: boolean;
   pairedAt: ApiTime;
   lastSeenAt: ApiTime;
+  // Accepted numbers; `status.*Number` is as reported.
   simNumber: string | null;
+  voiceNumber: string | null;
   status: BridgeStatus;
+  caps: { sms: boolean; gchat: boolean; gvoice: boolean; whatsapp: boolean };
   createdAt: ApiTime;
 }
 
 export type BridgeConversationStatus = "seen" | "subscribed" | "ignored" | "paused";
 
+export interface RosterEntry {
+  name: string;
+  nick: string;
+}
+
 export interface BridgeConversationRow {
   // sha256(conversationId)[:16] -- what every conversation route takes.
   ref: string;
+  bridgeId: string;
   conversationId: string;
+  source: "gchat" | "gvoice" | "whatsapp";
+  title: string | null;
   isGroup: boolean;
   link: string | null;
   people: string[];
   lastPreview: string;
   lastAt: ApiTime;
   firstSeenAt: ApiTime;
+  inspectedAt: ApiTime;
   heldCount: number;
   status: BridgeConversationStatus;
   uid: string | null;
@@ -291,10 +312,18 @@ export interface BridgeConversationRow {
   pagerName: string | null;
   customName: boolean;
   alertId: string | null;
+  // Subscribed / paused rows only.
+  alias?: string | null;
+  canReply?: boolean | null;
+  roster?: RosterEntry[] | null;
+  onPager?: boolean | null;
 }
 
 export interface ChatTabOut {
+  subscribed: BridgeConversationRow[];
   seen: BridgeConversationRow[];
+  // The member's bridge phones (for Add by link).
+  bridges: { id: string; label: string; paired: boolean; caps: { sms: boolean; gchat: boolean; gvoice: boolean; whatsapp: boolean } }[];
 }
 
 export interface SubscribeRequest {
@@ -304,4 +333,10 @@ export interface SubscribeRequest {
 }
 
 export interface SubscribeResult {
+  uid: string;
+  convKey: string | null;
+  alias: string;
+  delivered: number;
+  undelivered: number;
+  conversation: BridgeConversationRow;
 }

@@ -32,15 +32,19 @@ import { useAuth } from "@/lib/auth-context";
 import {
   BOOK_GROUP_ORDER,
   type BookEntry,
+  type BookResponse,
   NICK_MAX_CODEPOINTS,
   bookGroup,
   nickError,
   reasonText,
+  removeAdded,
   saveNick,
   useBook,
 } from "@/lib/book";
+import { sourceLabel } from "@/lib/bridges";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 interface Owner {
   uid: string;
@@ -58,6 +62,7 @@ function NickDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const fullScreen = useFullScreenDialog();
   // Re-keyed by the parent per entry, so the initial value is just the nick.
   const [value, setValue] = useState(entry?.nick ?? "");
   const [busy, setBusy] = useState(false);
@@ -80,6 +85,7 @@ function NickDialog({
   }
 
   return (
+    <Dialog fullScreen={fullScreen} open={entry !== null} onClose={onClose} fullWidth maxWidth="xs">
       <DialogTitle>Nickname for {entry?.displayName}</DialogTitle>
       <DialogContent>
         <TextField
@@ -124,6 +130,22 @@ function BookInner() {
   const effectiveOwner = isFamilyAdmin && ownerUid ? ownerUid : (me?.uid ?? "");
   const { data, error, loading, reload } = useBook(effectiveOwner === me?.uid ? undefined : effectiveOwner);
   const [editing, setEditing] = useState<BookEntry | null>(null);
+  // The DELETE response is the refreshed book; it wins until the next reload.
+  const [local, setLocal] = useState<{ owner: string; data: BookResponse } | null>(null);
+  const [removing, setRemoving] = useState<BookEntry | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const shown = local && local.owner === effectiveOwner ? local.data : data;
+
+  async function confirmRemove() {
+    if (!removing?.uid) return;
+    try {
+      setLocal({ owner: effectiveOwner, data: await removeAdded(effectiveOwner, removing.uid) });
+      setRemoveError(null);
+    } catch (err) {
+      setRemoveError(err instanceof ApiError ? String(err.detail ?? err.message) : "Could not remove the entry");
+    }
+    setRemoving(null);
+  }
 
   const owners = useMemo<Owner[]>(() => {
     const rows: Owner[] = [];
@@ -139,8 +161,10 @@ function BookInner() {
   const grouped = useMemo(() => {
     const out = new Map<string, BookEntry[]>();
     for (const g of BOOK_GROUP_ORDER) out.set(g, []);
+    for (const e of shown?.entries ?? []) out.get(bookGroup(e))?.push(e);
     for (const rows of out.values()) rows.sort((a, b) => a.label.localeCompare(b.label));
     return out;
+  }, [shown]);
 
   const selectedOwner = owners.find((o) => o.uid === effectiveOwner) ?? null;
 
@@ -160,12 +184,17 @@ function BookInner() {
       )}
 
       {error && <Alert severity="error">{error}</Alert>}
+      {removeError && <Alert severity="error">{removeError}</Alert>}
+      {loading && !shown && <CircularProgress size={24} />}
 
+      {shown?.truncated && (
         <Alert severity="info">
+          This pager shows {shown.pagerCap} of {shown.entries.length} entries. Entries marked Not on pager are
           only reachable from the web.
         </Alert>
       )}
 
+      {shown && shown.entries.length === 0 && <Alert severity="info">This address book is empty.</Alert>}
 
       {BOOK_GROUP_ORDER.map((g) => {
         const rows = grouped.get(g) ?? [];
@@ -185,6 +214,16 @@ function BookInner() {
                   key={`${e.kind}:${e.alias}`}
                   secondaryAction={
                     e.kind !== "group" && e.uid ? (
+                      <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
+                        {e.added && (
+                          <Button size="small" color="error" onClick={() => setRemoving(e)}>
+                            Remove
+                          </Button>
+                        )}
+                        <IconButton edge="end" aria-label={`Edit nickname for ${e.displayName}`} onClick={() => setEditing(e)}>
+                          <EditIcon fontSize="small" />
+                        </IconButton>
+                      </Stack>
                     ) : null
                   }
                 >
@@ -193,9 +232,11 @@ function BookInner() {
                     <Chip
                       size="small"
                       variant="outlined"
+                      label={sourceLabel(e.chat.source)}
                       sx={{ mr: e.sendable && e.onPager ? 4 : 1 }}
                     />
                   )}
+                  {e.added && <Chip size="small" variant="outlined" label="Added from pager" sx={{ mr: 1 }} />}
                   {!e.sendable && <Chip size="small" label={reasonText(e.reason)} sx={{ mr: 4 }} />}
                   {e.sendable && !e.onPager && (
                     <Chip size="small" color="warning" variant="outlined" label="Not on pager" sx={{ mr: 4 }} />
@@ -218,7 +259,27 @@ function BookInner() {
         owner={effectiveOwner}
         entry={editing}
         onClose={() => setEditing(null)}
+        onSaved={() => {
+          setLocal(null);
+          reload();
+        }}
       />
+
+      <Dialog open={!!removing} onClose={() => setRemoving(null)} fullWidth maxWidth="xs">
+        <DialogTitle>Remove from address book</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Remove {removing?.label}? It was added from the pager; it disappears from the list unless
+            another rule already includes it.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRemoving(null)}>Cancel</Button>
+          <Button color="error" onClick={() => void confirmRemove()}>
+            Remove
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   );
 }

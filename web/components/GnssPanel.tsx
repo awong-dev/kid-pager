@@ -75,6 +75,7 @@ export default function GnssPanel({ deviceId }: { deviceId: string }) {
           !loadError && <CircularProgress size={24} />
         ) : (
           <Stack spacing={1}>
+            <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
               <FormControlLabel
                 control={
                   <Switch

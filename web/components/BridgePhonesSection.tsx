@@ -5,7 +5,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
+import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
+import Card from "@mui/material/Card";
+import CardContent from "@mui/material/CardContent";
 import Chip from "@mui/material/Chip";
 import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
@@ -29,6 +32,7 @@ import {
   unpairBridge,
 } from "@/lib/bridges";
 import { formatRelativeAge } from "@/lib/time";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 export interface BridgeMember {
   uid: string;
@@ -52,6 +56,111 @@ function StatusChip({ label, ok }: { label: string; ok: boolean | undefined }) {
   return <Chip size="small" label={label} color={ok ? "success" : "default"} variant={ok ? "filled" : "outlined"} />;
 }
 
+function Fact({ label, children, color }: { label: string; children: React.ReactNode; color?: string }) {
+  return (
+    <>
+      <Typography variant="caption" color="text.secondary" sx={{ lineHeight: "24px" }}>
+        {label}
+      </Typography>
+      <Typography variant="body2" color={color} component="div" sx={{ minHeight: 24, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 0.5, overflowWrap: "anywhere", minWidth: 0 }}>
+        {children}
+      </Typography>
+    </>
+  );
+}
+
+interface BridgePhoneCardProps {
+  bridge: BridgeRow;
+  ownerLabel: string;
+  smsNumber: string | null;
+  seenLabel: string;
+  simMismatch: boolean;
+  onNewCode: () => void;
+  onNumbers: () => void;
+  onAccept: () => void;
+  onReassign: () => void;
+  onUnpair: () => void;
+}
+
+function BridgePhoneCard(p: BridgePhoneCardProps) {
+  const b = p.bridge;
+  const st = b.status ?? {};
+  const unpaired = !b.paired;
+  const sim = b.simNumber ?? null;
+  const voice = b.voiceNumber ?? null;
+  return (
+    <Card variant="outlined" sx={{ width: "100%" }}>
+      <CardContent sx={{ p: 2, "&:last-child": { pb: 2 } }}>
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, rowGap: 0.5, columnGap: 3 }}>
+          <Stack
+            direction="row"
+            useFlexGap
+            sx={{ gridColumn: "1 / -1", flexWrap: "wrap", columnGap: 1, rowGap: 0.5, alignItems: "center", minWidth: 0 }}
+          >
+            <Typography variant="h6" sx={{ fontWeight: 700, overflowWrap: "anywhere", lineHeight: 1.3 }}>
+              {b.label}
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>
+              {p.ownerLabel}
+            </Typography>
+            <StatusChip label="listener" ok={st.listenerBound} />
+            {sim && <StatusChip label="SMS app" ok={st.smsDefault} />}
+            <StatusChip label="accessibility" ok={st.accessibility} />
+            {b.caps?.whatsapp && <Chip size="small" color="success" label="WhatsApp" />}
+          </Stack>
+
+          <Box sx={{ display: "grid", gridTemplateColumns: "auto 1fr", columnGap: 1.5, alignItems: "center", alignContent: "start", minWidth: 0 }}>
+            <Fact label="Google account">{st.accounts?.join(", ") || "--"}</Fact>
+            <Fact label="SIM number">
+              {sim ?? "--"}
+              {p.simMismatch && (
+                <Typography variant="caption" color="warning.main">
+                  phone reports {st.simNumber}
+                </Typography>
+              )}
+            </Fact>
+            <Fact label="Voice number">
+              {voice ?? "--"}
+              {!sim && <Chip size="small" color="info" label="Voice only" />}
+            </Fact>
+            <Fact label="SMS number">{p.smsNumber ?? "none"}</Fact>
+          </Box>
+
+          <Box sx={{ display: "grid", gridTemplateColumns: "auto 1fr", columnGap: 1.5, alignItems: "center", alignContent: "start", minWidth: 0 }}>
+            <Fact label="Tier 2">{st.tier2Count ?? 0}</Fact>
+            {st.error && (
+              <Fact label="Error" color="error.main">
+                {st.error}
+              </Fact>
+            )}
+            <Box sx={{ gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", gap: 0.5, alignItems: "center", pt: 0.5 }}>
+              {unpaired && (
+                <Button size="small" variant="outlined" onClick={p.onNewCode}>
+                  New code
+                </Button>
+              )}
+              <Button size="small" variant="outlined" onClick={p.onNumbers}>
+                Numbers
+              </Button>
+              {p.simMismatch && (
+                <Button size="small" variant="outlined" onClick={p.onAccept}>
+                  Accept SIM
+                </Button>
+              )}
+              <Button size="small" variant="outlined" onClick={p.onReassign}>
+                Reassign
+              </Button>
+              <Button size="small" color="error" onClick={p.onUnpair} disabled={unpaired} sx={{ ml: { md: "auto" } }}>
+                Unpair
+              </Button>
+            </Box>
+          </Box>
+        </Box>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function BridgePhonesSection({
   familyId,
   members,
@@ -59,6 +168,7 @@ export default function BridgePhonesSection({
   familyId: string | null;
   members: BridgeMember[];
 }) {
+  const fullScreen = useFullScreenDialog();
   const [bridges, setBridges] = useState<BridgeRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   // each member's relay-derived SMS number
@@ -162,6 +272,7 @@ export default function BridgePhonesSection({
 
   return (
     <Stack spacing={2}>
+      <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">Bridge phones</Typography>
         <Button
           variant="contained"
@@ -179,7 +290,36 @@ export default function BridgePhonesSection({
       </Typography>
       {error && <Alert severity="error">{error}</Alert>}
 
+      {bridges.length === 0 && (
+        <Typography variant="body2" color="text.secondary">
+          No bridge phones yet.
+        </Typography>
+      )}
+      {bridges.map((b) => {
+        const st = b.status ?? {};
+        const seen = toMs(b.lastSeenAt);
+        const unpaired = !b.paired;
+        const sim = b.simNumber ?? null;
+        const voice = b.voiceNumber ?? null;
+        const simMismatch = Boolean(st.simNumber && st.simNumber !== sim);
+        return (
+          <BridgePhoneCard
+            key={b.id}
+            bridge={b}
+            ownerLabel={b.ownerName ? `${b.ownerName} (@${b.ownerAlias})` : memberLabel(b.ownerUid)}
+            smsNumber={smsByUid[b.ownerUid] ?? null}
+            seenLabel={unpaired ? "unpaired" : seen === null ? "never" : formatRelativeAge(seen)}
+            simMismatch={simMismatch}
+            onNewCode={() => void reissue(b)}
+            onNumbers={() => setNumbers({ id: b.id, sim: sim ?? "", voice: voice ?? "" })}
+            onAccept={() => void accept(b)}
+            onReassign={() => setReassign({ id: b.id, owner: b.ownerUid })}
+            onUnpair={() => setUnpair(b)}
+          />
+        );
+      })}
 
+      <Dialog fullScreen={fullScreen} open={addOpen} onClose={() => setAddOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add bridge phone</DialogTitle>
         <DialogContent>
           {addError && <Alert severity="error" sx={{ mb: 1 }}>{addError}</Alert>}
@@ -217,6 +357,7 @@ export default function BridgePhonesSection({
         />
       )}
 
+      <Dialog fullScreen={fullScreen} open={reassign !== null} onClose={() => setReassign(null)} fullWidth maxWidth="xs">
         <DialogTitle>Reassign bridge phone</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}
@@ -237,6 +378,7 @@ export default function BridgePhonesSection({
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={numbers !== null} onClose={() => setNumbers(null)} fullWidth maxWidth="xs">
         <DialogTitle>Phone numbers</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}
@@ -273,6 +415,9 @@ export default function BridgePhonesSection({
               void run(
                 async () =>
                   void (await patchBridge(numbers.id, {
+                    // "" clears, a string sets
+                    simNumber: numbers.sim.trim(),
+                    voiceNumber: numbers.voice.trim(),
                   })),
                 () => setNumbers(null)
               )
@@ -283,6 +428,7 @@ export default function BridgePhonesSection({
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={unpair !== null} onClose={() => setUnpair(null)}>
         <DialogTitle>Unpair {unpair?.label}?</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}

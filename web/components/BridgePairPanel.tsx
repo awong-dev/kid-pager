@@ -17,10 +17,19 @@ import Typography from "@mui/material/Typography";
 
 import { toMs } from "@/lib/bridges";
 import type { ApiTime, BridgeRow } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 const CHECKLIST = [
+  "Sign in to the member's own Google account (Chat and Voice): notifications on, contacts list empty.",
+  "Open the Bridge app and tap Grant runtime permissions.",
+  "Enable Notification access.",
+  "Make the Bridge app the Default SMS app (SIM phones only).",
   "Exempt the app from battery optimisation.",
   "Enable the Accessibility service.",
+  "Fill in the relay URL (above) and the numbers, then tap Save fields.",
+  "Enter the code above and tap Pair.",
+  "Set the screen lock to None and turn Do Not Disturb off.",
+  "Never leave Chat open on a thread (an open thread suppresses its notifications); use a charge limiter or a smart-plug duty cycle so the battery lasts.",
 ];
 
 function countdown(ms: number): string {
@@ -44,8 +53,11 @@ export default function BridgePairPanel({
   onEditNumbers: () => void;
   onClose: () => void;
 }) {
+  const fullScreen = useFullScreenDialog();
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
+  // guard for the static export pass
+  const [origin] = useState(() => (typeof window === "undefined" ? "" : window.location.origin));
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
@@ -53,6 +65,7 @@ export default function BridgePairPanel({
 
   const exp = toMs(expiresAt);
   const remaining = exp === null ? 0 : exp - now;
+  const paired = bridge.paired;
   const sim = bridge.simNumber ?? bridge.status.simNumber ?? null;
 
   async function copy() {
@@ -62,6 +75,7 @@ export default function BridgePairPanel({
   }
 
   return (
+    <Dialog fullScreen={fullScreen} open onClose={onClose} fullWidth maxWidth="xs">
       <DialogTitle>Pair {bridge.label}</DialogTitle>
       <DialogContent>
         <Stack spacing={2}>
@@ -72,6 +86,7 @@ export default function BridgePairPanel({
           <Typography variant="h4" sx={{ fontFamily: "monospace", textAlign: "center", letterSpacing: 4 }}>
             {code}
           </Typography>
+          <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap", justifyContent: "center", alignItems: "center" }}>
             <Button variant="outlined" onClick={() => void copy()} disabled={remaining <= 0}>
               {copied ? "Copied" : "Copy code"}
             </Button>
@@ -98,6 +113,9 @@ export default function BridgePairPanel({
 
           <Divider />
           <Typography variant="subtitle2">Phone setup</Typography>
+          <Typography variant="body2">
+            Relay URL: <code>{origin}</code> (the app&apos;s default already points here). Code expires in 10 minutes.
+          </Typography>
           <Stack component="ol" spacing={0.5} sx={{ m: 0, pl: 3 }}>
             {CHECKLIST.map((c) => (
               <Typography key={c} component="li" variant="body2">

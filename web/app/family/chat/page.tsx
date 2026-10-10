@@ -40,6 +40,9 @@ import {
   ignoreChat,
   inspectLink,
   isGoogleChatLink,
+  isWhatsAppLink,
+  sourceLabel,
+  WHATSAPP_LINK_MESSAGE,
   patchChat,
   toMs,
   unsubscribeChat,
@@ -47,6 +50,9 @@ import {
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
 import { formatRelativeAge } from "@/lib/time";
+import type { BridgeConversationRow, ChatTabOut, RosterEntry } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
+import { responsiveTableSx } from "@/lib/tableSx";
 
 const POLL_MS = 5000;
 const LINK_POLL_MS = 3000;
@@ -57,6 +63,7 @@ function errText(e: unknown, fallback: string): string {
 }
 
 function targetOf(r: BridgeConversationRow): SubscribeTarget {
+  return { bridgeId: r.bridgeId, ref: r.ref, title: r.title ?? "", isGroup: r.isGroup, people: r.people };
 }
 
 function lastSeen(r: BridgeConversationRow): string {
@@ -69,11 +76,13 @@ function SourceChip({ r }: { r: BridgeConversationRow }) {
   return (
     <Stack direction="row" spacing={0.5}>
       <Chip size="small" label={r.isGroup ? "Group" : "DM"} />
+      <Chip size="small" variant="outlined" label={sourceLabel(r.source)} />
     </Stack>
   );
 }
 
 function ChatInner() {
+  const fullScreen = useFullScreenDialog();
   const { familyId } = useFamily();
   const { contacts, byUid } = useDirectory();
   const [ownerUid, setOwnerUid] = useState<string | null>(() =>
@@ -85,6 +94,10 @@ function ChatInner() {
   const [subscribe, setSubscribe] = useState<SubscribeTarget | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  const [menu, setMenu] = useState<{ el: HTMLElement; row: BridgeConversationRow } | null>(null);
+  const [rename, setRename] = useState<{ row: BridgeConversationRow; name: string } | null>(null);
+  const [rosterEdit, setRosterEdit] = useState<{ row: BridgeConversationRow; roster: RosterEntry[] } | null>(null);
+  const [unsub, setUnsub] = useState<BridgeConversationRow | null>(null);
   const [dialogBusy, setDialogBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
 
@@ -118,6 +131,7 @@ function ChatInner() {
       }
       return t;
     } catch (e) {
+      if (alive.current) setError(errText(e, "Could not load bridged conversations"));
       return null;
     }
   }, [ownerUid]);
@@ -169,6 +183,10 @@ function ChatInner() {
   async function addByLink() {
     const url = link.trim();
     if (!ownerUid || !url) return;
+    if (isWhatsAppLink(url)) {
+      setLinkMsg({ severity: "error", text: WHATSAPP_LINK_MESSAGE });
+      return;
+    }
     if (!isGoogleChatLink(url)) {
       setLinkMsg({ severity: "error", text: "Paste a chat.google.com, mail.google.com/chat or voice.google.com link." });
       return;
@@ -176,6 +194,8 @@ function ChatInner() {
     setLinkBusy(true);
     setLinkMsg(null);
     try {
+      // The member's paired bridge phone (the tab response lists them; the first is asked).
+      const mine = (tab?.bridges ?? []).filter((b) => b.paired);
       if (mine.length === 0) {
         setLinkMsg({ severity: "warning", text: "This member has no paired bridge phone. Add one under Family -> Devices." });
         return;
@@ -206,6 +226,7 @@ function ChatInner() {
 
   return (
     <Stack spacing={3}>
+      <Typography variant="h5">Bridged chats</Typography>
 
       <Autocomplete
         options={owners}
@@ -217,12 +238,14 @@ function ChatInner() {
         sx={{ maxWidth: 480 }}
       />
 
+      {!ownerUid && <Alert severity="info">Pick a member to manage the Google Chat, Google Voice and WhatsApp conversations their bridge phone carries.</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
 
       {ownerUid && (
         <>
           <Stack spacing={1}>
             <Typography variant="h6">Subscribed</Typography>
+            <TableContainer sx={responsiveTableSx([3,4])}>
               <Table size="small">
                 <TableHead>
                   <TableRow>
@@ -247,6 +270,8 @@ function ChatInner() {
                     <TableRow key={`${r.bridgeId}/${r.ref}`}>
                       <TableCell>
                         {r.pagerName ?? r.title}
+                        <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap", mt: 0.5 }}>
+                          {r.onPager === false && <Chip size="small" color="warning" variant="outlined" label="Not on pager" />}
                           {r.status === "paused" && <Chip size="small" label="Paused" />}
                           {r.canReply === false && <Chip size="small" variant="outlined" label="Read only" />}
                         </Stack>
@@ -269,12 +294,14 @@ function ChatInner() {
           </Stack>
 
           <Stack spacing={1}>
+            <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
               <Typography variant="h6">Seen, not subscribed</Typography>
               <FormControlLabel
                 control={<Switch checked={showIgnored} onChange={(e) => setShowIgnored(e.target.checked)} />}
                 label="Show ignored"
               />
             </Stack>
+            <TableContainer sx={responsiveTableSx([3,4])}>
               <Table size="small">
                 <TableHead>
                   <TableRow>
@@ -312,6 +339,7 @@ function ChatInner() {
                       <TableCell>{r.people.join(", ") || "--"}</TableCell>
                       <TableCell>{lastSeen(r) || "--"}</TableCell>
                       <TableCell>
+                        <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
                           <Button size="small" variant="contained" onClick={() => setSubscribe(targetOf(r))}>
                             Subscribe
                           </Button>
@@ -332,8 +360,10 @@ function ChatInner() {
           <Stack spacing={1} sx={{ maxWidth: 640 }}>
             <Typography variant="h6">Add by link</Typography>
             <Typography variant="body2" color="text.secondary">
+              To start a conversation nobody has posted in yet, paste its Google Chat or Voice link (WhatsApp chats cannot be added by link). The phone opens it
               and reports back.
             </Typography>
+            <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
               <TextField
                 fullWidth
                 size="small"
@@ -354,6 +384,7 @@ function ChatInner() {
       <Menu anchorEl={menu?.el} open={menu !== null} onClose={() => setMenu(null)}>
         <MenuItem
           onClick={() => {
+            if (menu) setRename({ row: menu.row, name: menu.row.pagerName ?? menu.row.title ?? "" });
             setDialogError(null);
             setMenu(null);
           }}
@@ -365,6 +396,7 @@ function ChatInner() {
             onClick={() => {
               if (menu) {
                 const r = menu.row;
+                setRosterEdit({ row: r, roster: defaultRoster(r.people, Object.fromEntries((r.roster ?? []).map((x) => [x.name, x.nick]))) });
               }
               setDialogError(null);
               setMenu(null);
@@ -397,6 +429,7 @@ function ChatInner() {
         </MenuItem>
       </Menu>
 
+      <Dialog fullScreen={fullScreen} open={rename !== null} onClose={() => setRename(null)} fullWidth maxWidth="xs">
         <DialogTitle>Rename on pager</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}
@@ -431,6 +464,7 @@ function ChatInner() {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={rosterEdit !== null} onClose={() => setRosterEdit(null)} fullWidth maxWidth="sm">
         <DialogTitle>Roster for {rosterEdit?.row.pagerName ?? rosterEdit?.row.title}</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}
@@ -456,6 +490,7 @@ function ChatInner() {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={unsub !== null} onClose={() => setUnsub(null)}>
         <DialogTitle>Unsubscribe {unsub?.pagerName ?? unsub?.title}?</DialogTitle>
         <DialogContent>
           {dialogError && <Alert severity="error" sx={{ mb: 1 }}>{dialogError}</Alert>}
@@ -484,6 +519,7 @@ function ChatInner() {
           onSubscribed={(res, name) => {
             setSubscribe(null);
             setToast(
+              `${name} is on @${owner?.alias ?? "the member"}'s pager; ${res.delivered} waiting ${
                 res.delivered === 1 ? "message" : "messages"
               } delivered`
             );

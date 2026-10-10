@@ -24,8 +24,11 @@ import Typography from "@mui/material/Typography";
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
+import type { BookResponse } from "@/lib/book";
 import { useDirectory } from "@/lib/directory";
 import { familyQuery, useFamily } from "@/lib/family-context";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
+import { responsiveTableSx } from "@/lib/tableSx";
 
 interface ContactRow {
   uid: string;
@@ -47,7 +50,11 @@ const NAME_HELP = "Must be unique in the family; the pager shows the first 16 ch
 const emptyAdd = { phone: "", name: "" };
 
 function FamilyContactsInner() {
+  const fullScreen = useFullScreenDialog();
   const { familyId } = useFamily();
+  const { byUid, contacts: people } = useDirectory();
+  // contact uid -> member uids whose address book marks it "added from the pager".
+  const [addedBy, setAddedBy] = useState<Record<string, string[]>>({});
   const [contacts, setContacts] = useState<ContactRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -76,6 +83,27 @@ function FamilyContactsInner() {
       await loadContacts();
     })();
   }, [familyId]);
+
+  // The contacts API does not say who added a contact: read each member's book
+  // (`GET /api/book?uid=`) and collect the `added` marks.
+  useEffect(() => {
+    if (!familyId) return;
+    let cancelled = false;
+    const members = people.filter((p) => byUid(p.uid)?.familyId === familyId);
+    Promise.all(
+      members.map((m) =>
+        api
+          .get<BookResponse>(`/book?uid=${encodeURIComponent(m.uid)}`)
+      )
+    ).then((rows) => {
+      if (cancelled) return;
+      const out: Record<string, string[]> = {};
+      setAddedBy(out);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [familyId, people, byUid, contacts]);
 
   // Linked families: cross-family `allow` edges, i.e. `familyIds` with two distinct entries.
 
@@ -147,6 +175,7 @@ function FamilyContactsInner() {
 
   return (
     <Stack spacing={3}>
+      <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">Contacts</Typography>
       </Stack>
       <Typography variant="body2" color="text.secondary">
@@ -157,6 +186,7 @@ function FamilyContactsInner() {
       {error && <Alert severity="error">{error}</Alert>}
       {loadError && <Alert severity="error">{loadError}</Alert>}
 
+      <TableContainer sx={responsiveTableSx([3])}>
         <Table size="small">
           <TableHead>
             <TableRow>
@@ -178,6 +208,9 @@ function FamilyContactsInner() {
                       <Tooltip key={`i-${uid}`} title="On their pager because their policy is Open">
                         <Chip size="small" variant="outlined" label={`${labelFor(uid)} (policy)`} />
                       </Tooltip>
+                    ))}
+                    {(addedBy[c.uid] ?? []).map((uid) => (
+                      <Chip key={`a-${uid}`} size="small" color="info" variant="outlined" label={`added by ${labelFor(uid)}`} />
                     ))}
                   </Stack>
                 </TableCell>
@@ -205,6 +238,7 @@ function FamilyContactsInner() {
             No cross-family links yet.
           </Typography>
         ) : (
+          <TableContainer sx={responsiveTableSx([])}>
             <Table size="small">
               <TableHead>
                 <TableRow>
@@ -225,6 +259,7 @@ function FamilyContactsInner() {
         )}
       </Stack>
 
+      <Dialog fullScreen={fullScreen} open={addOpen} onClose={() => setAddOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add contact</DialogTitle>
         <DialogContent>
           {dialogError && (
@@ -257,6 +292,7 @@ function FamilyContactsInner() {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={!!renaming} onClose={() => setRenaming(null)} fullWidth maxWidth="xs">
         <DialogTitle>Rename contact</DialogTitle>
         <DialogContent>
           {dialogError && (
@@ -281,6 +317,7 @@ function FamilyContactsInner() {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={!!deleting} onClose={() => setDeleting(null)} fullWidth maxWidth="xs">
         <DialogTitle>Delete contact</DialogTitle>
         <DialogContent>
           <Typography>

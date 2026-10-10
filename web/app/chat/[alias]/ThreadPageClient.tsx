@@ -24,8 +24,10 @@ import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
+import { peerLabel } from "@/lib/names";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import type { SmsLogEntry, SmsLogResponse } from "@/lib/smsContacts";
+import { threadHeightSx } from "@/lib/layout";
 
 const PAGE_SIZE_STEP = 50;
 // within this distance of the bottom counts as at-bottom
@@ -300,6 +302,9 @@ function ThreadInner({ alias }: { alias: string }) {
   }
 
   return (
+    <Stack spacing={2} sx={threadHeightSx}>
+      <Stack direction="row" spacing={2} useFlexGap sx={{ alignItems: "center", flexWrap: "wrap" }}>
+        <Typography variant="h6" sx={{ wordBreak: "break-word" }}>{group ? group.name : peerLabel({ alias, displayName: peerEntry?.displayName, kind: peerEntry?.kind })}</Typography>
         {group && (
           <Typography variant="caption" color="text.secondary">
             @{alias}
@@ -311,6 +316,7 @@ function ThreadInner({ alias }: { alias: string }) {
           </Typography>
         )}
         <Box sx={{ flexGrow: 1 }} />
+        {group && !group.bridged && (
           <Button size="small" color="inherit" disabled={leaving} onClick={() => void handleLeave()}>
             Leave
           </Button>
@@ -331,6 +337,7 @@ function ThreadInner({ alias }: { alias: string }) {
       {!peerUid && !group && <Alert severity="info">No conversation with @{alias} yet</Alert>}
 
       {isExternal && (
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
           <Alert severity="info" sx={{ flexGrow: 1 }}>
             Texts with SMS contacts go through the pager&apos;s modem.
           </Alert>

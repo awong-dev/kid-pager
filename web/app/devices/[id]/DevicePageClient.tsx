@@ -25,6 +25,7 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 
 import AppShell from "@/components/AppShell";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
+import EditDeviceLabelButton from "@/components/EditDeviceLabelDialog";
 import FirmwareChip from "@/components/FirmwareChip";
 import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
@@ -32,6 +33,7 @@ import BatteryCard from "@/components/BatteryCard";
 import GnssPanel from "@/components/GnssPanel";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
+import { deviceName } from "@/lib/devices";
 import { useNewestBuild } from "@/lib/firmware";
 import { useDirectory } from "@/lib/directory";
 import {
@@ -43,6 +45,7 @@ import {
   statusColor,
 } from "@/lib/smsContacts";
 import type { DeviceDoc } from "@/lib/types";
+import { responsiveTableSx } from "@/lib/tableSx";
 
 const LOG_PAGE_SIZE = 100;
 
@@ -120,6 +123,10 @@ function LogRow({ e }: { e: SmsLogEntry }) {
 function DeviceInner() {
   const id = useDeviceId();
   const router = useRouter();
+  const { isSuper, isFamilyAdmin } = useAuth();
+  // A super uses the account-level admin routes; a family admin the family ones.
+  const fwScope = isSuper ? "admin" : "family";
+  const newestBuild = useNewestBuild(isFamilyAdmin, fwScope, id);
   const [fwOpen, setFwOpen] = useState(false);
 
   const [contacts, setContacts] = useState<SmsContact[] | null>(null);
@@ -190,9 +197,19 @@ function DeviceInner() {
 
   return (
     <Stack spacing={2}>
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
         <IconButton onClick={() => router.back()} aria-label="back" size="small">
           <ArrowBackIcon fontSize="small" />
         </IconButton>
+        <Stack sx={{ flexGrow: 1 }}>
+          <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
+            <Typography variant="h5">{device ? deviceName(device) : id}</Typography>
+            {device && isFamilyAdmin && <EditDeviceLabelButton device={device} scope={fwScope} />}
+          </Stack>
+          <Typography variant="caption" color="text.secondary" sx={{ fontFamily: "monospace" }}>
+            {id}
+          </Typography>
+        </Stack>
         <DeviceTrustChip tls={device?.status?.tls} caFp={device?.status?.caFp} />
         {device?.status?.car && <Chip size="small" variant="outlined" label={device.status.car} />}
       </Stack>
@@ -200,12 +217,15 @@ function DeviceInner() {
       {deviceError && <Alert severity="warning">{deviceError}</Alert>}
 
       {device && (
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "flex-start" }}>
+          {isFamilyAdmin && (
             <Button size="small" onClick={() => setFwOpen(true)}>
               Update firmware…
             </Button>
           )}
         </Stack>
       )}
+      {fwOpen && <FirmwareUpdateDialog device={device} scope={fwScope} open onClose={() => setFwOpen(false)} />}
 
       {smsLost > 0 && (
         <Alert severity="warning">
@@ -248,6 +268,7 @@ function DeviceInner() {
               No approved numbers yet.
             </Typography>
           ) : (
+            <TableContainer sx={responsiveTableSx([])}>
               <Table size="small">
                 <TableHead>
                   <TableRow>
@@ -271,6 +292,7 @@ function DeviceInner() {
 
       <Card variant="outlined">
         <CardContent>
+          <Stack direction="row" sx={{ flexWrap: "wrap", alignItems: "center", mb: 1 }}>
             <Typography variant="h6" sx={{ flexGrow: 1 }}>
               SMS log
             </Typography>
@@ -289,6 +311,7 @@ function DeviceInner() {
             </Typography>
           )}
           {log !== null && log.length > 0 && (
+            <TableContainer sx={responsiveTableSx([2,4])}>
               <Table size="small">
                 <TableHead>
                   <TableRow>

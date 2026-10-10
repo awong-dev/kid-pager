@@ -20,6 +20,7 @@ import { ApiError } from "@/lib/api";
 import { NICK_MAX_CODEPOINTS, nickError, useBook } from "@/lib/book";
 import { defaultRoster, outboundBlocksPeople, subscribeChat } from "@/lib/bridges";
 import type { RosterEntry, SubscribeResult } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 export interface SubscribeTarget {
   bridgeId: string;
@@ -64,6 +65,7 @@ function Body({
         canReply: replyBlocked ? false : canReply,
         roster: target.isGroup ? roster : [],
       });
+      onSubscribed(res, name.trim());
     } catch (e) {
       setFailure(e instanceof ApiError ? String(e.detail ?? e.message) : "Could not subscribe");
     } finally {
@@ -133,9 +135,11 @@ export default function ChatSubscribeDialog({
   onClose: () => void;
   onSubscribed: (result: SubscribeResult, pagerName: string) => void;
 }) {
+  const fullScreen = useFullScreenDialog();
   // keyed per conversation so form state resets
   const key = useMemo(() => (target ? `${target.bridgeId}/${target.ref}` : "none"), [target]);
   return (
+    <Dialog fullScreen={fullScreen} open={target !== null} onClose={onClose} fullWidth maxWidth="sm">
       {target && <Body key={key} ownerUid={ownerUid} target={target} onClose={onClose} onSubscribed={onSubscribed} />}
     </Dialog>
   );

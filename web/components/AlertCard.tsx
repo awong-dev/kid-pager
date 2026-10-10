@@ -26,8 +26,11 @@ import SmsIcon from "@mui/icons-material/Sms";
 import ChatSubscribeDialog from "@/components/ChatSubscribeDialog";
 import { formatPhoneDigits } from "@/components/NewChatDialog";
 import { ApiError, api } from "@/lib/api";
+import { ignoreChat, sourceLabel } from "@/lib/bridges";
+import { isHashAlias } from "@/lib/names";
 import { familyQuery } from "@/lib/family-context";
 import type { AlertDoc } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 /** One row of `GET /api/family/alerts/{id}/held`. */
 interface HeldText {
@@ -76,6 +79,7 @@ function kindIcon(kind: AlertDoc["kind"]) {
   }
 }
 
+function kindLabel(kind: AlertDoc["kind"], source?: AlertDoc["source"]): string {
   switch (kind) {
     case "sms_unknown":
       return "Unknown number";
@@ -84,10 +88,32 @@ function kindIcon(kind: AlertDoc["kind"]) {
     case "contact_request":
       return "Contact request";
     case "chat_unknown":
+      // name the app the bridged conversation came from
+      return source === "gchat" || source === "gvoice" || source === "whatsapp"
+        ? sourceLabel(source)
+        : "Unknown source";
   }
 }
 
+/** Who a `new_conversation` alert's kid wrote to: never a hash alias. */
+function newConversationPeer(alert: AlertRow): string {
+  const phone = alert.peerPhone
+    ? formatPhoneDigits(alert.peerPhone.replace(/^\+/, ""))
+    : null;
+  const name = alert.peerName?.trim();
+  if (phone) {
+    return name ? `${name} (${phone})` : phone;
+  }
+  if (alert.peerAlias) {
+    const at = isHashAlias(alert.peerAlias) ? null : `@${alert.peerAlias}`;
+    if (at) return name ? `${at} (${name})` : at;
+    return name || "someone";
+  }
+  return name || "someone";
+}
+
 export default function AlertCard({ alert }: { alert: AlertRow }) {
+  const fullScreen = useFullScreenDialog();
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -183,6 +209,8 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
   return (
     <Card variant="outlined">
       <CardContent>
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center", mb: 1 }}>
+          <Chip size="small" icon={kindIcon(alert.kind)} label={kindLabel(alert.kind, alert.source)} />
           <Typography variant="caption" color="text.secondary">
             {formatAge(alert.ts)}
           </Typography>
@@ -222,6 +250,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
                   <Stack spacing={1} sx={{ mt: 0.5 }}>
                     {heldList?.map((h) => (
                       <div key={h.id}>
+                        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
                           <Typography variant="caption" color="text.secondary">
                             {formatReceived(h.receivedAt)}
                           </Typography>
@@ -255,8 +284,11 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
         {alert.kind === "new_conversation" && (
           <>
             <Typography variant="body1">
+              @{alert.subjectAlias} started a chat with {newConversationPeer(alert)}
             </Typography>
+            {alert.preview && !/^@\S+ started a chat with /.test(alert.preview) && (
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                &ldquo;{alert.preview}&rdquo;
               </Typography>
             )}
           </>
@@ -266,6 +298,9 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
           <>
             {isSms ? (
               <>
+                <Typography variant="body1">
+                  @{alert.subjectAlias} wants to text {alert.peerName ?? "a number"} (
+                  {formatPhoneDigits((alert.peerPhone ?? "").replace(/^\+/, ""))}) · added from the pager
                 </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
                   Approve: @{alert.subjectAlias}&apos;s pager can text this number.
@@ -274,6 +309,8 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             ) : (
               <>
                 <Typography variant="body1">
+                  @{alert.subjectAlias} wants to message @{alert.peerAlias} ({alert.peerName ?? "unknown"}) · added
+                  from the pager
                 </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
                   Approve: @{alert.subjectAlias} can message @{alert.peerAlias}.
@@ -290,6 +327,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             </Typography>
             <Typography variant="body2" color="text.secondary">
               {alert.isGroup ? `Group (${chatPeople.length} ${chatPeople.length === 1 ? "person" : "people"} seen)` : "Direct message"}
+              {alert.source === "gvoice" || alert.source === "whatsapp" ? ` · ${sourceLabel(alert.source)}` : ""}
             </Typography>
             {chatPeople.length > 0 && (
               <Stack direction="row" spacing={0.5} useFlexGap sx={{ mt: 0.5, flexWrap: "wrap" }}>
@@ -392,10 +430,12 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
           onClose={() => setSubscribeOpen(false)}
           onSubscribed={(res, name) => {
             setSubscribeOpen(false);
+            setChatResult(`${name} is on the pager; ${res.delivered} waiting messages delivered`);
           }}
         />
       )}
 
+      <Dialog fullScreen={fullScreen} open={smsOpen} onClose={() => setSmsOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Approve {alert.peerPhone ?? "number"}</DialogTitle>
         <DialogContent>
           {nameConflict && smsOpen && (
@@ -429,6 +469,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={nameOpen} onClose={() => setNameOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Choose another name</DialogTitle>
         <DialogContent>
           {nameConflict && (

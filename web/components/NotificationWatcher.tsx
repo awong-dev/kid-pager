@@ -9,6 +9,13 @@ import { useEffect, useRef } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import {
+  notificationPermission,
+  notificationsSupported,
+  registerForPush,
+  showForegroundMessageNotification,
+} from "@/lib/notifications";
+import { peerLabel } from "@/lib/names";
 import type { AlertDoc, ConversationDoc } from "@/lib/types";
 
 /** Alerts show the relay-provided `preview` and link to `/family/alerts`. */
@@ -64,6 +71,13 @@ export default function NotificationWatcher() {
     byUidRef.current = byUid;
   }, [byUid]);
 
+  const pushRefreshed = useRef(false);
+  useEffect(() => {
+    if (!me || pushRefreshed.current) return;
+    if (!notificationsSupported() || notificationPermission() !== "granted") return;
+    pushRefreshed.current = true;
+  }, [me]);
+
   useEffect(() => {
     if (!me) return;
     const previousUnread = new Map<string, number>();
@@ -85,8 +99,15 @@ export default function NotificationWatcher() {
             }
           } else {
             const peerUid = data.uids.find((u) => u !== me.uid) ?? data.uids[0]!;
+            const part = data.participants?.[peerUid];
+            const dir = byUidRef.current(peerUid);
+            const alias = part?.alias ?? dir?.alias;
+            const title = alias
+              ? peerLabel({ alias, displayName: part?.displayName || dir?.displayName, kind: part?.kind ?? dir?.kind })
+              : undefined;
             const threadOpen = alias !== undefined && alias === openAlias;
             if (alias !== undefined && (document.visibilityState !== "visible" || !threadOpen)) {
+              showForegroundMessageNotification(alias, data.lastPreview, title);
             }
           }
         }

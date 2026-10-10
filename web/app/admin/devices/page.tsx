@@ -17,8 +17,10 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import DeviceCard, { type DeviceRow, type PendingCfgDoc, type ProvisionState } from "@/components/DeviceCard";
 import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
+import SoracomSimsSection from "@/components/SoracomSimsSection";
 import { ApiError, api } from "@/lib/api";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
@@ -26,6 +28,8 @@ import { useNewestBuild } from "@/lib/firmware";
 import type { DeviceDoc, UserDoc } from "@/lib/types";
 
 import SetupCodePanel, { type SetupCodeResult } from "./SetupCodePanel";
+import { DEVICE_LABEL_MAX_CHARS } from "@/lib/devices";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 // `POST /api/admin/devices/{id}/ca` with `{"action":"push"|"unpin"}`.
 type CaAction = "push" | "unpin";
@@ -38,6 +42,7 @@ interface CaConfirmState {
 
 const ALL_FAMILIES = "__all__";
 
+const emptyForm = { ownerAlias: "", label: "", defaultToAlias: "", familyId: "" };
 
 // Response of device create and rotate-credentials; only the fields read here.
 interface DeviceSetupResponse {
@@ -49,6 +54,7 @@ interface DeviceSetupResponse {
 }
 
 function DevicesInner() {
+  const fullScreen = useFullScreenDialog();
   const { uidToAlias } = useDirectory();
   const { familyId: scopeFamilyId, families } = useFamily();
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +63,7 @@ function DevicesInner() {
   const [setupResult, setSetupResult] = useState<SetupCodeResult | null>(null);
   const [caConfirm, setCaConfirm] = useState<CaConfirmState | null>(null);
   const [fwDeviceId, setFwDeviceId] = useState<string | null>(null);
+  const newestBuild = useNewestBuild(true, "admin");
   const [caBusy, setCaBusy] = useState(false);
   const [caError, setCaError] = useState<string | null>(null);
   const [caSuccess, setCaSuccess] = useState<string | null>(null);
@@ -177,6 +184,7 @@ function DevicesInner() {
     }
   }
 
+  const formValid = form.ownerAlias.trim() && form.label.trim();
   const setupResultDevice = setupResult
     ? devices.find((d) => d.id === setupResult.deviceId)
     : undefined;
@@ -184,6 +192,7 @@ function DevicesInner() {
 
   return (
     <Stack spacing={2}>
+      <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">Devices</Typography>
         <Button variant="contained" onClick={openCreate}>
           Add device
@@ -206,7 +215,30 @@ function DevicesInner() {
       </TextField>
       {error && <Alert severity="error">{error}</Alert>}
 
+      <Stack spacing={2}>
+        {visibleDevices.map((d) => (
+          <DeviceCard
+            key={d.id}
+            device={d}
+            scope="admin"
+            newestBuild={newestBuild}
+            ownerLabel={`@${uidToAlias(d.ownerUid) ?? d.ownerUid.slice(0, 8)}`}
+            defaultToLabel={d.defaultToUid ? `@${uidToAlias(d.defaultToUid) ?? d.defaultToUid.slice(0, 8)}` : "--"}
+            familyLabel={d.familyId ? (familyNameById.get(d.familyId) ?? d.familyId) : "--"}
+            onRotate={() => void rotate(d)}
+            onRevoke={() => void revoke(d.id)}
+            onDelete={() => void deleteDevice(d.id)}
+            onFirmware={() => setFwDeviceId(d.id)}
+            onCa={(action) => setCaConfirm({ deviceId: d.id, label: d.label, action })}
+            onSetAutoLock={(m) => void setAutoLock(d.id, m)}
+            onClearPasscode={() => void clearPasscode(d.id)}
+          />
+        ))}
+      </Stack>
 
+      <SoracomSimsSection />
+
+      <Dialog fullScreen={fullScreen} open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add device</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -214,6 +246,9 @@ function DevicesInner() {
               label="Label"
               value={form.label}
               onChange={(e) => setForm({ ...form, label: e.target.value })}
+              helperText="Shown on the web and on the pager's device screen"
+              slotProps={{ htmlInput: { maxLength: DEVICE_LABEL_MAX_CHARS } }}
+              autoFocus
               fullWidth
             />
             <TextField
@@ -275,6 +310,7 @@ function DevicesInner() {
         />
       )}
 
+      <Dialog fullScreen={fullScreen} open={caConfirm !== null} onClose={() => (caBusy ? undefined : setCaConfirm(null))}>
         <DialogTitle>
           {caConfirm?.action === "push" ? "Push CA certificate" : "Un-pin CA certificate"}
         </DialogTitle>
@@ -319,6 +355,7 @@ function DevicesInner() {
       {fwDeviceId !== null && (
         <FirmwareUpdateDialog
           device={devices.find((x) => x.id === fwDeviceId) ?? null}
+          scope="admin"
           open
           onClose={() => setFwDeviceId(null)}
         />

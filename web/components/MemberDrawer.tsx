@@ -83,6 +83,15 @@ function MemberProfileForm({
         <MenuItem value="admin">Admin</MenuItem>
         {member.role === "super" && <MenuItem value="super">Super</MenuItem>}
       </TextField>
+      <div>
+        <Typography variant="caption" color="text.secondary">
+          SMS number
+        </Typography>
+        <Typography>{member.smsNumber ?? "none"}</Typography>
+        <Typography variant="caption" color="text.secondary">
+          Set by the member&apos;s bridge phone (Family → Devices).
+        </Typography>
+      </div>
       <FormControlLabel
         control={<Switch checked={!disabled} onChange={(e) => setDisabled(!e.target.checked)} />}
         label={disabled ? "Disabled" : "Enabled"}
@@ -98,7 +107,9 @@ function MemberProfileForm({
 
       <Divider />
 
+      <Typography variant="subtitle2">Bridged chats</Typography>
       <Button component={Link} href={`/family/chat?uid=${encodeURIComponent(member.uid)}`} variant="outlined">
+        Bridged chats…
       </Button>
 
       <Divider />
@@ -119,6 +130,7 @@ export default function MemberDrawer({
 }) {
   return (
     <Drawer anchor="right" open={member !== null} onClose={onClose}>
+      <Stack spacing={2} sx={{ width: { xs: "100vw", sm: 420 }, maxWidth: "100vw", overflowY: "auto", p: 3 }}>
         {member && <MemberProfileForm key={member.uid} member={member} onClose={onClose} />}
       </Stack>
     </Drawer>

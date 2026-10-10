@@ -17,10 +17,13 @@ export interface BookEntry {
   label: string;
   phone?: string | null;
   // Set on a bridged Google Chat / Voice / WhatsApp contact (`t:"chat"` on the pager).
+  chat?: { source: "gchat" | "gvoice" | "whatsapp" } | null;
   inFamily: boolean;
   sendable: boolean;
   reason?: string | null;
   onPager: boolean;
+  // The entry was added from the pager.
+  added: boolean;
 }
 
 export interface BookResponse {
@@ -111,6 +114,11 @@ export async function saveNick(owner: string, peer: string, nick: string): Promi
   } else {
     await api.put(path, { nick: t });
   }
+}
+
+/** `DELETE /api/book/{owner}/added/{peer}`: drops the "added from the pager" marker. */
+export async function removeAdded(owner: string, peer: string): Promise<BookResponse> {
+  return api.del<BookResponse>(`/book/${encodeURIComponent(owner)}/added/${encodeURIComponent(peer)}`);
 }
 
 export function reasonText(reason?: string | null): string {

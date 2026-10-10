@@ -11,6 +11,7 @@ import Radio from "@mui/material/Radio";
 import RadioGroup from "@mui/material/RadioGroup";
 import Typography from "@mui/material/Typography";
 
+import { deviceName } from "@/lib/devices";
 import { ApiError } from "@/lib/api";
 import {
   MONTHLY_TARGET_BYTES,
@@ -19,22 +20,28 @@ import {
   listBuilds,
   pushOta,
   type FirmwareBuild,
+  type FirmwareScope,
 } from "@/lib/firmware";
 import type { DeviceDoc } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 function errText(e: unknown): string {
   return e instanceof ApiError ? e.message : "Request failed.";
 }
 
+/** "Update firmware" dialog for a super (`admin` scope) or a family admin (own family only). */
 export default function FirmwareUpdateDialog({
   device,
+  scope,
   open,
   onClose,
 }: {
   device: (DeviceDoc & { id: string }) | null;
+  scope: FirmwareScope;
   open: boolean;
   onClose: () => void;
 }) {
+  const fullScreen = useFullScreenDialog();
   const [builds, setBuilds] = useState<FirmwareBuild[]>([]);
   const [selected, setSelected] = useState("");
   const [busy, setBusy] = useState(false);
@@ -44,6 +51,7 @@ export default function FirmwareUpdateDialog({
   useEffect(() => {
     if (!open || !deviceId) return;
     let cancelled = false;
+    listBuilds(scope, deviceId)
       .then((b) => {
         if (!cancelled) setBuilds([...b].sort((x, y) => y.published - x.published));
       })
@@ -53,6 +61,7 @@ export default function FirmwareUpdateDialog({
     return () => {
       cancelled = true;
     };
+  }, [open, deviceId, scope]);
 
   // Same normalisation as the relay's 409 check: trim, lowercase, first 16 hex.
   const running = device?.status?.img ? device.status.img.trim().toLowerCase().slice(0, 16) : null;
@@ -76,6 +85,8 @@ export default function FirmwareUpdateDialog({
   }
 
   return (
+    <Dialog fullScreen={fullScreen} open={open} onClose={busy ? undefined : onClose} fullWidth maxWidth="sm">
+      <DialogTitle>Update firmware{device ? ` -- ${deviceName(device)}` : ""}</DialogTitle>
       <DialogContent>
         <Typography variant="body2" sx={{ mb: 2 }}>
           Running:{" "}
@@ -124,6 +135,7 @@ export default function FirmwareUpdateDialog({
                       </Typography>
                       <Typography variant="caption" color="text.secondary">
                         {new Date(b.published * 1000).toLocaleDateString()}, {formatBytes(b.size)};{" "}
+                        {b.onDemandDelta ? "delta (made at push)" : b.kind}, ~{formatBytes(b.estBytes)}
                       </Typography>
                     </>
                   }
@@ -134,6 +146,11 @@ export default function FirmwareUpdateDialog({
         </FormControl>
         {chosen && (
           <Typography variant="body2" sx={{ mt: 2 }}>
+            Cellular data for this update:{" "}
+            {chosen.onDemandDelta
+              ? `up to ~${formatBytes(chosen.estBytes)}; a delta is generated at push time and is usually much smaller`
+              : `~${formatBytes(chosen.estBytes)}`}{" "}
+            (about{" "}
             {((chosen.estBytes / MONTHLY_TARGET_BYTES) * 100).toFixed(1)} % of the 10 MB monthly
             target)
           </Typography>
@@ -146,6 +163,7 @@ export default function FirmwareUpdateDialog({
         <Button
           variant="contained"
           disabled={busy || !capable || !chosen || chosenIsRunning || !deviceId}
+          onClick={() => deviceId && chosen && void run(() => pushOta(scope, deviceId, chosen.id16))}
         >
           Send update
         </Button>

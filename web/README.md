@@ -88,6 +88,8 @@ config's `rewrites()` only matters to `next dev`.
 
 ## Known limitations
 
+- **The FCM token is refreshed automatically** once per page load by `NotificationWatcher`
+  when notification permission is already granted (no prompt).
 - **The notifications "test" button is local-only.** There is no relay
   endpoint that sends a real push on demand, so it only proves permission +
   display work in this browser, not the full FCM round trip.
@@ -97,6 +99,7 @@ config's `rewrites()` only matters to `next dev`.
 The **Add device** flow (`/admin/devices` -> click the "Add device" button) walks a
 household admin through creating a new pager:
 
+1. Enter a **Label** (e.g. "Kid's pager"; the relay generates the device ID, `pgr-` plus 8 hex), select the
    **Owner** (the student who will use it), and optionally a **Default recipient** (where
    messages go if not explicitly addressed).
 2. Click **Create**. The page generates a one-time **setup code** (40–55 characters), displays
@@ -185,6 +188,8 @@ incognito window) to act as two different people at once where noted.
    if `/settings/notifications` was enabled first and the tab isn't focused.
    A thread marks messages read only when the viewer is at the bottom of
    the list and the tab is visible.
+10. **On-demand OTA delta**: push to a device on an older published build shows
+   "delta (made at push)" in the dialog; after the push the job reads delta.
 
 ## Thread auto-scroll behaviour
 
@@ -231,6 +236,9 @@ incognito window) to act as two different people at once where noted.
     note.
 15. **Sign out**: confirm "Sign out" returns to `/login` and that navigating
     back to `/chat` redirects to `/login` rather than showing stale data.
+16. **Soracom SIMs**: Admin -> Devices -> Soracom SIMs lists the account's SIMs;
+    Enroll moves one into pager-beam; Enroll all handles the rest; an
+    unconfigured relay shows the setup alert.
 
 ## Multi-family tenancy checklist
 
@@ -270,6 +278,12 @@ incognito window) to act as two different people at once where noted.
     malformed audit upload (bad `sms_log` payload from the pager) shows a red "malformed" chip, its reason in italics,
     "—" for unknown fields, and a "raw" toggle revealing the hex. A chat with an SMS contact interleaves the pager's modem texts for that number as bubbles (out = right, in = left,
     "modem" chip, status, malformed rows with reason/raw); Refresh or window focus reloads them.
+26. **SMS numbers**: SMS numbers come from bridge phones and are read-only:
+    People -> member drawer and Admin -> Users (column "SMS number") show the number or "none". A held `sms_unknown`
+    card reads "to @kid · +1 ...", the newest text, "N messages waiting" (expander lists each text; status chip only
+    when not `held`); Approve (name) shows "Delivered N" and a 409 keeps the dialog open. Delivery chips: "waiting to
+    send SMS" / "sent by SMS" / "SMS failed". New chat lists sendable SMS contacts only for a user with an SMS number;
+    the address book shows "needs an SMS number" for unsendable ones.
 
 27. **Bridge phone** (needs the relay's bridge routes; `tools/bridge_sim.py` can stand in for the phone):
     - Family -> Devices -> "Bridge phones": Add bridge phone (member + label) opens the pairing panel with an 8-digit
@@ -287,6 +301,8 @@ incognito window) to act as two different people at once where noted.
       "<name> is on @kid's pager; N waiting messages delivered". Rename, Edit roster, Pause / Resume, Unsubscribe
       work from Manage; entries past the pager's 32 show "Not on pager". Add by link: paste a chat.google.com or
       voice.google.com link, Inspect; the dialog opens within ~30 s when the phone reports it.
+    - WhatsApp is a third bridge source: "WhatsApp" caps chip on the phone row, "WhatsApp" labels on chats/alerts/book;
+      Add by link refuses wa.me / whatsapp.com links (wait for a message from the chat).
     - Address book shows a "Google Chat" / "Google Voice" chip on bridged contacts; New chat lists sendable ones
       without needing an SMS number. Delivery chips: "waiting for the phone" / "sent on Google Chat".
 

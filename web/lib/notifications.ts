@@ -63,9 +63,13 @@ export async function showLocalTestNotification(): Promise<void> {
 /** Shows a notification for a message in a thread that is not the open one. */
 export async function showForegroundMessageNotification(
   alias: string,
+  preview: string,
+  /** Display label for the sender (lib/names.ts `peerLabel`); defaults to `@alias`. */
+  label?: string
 ): Promise<void> {
   if (notificationPermission() !== "granted") return;
   await showNotification(
+    `New message from ${label ?? `@${alias}`}`,
     {
       body: preview,
       icon: "/icons/icon-192.png",

@@ -52,6 +52,7 @@ export default function LocationCard({
   return (
     <Card variant="outlined" sx={{ maxWidth: 360 }}>
       <CardContent>
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
           <RoomIcon color="action" fontSize="small" />
           <Typography variant="subtitle2">{title}</Typography>
         </Stack>
@@ -85,6 +86,7 @@ export default function LocationCard({
           {cached ? " (cached)" : ""}
         </Typography>
 
+        <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap", mt: 1 }}>
           <Link href={googleUrl} target="_blank" rel="noopener noreferrer">
             Open in Google Maps
           </Link>

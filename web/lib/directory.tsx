@@ -41,6 +41,8 @@ export interface GroupInfo {
   alias: string;
   name: string;
   uids: string[];
+  /** True for a group bridged to Google Chat: managed under Family -> Google Chat, no leave. */
+  bridged: boolean;
 }
 
 interface DirectoryContextValue {

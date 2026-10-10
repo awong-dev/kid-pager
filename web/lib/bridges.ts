@@ -4,7 +4,9 @@ import { api } from "./api";
 import { familyQuery } from "./family-context";
 import type {
   ApiTime,
+  BridgeConversationRow,
   BridgeRow,
+  BridgeSource,
   ChatTabOut,
   RosterEntry,
   SubscribeRequest,
@@ -13,7 +15,9 @@ import type {
 
 const seg = encodeURIComponent;
 
+/** Epoch ms from the relay's ISO-8601 timestamps; null when absent. */
 export function toMs(v: ApiTime | undefined): number | null {
+  if (!v) return null;
   const ms = Date.parse(v);
   return Number.isNaN(ms) ? null : ms;
 }
@@ -27,6 +31,7 @@ export interface CreatedBridge extends BridgeCode {
   bridge: BridgeRow;
 }
 
+export const listBridges = () => api.get<BridgeRow[]>(`/family/bridges${familyQuery()}`);
 
 export const createBridge = (ownerUid: string, label: string) =>
   api.post<CreatedBridge>(`/family/bridges${familyQuery()}`, { ownerUid, label });
@@ -34,8 +39,12 @@ export const createBridge = (ownerUid: string, label: string) =>
 export const newBridgeCode = (id: string) =>
   api.post<BridgeCode>(`/family/bridges/${seg(id)}/code${familyQuery()}`);
 
+export const patchBridge = (id: string, body: { ownerUid?: string; label?: string; simNumber?: string; voiceNumber?: string }) =>
+  api.patch<BridgeRow>(`/family/bridges/${seg(id)}${familyQuery()}`, body);
 
+export const acceptSim = (id: string) => api.post<BridgeRow>(`/family/bridges/${seg(id)}/accept-sim${familyQuery()}`);
 
+export const unpairBridge = (id: string) => api.del<BridgeRow>(`/family/bridges/${seg(id)}${familyQuery()}`);
 
 export const inspectLink = (bridgeId: string, link: string) =>
   api.post<{ outboxId: string }>(`/family/bridges/${seg(bridgeId)}/inspect${familyQuery()}`, { link });
@@ -50,6 +59,7 @@ export const subscribeChat = (bridgeId: string, ref: string, body: SubscribeRequ
   api.post<SubscribeResult>(`${convPath(bridgeId, ref)}/subscribe${familyQuery()}`, body);
 
 export const ignoreChat = (bridgeId: string, ref: string) =>
+  api.post<BridgeConversationRow>(`${convPath(bridgeId, ref)}/ignore${familyQuery()}`);
 
 export interface ChatPatch {
   pagerName?: string;
@@ -59,8 +69,10 @@ export interface ChatPatch {
 }
 
 export const patchChat = (bridgeId: string, ref: string, body: ChatPatch) =>
+  api.patch<BridgeConversationRow>(`${convPath(bridgeId, ref)}${familyQuery()}`, body);
 
 export const unsubscribeChat = (bridgeId: string, ref: string) =>
+  api.del<BridgeConversationRow>(`${convPath(bridgeId, ref)}${familyQuery()}`);
 
 
 /** The wire's alias shape for a roster nick (`sndr`, docs/PROTOCOL.md §3.1). */
@@ -117,4 +129,25 @@ export function defaultRoster(names: string[], known: Record<string, string> = {
  * forces canReply=false. */
 export function outboundBlocksPeople(policyOut: string): boolean {
   return policyOut === "sms" || policyOut === "any_sms";
+}
+
+/** Human label for a bridge source. */
+export function sourceLabel(source: BridgeSource | undefined): string {
+  switch (source) {
+    case "gchat":
+      return "Google Chat";
+    case "gvoice":
+      return "Google Voice";
+    case "whatsapp":
+      return "WhatsApp";
+    default:
+      return "SMS";
+  }
+}
+
+export const WHATSAPP_LINK_MESSAGE = "WhatsApp chats cannot be added by link; wait for a message from the chat";
+
+/** wa.me, whatsapp.com (incl. chat.whatsapp.com) and whatsapp:// links. */
+export function isWhatsAppLink(url: string): boolean {
+  return /^\s*(whatsapp:\/\/|(https?:\/\/)?([a-z0-9-]+\.)*(wa\.me|whatsapp\.com)(\/|\?|#|$))/i.test(url);
 }

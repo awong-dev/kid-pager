@@ -27,9 +27,12 @@ import Typography from "@mui/material/Typography";
 import AppShell from "@/components/AppShell";
 import MemberDrawer, { type MemberDrawerMember } from "@/components/MemberDrawer";
 import RequireAuth from "@/components/RequireAuth";
+import { deviceName } from "@/lib/devices";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import { inboundLabel, outboundLabel } from "@/lib/policy";
 import type { DeviceDoc, FamilyDoc, Role, UserDoc } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
+import { responsiveTableSx } from "@/lib/tableSx";
 
 interface MemberRow extends UserDoc {
   uid: string;
@@ -42,6 +45,7 @@ interface DeviceRow extends DeviceDoc {
 const emptyForm = { alias: "", displayName: "", email: "", phone: "", role: "member" as Role };
 
 function FamilyPeopleInner() {
+  const fullScreen = useFullScreenDialog();
   const { familyId } = useFamily();
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -130,6 +134,7 @@ function FamilyPeopleInner() {
 
   return (
     <Stack spacing={2}>
+      <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">People</Typography>
         <Button variant="contained" onClick={() => setCreateOpen(true)}>
           Add person
@@ -137,6 +142,7 @@ function FamilyPeopleInner() {
       </Stack>
       {error && <Alert severity="error">{error}</Alert>}
 
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
         <Typography variant="body1">Family: {familyName ?? "--"}</Typography>
         <Button
           size="small"
@@ -150,6 +156,7 @@ function FamilyPeopleInner() {
         </Button>
       </Stack>
 
+      <TableContainer sx={responsiveTableSx([4,5,6])}>
         <Table size="small">
           <TableHead>
             <TableRow>
@@ -183,6 +190,7 @@ function FamilyPeopleInner() {
                         onClick={(e) => e.stopPropagation()}
                         style={{ textDecoration: "none" }}
                       >
+                        <Chip size="small" label={deviceName(d)} clickable />
                       </Link>
                     ))}
                   </Stack>
@@ -203,6 +211,7 @@ function FamilyPeopleInner() {
         </Table>
       </TableContainer>
 
+      <Dialog fullScreen={fullScreen} open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add person</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -230,6 +239,7 @@ function FamilyPeopleInner() {
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
               helperText={
                 <>
+                  Used to sign in. Texts from this number to a family bridge phone count as this person. To text a number from a pager, add it under{" "}
                   <Link href="/family/contacts">Contacts</Link>.
                 </>
               }
@@ -255,6 +265,7 @@ function FamilyPeopleInner() {
         </DialogActions>
       </Dialog>
 
+      <Dialog fullScreen={fullScreen} open={renameOpen} onClose={() => setRenameOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Rename family</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>

@@ -25,6 +25,7 @@ import LocationOnIcon from "@mui/icons-material/LocationOn";
 import AppShell from "@/components/AppShell";
 import LocationTimeline from "@/components/LocationTimeline";
 import RequireAuth from "@/components/RequireAuth";
+import { deviceName } from "@/lib/devices";
 import { ApiError, api } from "@/lib/api";
 import { locBackoffLabel } from "@/lib/deviceTrust";
 import { useAuth } from "@/lib/auth-context";
@@ -64,6 +65,7 @@ function PersonListItem({
     <ListItemButton selected={selected} onClick={onSelect} sx={{ borderRadius: 1 }}>
       <ListItemText
         primary={device.isOwn ? "You" : alias ? `@${alias}` : `uid:${device.ownerUid.slice(0, 8)}`}
+        secondary={`${deviceName(device)}${updatedMs !== null ? ` · updated ${formatRelativeAge(updatedMs)}` : ""}`}
       />
     </ListItemButton>
   );
@@ -155,6 +157,7 @@ function LocationDetail({
           </IconButton>
         )}
         <Typography variant="h6">
+          {device.isOwn ? `You · ${deviceName(device)}` : ownerAlias ? `@${ownerAlias}` : deviceName(device)}
         </Typography>
         <Box sx={{ flexGrow: 1 }} />
         <Stack spacing={0.25} sx={{ alignItems: "flex-end" }}>

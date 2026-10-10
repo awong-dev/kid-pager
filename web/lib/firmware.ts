@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 
 import { api } from "@/lib/api";
+import { familyQuery } from "@/lib/family-context";
 import type { DeviceStatusDoc } from "@/lib/types";
 
 /** Monthly cellular data target, 10 MB. */
@@ -16,6 +17,8 @@ export interface FirmwareBuild {
   kind: "full" | "delta";
   osz: number;
   estBytes: number;
+  /** True: preview says "full" but the push will generate a delta. */
+  onDemandDelta?: boolean;
 }
 
 export interface OtaPushResult {
@@ -23,6 +26,7 @@ export interface OtaPushResult {
   kind?: "full" | "delta";
   osz?: number;
   estBytes?: number;
+  onDemand?: boolean;
 }
 
 type OtaStatus = Pick<DeviceStatusDoc, "otaState" | "otaPct" | "otaErr">;
@@ -56,12 +60,40 @@ export function formatBytes(n: number): string {
   return `${n} B`;
 }
 
+/** `admin` is super-only `/api/admin/*`; `family` is `/api/family/*` (list needs `device=`). */
+export type FirmwareScope = "admin" | "family";
+
+/** Joins `familyQuery()` onto a path that may already carry a query string. */
+function withFamily(path: string): string {
+  const fq = familyQuery();
+  if (!fq) return path;
+  return path + (path.includes("?") ? "&" : "?") + fq.slice(1);
+}
+
+export async function listBuilds(scope: FirmwareScope, deviceId?: string): Promise<FirmwareBuild[]> {
+  let path: string;
+  if (scope === "family") {
+    if (!deviceId) throw new Error("device id required for the family build list");
+    path = withFamily(`/family/firmware?device=${encodeURIComponent(deviceId)}`);
+  } else {
+    path = deviceId ? `/admin/firmware?device=${encodeURIComponent(deviceId)}` : "/admin/firmware";
+  }
+  const r = await api.get<{ builds: FirmwareBuild[] }>(path);
   return r.builds;
 }
 
+/** Newest published build, fetched when `enabled`; the family scope needs `deviceId`. */
+export function useNewestBuild(
+  enabled: boolean,
+  scope: FirmwareScope,
+  deviceId?: string
+): FirmwareBuild | undefined {
   const [newest, setNewest] = useState<FirmwareBuild | undefined>(undefined);
+  const ready = enabled && (scope === "admin" || !!deviceId);
   useEffect(() => {
+    if (!ready) return;
     let cancelled = false;
+    listBuilds(scope, deviceId)
       .then((b) => {
         if (!cancelled) setNewest(b[0]);
       })
@@ -71,9 +103,23 @@ export function formatBytes(n: number): string {
     return () => {
       cancelled = true;
     };
+  }, [ready, scope, deviceId]);
   return newest;
 }
 
+function otaPath(scope: FirmwareScope, deviceId: string): string {
+  const p = `/${scope}/devices/${encodeURIComponent(deviceId)}/ota`;
+  return scope === "family" ? withFamily(p) : p;
 }
 
+export function pushOta(
+  scope: FirmwareScope,
+  deviceId: string,
+  target16: string
+): Promise<OtaPushResult> {
+  return api.post<OtaPushResult>(otaPath(scope, deviceId), { target: target16 });
+}
+
+export function cancelOta(scope: FirmwareScope, deviceId: string): Promise<OtaPushResult> {
+  return api.post<OtaPushResult>(otaPath(scope, deviceId), { cancel: true });
 }

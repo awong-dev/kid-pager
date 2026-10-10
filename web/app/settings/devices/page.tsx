@@ -16,6 +16,7 @@ import Typography from "@mui/material/Typography";
 import AppShell from "@/components/AppShell";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
 import RequireAuth from "@/components/RequireAuth";
+import { deviceName } from "@/lib/devices";
 import { ApiError, api } from "@/lib/api";
 import type { DeviceListItem } from "@/lib/smsContacts";
 
@@ -66,7 +67,9 @@ function DevicesInner() {
         {devices?.map((d) => (
           <Card key={d.id} variant="outlined">
             <CardContent>
+              <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
                 <Stack sx={{ flexGrow: 1 }}>
+                  <Typography variant="subtitle1">{deviceName(d)}</Typography>
                   <Typography variant="caption" color="text.secondary">
                     {d.id} -- {d.status?.state ?? "unknown"}
                   </Typography>

@@ -71,6 +71,7 @@ function BackendsInner() {
         {backends.map((b) => (
           <Card key={b.id} variant="outlined">
             <CardContent>
+              <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
                 <Chip label={b.kind} size="small" />
                 <Typography sx={{ flexGrow: 1 }}>{configSummary(b)}</Typography>
                 {!b.verifiedAt && b.kind !== "webapp" && b.kind !== "pager" && (
@@ -88,6 +89,7 @@ function BackendsInner() {
         ))}
       </Stack>
 
+      <Stack direction="row" spacing={2} useFlexGap sx={{ flexWrap: "wrap" }}>
         <Button variant="outlined" onClick={() => void addGchat()}>
           Add Google Chat
         </Button>
