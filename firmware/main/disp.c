@@ -211,6 +211,7 @@ static void disp_delay_at_least_ms(uint32_t ms)
     vTaskDelay((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1);
 }
 
+// Weak no-op; ui.c overrides it to wait for the LTE uplink to go quiet.
 __attribute__((weak)) void disp_pre_write_gate_hook(void) {}
 
 // fallback_ms != 0: an update is in flight; if BUSY never asserts within the grace period, wait

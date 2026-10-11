@@ -12,6 +12,7 @@ hardcodes a pin.
 |---|---|---|
 | Walter module (DPTechnics) | ESP32-S3-WROOM-1-N16R2 + Sequans GM02SP LTE-M modem + GNSS | — |
 | Adafruit eInk Breakout Friend, Orient Display AES128296A00-2.9ENRS panel (SSD1680-compatible, 296×128) | E-paper display | SPI via the GPIO matrix, 4 MHz: SCK IO2, MISO IO42, MOSI IO41, ECS IO40, D/C IO39, RST IO13, BUSY IO11; SRCS IO38 held high (SRAM unused); SDCS not wired. ENA IO12 is the Friend's regulator enable (active-high, pulled up on the Friend): low = panel unpowered. Friend VIN from the power board's always-on "3V" rail, not Walter VIN or Walter 3V3-OUT. |
+| M5Stack CardKB | Keyboard | I2C_NUM_0 addr 0x5F, SDA IO10 / SCL IO9, scanned by the `kbd` task every 10 ms (see "Keyboard task" below). VCC from Walter's own switched 3V3-OUT (header pin 26, gated by IO0), so it switches with the attentive window independently of the display. |
 | Adafruit LIS3DH breakout | Motion wake | I2C_NUM_1 addr 0x18 (SDO/SA0 open), SDA IO17 / SCL IO18; INT1 → IO16 (push-pull, active-high, 3.3 V, the only ext1 wake). VIN from the power board's always-on "3V" rail (not gated by any Walter GPIO), so it stays alive through every rail_off() and every light sleep/reset. |
 | Adafruit 6092 (bq25185 + TLV62569) power board + 3.7 V 2500 mAh LiPo (Adafruit 328) | Power | Board "4.5V" (SYS) → Walter VIN; board always-on "3V" buck → Friend VIN + LIS3DH VIN |
 
@@ -88,12 +89,15 @@ device-local behaviour the protocol doc does not specify.
 
 - **SIM budget**: 100 MB/month data, 100 SMS/month. The pager sends SMS only through the modem path
   (`cfg.sms`, `sms.c`), and the Soracom preset refuses it. Relay SMS runs through the family's bridge
+  phone on the server, not on the pager. The pager keeps one persistent TLS+MQTT session and never
   reconnects on a timer.
 - **Power**: the device sleeps most of the day. In **sleep mode** the modem uses eDRX (target
   20.48 s cycle) and the ESP32 light-sleeps; delivery within ~30 s is acceptable. In **active
   mode** the modem stays connected and messages must show within 5 s.
 - **Modes**: boot in sleep mode. Enter active mode on an incoming message or a shake plus a key;
   leave it after 10 minutes with no keyboard activity. The 10-minute timeout runs from mode
+  *entry*, not from the last activity. The CardKB is read by the `kbd` task (see "Keyboard task"
+  below), not by the main loop.
 - **Display refresh**: partial refresh for the message pane. Full refreshes come from the refresh
   policy (`refreshpol.c`), not from a fixed count. Its defaults are a floor of 40 partials, an 8 s
   idle gap, a ceiling of 120 partials and a pre-sleep minimum of 6 (`refreshpol.h`).
@@ -136,6 +140,35 @@ override is read at boot. `carrier` shows what was detected and what is in force
 
 The CardKB is scanned by a static FreeRTOS task, `kbd` (`ui.c`; priority 2, floating across both
 cores). It polls every 10 ms while the keyboard rail is on and past the 1300 ms boot guard. While
+the rail is off it blocks on a rail notification. The task is the only CardKB read path; the main
+loop does not touch the CardKB. Keys go to the input queue (`input.c`, 32 deep); a queue-full drop
+logs at WARN.
+
+- **Console:** `i2cscan` and `kbtime` pause the task and resume it after. `i2cscan swap` re-inits
+  the bus only with the rail on.
+- **Light sleep:** the task is parked around `esp_light_sleep_start()`, so a sleep never starts in
+  the middle of an I2C read.
+- **Main loop wake:** the awake loop's 100 ms wait is `input_wait_event(100)` (`input.c`): a
+  task-notification wait on the `modes_run()` task that `push_event()` signals after every
+  successful enqueue, so a keystroke is seen at once; with nothing happening the period is still
+  100 ms. At the sleep edge `net_sleep()` parks `kbd`, then returns false (no sleep, no wake/RTS
+  state touched; modes.c re-arms the awake window and loops) if `input_pending()`.
+- **Wake status refresh:** `ui_wake_status_refresh()` (two modem round trips) is deferred: the awake
+  edge sets `s_wake_status_pending`, and `modes_run()` runs it right after that pass's
+  `ui_render()`. The refreshed battery/RSSI show on the next partial.
+
+Keyboard burst check: type `abcdefgh` fast, three times each (a) with the screen awake in an idle
+chat, (b) right after a shake, starting at the first draw (keys typed during the 1.3 s boot guard
+are lost because the CardKB is still booting), (c) within 2 s of sending a message. Expect all 8
+keys in each case (`ui: CardKB: 0x61`-`0x68` DEBUG lines) and no `input event queue full` lines.
+Also expect `kbd: task started` at boot, `kbd: paused (rail off)` after about 120 s idle, and
+`kbd: boot guard` then `kbd: polling` about 1300 ms after a shake.
+
+## Bring-up checks
+
+Numbers the firmware assumes or logs but that need a device to confirm. See `docs/PROTOCOL.md`
+§6.5 and §8.2-§8.4 for the arithmetic they feed.
+
 | What to measure | Why it matters |
 |---|---|
 | Sleep-mode average current at `T` = 5 s | Validates the ~1.8-2.1 mA / 43-50 mAh/day estimate (§8.4) |
@@ -144,6 +177,7 @@ cores). It polls every 10 ms while the keyboard rail is on and past the 1300 ms 
 | Granted eDRX/PTW from `WALTER_MODEM_NETWORK_EVENT_EDRX_RECEIVED` | Granted eDRX should equal the requested `"0010"` (20.48 s); logged by `net.cpp`'s network event handler |
 | `MEMORY_FULL` event count over 24 h | Evidence that the wake-and-drain cycle is losing messages; counted in RTC (`mqtt_memfull_count`) |
 | Modem PINGREQ at the configured keepalive | The Sequans modem sends PINGREQ autonomously at 60-1200 s; AT&T silently drops idle flows between 240 and 360 s, so a longer keepalive's PINGREQ never arrives there |
+| Whether the modem/broker clamp a long MQTT keepalive, and whether the carrier NAT tolerates the idle flow | PROTOCOL.md §6.2 |
 | Clean-session behaviour across an ESP32-only reset (does the modem session survive?) | PROTOCOL.md §12 item 4; decides whether deep sleep with forced redelivery (§8.3(b)) is worth revisiting |
 | CardKB I2C polling across repeated 100 ms light-sleep cycles | Whether the CardKB and its bus survive `net_sleep()`'s light-sleep re-entry without a dropped or garbled byte |
 | `bars_from_rssi_dbm()` thresholds (`ui.c`: dBm ≥ -85/-95/-105/-115 → 4/3/2/1/0 bars) | The dBm conversion is fixed (`dBm = -113 + raw*2`, `raw == 99` = no reading); the bucket boundaries are estimates |

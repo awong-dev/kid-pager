@@ -113,6 +113,7 @@ void bs_core_sleep(battstat_rtc_t *r, bs_ram_t *ram, int64_t slept_us)
 
 void bs_core_note_mv(battstat_rtc_t *r, int mv)
 {
+    if (mv < 2000 || mv > 5000) {
         return;
     }
     if (r->mvn == 0 || mv < (int) r->mvn) {

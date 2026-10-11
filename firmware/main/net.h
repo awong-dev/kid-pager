@@ -150,6 +150,7 @@ void net_get_resub_hold_stats(uint32_t *holds, uint32_t *max_hold_ms, uint32_t *
 void net_set_msg_cb(void (*cb)(const char *topic, const char *body, uint16_t len));
 
 /* Light-sleeps up to `ms` (ext1 wake from the LIS3DH); false if a key is queued. Power: ~1 mA. */
+bool net_sleep(uint32_t ms);
 
 /* Per-wake URC drain probe: one async bare "AT"; false if one is outstanding or modem busy. */
 bool net_urc_probe(void);

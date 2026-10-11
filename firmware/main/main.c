@@ -557,6 +557,7 @@ static int cmd_kbtime(int argc, char **argv)
             // recovery at ~50 ms.
             if (!reinit_done && esp_timer_get_time() - t0 >= 50000) {
                 reinit_done = true;
+                ui_kb_i2c_reinit();
             }
             vTaskDelay(pdMS_TO_TICKS(1));
         }
@@ -713,6 +714,9 @@ static int cmd_i2cscan(int argc, char **argv)
     // `i2cscan accel` scans the LIS3DH's bus (I2C_NUM_1).
     bool accel = (argc >= 2) && (strcmp(argv[1], "accel") == 0);
     i2c_port_t port = accel ? I2C_NUM_1 : I2C_NUM_0;
+    if (!accel) {
+        ui_debug_pause_kb_poll(true); // kbd task owns I2C_NUM_0 otherwise; power effect: none
+    }
     int sda = accel ? PAGER_PIN_ACCEL_SDA : (swap ? PAGER_PIN_KB_SCL : PAGER_PIN_KB_SDA);
     int scl = accel ? PAGER_PIN_ACCEL_SCL : (swap ? PAGER_PIN_KB_SDA : PAGER_PIN_KB_SCL);
     if (swap) {
@@ -755,6 +759,16 @@ static int cmd_i2cscan(int argc, char **argv)
            "Lines idle: SDA=%d SCL=%d (1 = pulled up, as they should be)\n",
            found, sda, scl, nack, timeout, other, gpio_get_level((gpio_num_t) sda),
            gpio_get_level((gpio_num_t) scl));
+    if (swap) {
+        if (rail_is_on()) {
+            ui_kb_i2c_reinit(); // back to the real pins (driver was reinstalled on the swapped ones)
+        } else {
+            ui_kb_bus_release(); // rail off: no driver on dead pins; drive the bus low again
+        }
+    }
+    if (!accel) {
+        ui_debug_pause_kb_poll(false); // kbd task resumes
+    }
     if (timeout > 0) {
         printf("i2cscan: timeouts mean a line is stuck: check for a short, a swapped pair, or a "
                "keyboard powered from the wrong rail\n");

@@ -170,6 +170,7 @@ static int visible_rows(void)
 // Per-message header strings and wrapped row counts for the open peer, newest first. Bodies are
 // not stored; s_body_scratch holds the one being measured or drawn. Static: too big for the stack.
 typedef struct {
+    char who[BOOK_NICK_MAX]; // fits a book name/nickname, not just an alias
     char ts[6];
     char id[MSG_ID_MAX];
 } chat_row_src_t;
@@ -190,6 +191,11 @@ static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch current
         strncpy(out->who, "you", sizeof(out->who) - 1);
     } else {
         // a group page's per-message author replaces `from`; `sndr` is "" on a DM
+        if (m->sndr[0] != '\0') {
+            strncpy(out->who, m->sndr, sizeof(out->who) - 1);
+        } else {
+            book_display_name(m->from, out->who, sizeof(out->who));
+        }
     }
     out->who[sizeof(out->who) - 1] = '\0';
 
@@ -203,6 +209,7 @@ static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch current
 // Pixels left for row 0's body after the "who HH:MM " prefix and the right-aligned tag.
 static int wrap_width_row0(gfx_font_t sz, const chat_row_src_t *src)
 {
+    char prefix[BOOK_NICK_MAX + 16];
     snprintf(prefix, sizeof(prefix), "%s %s ", src->who, src->ts);
     int avail = GFX_SCREEN_W - gfx_text_width(sz, prefix);
         avail -= gfx_text_width(sz, src->tag) + 4;
@@ -622,6 +629,7 @@ static void chat_render(void)
     int pitch = ((sz == GFX_FONT_LARGE) ? 16 : 12) + 2;
     int rows = visible_rows();
 
+    // header: "[name]", or "[name] · group" for a `grp` contact
     {
         char peer[BOOK_ALIAS_MAX];
         resolve_effective_peer(peer, sizeof(peer));
@@ -638,6 +646,7 @@ static void chat_render(void)
                 break;
             }
         }
+        const char *disp = book_display_name(peer, nick, sizeof(nick));
         char header[BOOK_NICK_MAX + BOOK_ALIAS_MAX + 12];
         snprintf(header, sizeof(header), is_group ? "[%s] \xC2\xB7 group" : "[%s]", disp);
         gfx_text(0, UI_BODY_TOP + 2, sz, header);

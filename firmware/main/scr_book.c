@@ -1,3 +1,4 @@
+// Address Book screen: contact list, Add-contact form and per-contact Nickname form.
 // The Phone field takes E.164 digits after '+'/digit, or an alias after '@' (PROTOCOL.md §1).
 
 #include "ui.h"
@@ -161,6 +162,7 @@ static void add_submit(void)
         ph_or_alias = stripped;
     }
     if (book_request(s_add_name.buf, ph_or_alias)) {
+        ui_show_toast("added");
         s_mode = BOOK_MODE_LIST;
     } else {
         ui_show_toast("could not send request");
@@ -227,6 +229,7 @@ static void add_render(void)
     gfx_text(8, y, GFX_FONT_NORMAL, "(or leave blank and type an @alias)");
 
     gfx_text(0, UI_FOOTER_Y, GFX_FONT_NORMAL,
+             "tab next field   enter add   esc cancel");
 }
 
 static char s_nick_alias[BOOK_ALIAS_MAX];
@@ -348,6 +351,8 @@ static void list_render(void)
     size_t n_contacts = book_contact_count();
     int y = UI_BODY_TOP + 2;
 
+    int total_n = (int) n_contacts + 1;
+    int sel_abs = s_sel;
     int scroll_top = 0;
     if (sel_abs >= BOOK_VISIBLE_ROWS) {
         scroll_top = sel_abs - BOOK_VISIBLE_ROWS + 1;

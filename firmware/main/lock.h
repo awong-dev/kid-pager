@@ -62,6 +62,7 @@ void lock_set_auto_min(uint8_t minutes);
 /* True on match or when no passcode is set (unlocks). Power effect: ~50-100 ms CPU per attempt. */
 bool lock_try_passcode(const char *passcode, size_t len);
 
+/* Call on every input event and UI wake: locks after auto_min minutes since the previous call. */
 void lock_check_autolock(int64_t now_us);
 
 /* Locks now; no-op if no passcode is set. */

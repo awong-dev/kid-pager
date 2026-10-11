@@ -25,6 +25,7 @@
 #include "cfg.h"
 #include "catrust.h"
 
+#include "archive.h"
 #include "book.h"
 #include "ota.h"
 #include "cafetch.h"
@@ -73,6 +74,7 @@ static const char *TAG = "modes";
 // promptly. Below PAGER_PROBE_WAIT_MIN_INTERVAL_MS, so the probe does not wait.
 #define PAGER_WAKE_INTERVAL_ATTENTIVE_MS 1000u
 // How long the attentive cadence stays armed after the last input.
+#define PAGER_ATTENTIVE_S 120
 // Awake time with RTS asserted after each timer wake. The modem holds URCs while RTS is deasserted
 // and does not hand them over within 50 ms.
 #define PAGER_POST_WAKE_YIELD_MS 200u
@@ -187,6 +189,7 @@ static void rtc_lock(void) { xSemaphoreTake(s_rtc_mutex, portMAX_DELAY); }
 static void rtc_unlock(void) { xSemaphoreGive(s_rtc_mutex); }
 
 static bool s_was_mqtt_connected = false;
+static bool s_wake_status_pending = false; // ui_wake_status_refresh() owed after the next render
 static bool s_ui_awake_prev = false; // edge-detects input_awake()
 
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
@@ -1481,6 +1484,7 @@ void modes_boot(void)
     // save trio and the epoch-wrap hook.
     book_bind(&g_rtc.auth, rtc_lock, rtc_unlock, rtc_save, on_auth_epoch_wrap);
     book_init();
+    archive_init(); // device-local archive table, one NVS read; no modem/sleep effect
 
     // Must run before net_set_msg_cb(): a nudge could arrive as soon as MQTT subscribes.
     bookpull_bind(rtc_lock, rtc_unlock);
@@ -1584,6 +1588,8 @@ static bool attentive_service(void)
             // The attentive window lapsed: render once so the status-bar clock reads "--:--" before 20 s
             // sleeps resume. The rail was on for the whole window, so painting here is safe.
             // Auto-lock at this edge bounds an unattended pager (lock.auto may be longer); the screen
+            // sync must precede this render so the frame shows Lock.
+            if (lock_is_set()) {
                 lock_now();
                 lock_screen_sync();
             }
@@ -1789,6 +1795,12 @@ void modes_run(void)
             }
             watchdog_kick(WD_SLEEP_ENTER);
             int64_t bs_t0 = esp_timer_get_time();
+            if (!net_sleep(interval_ms)) {
+                // Input queued at the sleep edge: no sleep happened, so skip the post-wake handling;
+                // input_arm_awake() keeps the next pass awake.
+                input_arm_awake();
+                continue;
+            }
             battstat_note_sleep(esp_timer_get_time() - bs_t0); // time inside light sleep, for `bs.sl`
             // Wake path: the rail comes up here only for real input (an ext1 wake), or lazily via
             // ui_ensure_powered() when a render needs it; a timer wake with nothing to draw leaves it off.
@@ -1896,6 +1908,7 @@ void modes_run(void)
 #endif
             assert(yield_ms >= 30); // debug builds only
             // On a lengthened cadence, hold the window open until the probe is answered; after the yield so
+            // the time is charged to the post-wake bucket. Skipped on input wakes (UI-awake holds RTS).
             if (!wake_is_ext1) {
                 wait_for_probe_answer(interval_ms);
             }
@@ -1906,6 +1919,8 @@ void modes_run(void)
             vTaskDelay(pdMS_TO_TICKS(PAGER_WAKE_INTERVAL_SLEEP_MS));
         } else {
             // UI awake, hot shake window or busy button: no light sleep; 100 ms period when idle, returns
+            // early when input.c queues an event.
+            input_wait_event(100);
         }
 
         // If the modem UART still has buffered bytes this wake's drain burst is still arriving: defer
@@ -1920,6 +1935,7 @@ void modes_run(void)
         watchdog_kick(WD_INPUT_UI);
         input_poll(); // power effect: one GPIO read (button FSM step)
 
+        // CardKB is read by ui.c's kbd task (feeds input.c's queue); no polling here.
         bool ui_awake_now = input_awake();
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
         // Debug builds: the one marked point `period` is measured from, every iteration.
@@ -1930,6 +1946,8 @@ void modes_run(void)
         input_event_t ievt;
         while (input_get_event(&ievt)) {
             modes_note_activity(); // any resolved key/button event counts as activity
+            // lock_check_autolock() on every input event.
+            lock_check_autolock(esp_timer_get_time());
             switch (ievt.type) {
             case INPUT_EVT_BTN_DOWN:
                 // a button press enters active mode
@@ -1959,7 +1977,11 @@ void modes_run(void)
         bool ui_awake_edge_out = !ui_awake_now && s_ui_awake_prev;
         s_ui_awake_prev = ui_awake_now;
         if (ui_awake_edge_in) {
+            // The two modem round trips (5 s timeouts) run after this pass's render, not ahead of the
+            // first frame.
+            s_wake_status_pending = true;
             // Also checked on every UI wake, in case no fresh input event arrived.
+            lock_check_autolock(esp_timer_get_time());
         }
 
         // Renders an incoming message on this task, then marks `shown`.
@@ -1977,6 +1999,7 @@ void modes_run(void)
         // Keys and buttons render this iteration; an idle iteration's ui_render() is a no-op diff.
         bool render_now = ui_awake_now;
         // Checked every pass, not just while UI-awake: modes_in_use() is the wider attentive window with
+        // the rail on throughout, so a status-bar-only partial is safe.
         if (!render_now && ui_clock_due()) {
             render_now = true;
         }
@@ -2006,13 +2029,29 @@ void modes_run(void)
                     (dbg_log_now_us - s_dbg_looptime_last_log_us) >= 1000000) {
                     s_dbg_looptime_last_log_us = dbg_log_now_us;
                     ESP_LOGI(TAG,
+                             "looptime: period=%lld ms paint=%lld refresh=%lld rest=%lld",
                              (long long) (dbg_period_us / 1000), (long long) (dbg_paint_us / 1000),
+                             (long long) (dbg_refresh_us / 1000), (long long) (dbg_rest_us / 1000));
                 }
             }
 #endif
         } else if (ui_awake_edge_out) {
             // The UI-awake window lapsed: a due full refresh may land here.
             ui_on_awake_lapse();
+        }
+
+        // Deferred wake status refresh: after the render, once per awake edge. Power effect: two AT
+        // round trips (~43 ms, 5 s timeout each).
+        if (s_wake_status_pending) {
+            s_wake_status_pending = false;
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            int64_t dbg_status_t0 = esp_timer_get_time();
+#endif
+            ui_wake_status_refresh();
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            ESP_LOGI(TAG, "wake status refresh after first draw: %lld ms",
+                     (long long) ((esp_timer_get_time() - dbg_status_t0) / 1000));
+#endif
         }
 
         // Deferred mode-edge /status publish (set_mode()): after this

@@ -399,6 +399,8 @@ bool lock_try_passcode(const char *passcode, size_t len)
     return match;
 }
 
+// Locks after auto_min minutes of inactivity; modes.c also locks when the attentive window ends,
+// whichever comes first.
 void lock_check_autolock(int64_t now_us)
 {
     s_lock();
@@ -407,8 +409,11 @@ void lock_check_autolock(int64_t now_us)
     bool locked = s_rtc->locked != 0;
     s_unlock();
 
+    if (have && !locked && auto_min != 0 &&
+        (now_us - s_last_input_us) >= (int64_t) auto_min * 60 * 1000000) {
         lock_now();
     }
+    s_last_input_us = now_us;
 }
 
 void lock_now(void)

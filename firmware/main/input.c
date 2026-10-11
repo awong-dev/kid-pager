@@ -39,6 +39,7 @@ input_key_t input_decode_key(uint8_t byte)
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 static const char *TAG = "input";
 
@@ -46,9 +47,12 @@ static const char *TAG = "input";
 #define PAGER_BTN_DEBOUNCE_MS 30u
 #define PAGER_BTN_STUCK_MS 5000u /* ~5 s in BTN_HELD */
 
+/* Must be at least 1 s shorter than modes.c's PAGER_ATTENTIVE_S (120). */
+#define PAGER_UI_AWAKE_S 119
 /* Hot keyboard window opened by a shake from sleep. */
 #define PAGER_UI_HOT_S 15
 
+#define INPUT_QUEUE_DEPTH 32 /* kbd task can queue ~17 keys across a gate + refresh stall */
 
 typedef enum {
     BTN_IDLE = 0,
@@ -65,15 +69,24 @@ static int64_t s_btn_debounce_start_us = 0;
 #endif
 
 static int64_t s_awake_until_us = 0;
+/* Guards s_awake_until_us/s_hot_until_us: written on the kbd task's CPU
+ * (input_feed_key) and read on the main loop's; Xtensa int64 can tear. */
+static portMUX_TYPE s_win_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static StaticQueue_t s_queue_buf;
 static uint8_t s_queue_storage[INPUT_QUEUE_DEPTH * sizeof(input_event_t)];
 static QueueHandle_t s_queue;
+/* Waiter task; push_event() notifies after the enqueue, so a wait cannot miss an event. */
+static volatile TaskHandle_t s_waiter;
 
 static int64_t s_hot_until_us;
 
 static void arm_awake_window(int64_t now_us)
 {
+    int64_t until_us = now_us + (int64_t) PAGER_UI_AWAKE_S * 1000000;
+    portENTER_CRITICAL(&s_win_mux);
+    s_awake_until_us = until_us;
+    portEXIT_CRITICAL(&s_win_mux);
 }
 
 static void push_event(input_event_t evt)
@@ -81,6 +94,12 @@ static void push_event(input_event_t evt)
     /* Non-blocking: a full queue drops the event. */
     frontlight_activity(); /* restarts the front light's idle timer */
     if (xQueueSend(s_queue, &evt, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "input event queue full, dropping event type=%d", (int) evt.type);
+        return;
+    }
+    TaskHandle_t waiter = s_waiter;
+    if (waiter != NULL) {
+        xTaskNotifyGive(waiter);
     }
 }
 
@@ -200,10 +219,18 @@ void input_note_shake_wake(int64_t now_us)
         arm_awake_window(now_us);
         return;
     }
+    int64_t until_us = now_us + (int64_t) PAGER_UI_HOT_S * 1000000;
+    portENTER_CRITICAL(&s_win_mux);
+    s_hot_until_us = until_us;
+    portEXIT_CRITICAL(&s_win_mux);
 }
 
 bool input_hot(void)
 {
+    portENTER_CRITICAL(&s_win_mux);
+    int64_t until_us = s_hot_until_us;
+    portEXIT_CRITICAL(&s_win_mux);
+    return esp_timer_get_time() < until_us;
 }
 
 void input_feed_key(uint8_t byte)
@@ -212,7 +239,9 @@ void input_feed_key(uint8_t byte)
     if (key.type == INPUT_KEY_NONE) {
         return;
     }
+    portENTER_CRITICAL(&s_win_mux);
     s_hot_until_us = 0; /* the full awake window supersedes the hot one */
+    portEXIT_CRITICAL(&s_win_mux);
     arm_awake_window(esp_timer_get_time());
     push_event((input_event_t) { .type = INPUT_EVT_KEY, .key = key });
 }
@@ -246,8 +275,28 @@ bool input_get_event(input_event_t *out)
     return xQueueReceive(s_queue, out, 0) == pdTRUE;
 }
 
+bool input_pending(void)
+{
+    return uxQueueMessagesWaiting(s_queue) > 0;
+}
+
+void input_wait_event(uint32_t ms)
+{
+    if (s_waiter == NULL) {
+        s_waiter = xTaskGetCurrentTaskHandle();
+    }
+    if (uxQueueMessagesWaiting(s_queue) > 0) {
+        return;
+    }
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms));
+}
+
 bool input_awake(void)
 {
+    portENTER_CRITICAL(&s_win_mux);
+    int64_t until_us = s_awake_until_us;
+    portEXIT_CRITICAL(&s_win_mux);
+    return esp_timer_get_time() < until_us;
 }
 
 bool input_button_busy(void)

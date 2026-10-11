@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "pins.h"
 #include "msg.h"
+#include "book.h"
 #include "modes.h"
 #include "net.h"
 #include "disp.h"
@@ -10,6 +11,7 @@
 #include "gfx.h"
 #include "lock.h"
 #include "catrust.h"
+#include "rail.h"
 #include "clockfmt.h"
 
 #include <string.h>
@@ -23,6 +25,7 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "ui";
 
@@ -456,6 +459,8 @@ bool ui_incoming(const char *from, bool was_asleep)
 
     if (!steal) {
         char toast[40];
+        char disp[24];
+        snprintf(toast, sizeof(toast), "new: %s", from ? book_display_name(from, disp, sizeof(disp)) : "?");
         ui_show_toast(toast);
         return false;
     }
@@ -519,12 +524,43 @@ static int s_i2c_fail_count = 0;
 // recovery ~1137 ms, mostly I2C bus recovery, plus margin).
 #define PAGER_KB_BOOT_GUARD_MS 1300
 
+// Pauses the kbd task so console commands can drive I2C_NUM_0 themselves; concurrent driver
+// re-init from both sides makes every probe NACK.
 static volatile bool s_kb_poll_paused = false;
+
+// Guards every I2C_NUM_0 driver call in this file; non-recursive.
+static SemaphoreHandle_t s_kb_bus_mutex = NULL;
+static StaticSemaphore_t s_kb_bus_mutex_buf;
+static TaskHandle_t s_kbd_task = NULL;
+#define KBD_STACK_BYTES 4096
+
+// Synchronous: no read is in flight once this returns. Power effect: none (resuming restarts
+// ~100 reads/s while the rail is on).
+void ui_debug_pause_kb_poll(bool paused)
+{
+    s_kb_poll_paused = paused;
+    if (paused) {
+        if (s_kb_bus_mutex) {
+            xSemaphoreTake(s_kb_bus_mutex, portMAX_DELAY);
+            xSemaphoreGive(s_kb_bus_mutex);
+        }
+    } else if (s_kbd_task) {
+        xTaskNotifyGive(s_kbd_task);
+    }
+}
+
+void ui_kb_rail_changed(void)
+{
+    if (s_kbd_task) {
+        xTaskNotifyGive(s_kbd_task);
+    }
+}
 
 // rail_restored_us() value the guard state was last evaluated for; -1 forces the first evaluation.
 static int64_t s_kb_guard_restored_us = -1;
 // At most one driver re-init (and log line) per rail-restore edge.
 static bool s_kb_reinit_done_this_restore = false;
+// Rail-restore edges whose boot guard the kbd task waited out.
 static uint32_t s_kb_skipped_reads = 0;
 
 static bool s_i2c_installed = false;
@@ -552,6 +588,9 @@ static uint32_t s_kb_bus_releases = 0;
 // is off. The accelerometer is on its own bus and is untouched.
 void ui_kb_bus_release(void)
 {
+    if (s_kb_bus_mutex) {
+        xSemaphoreTake(s_kb_bus_mutex, portMAX_DELAY);
+    }
     if (s_i2c_installed) {
         i2c_driver_delete(I2C_NUM_0);
         s_i2c_installed = false;
@@ -572,29 +611,138 @@ void ui_kb_bus_release(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_KB_SDA);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_KB_SCL);
     s_kb_bus_releases++;
+    if (s_kb_bus_mutex) {
+        xSemaphoreGive(s_kb_bus_mutex);
+    }
 }
 
 void ui_kb_bus_restore(void)
 {
+    if (s_kb_bus_mutex) {
+        xSemaphoreTake(s_kb_bus_mutex, portMAX_DELAY);
+    }
     i2c_kb_init();
+    if (s_kb_bus_mutex) {
+        xSemaphoreGive(s_kb_bus_mutex);
+    }
 }
 
 uint32_t ui_kb_bus_release_count(void) { return s_kb_bus_releases; }
 
+// Driver delete and reinstall; the caller holds s_kb_bus_mutex or runs before it exists.
+static void kb_reinit_locked(void)
 {
     i2c_driver_delete(I2C_NUM_0);
     i2c_kb_init();
 }
 
+void ui_kb_i2c_reinit(void)
 {
+    if (s_kb_bus_mutex) {
+        xSemaphoreTake(s_kb_bus_mutex, portMAX_DELAY);
     }
+    kb_reinit_locked();
+    if (s_kb_bus_mutex) {
+        xSemaphoreGive(s_kb_bus_mutex);
     }
-    }
-    }
+}
 
-    }
-    }
+static bool s_kb_sleep_parked = false;
 
+void ui_kb_sleep_park(void)
+{
+    if (!s_kb_bus_mutex || !rail_is_on()) {
+        return; // rail off: bus already released
+    }
+    if (xSemaphoreTake(s_kb_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_kb_sleep_parked = true;
+    } else {
+        ESP_LOGI(TAG, "kbd: sleep park timed out (100 ms); sleeping anyway");
+    }
+}
+
+void ui_kb_sleep_unpark(void)
+{
+    if (s_kb_sleep_parked) {
+        s_kb_sleep_parked = false;
+        xSemaphoreGive(s_kb_bus_mutex);
+    }
+}
+
+// Last logged kbd task state; logged only on change.
+static const char *s_kbd_state = "";
+
+static void log_state_once(const char *state)
+{
+    if (strcmp(state, s_kbd_state) != 0) {
+        s_kbd_state = state;
+        int64_t r = rail_restored_us();
+        ESP_LOGI(TAG, "kbd: %s (rail on +%lld ms)", state,
+                 r != 0 ? (long long) ((esp_timer_get_time() - r) / 1000) : 0LL);
+    }
+}
+
+// Polls the CardKB every 10 ms while the rail is on and past the boot guard. Power effect: ~100 I2C
+// reads/s while the rail is on and the chip is awake.
+static void kbd_task(void *arg)
+{
+    (void) arg;
+    ESP_LOGI(TAG, "kbd: task started float (core %d) prio2 period 10ms", (int) xPortGetCoreID());
+    for (;;) {
+        if (s_kb_poll_paused || !rail_is_on()) {
+            log_state_once(s_kb_poll_paused ? "paused (console)" : "paused (rail off)");
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+        int64_t restored_us = rail_restored_us();
+        if (restored_us != s_kb_guard_restored_us) {
+            // new rail-restore edge: per-edge state restarts
+            s_kb_guard_restored_us = restored_us;
+            s_kb_reinit_done_this_restore = false;
+            if (restored_us != 0) {
+                s_kb_skipped_reads++; // once per edge
+            }
+        }
+        if (restored_us != 0 &&
+            esp_timer_get_time() - restored_us < (int64_t) PAGER_KB_BOOT_GUARD_MS * 1000) {
+            log_state_once("boot guard");
+            // one tick at a time: the tick count does not advance across a light sleep
+            ulTaskNotifyTake(pdTRUE, 1);
+            continue;
+        }
+        log_state_once("polling");
+
+        uint8_t byte = 0;
+        xSemaphoreTake(s_kb_bus_mutex, portMAX_DELAY);
+        if (!s_kb_poll_paused && s_i2c_installed && rail_is_on()) {
+            esp_err_t err = i2c_master_read_from_device(I2C_NUM_0, PAGER_I2C_ADDR_CARDKB, &byte, 1,
+                                                        pdMS_TO_TICKS(50));
+            if (err != ESP_OK) {
+                byte = 0;
+                s_i2c_fail_count++;
+                if (s_i2c_fail_count == 3) {
+                    ESP_LOGI(TAG, "CardKB: 3 consecutive I2C failures");
+                }
+                // the bus may have been left mid-transaction when the rail dropped
+                if (!s_kb_reinit_done_this_restore) {
+                    s_kb_reinit_done_this_restore = true;
+                    ESP_LOGI(TAG, "CardKB: I2C read failed post-restore; re-initializing the driver");
+                    kb_reinit_locked();
+                }
+            } else {
+                if (s_i2c_fail_count >= 3) {
+                    ESP_LOGI(TAG, "CardKB: answering again");
+                }
+                s_i2c_fail_count = 0;
+            }
+        }
+        xSemaphoreGive(s_kb_bus_mutex);
+
+        if (byte) {
+            ESP_LOGD(TAG, "CardKB: 0x%02x", byte);
+            input_feed_key(byte);
+        }
+        ulTaskNotifyTake(pdTRUE, 1); // 10 ms; wakes early on rail or pause change
     }
 }
 
@@ -643,6 +791,12 @@ bool ui_init(void)
     }
     s_ui_inited = true;
     i2c_kb_init();
+    s_kb_bus_mutex = xSemaphoreCreateMutexStatic(&s_kb_bus_mutex_buf);
+    // stack and TCB come from the heap once, at init (a static stack overflowed .dram0.bss)
+    if (xTaskCreatePinnedToCore(kbd_task, "kbd", KBD_STACK_BYTES, NULL, 2, &s_kbd_task, tskNO_AFFINITY) != pdPASS) {
+        s_kbd_task = NULL;
+        ESP_LOGE(TAG, "kbd: task create failed; no keyboard");
+    }
     gfx_clear();
 #ifdef ESP_PLATFORM
     if (!gfx_init()) {

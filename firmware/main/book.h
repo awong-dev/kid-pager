@@ -80,6 +80,9 @@ uint32_t book_get_bv(void);
 // Default recipient alias (`d`); false if none.
 bool book_get_default_alias(char *out, size_t cap);
 
+// Nickname, else book name, else the alias; truncates on a UTF-8 boundary.
+const char *book_display_name(const char *alias, char *buf, size_t n);
+
 size_t book_contact_count(void);
 // Copies contact `index`; false if out of range.
 bool book_contact_at(size_t index, book_contact_t *out);

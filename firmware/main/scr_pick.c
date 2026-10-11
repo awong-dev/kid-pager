@@ -86,6 +86,7 @@ static void pick_render(void)
         return;
     }
 
+    int total_n = (int) n_contacts;
     int sel_abs = s_sel;
     int scroll_top = 0;
     if (sel_abs >= PICK_VISIBLE_ROWS) {

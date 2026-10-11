@@ -12,6 +12,8 @@
 #include "net_connect_guard.h"
 #include "net_probe_guard.h"
 #include "publish_quiet.h"
+#include "input.h"
+#include "ui.h"
 extern "C" {
 #include "battstat.h"
 }
@@ -496,6 +498,7 @@ void note_registration(bool registered)
 
 bool configure_session(void);
 
+// Weak no-op; ui.c supplies the strong definition. Called only on net_init()'s caller task.
 extern "C" __attribute__((weak)) void net_boot_progress_hook(const char *status)
 {
     (void) status;
@@ -959,7 +962,14 @@ extern "C" void net_liveness_ping_now(void)
     }
 }
 
+extern "C" bool net_sleep(uint32_t ms)
 {
+    // Park the kbd task (<=100 ms), then a non-empty input queue is a key typed at the sleep edge: skip.
+    ui_kb_sleep_park();
+    if (input_pending()) {
+        ui_kb_sleep_unpark();
+        ESP_LOGD(TAG, "net_sleep: input pending, sleep skipped");
+        return false;
     }
 
     // Power effect: ESP32 ~1 mA for up to `ms`. Not WalterModem::sleep() (timer-only), so its RTS
@@ -991,6 +1001,7 @@ extern "C" void net_liveness_ping_now(void)
     }
 
     esp_light_sleep_start();
+    ui_kb_sleep_unpark();
 
     // esp_light_sleep_start() latches an RTC pad HOLD on each ext1 pad that the S3 never releases
     // (gpio_get_level() freezes, reads 1 at 0 V); release it each wake. input_init() clears old holds.
@@ -1016,6 +1027,7 @@ extern "C" void net_liveness_ping_now(void)
                         (int32_t) net_uart_rx_buffered_bytes());
         flightrec_event('F', flightrec_cts_level(), 0);
     }
+    return true;
 }
 
 extern "C" bool net_check(void)

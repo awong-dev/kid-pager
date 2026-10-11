@@ -41,6 +41,10 @@ extern const ui_screen_t g_scr_lock;
 void scr_lock_start_entry(void);
 extern const ui_screen_t g_scr_pick;
 extern const ui_screen_t g_scr_book;
+extern const ui_screen_t g_scr_archive;
+
+/* Home's visible (non-archived) peers in Home's order; returns the count (<= max). */
+int scr_home_visible_peers(char (*aliases)[17], int64_t *newest_ts, int max);
 
 typedef enum {
     GREETING_HELLO = 0,
@@ -154,8 +158,17 @@ bool ui_incoming(const char *from, bool was_asleep);
  * ui_render() overwrites it. Power effect: ~0.3-0.8 s, a no-op if the display is dead. */
 void ui_show_toast(const char *text);
 
+/* rail.c calls this once the rail state is final: wakes the kbd task. Safe before ui_init(). */
+void ui_kb_rail_changed(void);
+
+ * bound, then sleeps anyway) so sleep never starts mid-transaction; unpark releases it. */
+void ui_kb_sleep_park(void);
+void ui_kb_sleep_unpark(void);
+
+/* Pauses the kbd task so a console command can use I2C_NUM_0; returns once any read has finished. */
 void ui_debug_pause_kb_poll(bool paused);
 
+/* Count of rail-restore edges whose CardKB boot guard the kbd task waited out; never reset. */
 uint32_t ui_kb_skipped_read_count(void);
 
 /* Called before the rail drops: deletes the I2C driver and holds CardKB SDA/SCL low, since the
@@ -168,6 +181,7 @@ void ui_kb_bus_restore(void);
 /* Count of ui_kb_bus_release() calls since boot; never reset. */
 uint32_t ui_kb_bus_release_count(void);
 
+/* Re-initialises the I2C driver the way the kbd task does after failed post-restore reads. */
 void ui_kb_i2c_reinit(void);
 
 /* Body text size, stored in NVS ns "ui" key "textsz"; the status bar and footer are always

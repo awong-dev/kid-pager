@@ -215,6 +215,15 @@ $(BUILD)/test_home_list.o: test_home_list.c $(MAIN_SRC)/msg.h | $(BUILD)
 $(BUILD)/test_home_list: $(BUILD)/scr_home.o $(BUILD)/test_home_list.o $(BUILD)/msg.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/scr_home.o $(BUILD)/test_home_list.o $(BUILD)/msg.o
 
+$(BUILD)/archive.o: $(MAIN_SRC)/archive.c $(MAIN_SRC)/archive.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/archive.c
+
+$(BUILD)/test_archive.o: test_archive.c $(MAIN_SRC)/archive.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_archive.c
+
+$(BUILD)/test_archive: $(BUILD)/archive.o $(BUILD)/test_archive.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/archive.o $(BUILD)/test_archive.o
+
 $(BUILD)/carrier.o: $(MAIN_SRC)/carrier.c $(MAIN_SRC)/carrier.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/carrier.c
 

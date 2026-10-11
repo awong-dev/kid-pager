@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "archive.h"
 #include "msg.h"
 
 #define HOME_MAX_PEERS 16
@@ -51,6 +52,28 @@ int home_peers_build(const msg_t *msgs, size_t n, bool have_default, const char 
         }
     }
     return count;
+}
+
+/* Drops, in place, every peer for which hidden() is true; calls unhide() on the others (prunes
+ * stale archive entries). Keeps order, at most `max_keep`. Returns the new count. */
+int home_peers_filter(home_peer_t *p, int n, int max_keep, bool (*hidden)(const char *, int64_t),
+                      void (*unhide)(const char *))
+{
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        if (hidden(p[i].alias, p[i].ts)) {
+            continue;
+        }
+        unhide(p[i].alias);
+        if (w >= max_keep) {
+            continue;
+        }
+        if (w != i) {
+            p[w] = p[i];
+        }
+        w++;
+    }
+    return w;
 }
 
 /* Number of leading codepoints (advances in `adv`) that fit in `avail_px`; *out_marker is set when
@@ -103,6 +126,7 @@ int home_body_clip(const uint8_t *adv, int n, int avail_px, int marker_px, bool 
 
 typedef enum {
     HROW_NEWMSG = 0,
+    HROW_ARCHIVE, /* shown only while at least one visible peer exists */
     HROW_BOOK,
     HROW_DEVICE,
     HROW_LOCK,
@@ -111,6 +135,8 @@ typedef enum {
 
 static int s_sel = 0;
 
+// Larger than the visible cap: archived peers take slots before filtering.
+static home_peer_t s_peers[HOME_MAX_PEERS + ARCHIVE_MAX];
 static int s_peer_count = 0;
 static char s_default_alias[BOOK_ALIAS_MAX];
 static bool s_have_default = false;
@@ -131,8 +157,35 @@ static void refresh_peers(void)
         s_msg_scratch[i] = *m;
     }
     s_have_default = book_get_default_alias(s_default_alias, sizeof(s_default_alias));
+    int built = home_peers_build(s_msg_scratch, n, s_have_default, s_default_alias, s_peers,
+                                 HOME_MAX_PEERS + ARCHIVE_MAX);
+    s_peer_count = home_peers_filter(s_peers, built, HOME_MAX_PEERS, archive_is_hidden, archive_prune);
 }
 
+int scr_home_visible_peers(char (*aliases)[17], int64_t *newest_ts, int max)
+{
+    refresh_peers();
+    int n = s_peer_count < max ? s_peer_count : max;
+    for (int i = 0; i < n; i++) {
+        strncpy(aliases[i], s_peers[i].alias, 16);
+        aliases[i][16] = '\0';
+        newest_ts[i] = s_peers[i].ts;
+    }
+    return n;
+}
+
+// "Archive Chat" is hidden when there is no visible peer.
+static int fixed_count(void) { return s_peer_count > 0 ? HROW_FIXED_COUNT : HROW_FIXED_COUNT - 1; }
+
+static home_fixed_row_t fixed_kind(int k)
+{
+    if (s_peer_count == 0 && k >= (int) HROW_ARCHIVE) {
+        k++;
+    }
+    return (home_fixed_row_t) k;
+}
+
+static int row_count(void) { return s_peer_count + fixed_count(); }
 
 static void clamp_sel(void)
 {
@@ -149,6 +202,7 @@ static const char *fixed_label(home_fixed_row_t k)
 {
     switch (k) {
     case HROW_NEWMSG: return "New message";
+    case HROW_ARCHIVE: return "Archive Chat";
     case HROW_BOOK: return "Address book";
     case HROW_DEVICE: return "Device";
     case HROW_LOCK: return lock_is_set() ? "Lock now" : "Lock now (no passcode set)";
@@ -186,8 +240,12 @@ static void home_on_key(input_key_t key)
             const home_peer_t *p = &s_peers[s_sel];
             scr_chat_open_peer(p->alias);
         } else {
+            switch (fixed_kind(s_sel - s_peer_count)) {
             case HROW_NEWMSG:
                 ui_push(&g_scr_pick);
+                break;
+            case HROW_ARCHIVE:
+                ui_push(&g_scr_archive);
                 break;
             case HROW_BOOK:
                 ui_push(&g_scr_book);
@@ -297,7 +355,9 @@ static void home_render(void)
         lines[nlines].sel_index = -1;
         nlines++;
     }
+    for (int k = 0; k < fixed_count(); k++) {
         lines[nlines].kind = HLINE_MENU;
+        lines[nlines].idx = (int) fixed_kind(k);
         lines[nlines].selectable = true;
         lines[nlines].sel_index = s_peer_count + k;
         nlines++;
@@ -330,6 +390,7 @@ static void home_render(void)
                 gfx_text(0, y, sz, ">");
             }
             char nick[BOOK_NICK_MAX];
+            const char *alias_disp = book_display_name(p->alias, nick, sizeof(nick));
             int x = gfx_text(10, y, sz, "[");
             x = gfx_text(x, y, sz, alias_disp);
             x = gfx_text(x, y, sz, "] ");

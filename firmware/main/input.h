@@ -58,6 +58,13 @@ void input_feed_key(uint8_t byte);
 /* Non-blocking dequeue; false (leaving *out untouched) if empty. */
 bool input_get_event(input_event_t *out);
 
+/* True if the queue holds at least one event. */
+bool input_pending(void);
+
+/* Blocks up to `ms` or until an event is posted; only the first caller is woken. Power effect: none. */
+void input_wait_event(uint32_t ms);
+
+/* True for PAGER_UI_AWAKE_S (119 s) after the most recent event armed the window. */
 bool input_awake(void);
 
 /* Arms the UI-awake window without an event (console `wake`). */
