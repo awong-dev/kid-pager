@@ -12,6 +12,10 @@ for a book sync periodically.
 - Every book change is `contacts_store.bump_book_version(d)` (one transaction on `devices/{d}`)
   then `devcfg.push_book(d)` (nudge or full book). Callers: approve/reject contact, allow-list PUT,
   `/approved` PUT, group create/join/leave (`conversations._push_book_to_members`), device create,
+  displayName change (edge holders only). External rename (`PATCH /api/family/contacts/{uid}`):
+  re-derives `cfg.sms` and pushes it for every family member (modem owners carry the name there, not
+  in `c[]`, so no book bump). For owners with a relay `smsNumber` the contacts are in `c[]`, so the
+  same re-derive also bumps and pushes their book (`reason=sms_contacts`).
 - The pager sends `bv` in every `/status` (`modes.c`), including the hourly heartbeat
   (`maybe_publish_heartbeat`, §5.4(d)). `ingest.handle_status` re-nudges whenever the reported `bv` is
   behind (`renudge_if_behind`). The Device screen's "Re-sync address book" publishes `/status`.
@@ -23,6 +27,13 @@ for a book sync periodically.
 1. **The book is derived, not stored.** Entries = same-family persons (not self, not disabled) ∪ the
    owner's outgoing message-edge peers (cross-family people, externals) ∪ the owner's groups. One
    function, `app/book.py` `entries_for(owner_uid)`, feeds the pager (`devcfg`), `GET /api/book` and
+   New chat. *(Two lists that must agree will drift; the pager and the web must show the same people.)*
+   Externals come from `book.sms_contacts_for(owner)`, the same list `cfg.sms` is cut from. They are
+   listed with `phone`, sendable, and `onPager` for the first 8. They never enter the pager's `c[]` on
+   the modem path: the pager texts them from `cfg.sms`, so the relay emits no `t:"sms"`. For a member
+   with a relay SMS number, externals enter `c[]` with `t:"sms"` (name ≤16 cp, capped at 32 total with
+   persons and groups). `entries_for` also lists a peer carrying the `added` marker (decision 3), a
+   person or an external of the owner's family, so the set is not limited to the groups above.
 2. **Same-family persons count as approved.** In `routing` the `approved` people rule passes on an
    edge **or** both ends being persons with the same non-null `familyId`. `none` rules (policy `sms`,
    `any_sms`) still refuse. *(An entry that is listed by default but cannot be messaged is
@@ -32,12 +43,15 @@ for a book sync periodically.
    edge removes one. Each entry carries `sendable` = `policy.check(...) is None`. The pager and New chat
    list only sendable entries; the Address book page lists all of them and says why a given one is not
    sendable. An added entry is listed on the pager whether or not it is sendable (decision 5 of
+   BOOK_ADD_ANYONE_DESIGN.md).
 3. **Only the nickname is stored.** `users/{ownerUid}/book/{peerUid}` = `{nick, familyId (owner's,
    copied for the rules), updatedAt, updatedBy}`; a missing doc means "no nickname". People and
    externals only; a group is named by its group name. The pager's `n` = `nick or displayName`.
    Numbers are added on Family → Contacts, and People → Approved picks from them. For an entry the
    pager added, the doc also carries `added` (plus `addedAt`, `addedBy`). The marker is a list of
    entries to show, not an allow-list: `routing`, policy and `sms_contacts_for` never read it (see
+   BOOK_ADD_ANYONE_DESIGN.md). *(Membership is policy and edges, already edited in People → Approved;
+   a second list of who is in the book would be a second allow-list.)*
 4. **Nickname bounds = the wire's `n`:** trimmed, 1–16 code points, ≤ 48 UTF-8 bytes, no control
    characters. Violations are 422 (rejected, not truncated, because a person is typing it).
    A device-local nickname (§5.5, ≤12 cp) still wins on that pager.

@@ -35,6 +35,7 @@ since the first release is optional, so a device that ignores all of them stays 
 
 | Thing | Format | Max len | Notes |
 |---|---|---|---|
+| `device_id` | `^[a-z0-9][a-z0-9-]{2,23}$` | 24 | lowercase; example `pgr-3fa9c01e`; issued by the relay at create time (`pgr-` + 8 hex), never typed by a human; `label` is the display name *(bounds max topic length to 37 bytes so device-side topic buffers are static)* |
 | MQTT client id (device) | exactly `device_id` | 24 | *(stable across reboots is required for `cleanSession=false` session resumption; see §6)* |
 | MQTT client id (relay) | `relay-1` | — | *(fixed id so the relay also resumes a persistent session and does not miss `/up` while restarting.)* *(the relay holds no MQTT session at all; see §2's transport note. The id is retained only for whatever short-lived client the relay or a test harness opens, and nothing on the device depends on it.)* |
 | Message id (relay-originated, down) | `m_` + 8 lowercase hex | 10 | 32 bits of `os.urandom`; UNIQUE in the relay store, regenerate on collision |
@@ -130,7 +131,9 @@ Base envelope:
 | `sig` | bstr(8) in CBOR / base64url(8) in JSON | no; signed envelopes only | — | HMAC-SHA256 tag, truncated to 64 bits, MUST be the last pair (§2.4). |
 | `bv` | int | `/status` only | 0…2³²-1 | Book version (`DEVICE_PLAN.md` §4.3; §5.1 here). *(Also carried by the `/down` `book` nudge and the fetch response, §3.7; it is the whole content of the nudge.)* |
 | `name` | string | `contact_req` only | ≤16 code points, ≤48 UTF-8 bytes | Contact display name (§4.2). *(Also the group's display name on `/up` `grp_req`, §3.8, same bounds — one name rule for both requests.)* |
+| `ph` | string | `contact_req` only | E.164 or absent | Phone number `+…` or alias reference (§4.2). *(A `contact_req` with `ph` adds the entry at once, §3.2; the digits-only rule is unchanged.)* |
 | `d` | string | `book` only | same regex as `from` | Default recipient alias (`DEVICE_PLAN.md` §4.3). |
+| `p` | array of objects | `book` only | ≤4 pending requests | Pending `contact_req`; each has `n` (name), `s` (status: `pend`/`no`) (`DEVICE_PLAN.md` §4.3). *(Not sent, §3.2; an absent `p` is empty.)* |
 | `more` | bool | `book` only | — | Reserved for chunking if the cap moves (`DEVICE_PLAN.md` §4.3). |
 | `peer` | string | `sms_log` only | E.164 | The other party's phone number (§3.6). |
 | `dir` | string | `sms_log` only | `out` \| `in` | Direction of the SMS this entry audits (§3.6). |
@@ -170,6 +173,8 @@ Additional rules:
 |---|---|---|---|
 | Down message (sender → device) | `/down` | `{"v":1,"id":"m_7f3a","ts":…,"from":"parent","body":"…","ack":null}` — **99 bytes** for the example above | Thread entry, rendered and acked. |
 | Location request | `/down` | `{"v":1,"id":"m_7f3a","ts":…,"kind":"loc_req","from":"mom","ack":null}` — **78 bytes**; no `body` | Not a thread entry; device answers on `/loc` (§13.2). |
+| Contact request (device → relay) | `/up` | `{"v":1,"id":"u_2b7c…","ts":…,"kind":"contact_req","name":"Grandma","ph":"+15551234567","ack":null,"n":…,"sig":"…"}` — ≈140 bytes; no `from`, no `body` | Adds a contact (§4.2); rate-limited and deduped on `id`. *(An add, not an approval request; see the paragraph below the table.)* |
+| Book (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"book","bv":7,"d":"mom","c":[{"a":"mom","n":"Mom","t":"web"},…],"p":[{"n":"Uncle Bob","s":"pend"},…],"ack":null,"n":…,"sig":"…"}` — ≈590 bytes max | Not a thread entry; acked `shown` on apply (`DEVICE_PLAN.md` §4.3); only newest re-published. |
 | Book nudge (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"book","bv":7,"url":"https://…/api/device/book","ack":null,"n":…,"sig":"…"}` — ≤338 bytes signed JSON; no `d`/`c`/`p`/`more` | A `book` with no `c` and no `p`. Sent only to a device whose `/status` carries `bpull:1`; the device fetches the book over HTTPS and acks `shown` once it is applied (§3.7); only newest re-published. *(A full book lists every allowed user and group, which no longer fits the 640-byte legacy envelope, §3.7.)* |
 | Group request (device → relay) | `/up` | `{"v":1,"id":"u_…","ts":…,"kind":"grp_req","name":"Cousins","m":["mom","carol"],"ack":null,"n":…,"sig":"…"}` — ≤380 bytes signed JSON, ≤250 signed CBOR; no `from`/`to`/`body` | Asks the relay to create a group with the owner as creator (§3.8); deduped on `id`, 1 per minute per device; no reply on the wire. *(See `docs/CHAT_UI_DESIGN.md`.)* **Not implemented:** no firmware sends it, and the relay has no handler, so it is dropped as an unknown `kind` (§3.4). |
 | Config (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"lock":{"clear":true,"auto":5}},"ack":null,"n":…,"sig":"…"}` | Not a thread entry; carries device settings; acked `shown` on apply (the `lock` shape is in `DEVICE_PLAN.md` §5.8); only newest re-published. |
@@ -218,6 +223,17 @@ nor a person with a `message` edge to the owner) is answered by one `system` dow
 the request's `name` and the reason; a request the book already satisfies is answered
 `<name>: already in your book` and not recorded.
 
+A request is an **add**, not a request for approval: the relay
+adds the entry at once (a phone becomes the owner's family SMS contact; an alias resolves only to
+a same-family person or a person with a `message` edge to the owner, and any other alias gets
+the one `no contact` reply), and it appears in the next book's `c[]` whether or not the owner may
+message it. Whether a message to it delivers is §4.2's decision. Adds are limited to
+at most 10 per device per hour (`too many adds; try later`) and 32 added entries per
+owner (`<name>: address book full`). An owner without an SMS number whose policy does not allow
+the number yet gets `<name>: added; needs a parent's OK to text` or `<name>: added; settings
+don't allow texting`, and the number stays off `cfg.sms` until allowed. *(Membership and permission
+are separate; docs/BOOK_ADD_ANYONE_DESIGN.md.)*
+
 **`kind:"book"` (relay → device).** An address book is a down message with `kind:"book"`, `ack:null`,
 carrying the approved contacts and pending requests for this device:
 - **Not a thread entry:** the device MUST NOT render it in the message thread, and MUST NOT `shown`-
@@ -229,6 +245,9 @@ carrying the approved contacts and pending requests for this device:
 - The payload carries `bv` (book version), `d` (default recipient alias), `c[]` (approved contacts,
   max 10), `p[]` (pending requests from §4.2, max 4, each with status `pend` or `no`), and `more`
   (reserved for chunking).
+  *(The relay does not send `p`. A full book always carries `c`,
+  possibly empty, so it is never read as a §3.7 nudge; a receiver MUST treat an absent `p` as
+  empty.)* *(An add creates the entry, so there is nothing to list as pending.)*
 - A `/down book` is signed by the relay (§2.4, §2.6), carrying `n` and `sig`.
 
 **`kind:"cfg"` (relay → device).** A configuration message is a down message with `kind:"cfg"`,
@@ -346,6 +365,8 @@ window's typical counters and 399 with every counter at 2³²−1. The JSON form
 bytes, over the limit, so **`bs` is CBOR-only: a device that encodes `/status` as JSON MUST omit
 `bs`** *(the firmware emits `/status` only in CBOR, so this costs nothing today and keeps the
 JSON form legal)*.
+
+*(A §4.2 refused-send reply, `<n>: needs a parent's OK; resend once approved`, is up to 48 + 43 = 91 bytes, one over the 90 quoted above; the envelope limit is unaffected.)*
 
 *(GNSS disable, stated so the worst case stays a number in this section.)* A maximal
 `/down` `cfg.loc` (`id` 16, `n` at its maximum) is **141 bytes** signed JSON. `/status` `gnss`
@@ -518,6 +539,8 @@ nickname for a listed entry, a member joining or leaving the owner's family, and
 re-nudged within an hour; there is no periodic fetch. *(an hourly signed GET would cost ~2.4
 mAh/day to learn what the heartbeat already reports.)*
 
+*(`p[]` is retired: no `p` on the nudge or on the fetch (§3.2). A full book always carries `c` (possibly `[]`), so the nudge test above is unchanged.)*
+
 ### 3.8 `kind:"grp_req"` (device → relay)
 
 > **Not implemented.** No firmware sends this kind, and the relay has no handler for it; a relay drops it as an unknown `kind` (§3.4). The text below is the intended contract.
@@ -644,6 +667,13 @@ The allow-list decision is made by the relay **and** re-stated in the data store
 rules; neither alone is the enforcement point. Case 3's `system` reply is the single exception to
 §3.4's "never auto-reply on MQTT". *(Also §3.2's `contact_req` rejection replies, same shape, one per offending `id`.)* *(A DM to an external whose sender has no SMS number (`users.smsNumber`) gets `sms not set up; ask your admin`.)* *(A `to` naming a bridged Google Chat contact or group whose bridge phone is not paired gets `bridge not set up; ask your admin`, the same shape.)*
 
+*(When `to` names an entry added under §3.2 and the policy refuses it, the
+body names the entry instead: `<n>: needs a parent's OK; resend once approved` when the owner's
+own approval would let it through (a parent is alerted, one open alert per owner and entry),
+`<n>: not approved` when a parent declined within 24 h, else `<n>: not allowed`.
+The message is still dropped, never held; `<n>` is the entry's book name.)* *(the device already
+lists the entry, so naming it leaks nothing, and the user needs to know to resend.)*
+
 ---
 
 ## 5. Status / LWT contract
@@ -722,6 +752,7 @@ re-sent window must be recognisable and a reset must not lose one, `docs/BATTERY
 | `x1` | ext1 (accelerometer) wakes. |
 | `rl` | 3V3 peripheral rail-on seconds (display and CardKB). |
 | `rf` | `[full, partial, upgraded]` display refreshes. |
+| `mvn` | Lowest valid battery reading in the window, mV, 2000…5000; omitted if there was none (airplane). Taken only from readings that already happen. |
 | `cn` | MQTT session (re)connects, i.e. TLS handshakes. |
 | `md` | `[off, search, gnss]`: modem-state seconds over the whole window, sleep included; registered idle is `dt − off − search − gnss`. |
 | `re` | Radio events: successful publishes, liveness SUBSCRIBEs and inbound MQTT messages (each costs an RRC tail). |

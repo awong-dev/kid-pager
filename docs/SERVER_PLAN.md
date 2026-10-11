@@ -656,8 +656,12 @@ implicit `webapp` backend at creation.
 
 ### 6.4 `sms` — removed
 The relay neither sends nor receives SMS. SMS runs through the bridge phone
+(`docs/BRIDGE_PHONE_DESIGN.md`) or the pager's own modem to its `cfg.sms` list (`PROTOCOL.md` §3.6;
+`V02_DESIGN.md` §6).
 
 ### 6.5 `gchat` — Google Chat app
+Consumer Google accounts cannot use the Chat API (Workspace only). For those accounts the bridge
+phone covers Chat instead (`docs/BRIDGE_PHONE_DESIGN.md`); this adapter is for a Workspace deployment.
 Outbound: `spaces.messages.create` with the relay's service account (Chat API enabled by
 Terraform; the Chat app itself is configured in the console — there is no Terraform resource for
 it). Link flow: the user opens a DM with the app and sends `/link 123456`; the inbound webhook
@@ -798,6 +802,7 @@ watch <alias>                       poll the thread (Firestore REST has no strea
 tick ; sweep                        call /internal/tick and /internal/sweep (dev auth)
 admin user-add <alias> <name> --email/--phone [--admin]
 admin allow <a> <b> [--no-locate] [--one-way] ; admin deny <a> <b>
+admin device-add <label> --owner <alias> [--default-to <alias>]   relay issues the device id (`pgr-xxxxxxxx`); prints id + setup code
 admin settings retention messages=4w locations=10d
 ```
 
@@ -826,6 +831,7 @@ with `DEV_MODE=1`), and runs named scenarios:
 - `setup_code`: admin creates a device; a simulated device performs the real bootstrap fetch with
   the setup code.
 - `sms_log`: admin creates an SMS contact and picks it for the student; the device's SMS audit
+  (`sms_log`) is checked.
 - `bridge`: against the `bridge-sim` service: pair a bridge phone; an SMS from an unknown number is
   held (`sms_unknown`).
 - `bridge_voice`: a Google Voice-only bridge (no SIM): the member's `smsNumber` is the Voice number.
@@ -870,6 +876,7 @@ relay/firestore.rules, relay/firestore.indexes.json, web/firebase.json   deploye
 - `google_firestore_database` (native, `nam5` or the region nearest the family),
   `google_firebase_web_app` + config output, `google_identity_platform_config` with email
   (passwordless) and phone providers, `google_firebase_hosting_site` + custom domain.
+- Secrets: `BROKER_API_KEY`, `BROKER_API_SECRET`, `WEBHOOK_KEY`, `GCHAT_*`. The
   Firestore/FCM credential is the Cloud Run service account itself (ADC) — no key file.
   Terraform creates the *containers*; values are added with `gcloud secrets versions add`.
 - CI: GitHub Actions builds the image, pushes to Artifact Registry (prune to the last 3 tags —
@@ -946,6 +953,7 @@ exists to avoid).
 | Firebase Auth (email link free; phone within the no-cost allowance), FCM, Hosting | $0 |
 | Artifact Registry (pruned), Secret Manager (≤ 6 active versions free), logging | $0 – $1 |
 | EMQX Cloud Serverless: 1 device × 43 200 session-min/month + ≈ 7 MB traffic vs 1M min / 1 GB free | **$0** |
+| **Total** | **≈ $0 – $2** |
 
 The saving over an always-on design is the always-on instance, which the rule-engine bridge
 makes unnecessary.
@@ -1003,7 +1011,10 @@ item marked **OPEN** needs a real account before it can be confirmed.
 |---|---|---|
 | D1 | Cloud Run always-on vs. a VM | Scale-to-zero Cloud Run, ≈ $0. The VM reappears only as the broker fallback in §9.5. |
 | D2 | Broker: EMQX Cloud Serverless vs. the open-source options in §9.5 | EMQX Cloud Serverless. **OPEN** — the free tier's rule-engine HTTP action, REST publish and ≥15 s webhook timeout are assumed but not yet verified against a real account (§9.4). §9.5 (a) is the documented fallback if any of the three does not hold. |
+| D3 | SMS provider, and US A2P 10DLC / toll-free registration | Removed. The relay has no SMS provider; SMS is bridge-phone only (`docs/BRIDGE_PHONE_DESIGN.md`). |
+| D4 | Are the deployment's Google accounts on Workspace? Chat apps are unavailable on consumer Gmail. | Consumer accounts. The Chat API is Workspace-only, so personal Google Chat is bridged by the Android bridge phone (`docs/BRIDGE_PHONE_DESIGN.md`); `gchat` remains for a Workspace deployment. |
 | D5 | Sign-in methods: email link, phone, or both | Both enabled; the login page accepts either. Phone needs reCAPTCHA and has a small per-SMS cost past the no-cost allowance. |
+| D6 | Custom domain for the web app | None assumed. The `*.web.app` URL works for everything, including the broker and Chat webhook URLs. |
 | D7 | Retention defaults | 4 weeks messages, 1 week locations, 52-week cap, weekly sweep Sunday 03:00 local. |
 | D8 | Device addressing UX: `@alias` typed on the CardKB vs. a recipient picker on the e-paper | The wire supports both (`to` is optional); firmware decides. |
 | D9 | Map: link-out or an embedded map | Link-out. A Leaflet + OpenStreetMap tile map is an optional follow-up. |

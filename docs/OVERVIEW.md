@@ -74,6 +74,7 @@ Nothing is flashed per device. An admin creates the device in the web app and ge
 **setup code**, valid for ten minutes: a random token plus `@ broker-host`. It is typed into the
 pager (`setup <code>` on the USB console today). From the token both sides derive, with HKDF, a
 temporary broker login, a topic and an AES-256-GCM key. The pager attaches, connects to the broker
+with that login, and receives a retained, encrypted **bundle**: its device id (issued by the relay as `pgr-` plus 8 hex digits; the human-facing name is the editable `label`), broker password,
 32-byte signing key, broker host and port, flags, label, and a pointer to the broker's CA (a URL
 and a SHA-256). It stores these in flash, restarts, and comes up as itself. Rotating credentials
 is the same flow with a new code.
@@ -136,12 +137,50 @@ pager itself computes.
 
 ## Texting from the pager
 
+Texts go through the relay and the member's bridge phone (below), which carries the member's SIM or
+Google Voice number. A member without a bridge phone has no SMS. A text to or from a known, approved
+contact is delivered. A text from anyone else is held and the family's admins are alerted; a held text
+reaches the pager only after an admin approves the sender. The pager's own modem can also send
 single-part SMS to contacts on its direct-SMS list (`docs/V02_DESIGN.md` §6). A carrier preset can
 refuse modem SMS; the Soracom preset does. Whether it works on a given SIM is listed in
 `docs/HARDWARE_TESTING.md`.
 
+## Bridge phones
+
+A bridge phone is a headless Android phone running the app in `bridge-android/`. It carries a
+member's texts, Google Chat and WhatsApp (`BRIDGE_PHONE_DESIGN.md`). It is signed into the
+member's own Google account and nobody uses it. The relay holds no connection to it: the phone
+polls the relay for outbound items and posts inbound messages.
+
+- **SIM.** The phone's SIM number becomes the member's `smsNumber`. Texts to and from it go through
+  the phone as ordinary SMS, which needs the phone to be the default SMS app.
+- **Voice-only.** A phone with no SIM can carry the member's Google Voice number instead. Texts then
+  go through Google Voice, and the relay can start a new thread to any number, because it sends the
+  Voice thread link. A bridge may carry both numbers; the SIM is then the member's `smsNumber`.
+- **Google Chat.** A message from a conversation nobody has subscribed to is held, and the admins
+  get one `chat_unknown` alert. Subscribing (Family → Google Chat) puts the conversation on the
+  pager: a group becomes a group with each writer's roster nickname as the sender, and a DM becomes
+  a contact. Waiting messages are delivered in order, and later ones follow. A family admin sets whether
+  the child may reply, and can rename, pause, unsubscribe or ignore the conversation. A conversation
+  can also be added by pasting its link.
+- **WhatsApp.** A WhatsApp direct message is a text from the sender's number, held for approval like any
+  unknown number; later texts to that person go back on WhatsApp, because the last inbound channel wins.
+  A WhatsApp group is held and subscribed like a Chat conversation. Replies use the same two tiers. Tier 2
+  drives the WhatsApp screen, which carries an account-ban risk, and group tier 2 is best-effort: it finds
+  the group by its title.
+- **Replies, two tiers.** Tier 1 fires the reply action on the Chat, Voice or WhatsApp notification, which
+  needs no screen. If that action is gone (after a reboot, or after the notification was dismissed),
+  tier 2 opens the conversation's stored link, types the reply through the phone's accessibility
+  service, and goes home.
+- **Delivery.** A pager text to a bridged contact shows as waiting for the phone until the phone
+  acks it. An item the phone has not taken within 24 h fails.
+- **Scope.** The app carries SMS (SIM or Voice-only), Google Chat and WhatsApp as described above. Tier 2
+  depends on the messaging apps' screens and can break when they change. Open items are in
+  `docs/ROADMAP.md`.
+
 ## Firmware updates
 
+A family admin (or super) pushes a build from the web app's Devices page. The relay sends the
 pager a signed `cfg.ota` job, and the pager downloads the image over HTTPS from a public bucket,
 checks its SHA-256 and switches to it. If the new image does not confirm itself after boot, the
 pager rolls back to the old one (`OTA_DESIGN.md`).
@@ -158,3 +197,4 @@ pager rolls back to the old one (`OTA_DESIGN.md`).
 | Screens | `firmware/main/ui.c`, `scr_*.c`, `gfx.c`; fonts are built by `tools/mkassets.py` |
 | Deployment | `infra/README.md` (runbook), `.github/workflows/deploy.yml` (push to `main` deploys) |
 | A simulated pager | `tools/pager_client.py`; the end-to-end suite is `tools/e2e_v2.py` |
+| Bridge phones | `relay/app/routers/bridge.py`, `relay/app/backends/bridge.py`, `relay/app/chat_subscribe.py`; the phone app in `bridge-android/` |

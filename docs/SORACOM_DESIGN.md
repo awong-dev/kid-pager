@@ -41,6 +41,8 @@ on the pager. The bench unit is driven over USB and through the production relay
   The IMSI prefix for Soracom Global SIMs is read from the SIM on the bench (section 6, step A), and
   the preset is written from that reading.
 - A device-originated SMS on a Soracom SIM can only reach Soracom's own endpoint, never a phone. On
+  the Beam bearer the firmware never attempts modem SMS. SMS for users runs through the bridge phone
+  (`docs/BRIDGE_PHONE_DESIGN.md`).
 
 ## 3. Firmware design
 
@@ -226,3 +228,22 @@ bearer; D release build on the direct bearer; E the Beam hop; F regression (host
 
 The admin web UI can move SIMs into the Beam group without the CLI. Three super-only routes in
 `relay/app/routers/admin.py`, backed by `relay/app/soracom.py` (which `tools/soracom_beam.py` wraps):
+
+- `GET /api/admin/soracom/sims`: the account's SIMs (`GET /v1/subscribers`, paged, at most 10 pages of
+  100) with `enrolled` = the SIM's `groupId` equals the `pager-beam` group's id. When no key is
+  configured it answers 200 with `configured: false` and an empty list, so the page can show setup
+  instructions. A Soracom failure is 502 `soracom: HTTP <status>` (no body, no secrets).
+- `POST /api/admin/soracom/sims/{imsi}/enroll`: finds or creates the group, PUTs the Beam entry
+  (section 5), and sets the SIM's group. Idempotent. 503 when not configured; 422 unless the IMSI is
+  14–15 digits.
+- `POST /api/admin/soracom/enroll-all`: enrolls every listed SIM not already in the group.
+
+The key is a SAM user's auth key (`SORACOM_AUTH_KEY_ID`, `SORACOM_AUTH_KEY`), held in Secret Manager.
+The MSISDN is never returned or logged, and each enrollment writes one info line that logs the IMSI
+masked to its last four digits.
+
+**Enroll before a pager's first boot on that SIM.** A SIM outside the Beam group cannot reach Beam, so
+the pager's first MQTT connect fails.
+
+Not yet checked against the live account: the `/subscribers` list fields, which are taken from the
+public API specification.

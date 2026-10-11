@@ -12,6 +12,7 @@ exist to prevent a repeat.
 
 **Firmware does not change.** The pager sends `ph` as typed (`scr_book.c` `add_submit`: digits,
 `+digits`, or an alias without `@`), renders `p[]` `s:"no"` as "not approved" (`scr_book.c`), and
+renders any `from:"system"` message in a thread. Family names never reach the pager.
 
 ## Decisions
 **1. Ingest classifies, validates and answers.** `ContactReqEnvelope._check_ph` only requires 1-16
@@ -35,6 +36,7 @@ One body serves every alias failure, so a pager cannot probe which aliases exist
 `_send_system_reply` (id derived from the request id, so a redelivery cannot alert twice). An admin's
 Block or Dismiss is visible as `p[]` `s:"no"`. A reason is sent only when the user can fix it.
 **Dedup is transactional:** `create_request` writes with `DocumentReference.create()`. On
+`AlreadyExists`, the stored row is returned, and only the winner raises an alert.
 
 **2. Approval never creates a person.** For a `contact_request` alert without `contactRequestKey`,
 `mode`/`alias` are ignored, and `mode:"create"` → 400 `new people are added under Family > People`.
@@ -56,6 +58,7 @@ when resolved) with Approve / Block / Dismiss, or a link "Link @kid to @gma (Gra
 Grandma" with Approve / Dismiss. Approve is one click. The dialog, radio, alias field, and "Also allow
 location requests" box are not part of the design. The box never did anything: `ApproveAlertRequest`
 has no `locate`.
+A legacy alert with `contactRequestKey` gets 409 `superseded; add again from the pager`.
 
 **3. Orphans.** Invariant: `kind:"person"` ⇒ `familyId` names an existing family; `kind:"external"`
 ⇒ `familyId` null, `ownerFamilyId` non-null (decision 7), no Auth account. Enforced in
@@ -73,6 +76,8 @@ in Google Chat. failed → "<where> failed"; expired → "expired"; fulfilled �
 time suffix is unchanged.
 
 **5. A person's phone is a sign-in number, never an SMS route.** `users.phone` is the Firebase Auth
+`phone_number` that `/login` uses. The SMS number is a separate `users.smsNumber`, set or cleared by a
+family admin or super. For inbound only, a text from a same-family member's `users.phone` is delivered
 as that member. Outbound, it is still never an SMS route. People (`web/app/family/people`) and Users
 (`web/app/admin/users`) label it "Sign-in phone", with the helper "For signing in only. To text a number
 from a pager, add it under Contacts." (link). `POST /api/family/members` and `POST /api/admin/users`

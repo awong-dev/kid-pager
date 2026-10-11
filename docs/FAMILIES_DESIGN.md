@@ -60,11 +60,13 @@ the same book, `cfg.sms` and envelopes as before.
     member's bridge phone (`docs/BRIDGE_PHONE_DESIGN.md` decision 3), and the relay sends and receives SMS
     through the bridge. §9 covers the alerts and decision 6 covers externals' backend rows.
 11. **The pager's modem SMS path is a projection, not a second policy.** `devices.smsContacts` (max 8) is
+    derived: the member's approved numbers, editable only through the member's approved-numbers list. When the
     member's numbers rule is `any`, every family contact is included, minus explicit denies
     (`docs/CONTACT_REQ_DESIGN.md` decision 7). A pager add writes the `added` marker, and the number reaches
     `cfg.sms` only through this derivation (`docs/BOOK_ADD_ANYONE_DESIGN.md` decision 12). The list therefore
     stays policy-derived and capped at 8. `any_sms` cannot be honoured on the device, because the firmware shows
     only listed numbers. The relay-side audit log still records blocked texts. A firmware follow-up, not part
+    of this plan.
 
 ## 2. Policies
 Two pickers per member, five presets each. Machine codes are stored; labels are what the UI shows; the
@@ -107,6 +109,7 @@ whether a send delivers, and the modem list still comes only from `sms_contacts_
 Defaults are applied at user creation from role (`member` → `people`/`people`, `admin`/`super` →
 `open`/`any`), and by the migration for existing users.
 
+## 3. Data model
 
 ```
 families/{fid}                 {name, createdAt, createdBy}
@@ -187,6 +190,7 @@ members whose rules-visible set is narrower than the people they talk to.
 | `PATCH /api/family/members/{uid}` | `displayName`, `role` (admin↔member), `disabled`, `policy{out,in}` |
 | `PUT /api/family/members/{uid}/approved` | `{people:[{alias, message, locate}], numbers:[phone…]}` rewrites that member's outgoing edges. Refuses `locate` to another family. Removes people not listed, as well as contacts. An unknown number creates an external. Re-derives `devices.smsContacts`, and pushes `cfg.sms` and the book |
 | `GET/POST/PATCH /api/family/contacts` | externals used by this family (`{phone, name}`); PATCH renames |
+| `GET/POST /api/family/devices` (the relay issues the device id; the body has no `deviceId`), `PATCH /{id}` (edit `label`), `/{id}/rotate-credentials`, `/revoke`, `/cfg`, `/ca`, `DELETE`; `GET /firmware?device=`, `POST /{id}/ota`, `GET /apn-presets`, `PUT /{id}/apn` | today's admin device handlers with an in-family check |
 | `POST /api/family/groups` | group create, members restricted to own family and edge peers |
 | `GET /api/family/alerts`, `POST /api/family/alerts/{id}/{approve\|block\|dismiss}` | approve = create external if needed, plus edges. Block = mark, and add to `families.blockedNumbers` |
 | `GET /api/family/conversations` | optional; the web reads Firestore directly by `familyIds` |
@@ -203,6 +207,8 @@ not_member, sms_contact, no_sms_number}` and a message the UI shows verbatim. `P
 create) moves to `/api/family/groups`. Join (`POST …/members`) requires the joiner to be a family admin of the
 group creator's family, and it no longer writes `locate` edges.
 
+**Webhooks.** None for SMS. Inbound SMS arrives from the bridge phone at `POST /bridge/events`
+(`docs/BRIDGE_PHONE_DESIGN.md` decision 5).
 
 ## 5. Web UI
 
@@ -308,6 +314,8 @@ Unchanged, except that `/settings/notifications` gains a per-user toggle "Family
   `sms_log` of an unlisted number. `contact_request` when a pager `contact_req` is stored (it wraps the
   `contactRequests` write).
 - **Push**: `backends/webapp.py` `push_alert(family_id, alert)` sends `{kind: "alert", alertKind, id, title, body,
+  url: "/family/alerts"}` to every token of every admin and super of that family whose `notify.alerts` is not
+  false. The service worker's `onBackgroundMessage` already switches on `kind`. It gains an `alert` arm and a
   `pager-alert-{id}` tag.
 - **Foreground**: `NotificationWatcher` listens to open alerts (admins only). It shows a browser notification for a
   new alert when the tab is hidden or not on `/family/alerts`.
@@ -359,11 +367,14 @@ Where the build deviates from the sections above. The code is the reference.
    (`open`, `any_sms`). Under `people_sms` or `sms`, an unknown number is 404 `unknown_alias`, and the admin adds it
    through Approved numbers first. Superseded by `docs/BOOK_ADD_ANYONE_DESIGN.md` decision 1: a pager reaches a new
    number by adding it, whatever the numbers rule, and the add creates the external.
+3. **Contact approval in `create` mode** still creates a Firebase Auth user with an `sms` backend, rather than an
    `external`. Switching it to `externals.get_or_create` would rename the alias to digits. Both shapes route
    identically.
 4. **`LocateCrossFamily` is enforced at every API writer of `locate` edges** (`PUT /api/admin/allowlist`,
    `PUT /api/family/members/{uid}/approved`), rather than inside `store/allow.set_edge`. Group create and join, and
    contact approval, never write `locate`.
+5. **Alerts push every admin and super of the family**, including a super whose `familyId` is that family,
+   honouring `notify.alerts`.
 6. **The policy gate is mutual**: a DM between two `people`/`people` members needs an edge in each direction. The
    allow-list matrix and the Approved editor write both directions. Tests that set one edge were updated.
 7. **A `devices` query without `where('familyId','==', fam)` is denied by the rules** for every non-super user,

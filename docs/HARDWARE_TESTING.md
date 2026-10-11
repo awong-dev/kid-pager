@@ -194,6 +194,7 @@ In the order worth testing:
    cold and hot, and re-attach time. Record numbers for tuning attempt and backoff budgets.
 7. **Modem SMS**: on one SIM line an earlier attempt failed with `AT+CMGS` returning `OK` with
    `+CMGS: -2147483648` (no message reference) and nothing arriving. Re-check on the current line
+   before relying on modem SMS. The Soracom preset refuses modem SMS. Relay SMS through the bridge
    phone has not been run on the bench: texts from listed and unlisted numbers are still to test.
 8. The accelerometer on the current pins (SDA IO17, SCL IO18, INT1 IO16) has not been bench-tested
    since the rewire. The shake threshold was calibrated on the earlier pins.

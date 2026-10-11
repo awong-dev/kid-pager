@@ -67,6 +67,14 @@ Open work, unverified items and decisions still needed. Items that are done are 
 - The modem library's payload parser miscounts by one byte at a newline end. The symptom is patched;
   the cause is not found (`docs/VENDOR_BUG_REPORTS.md`, item 7).
 - Device-direct SMS through the modem (`docs/PROTOCOL.md` §3.6) needs a carrier preset that allows
+  modem SMS (`sms_mo` in `firmware/main/carrier.c`; the Soracom preset does not). Not verified on the
+  current SIM.
+- The accelerometer (LIS3DH) is wired on the right header and drives shake-to-wake. Tuning for the
+  location and no-coverage backoff resets is open (`docs/HARDWARE_TESTING.md`, item 8).
+- Group chat `sndr`: parsing is in place. The author line on the real pager needs a visual check
+  (`docs/GROUP_CHAT_DESIGN.md`).
+- Sleep phase 2, a modem-woken host: CTS asserted through sleep, `esp_sleep_enable_uart_wakeup()`,
+  and a parser resync for a clipped first line. First establish whether the modem's ring indicator
   (RI) line is wired. If it is, the fix is simpler and has no clipping risk
   (`docs/SLEEP_URC_DESIGN.md` §8.7).
 
@@ -75,6 +83,13 @@ Open work, unverified items and decisions still needed. Items that are done are 
 - The Android app has never run on a phone. Bench steps are in `bridge-android/README.md`. Until
   they run, the notification shapes, the conversation-id rule, the reply cache and the tier-2
   selectors in `Targets.kt` are assumptions.
+- Firebase Android registration is a manual step: create the Android app `app.kidpager.bridge` in
+  the Firebase project and save its `google-services.json` as `bridge-android/app/`. Until then the
+  build is poll-only (`BuildConfig.FCM = false`), with outbound latency up to 60 s.
+- WhatsApp bench verification: not yet run on a phone. This covers the tier-2 selectors (`entry`,
+  `Send`, `menuitem_search`, the conversation row ids), the JID shortcut ids (`@s.whatsapp.net`,
+  `@g.us`), the media placeholders, and group search by title. Until these run, WhatsApp tier 2 is
+  best-effort.
 - The WhatsApp end-to-end retest is pending.
 - Voice sender number: the Voice number is typed on the setup screen, and no detection is built. The
   sender number comes from the notification's ids, sender line or title. Which of these Voice fills
@@ -88,6 +103,57 @@ Open work, unverified items and decisions still needed. Items that are done are 
 - Reboot with a screen lock: the boot receiver listens for `BOOT_COMPLETED` only, with no direct-boot
   handling. The mitigation is a screen lock of None (`docs/GOTCHAS.md`).
 - Heartbeat gap: the Devices row turns red after 15 minutes. There is no push alert for it.
+
+## Relay
+
+- Book size check: the cfg envelope check (the legacy 640-byte limit, `docs/PROTOCOL.md` §3.3)
+  fails for ten maximal-length contacts. The case was found while adding `t:"grp"`, at 707 bytes
+  against a 640-byte cap. Either the cap, the count or the field lengths must give. Not verified
+  against the current limits.
+- Alerts retention: verify the `alertsDays` sweep mechanics (`docs/RETENTION_DESIGN.md`).
+- `ca_resolve.resolve_broker_ca()` is never called at startup. The CA comes only from
+  `BROKER_CA_PEM`.
+- No end-to-end scenario exists for a CA push.
+- Per-device APN field: the API exists but there is no web UI. Pager auto-detection makes it rarely
+  needed.
+- Cell-tower location needs a real `CELL_GEO_API_KEY` in production. The `opencellid` provider
+  support exists, but its response shape is not verified (`docs/SERVER_PLAN.md` §10).
+- Real FCM push notifications are not complete:
+  - the relay's FCM client is a null client;
+  - the service worker's Firebase config is hardcoded for the demo;
+  - the payload does not match (the relay sends `senderUid`, and the service worker reads
+    `senderAlias`);
+  - token hygiene is missing: a token should be removed after three consecutive unregistered
+    errors.
+- Geofences driven by serving-cell-change reports: the cell-tower backend is complete. The geofence
+  acceptance policy on the relay is pending (`docs/SERVER_PLAN.md` §11).
+
+## Web
+
+- No test runner. Validation logic lives in pure modules for later testing.
+- Chat auto-scroll with the new-messages chip, and mark-read gated on being at the bottom. Status
+  not verified.
+- PWA installability: manifest (icons, maskable variant), install prompt handling, and the service
+  worker (`onMessage` in the foreground, caching and fetch handler) (`docs/SERVER_PLAN.md` §15).
+  Status not verified.
+
+## Hardware tests not yet seen working (`docs/HARDWARE_TESTING.md`)
+
+1. Confirm the 480 s MQTT keepalive on AT&T for at least one hour idle, with an overnight run as the
+   minimum. A one-hour relay-side watch on the Soracom direct bearer is not the same test.
+2. Bisect the post-wake window between 50 and 200 ms. Explain the 136 s delivery. Try a bare `AT`
+   probe.
+3. No-coverage radio duty cycle, field-tested. Sustained motion resets the backoff.
+4. End-to-end `/loc` cell answer: the relay receives and resolves the cell envelope, and stores
+   `src: "cell"`.
+5. CA push from the web app, with a right CA and a wrong CA.
+6. `gnsstest` outdoors: which radio route (in place, or a `CFUN=4` window), cold and hot fix times,
+   and re-attach time.
+7. SMS on the SIM: texts from listed and unlisted numbers (see the Firmware section).
+8. Accelerometer field tuning: shake-to-wake is wired and calibrated on the bench; tuning for the
+   location and no-coverage backoff resets is open.
+9. Power board bring-up: SYS to Walter VIN, 3V to the Friend and LIS3DH, CardKB gated by IO0, button
+   to 3V, and sleep current with the green LED removed.
 
 ## Measurements not yet made
 
@@ -141,6 +207,8 @@ location.
    while attached, or needs a `CFUN=4` window (modem radio off, TLS session lost, full re-attach and
    re-handshake). Record cold-boot and hot-fix times, and the re-attach time if GNSS needs a
    dedicated window. Update `docs/HARDWARE_TESTING.md` with the numbers.
+2. Try a GNSS fix inside a short PSM window. A Sequans forum thread reports that GNSS can run in LTE
+   "off" periods such as PSM. Measure the PSM entry and exit latency, and whether GNSS succeeds in
    the window.
 3. Tune the 20 s and 40 s attempt budgets and the 5 minute to 12 hour backoff from the measurements
    in step 1.

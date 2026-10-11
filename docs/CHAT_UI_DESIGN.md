@@ -107,3 +107,29 @@ that page's peer.
 - Separator: `gfx_hline(0,295,y)` and `gfx_hline(0,295,y+2)`, then `y += 6` (was one line, `+3`).
 
 ## 5. Archive
+
+- Home gets a fixed row "Archive Chat" right after "New message". It is hidden
+  while there is no visible peer (nothing to archive).
+- It opens `scr_archive.c`: the visible Home peers in Home's order and with
+  Home's display names. Enter toggles a check mark at the right edge
+  (`GFX_ICON_CHECK`, code-drawn). The last row "Archive Selected" archives
+  every checked peer, toasts "Archived N" (or "Nothing selected"), and
+  returns to Home. Esc returns with no change. List screens stay at the
+  normal 12 px font whatever the body text-size setting is.
+- Storage: `archive.c`, NVS namespace `archive`, up to 32 entries
+  `{alias, archived_ts}` where `archived_ts` is the thread's newest message ts
+  at archive time. Written only on change; the oldest `archived_ts` is evicted
+  when full.
+- A peer is hidden while its newest ts is `<= archived_ts`. Any newer message,
+  received or sent, shows it again; Home then prunes the stale entry
+  (`home_peers_filter()`), so a later archive starts clean. Unread logic is
+  unchanged. Messages are never deleted: New message and the address book
+  still open an archived thread with its history.
+
+## Known limitations
+
+- `grp_req` failures are silent on the pager (there is no error path on the wire yet).
+- The pending-ack queue holds 8 (`msg.h`). More than 8 unshown messages are acked only when the next
+  page arrives.
+- Group creation from the device is deferred past the beta (decision 1). The beta scope is the Home list,
+  the address book (pull), per-peer chat and New message.

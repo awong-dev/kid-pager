@@ -1,3 +1,4 @@
+# Bridge phone: Google Chat, Google Voice, WhatsApp and SIM SMS through a headless Android phone
 
 A bridge phone is a headless Android phone, signed into a family member's accounts, that carries that
 member's chat and text traffic to the relay. It is never used as a personal phone. The relay talks to it
@@ -23,11 +24,15 @@ The WhatsApp DM identity is in
   render_state`); `registry.py` maps one `kind` to one implementation: `pager`, `webapp`, `gchat` (the
   Workspace Chat-app adapter, `app/backends/gchat.py`, not usable for a personal account), and `sms`
   (`app/backends/sms.py` `SmsBackend`, bridge outbox only). `Routing._deliver_one` applies every
+  `DeliverResult` through `messages_store.record_delivery_attempt` (attempts+1; `ok=False` at 5 →
   `failed`; `ok=True` with state `queued` only clears `error`). `jobs.tick` retries `queued` `sms`
   deliveries via `messages_store.list_recent_queued_by_kind("sms")` + `Routing.redeliver` (24 h window);
+  bridge `ob_` items are skipped there.
 - **SMS model.** `users.smsNumber` plus the `smsNumbers/{e164}` index (`users_store.set_sms_number`). An
   external contact (`users/{x_…}` with `kind:"external"`, `ownerFamilyId`, `phone`,
   `externals_store.get_or_create`) carries one `sms` backend row (`ensure_sms_backend`, fixed id `sms`,
+  `config.phone`). The `sms` backend's `deliver` hands the send to the sender's bridge. Inbound:
+  `app/inbound_text.py` `handle_text` (from `/bridge/events`) resolves the target person, runs blocked,
   duplicate and known-contact-delivers checks, and otherwise holds the message (`held_sms_store.create`,
   `alerts.sms_held_upsert`). Approval is `routers/family.py` `_approve_sms_unknown` (contact, edge,
   `rederive_family_sms_contacts`, backlog via `routing.send(... wire_id=row.id)`). `Routing._sms_route_reject`
@@ -46,6 +51,7 @@ The WhatsApp DM identity is in
   sets `from` = the group alias and `sndr` = `msg.senderAlias` (`docs/PROTOCOL.md` §3.1: `sndr` has the
   alias regex, ≤16). `firmware/main/msg.c` stores `sndr` as a string; `scr_pick.c` labels rows from
   `type` verbatim.
+- **Alerts.** `app/alerts.py` (`create` = store + `push_alert` FCM to every admin and super of the family).
   `_ALERT_TITLES` in `backends/webapp.py` raises on an unknown kind. `store/alerts.py` has the `AlertKind`
   literal and `find_open(family, kind, subject_uid, peer_phone)`. The web `AlertCard.tsx` switches on kind.
 - **Setup codes.** `devsetup.issue()` and `store/setup_codes.py` (server-only collection, short expiry,
@@ -57,6 +63,8 @@ The WhatsApp DM identity is in
   `AlertCard.tsx`, `app/settings/book/page.tsx` (member picker over `GET /api/book`), `lib/api.ts`
   (`api.get/post/patch/put/del`), `lib/types.ts` (`AlertKind`, `BackendKind`). Static export
   (`output: 'export'`): no dynamic route segments, so member pages use `?uid=`.
+- **Dev and test.** `relay/docker-compose.yml` services `emqx`, `firebase`, `relay`, `bridge-sim`;
+  `tools/e2e_v2.py` scenarios; `relay/tests/conftest.py` emulator fixtures; `test_rules.py` through the
   emulator REST.
 - **Toolchain.** AGP 8.x needs JDK 17.
 
@@ -111,8 +119,12 @@ The WhatsApp DM identity is in
    (`PATCH /api/family/bridges/{id} {voiceNumber?, simNumber?}`), with the same normalisation and 409 rules as
    `smsNumber`. `caps.sms` means a SIM is present and the default-SMS role is held. `caps.gvoice` means a
    Voice number is present. The member's `smsNumber` on pair, reassign or number edit = `simNumber` if
+   present, else `voiceNumber`. `bridges_store.get_by_sms_number(n)` matches **either** field, so decision 4's
+   transport pick hands the send to the bridge in both cases, and `_sms_route_reject` needs no change. A
    Voice-only member therefore has an `smsNumber`.
    **Number uniqueness.** Numbers are unique across the whole relay. `POST /bridge/pair` runs the same check
+   as the family API's edit and accept-SIM paths (`bridge_numbers.number_taken`) and answers 409 with the
+   same detail text.
    **Lookup prefers the sender's own bridge.** `bridges_store.get_by_sms_number(e164, prefer_owner=…)`
    returns the matching paired bridge owned by `prefer_owner` when there is one, else the first match.
    `SmsBackend.deliver` and `apply_numbers` pass the sender or owner, so data written before the pair check
@@ -122,6 +134,9 @@ The WhatsApp DM identity is in
    `bridges_store.get_by_sms_number(sender.smsNumber, prefer_owner=…)`, which matches the accepted top-level
    `simNumber` **or** `voiceNumber`. When it names a paired bridge with `caps.sms` or `caps.gvoice`, the send
    is handed to `bridge_outbox.enqueue_send(bridge, msg, bid, source=<channel>, to={phone, conversationId?,
+   link?}, text=_render_body(msg))`. The channel is the one this member last used with this external
+   (decision 5), or `gvoice` for a Voice-number match, or `sms` otherwise. The delivery's `externalId` is set
+   to the outbox id, and the call returns `DeliverResult(ok=True, state="queued", external_id=<outbox id>)`.
    There is **no** consent gate, no relay wrapper, no disclosure and no defanging. Person-to-person texts from
    a personal SIM carry no 10DLC obligations. A member without a bridge has no SMS, so the send fails with
    `no_bridge`.
@@ -137,6 +152,7 @@ The WhatsApp DM identity is in
    than 24 h on every bridge, paired or not (`reason: bridge_offline`), and marks its delivery `failed`
    (`mark_delivery_failed_if_queued`). A dead phone therefore cannot hold deliveries forever.
    `render_state` for an `sms` delivery returns the raw state, `queued`. The web's chip text is the web's job.
+5. **Inbound events.** `POST /bridge/events {events: [{id, source: "sms"|"gchat"|"gvoice"|"whatsapp",
    kind?: "message"|"inspect", conversation: {id, title?, isGroup, link?}, sender: {name, phone?}, text, ts,
    attachments?: [{kind: "image"|"video"|"audio"|"file"}], people?: [name…]}]}` → `{results: [{id, outcome}]}`.
    Every event is processed. The phone retries the batch on a non-2xx response, so handled cases return 200.
@@ -156,6 +172,7 @@ The WhatsApp DM identity is in
      `_handle_inbound_sms` into `app/inbound_text.py` `handle_text(target, from_number, raw_body, sid, routing,
      reply)`. There are no keywords. `reply(text)` for the bridge enqueues an outbox send on the same source
      (the `too_long` hint). Empty text with attachments becomes `[photo]` for one image, else `[attachment]`.
+     A delivered text records the channel **per member** on the external's `sms` backend row:
      `config.via.<ownerUid> = "sms"|"gvoice"`, and for `gvoice`, `config.voiceConv.<ownerUid> = conversation.id`
      (`backends_store.update_backend`). Decision 4 uses these as the outbound `source` and `to.conversationId`.
      Replies go back on the channel the member last used. A peer reachable by both channels is one contact,
@@ -332,6 +349,8 @@ The WhatsApp DM identity is in
       `NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification`: `conversationTitle`,
       `isGroupConversation`, and `messages[]` (sender `Person.name`, text, timestamp). Only MessagingStyle
       notifications map. Calls, "checking for new messages", backup, status and group-summary notifications
+      (`FLAG_GROUP_SUMMARY`, "N messages from M chats") are ignored. The conversation id is
+      `sbn.notification.shortcutId` when set, else `sbn.key` with the account and tag stripped. Dedup is on
       `(conversation id, message timestamp, text hash)`, persisted in Room with a 7-day TTL. The reply-action
       cache is `conversationId → (action, RemoteInput[])`, taken from `notification.actions` and
       `NotificationCompat.WearableExtender(notification).actions`, and rebuilt from `getActiveNotifications()` on
@@ -343,6 +362,8 @@ The WhatsApp DM identity is in
       empty text, so the relay renders `[photo]` or `[attachment]`. A caption after the emoji is kept as text.
     - Tier 1 reply: `RemoteInput.addResultsToIntent(remoteInputs, intent, bundleOf(key to text))`, then
       `action.actionIntent.send(context, 0, intent)`. A `CanceledException` falls through to tier 2.
+    - Default SMS app: `SMS_DELIVER` and `WAP_PUSH_DELIVER` receivers (`BROADCAST_SMS` and `BROADCAST_WAP_PUSH`
+      permissions), `SmsManager.getSmsManagerForSubscriptionId` (dual SIM: `sim` from the outbox item, default
       otherwise), `divideMessage` + `sendMultipartTextMessage` with sent and delivered `PendingIntent`s. A
       quick-response service and a dummy `ACTION_SENDTO` activity make the role grantable. MMS text is extracted
       from the PDU, and attachments are reported by kind.
@@ -384,6 +405,9 @@ The WhatsApp DM identity is in
 
 ## WhatsApp
 
+WhatsApp is a third notification source, next to Google Chat and Google Voice. The `sms` backend is
+bridge-only, so a WhatsApp DM is a chat conversation keyed by its conversation id, and a WhatsApp group is a
+Chat-style conversation. The DM identity is in `docs/BRIDGE_WHATSAPP_LID_DESIGN.md`.
 
 - **Source and capability.** `whatsapp` is a source value wherever `sms|gchat|gvoice` is enumerated:
   `BridgeEvent.source`, outbox `source`, `BridgeCaps.whatsapp`, web `BridgeSource`, `ConversationOut.source`,
@@ -394,6 +418,7 @@ The WhatsApp DM identity is in
   whatever the owner registered (usually the SIM), and the relay never needs it. A WhatsApp number field on the
   bridge was rejected, because the relay never uses it.
 - **Groups.** `isGroup=true` goes to `_handle_chat_event` with source `whatsapp`. The conversation id is the group
+  JID `<id>@g.us` (shortcut id), and the title is the group subject. The sender name is the message's Person name,
   with a leading `~ ` stripped (unsaved members appear as `~ Name` or a number). Seen and held rows, one
   `chat_unknown` alert, and Subscribe, Ignore and the roster work exactly as for Chat. A subscribed group projects
   as `t:"grp"`. Add by link is not offered for WhatsApp (decision 10). A group deep link was rejected, because none
@@ -451,6 +476,8 @@ The WhatsApp DM identity is in
 | Chat title changes | `title` follows; the pager name follows unless custom | Rename |
 | pairing code expired or reused | 404 from `/bridge/pair` | issue a new code |
 | token leaked | the holder can inject texts to the owner as any approved contact or subscribed conversation, and read and ack (suppress) the owner's outbound texts. They cannot change `smsNumber` (decision 3) or reach another bridge | Unpair, then pair again (new token); the per-bridge limiter bounds the flood |
+| WhatsApp group tier 2 finds no conversation row with the title | outbox row `failed` `no_match` | tier 1 still works while the reply action exists; group tier 2 is best-effort (search by title) |
+| WhatsApp conversation id is not a LID, phone JID or group JID (e.g. `pkg\|notificationId`, no shortcut id) | `dropped_bad_conv`, one INFO line, nothing stored | none; the listener must send a shortcut id (`docs/BRIDGE_WHATSAPP_LID_DESIGN.md` L5) |
 
 ## What to measure
 - `bridge in … outcome=` per outcome per day; `held` vs `delivered`; `dropped_ignored` volume.
@@ -460,5 +487,11 @@ The WhatsApp DM identity is in
 - Open `chat_unknown` alerts older than 7 days.
 
 ## PROTOCOL.md impact
+**No envelope or firmware change.** `docs/PROTOCOL.md` carries two additive notes: the `c` row in §3.1 names
 `t:"chat"` for a bridged DM, and the §4.2 case-3 list includes the `bridge not set up; ask your admin` body. The
 pager receives a bridged group as a group page (`from` = the minted group alias, `sndr` = the roster nick, both
+alias-shaped), and a bridged DM as a page from an external's alias. The book lists them as `t:"grp"`, `t:"chat"`
+or `t:"sms"`, all of which `firmware/main/book.h` already carries as icon hints. `scr_pick.c` labels rows from
+`type` verbatim. A pager reply is an ordinary `/up to:<alias>`. The §4.2 case-3 system reply list gains one body,
+`bridge not set up; ask your admin` (relay text only; the device renders any `from:"system"` body). Firmware is
+not rebuilt for this design.

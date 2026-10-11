@@ -37,10 +37,20 @@
 - [GROUP_CHAT_DESIGN.md](GROUP_CHAT_DESIGN.md): group chat basics: conversation store, routing, the sender on the pager, web UI.
 - [HOMESERVER_DESIGN.md](HOMESERVER_DESIGN.md): the home deployment: nginx, Mosquitto and one relay image under docker compose.
 - [HOOKS_DESIGN.md](HOOKS_DESIGN.md): message hooks: where filters and processors run, verdicts, failure handling, callback API.
+- [LOCATION_TRACKING_DESIGN.md](LOCATION_TRACKING_DESIGN.md): background location: an hourly cell fix when stationary, cell plus GNSS when moving.
+- [LONG_BODY_DESIGN.md](LONG_BODY_DESIGN.md): message bodies up to 1024 bytes, split by the relay for pagers that cannot take them whole.
+- [OTA_DESIGN.md](OTA_DESIGN.md): over-the-air firmware update: signed job, HTTPS download, full or delta image, verification, rollback.
+- [RETENTION_DESIGN.md](RETENTION_DESIGN.md): data map, retention classes and the sweep, purge on delete, at-rest settings.
+- [SHAKE_WAKE_DESIGN.md](SHAKE_WAKE_DESIGN.md): shake to wake: a deliberate shake opens a short hot keyboard window; ordinary motion only feeds location.
+- [SLEEP_URC_DESIGN.md](SLEEP_URC_DESIGN.md): delivering a page URC through light sleep.
+- [SORACOM_DESIGN.md](SORACOM_DESIGN.md): the Soracom bearer: plain MQTT through Beam, selected by the inserted SIM.
 
 ## Evaluations and root-cause analyses
 
 - [CORES_EVAL.md](CORES_EVAL.md): whether network work moves to a worker task and whether the UI runs on CPU1.
+- [MODEM_KEEPALIVE_EVAL.md](MODEM_KEEPALIVE_EVAL.md): whether the modem sends MQTT keepalive pings on its own, and at which keepalive values.
+- [SORACOM_EVAL.md](SORACOM_EVAL.md): Soracom as the LTE provider, with Beam or a direct bearer.
 - [TWILIO_EVAL.md](TWILIO_EVAL.md): relay-side SMS through Twilio: the evaluation.
 - [RCA_SLEEP_PAGE_LOSS.md](RCA_SLEEP_PAGE_LOSS.md): root-cause analysis of pages lost while the pager light-sleeps.
+- [RCA_SLEEP_PUBLISH.md](RCA_SLEEP_PUBLISH.md): root-cause analysis of the release-only publish payload replaced by AT command text.
 

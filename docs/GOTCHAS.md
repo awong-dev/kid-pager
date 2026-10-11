@@ -304,7 +304,58 @@ misread as "the leftmost band did not flip". Always start at `seq 0` when judgin
 by eye, and predict the expected black/white bar pattern in advance (e.g. `w b w b w b ...`).
 Read the bars off the glass as a `b w b w ...` list and diff that against the prediction.
 
+## Cloud Run has no IPv6 egress: a dual-stack API host costs 30 s per call
+
+`g.api.soracom.io` publishes AAAA records. From Cloud Run, httpx tries the v6 address first and
+sits in the connect timeout (30 s) before falling back to v4, so the first Soracom SIM listing
+from the relay (auth + groups + subscribers) took 92 s. The fix is
+`httpx.HTTPTransport(local_address="0.0.0.0")` in `relay/app/soracom.py`, which forces IPv4
+(1.8 s for the same three calls). Any new outbound client in the relay that talks to a dual-stack
+host needs the same, or a short connect timeout; the broker, Firebase and GCS clients have not
+shown it because their hosts are v4-only or use Google libraries.
+
 ## A bridge phone that reboots with a screen lock stays dark
+
+**Symptom:** after a power cut or reboot, nothing from the bridge phone arrives. Chat and Voice texts do not reach the relay, SMS is not forwarded, outbox items wait, and the Devices row's last-seen goes red after 15 min.
+
+**Cause:** with a PIN, pattern or password set, Android keeps the phone in before-first-unlock state after a reboot. No app runs and no notification fires, and `BOOT_COMPLETED` is not sent until the first unlock. Pager Bridge's boot receiver listens only for `BOOT_COMPLETED` (`bridge-android/app/src/main/AndroidManifest.xml`), so nothing restarts it.
+
+**Rule:** the bridge phone's screen lock is **None** (the setup checklist in `relay/README.md`, "Bridge phones"). The app has no direct-boot handling yet (`docs/ROADMAP.md`), and the screen-lock-None recovery has not been tested on a phone.
+
+## A Voice text arrives as a name, not a number
+
+**Symptom:** a Google Voice text shows in the relay's `bridge in` log with `outcome=dropped_bad_from`. Nothing reaches the pager, and no alert appears.
+
+**Cause:** when the bridge account's contacts list holds the sender, Voice shows the contact's name instead of the number. The app takes the sender number from the notification ids, the sender line or the title. If none of them is a phone number, the event carries `sender.name` only, and the relay drops it.
+
+**Rule:** keep the bridge account's contacts list empty (the setup checklist). A name-only sender is dropped with one INFO line and never raises an alert.
+
+## CardKB holds one key: a main-loop stall drops the burst
+
+**Symptom:** typing fast into the composer shows about the first and last character of each burst;
+the middle keys never appear. Slow typing is fine.
+
+**Cause:** the CardKB has no FIFO. It holds one unread key, and the next key overwrites it if the
+pager has not read it yet. Any main-loop block longer than one keystroke gap loses the keys in
+between. The stalls measured on the bench: the wake status refresh (43 ms typical, 2 x 5000 ms
+worst case while the AT queue is busy), the publish-quiet gate in `disp_pre_write_gate_hook()`
+(560-710 ms seen, 1500 ms cap), and modem servicing (publish and session calls, hundreds of ms).
+
+**Rule:** read the CardKB from its own task (`kbd`, `ui.c`), never from the main loop. Keys that
+arrive during a stall wait in the input queue (`input.c`, 32 deep). A queue-full drop logs at WARN
+(`input event queue full`), so a loss there is visible. See `firmware/README.md`, "Keyboard task".
+
+Limitation: the keyboard task is not yet verified on hardware with a fast-typing burst test.
+
+## A CardKB that does not answer at 0x5F
+
+**Symptom:** `i2cscan` finds 0 devices, the SDA and SCL lines sit idle high, and `kbtime` reports
+"never acked".
+
+**Status:** not diagnosed. Check the wiring first (SDA IO10 on header pin 25, SCL IO9 on pin 24;
+VCC from 3V3-OUT on pin 26, gated by IO0), and check that the rail is on. Until it is diagnosed, no
+keystroke result from that unit counts as a keyboard result.
+
 ## Tools and workflow
 
 **`serial_capture.py` overwrites without warning:**
@@ -318,6 +369,10 @@ solo `esptool.py --after hard_reset chip_id`, then start captures in the same sh
 flash.
 
 **Console `key` injection:** Enter goes on the wire as `key \\n` (esp_console strips one backslash),
+and a `key` burst longer than the input queue loses its tail (the command feeds every character
+into the queue in one go). The input queue is 32 deep, so up to about 31 per call should fit. Not
+re-measured; keep bursts to 8 per call until a capture shows otherwise. See
+`docs/HARDWARE_TESTING.md` (Seen working, CardKB).
 
 **`gcloud logging read` needs `--project example-project`:**
 The shell's default project may be another one; the read then silently returns other services' logs
