@@ -216,6 +216,17 @@ def test_cfg_ota_shapes_and_envelope_limit():
         firmware.choose(idx, ID_NEW[:16], ID_OLD[:16]), settings(fw_bucket_base=long_base)
     )
     assert len(long_delta["url"]) == 90
+    # the `fw-cache/` path is 6 chars longer than `fw/` (96 chars)
+    cache_delta = firmware.FwDelta(
+        path=f"fw-cache/{ID_NEW[:16]}/from-{ID_OLD[:16]}.dz", osz=42513, osha="e5" * 32,
+        base=ID_OLD, psz=686466,
+    )
+    long_cache = firmware.build_cfg_ota(
+        firmware.Choice("delta", idx.find(ID_NEW[:16]), cache_delta, on_demand=True),
+        settings(fw_bucket_base=long_base),
+    )
+    assert len(long_cache["url"]) == 96
+    for cfg in (full, delta, long_delta, long_cache):
         devcfg._assert_within_envelope_limit(
             {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "kind": "cfg",
              "cfg": {"ota": cfg}, "ack": None}
@@ -289,6 +300,23 @@ def test_ingest_stores_ota_status_fields_and_drops_bad_ones():
     assert st.otaState == "dl"
     assert st.otaPct == 40  # bad value dropped, previous kept
     assert st.img == "0123456789abcdef"
+
+
+def test_ingest_clears_stale_ota_state_when_device_reports_no_job():
+    _device()
+    ingest = Ingest(FakeBrokerClient(), None)  # type: ignore[arg-type]
+    ingest.handle_status(
+        status_topic("pgr-ota-1"),
+        online_status_payload("s_00000001", img="0123456789abcdef", ota=1, ota_t="fedcba9876543210",
+                              ota_st="dl", ota_pct=0, ota_err="http"),
+    )
+    ingest.handle_status(
+        status_topic("pgr-ota-1"),
+        online_status_payload("s_00000002", img="1111222233334444", ota=1),
+    )
+    st = devices_store.get_device("pgr-ota-1").status
+    assert (st.otaTarget, st.otaState, st.otaPct, st.otaErr) == (None, None, None, None)
+    assert (st.img, st.otaCap) == ("1111222233334444", 1)
 
 
 def test_ingest_clears_otajob_when_job_finishes():

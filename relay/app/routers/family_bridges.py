@@ -301,6 +301,15 @@ GOOGLE_LINK_PREFIXES = (
     "https://mail.google.com/chat/",
     "https://voice.google.com/",
 )
+WHATSAPP_LINK_PREFIXES = (
+    "https://wa.me/",
+    "http://wa.me/",
+    "https://api.whatsapp.com/",
+    "https://chat.whatsapp.com/",
+    "https://whatsapp.com/",
+    "https://www.whatsapp.com/",
+    "whatsapp://",
+)
 
 
 class InspectRequest(BaseModel):
@@ -317,6 +326,11 @@ def inspect_link(bridge_id: str, req: InspectRequest, scope: FamilyScope) -> dic
     _, family_id = scope
     bridge = _require_bridge(bridge_id, family_id)
     link = req.link.strip()
+    lowered = link.lower()
+    if lowered.startswith(WHATSAPP_LINK_PREFIXES) or "//wa.me/" in lowered or ".whatsapp.com/" in lowered:
+        raise HTTPException(
+            status_code=400, detail="whatsapp links cannot be inspected; wait for a message"
+        )
     if not link.startswith(GOOGLE_LINK_PREFIXES):
         raise HTTPException(status_code=422, detail="not a Google Chat or Google Voice link")
     if not bridge.paired:
@@ -341,6 +355,8 @@ class BridgeOut(BaseModel):
     status: bridges_store.BridgeStatus
     caps: bridges_store.BridgeCaps
     createdAt: datetime | None
+    # Only on `PATCH` reassign: subscribed Chat conversations unsubscribed by the owner change.
+    unsubscribed: int = 0
 
 
 class CreateBridgeRequest(BaseModel):
@@ -432,6 +448,10 @@ def _normalize(raw: str | None, field: str) -> str | None:
 
 
 def _number_taken(owner_uid: str, number: str, bridge: bridges_store.Bridge) -> None:
+    """409 when `number` already belongs to another member or another bridge."""
+    detail = bridge_numbers.number_taken(owner_uid, number, bridge)
+    if detail is not None:
+        raise HTTPException(status_code=409, detail=detail)
 
 
 @router.patch("/bridges/{bridge_id}", dependencies=[Depends(require_family_write_rate_limit)])
@@ -472,9 +492,24 @@ def patch_bridge(
 
     if req.label is not None:
         bridges_store.set_label(bridge.id, req.label.strip())
+    unsubscribed = 0
+    if owner_changed:
+        # the old owner's subscriptions, queued texts and channels go; runs before ownerUid changes
+        principal, _ = scope
+        unsubscribed = chat_subscribe.reassign_conversations(
+            family_id, bridge, new_owner_uid, principal.uid, broker
+        )
+        for item in bridge_outbox.fail_pending(bridge.id, "reassigned"):
+            if item.msgId and item.bid:
     if bridge.paired:
         # release the previous owner's or numbers first
         bridge_numbers.release_numbers(bridge, broker)
+    caps = bridge_numbers.caps_for(
+        bridge.status.smsCapable or bridge.caps.sms,
+        bridge.caps.gchat,
+        new_sim,
+        new_voice,
+        whatsapp=bridge.caps.whatsapp,
     )
     if owner_changed:
         bridges_store.set_owner(bridge.id, new_owner_uid)
@@ -488,6 +523,9 @@ def patch_bridge(
         bridge_numbers.rederive(new_owner.uid, broker)
     fresh = bridges_store.get(bridge.id)
     assert fresh is not None
+    out = _bridge_out(fresh)
+    out.unsubscribed = unsubscribed
+    return out
 
 
 @router.post(
@@ -508,6 +546,12 @@ def accept_sim(
     if reported != bridge.simNumber:
         _number_taken(bridge.ownerUid, reported, bridge)
         bridge_numbers.release_numbers(bridge, broker)
+        caps = bridge_numbers.caps_for(
+            bridge.status.smsCapable or bridge.caps.sms,
+            bridge.caps.gchat,
+            reported,
+            bridge.voiceNumber,
+            whatsapp=bridge.caps.whatsapp,
         )
         bridges_store.set_numbers(
             bridge.id, sim_number=reported, voice_number=bridge.voiceNumber, caps=caps

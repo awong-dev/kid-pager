@@ -15,7 +15,11 @@ from app.db.firestore import get_db, run_transaction
 
 logger = logging.getLogger("relay.contacts")
 
+# Cap on `added` markers per owner.
+MAX_ADDED_PER_OWNER = 32
 
+# "pending" only exists on legacy rows; nothing creates one.
+Status = Literal["pending", "approved", "rejected", "added"]
 
 
 class ContactRequest(BaseModel):
@@ -28,6 +32,7 @@ class ContactRequest(BaseModel):
     name: str
     phone: str | None = None
     alias: str | None = None
+    peerUid: str | None = None
     status: Status = "pending"
     reason: str | None = None
     createdAt: datetime | None = None
@@ -69,13 +74,36 @@ def list_requests(
     return [_decode(snap.id, snap.to_dict() or {}) for snap in query.stream()]
 
 
+def add_entry(
     *,
     device_id: str,
     owner_uid: str,
+    family_id: str | None,
     req_id: str,
     name: str,
+    peer_uid: str,
+    nick: str | None,
     phone: str | None = None,
     alias: str | None = None,
+) -> Literal["added", "full", "dup"]:
+    """Creates the `added` request, merges the owner's book marker and bumps `bookVersion`."""
+    db = get_db()
+    row_ref = _contact_requests().document(key(device_id, req_id))
+    book_col = db.collection("users").document(owner_uid).collection("book")
+    marker_ref = book_col.document(peer_uid)
+    markers_query = book_col.where(filter=FieldFilter("added", "==", True))
+    devices_query = db.collection("devices").where(filter=FieldFilter("ownerUid", "==", owner_uid))
+
+    def _txn(transaction: Transaction) -> Literal["added", "full", "dup"]:
+        # All reads before any write.
+        if row_ref.get(transaction=transaction).exists:
+            return "dup"
+        marked = {s.id for s in markers_query.stream(transaction=transaction)}
+        if peer_uid not in marked and len(marked) >= MAX_ADDED_PER_OWNER:
+            return "full"
+        device_snaps = list(devices_query.stream(transaction=transaction))
+        transaction.create(
+            row_ref,
             {
                 "deviceId": device_id,
                 "reqId": req_id,
@@ -83,9 +111,29 @@ def list_requests(
                 "name": name,
                 "phone": phone,
                 "alias": alias,
+                "peerUid": peer_uid,
+                "status": "added",
                 "reason": None,
                 "createdAt": SERVER_TIMESTAMP,
+                "decidedAt": SERVER_TIMESTAMP,
+                "decidedBy": "relay",
+            },
         )
+        marker: dict = {
+            "added": True,
+            "addedAt": SERVER_TIMESTAMP,
+            "addedBy": device_id,
+            "familyId": family_id,
+        }
+        if nick is not None:
+            marker["nick"] = nick
+        transaction.set(marker_ref, marker, merge=True)
+        for snap in device_snaps:
+            bv = int((snap.to_dict() or {}).get("bookVersion", 0) or 0) + 1
+            transaction.update(snap.reference, {"bookVersion": bv})
+        return "added"
+
+    return run_transaction(_txn)
 
 
 def create_rejected(

@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from app import book, sms_text
 from app import policy as policy_module
 from app.broker import BrokerClient
 from app.routing import Routing
@@ -165,6 +166,7 @@ def _send_text(
 def release_backlog(row: BridgeConversation, owner: User, routing: Routing) -> tuple[int, int]:
     """Delivers every `held`/`too_long` row, oldest first; returns `(delivered, undelivered)`."""
     delivered = undelivered = 0
+        text = sms_text.pager_body(held.body)
             held_chat_store.set_status([held.id], "too_long")
             undelivered += 1
             continue
@@ -224,6 +226,13 @@ def subscribe(
         )
     except externals_store.ContactNameTaken as exc:
         raise ChatError(409, str(exc)) from exc
+    if ext.displayName != name:
+        # A retry with a different name: the external keeps the name the crashed attempt
+        # gave it, so rename it (the book bump follows below).
+        try:
+            externals_store.rename(family_id, ext.uid, name)
+        except externals_store.ContactNameTaken as exc:
+            raise ChatError(409, str(exc)) from exc
 
     conv_key: str | None = None
     if row.isGroup:
@@ -287,6 +296,7 @@ def deliver_subscribed(
         return None
     _follow_title(bridge, row, owner, previous_title, broker)
     raw = event.text.strip()
+    body = sms_text.pager_body(raw) or (
         placeholder_for([a.kind for a in event.attachments]) if event.attachments else ""
     )
     if not body:
@@ -331,6 +341,25 @@ def _follow_title(
     book.bump_and_push({owner.uid}, broker, reason="chat_title")
 
 
+def drop_held(family_id: str, row: BridgeConversation, by_uid: str) -> None:
+    """Dismiss the held rows and the open alert, and reset the row's `heldCount` / `alertId`."""
+    held_chat_store.set_status(
+        [r.id for r in held_chat_store.list_for_conversation(row.id, "held")], "dismissed"
+    )
+    if row.alertId:
+        alert = alerts_store.get(family_id, row.alertId)
+        if alert is not None and alert.status == "open":
+            alerts_store.decide(family_id, row.alertId, "dismissed", by_uid)
+    bridge_conversations.set_fields(row.id, heldCount=0, alertId=None)
+
+
+def dismiss_alert_conversation(family_id: str, bridge_id: str, conversation_id: str, by_uid: str) -> None:
+    """Dismiss path for a `chat_unknown` alert: the row stays `seen`."""
+    row = bridge_conversations.get(bridge_id, conversation_id)
+    if row is not None:
+        drop_held(family_id, row, by_uid)
+
+
 def ignore(
     family_id: str, bridge: bridges_store.Bridge, conversation_id: str, by_uid: str
 ) -> BridgeConversation:
@@ -340,6 +369,7 @@ def ignore(
     if row.status in ("subscribed", "paused"):
         raise ChatError(409, "unsubscribe this conversation first")
     bridge_conversations.set_status(row.id, "ignored")
+    drop_held(family_id, row, by_uid)
     fresh = bridge_conversations.get(bridge.id, conversation_id)
     assert fresh is not None
     return fresh
@@ -399,6 +429,9 @@ def unsubscribe(
     family_id: str, bridge: bridges_store.Bridge, conversation_id: str, broker: BrokerClient
 ) -> BridgeConversation:
     """Edges, group doc and external are deleted; the row goes back to `seen`, history kept."""
+    if bridge.familyId != family_id:
+        raise ChatError(404, "no such bridge")
+    owner = users_store.get_user(bridge.ownerUid)  # may be disabled: reassign away from them
     row = _require_row(bridge, conversation_id)
     if row.uid:
         if row.convKey:
@@ -407,6 +440,23 @@ def unsubscribe(
     bridge_conversations.set_fields(
         row.id, status="seen", uid=None, convKey=None, pagerName=None, customName=False
     )
+    if owner is not None:
+        book.bump_and_push({owner.uid}, broker, reason="chat_unsubscribe")
     fresh = bridge_conversations.get(bridge.id, conversation_id)
     assert fresh is not None
     return fresh
+
+
+def reassign_conversations(
+    family_id: str, bridge: bridges_store.Bridge, new_owner_uid: str, by_uid: str, broker: BrokerClient
+) -> int:
+    """Run before `bridge.ownerUid` changes: unsubscribes live rows, moves the rest."""
+    unsubscribed = 0
+    for row in bridge_conversations.list_for_bridge(bridge.id):
+        if row.status in ("subscribed", "paused"):
+            unsubscribe(family_id, bridge, row.conversationId, broker)
+            unsubscribed += 1
+    for row in bridge_conversations.list_for_bridge(bridge.id):
+        drop_held(family_id, row, by_uid)
+        bridge_conversations.set_fields(row.id, ownerUid=new_owner_uid)
+    return unsubscribed

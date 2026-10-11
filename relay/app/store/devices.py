@@ -148,6 +148,7 @@ class OtaJob(BaseModel):
     osz: int
     estBytes: int
     by_uid: str
+    onDemand: bool = False
     at: datetime | None = None
 
 
@@ -284,6 +285,11 @@ def set_gnss_enabled(device_id: str, enabled: bool) -> None:
     _devices().document(device_id).set({"gnss_enabled": enabled}, merge=True)
 
 
+def set_label(device_id: str, label: str) -> None:
+    """The caller has validated `label`; the pager learns it at the next setup code."""
+    _devices().document(device_id).update({"label": label})
+
+
 def set_apn(device_id: str, apn: str | None) -> None:
     """The caller has validated `apn`; it takes effect at the next setup code, nothing is pushed."""
     _devices().document(device_id).set({"apn": apn}, merge=True)
@@ -360,8 +366,12 @@ def set_last_cell(
     )
 
 
+def update_status(device_id: str, *, clear: tuple[str, ...] = (), **fields: object) -> None:
     """Overwrites `status` with `fields` + `updatedAt`; `clear` names are deleted."""
+    from google.cloud.firestore import DELETE_FIELD, SERVER_TIMESTAMP
 
     status = {k: v for k, v in fields.items() if v is not None}
+    for k in clear:
+        status.setdefault(k, DELETE_FIELD)
     status["updatedAt"] = SERVER_TIMESTAMP
     _devices().document(device_id).set({"status": status}, merge=True)

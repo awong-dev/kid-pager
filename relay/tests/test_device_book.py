@@ -352,3 +352,12 @@ def test_request_tag_not_valid_as_envelope_tag():
     req_tag_b64 = base64.urlsafe_b64encode(req_tag).rstrip(b"=").decode("ascii")
     envelope_sig_b64 = json.loads(envelope)["sig"]
     assert req_tag_b64 != envelope_sig_b64
+
+
+def test_book_always_has_c():
+    from app import devcfg
+
+    _make_user("student-db-empty", "student-db-empty")
+    _make_hmac_pager_device("pgr-db-empty", "student-db-empty")
+    for obj in (devcfg.build_book_body("pgr-db-empty"), devcfg.build_book("pgr-db-empty")):
+        assert "c" in obj and obj["c"] == [] and "p" not in obj

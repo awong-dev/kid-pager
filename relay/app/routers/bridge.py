@@ -21,6 +21,7 @@ from app import alerts as alerts_module
 from app.bridgeauth import mint_token, require_bridge
 from app.inbound_text import handle_text, placeholder_for
 from app.routers.webhooks import _check_webhook_ip_rate_limit
+from app.sms_text import redact_phone, voice_link
 from app.store import bridge_conversations, bridge_outbox
 from app.store import bridges as bridges_store
 from app.store import externals as externals_store
@@ -42,6 +43,7 @@ class PairCaps(BaseModel):
     sms: bool = False
     gchat: bool = False
     gvoice: bool = False
+    whatsapp: bool = False
 
 
 class PairRequest(BaseModel):
@@ -79,14 +81,29 @@ def pair(req: PairRequest, request: Request) -> PairResponse:
     sim = normalize_optional_phone(req.simNumber, "simNumber")
     voice = normalize_optional_phone(req.voiceNumber, "voiceNumber")
 
+    # Numbers are unique across the relay: check before consuming the code, so a 409 keeps it.
+    peeked_id = bridges_store.peek_pair_code(req.code)
+    peeked = bridges_store.get(peeked_id) if peeked_id else None
+    if peeked is not None and not peeked.paired:
+        for number in (sim, voice):
+            if number is not None:
+                detail = bridge_numbers.number_taken(peeked.ownerUid, number, peeked)
+                if detail is not None:
+                    raise HTTPException(status_code=409, detail=detail)
+
     bridge_id = bridges_store.consume_pair_code(req.code)
     bridge = bridges_store.get(bridge_id) if bridge_id else None
     if bridge is None or bridge.paired:
         raise HTTPException(status_code=404, detail="unknown or expired code")
 
     token, token_hash = mint_token(bridge.id)
+    caps = bridge_numbers.caps_for(
+        req.caps.sms, req.caps.gchat, sim, voice, whatsapp=req.caps.whatsapp
+    )
     status = {
         "accounts": req.accounts,
+        "smsCapable": req.caps.sms,
+        "whatsapp": req.caps.whatsapp,
         "simNumber": sim,
         "voiceNumber": voice,
         "version": req.version,
@@ -100,9 +117,27 @@ def pair(req: PairRequest, request: Request) -> PairResponse:
                 bool(sim), bool(voice))
 
 
+class HeartbeatStatus(BaseModel):
+    """What the phone may report; typed so a bad value is a 422. `error` is relay-owned, ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    battery: int | None = Field(default=None, ge=0, le=100)
+    listenerBound: bool | None = None
+    smsDefault: bool | None = None
+    accessibility: bool | None = None
+    whatsapp: bool | None = None
+    accounts: list[Annotated[str, Field(max_length=120)]] | None = Field(default=None, max_length=10)
+    simNumber: str | None = Field(default=None, max_length=32)
+    voiceNumber: str | None = Field(default=None, max_length=32)
+    version: str | None = Field(default=None, max_length=40)
+    error: str | None = Field(default=None, max_length=200)
+
+
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    status: HeartbeatStatus = Field(default_factory=HeartbeatStatus)
     fcmToken: str | None = Field(default=None, max_length=4096)
 
 
@@ -113,6 +148,9 @@ SIM_CHANGED = "SIM changed"
 def heartbeat(
 ) -> dict:
     """Record the status; a reported SIM differing from the accepted one sets `status.error`."""
+    status = req.status.model_dump(exclude_unset=True, exclude={"error"})
+    if status.get("smsDefault") is not None:
+        status["smsCapable"] = status["smsDefault"]
     for key in ("simNumber", "voiceNumber"):
         value = status.get(key)
         if isinstance(value, str) and value.strip():
@@ -123,6 +161,20 @@ def heartbeat(
         elif key in status:
             status[key] = None
     bridges_store.touch(bridge.id, status, req.fcmToken)
+    if status.get("whatsapp") is None:
+        status.pop("whatsapp", None)
+    if status.get("listenerBound") is None:
+        status.pop("listenerBound", None)
+    if "smsCapable" in status or "whatsapp" in status or "listenerBound" in status:
+        caps = bridge_numbers.caps_for(
+            status.get("smsCapable", bridge.status.smsCapable or bridge.caps.sms),
+            status.get("listenerBound", bridge.caps.gchat),
+            bridge.simNumber,
+            bridge.voiceNumber,
+            whatsapp=status.get("whatsapp", bridge.caps.whatsapp),
+        )
+        if caps != bridge.caps:
+            bridges_store.set_caps(bridge.id, caps)
     reported = status.get("simNumber")
     if reported is not None and reported != bridge.simNumber:
         bridges_store.set_error(bridge.id, SIM_CHANGED)
@@ -218,6 +270,7 @@ class BridgeEvent(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     id: str
+    source: Literal["sms", "gchat", "gvoice", "whatsapp"]
     kind: Literal["message", "inspect"] = "message"
     conversation: EventConversation
     sender: EventSender = Field(default_factory=EventSender)
@@ -245,6 +298,7 @@ def conv_log_id(conversation_id: str) -> str:
 
 def _from_label(event: BridgeEvent) -> str:
     if event.sender.phone:
+        return redact_phone(event.sender.phone)
     return event.sender.name or "-"
 
 
@@ -264,6 +318,10 @@ def _handle_text_event(
         or target.familyId is None
     ):
         return "dropped_owner"
+    caps_ok = {
+        "sms": bridge.caps.sms,
+        "gvoice": bridge.caps.gvoice,
+    }.get(event.source, False)
     if not caps_ok:
         return "dropped_cap"
     try:
@@ -271,6 +329,8 @@ def _handle_text_event(
     except ValueError:
         return "dropped_bad_from"
     sid = f"br_{bridge.id}_{event.id}"
+    # Voice carries a thread id and a deep link for the tier-2 reply.
+    conv_link = voice_link if event.source == "gvoice" else None
 
     def reply(text: str) -> None:
         bridge_outbox.enqueue_hint(
@@ -280,6 +340,8 @@ def _handle_text_event(
             text=text,
             wire_id=sid,
             to_extra=(
+                {"conversationId": event.conversation.id, "link": conv_link(from_number)}
+                if conv_link
                 else None
             ),
         )
@@ -293,10 +355,15 @@ def _handle_text_event(
         reply=reply,
         attachments=[a.kind for a in event.attachments],
         via=event.source,
+        voice_conv=event.conversation.id if conv_link else None,
     )
 
 
 CONVERSATIONS_PER_DAY = 50
+
+# WhatsApp DM is `<digits>@lid` or `<digits>@s.whatsapp.net`, a group `<digits-and-dashes>@g.us`;
+# anything else changes per notification.
+WA_CONV_RE = re.compile(r"^(\d+@(lid|s\.whatsapp\.net)|[\d-]+@g\.us)$")
 
 
 def _preview(event: BridgeEvent) -> str:
@@ -309,11 +376,35 @@ def _handle_chat_event(
     """`gchat` events."""
     conv = event.conversation
     existing = bridge_conversations.get(bridge.id, conv.id)
+    target = users_store.get_user(bridge.ownerUid)
+    if target is None or target.kind != "person" or target.disabled or target.familyId is None:
+        return "dropped_owner"
+    caps_ok = {
+        "gchat": bridge.caps.gchat,
+        "gvoice": bridge.caps.gvoice,
+        "whatsapp": bridge.caps.whatsapp,
+    }.get(event.source, False)
+    if not caps_ok:
+        return "dropped_cap"
+    if event.source == "whatsapp" and event.sender.name.startswith("~"):
+        # unsaved group members show as "~ Name"
+        event = event.model_copy(
+            update={"sender": event.sender.model_copy(update={"name": event.sender.name.lstrip("~").strip()})}
+        )
+    title = conv.title
+    if not conv.isGroup and not title:
+        # a 1:1 row is titled by the peer's display name
+        title = event.sender.name or None
+    if existing is None:
+        since = datetime.now(UTC) - timedelta(days=1)
+        if bridge_conversations.count_created_since(bridge.id, since) >= CONVERSATIONS_PER_DAY:
+            return "dropped_conv_cap"
     if event.kind == "inspect":
         bridge_conversations.upsert_seen(
             bridge,
             source=event.source,
             conversation_id=conv.id,
+            title=title,
             is_group=conv.isGroup,
             link=conv.link,
             speaker=None,
@@ -333,6 +424,7 @@ def _handle_chat_event(
         bridge,
         source=event.source,
         conversation_id=conv.id,
+        title=title,
         is_group=conv.isGroup,
         link=conv.link,
         speaker=event.sender.name,
@@ -369,6 +461,11 @@ def _handle_chat_event(
 
 
 def process_event(bridge: bridges_store.Bridge, event: BridgeEvent, routing, broker) -> str:
+    if event.source == "whatsapp":
+        # every WhatsApp conversation is keyed by its conversation id and takes the chat path
+        if not WA_CONV_RE.match(event.conversation.id):
+            return "dropped_bad_conv"
+        return _handle_chat_event(bridge, event, routing, broker)
     if event.source in ("sms", "gvoice") and event.kind == "message":
         return _handle_text_event(bridge, event, routing)
     if event.source in ("gchat", "gvoice"):
@@ -379,9 +476,19 @@ def process_event(bridge: bridges_store.Bridge, event: BridgeEvent, routing, bro
 def process_events(
     bridge: bridges_store.Bridge, events: list[BridgeEvent], routing, broker
 ) -> list[dict]:
+    if events and not rate_limits_store.check_and_increment(
+        f"bridge_events:{bridge.id}", limit=EVENTS_PER_MINUTE, window_s=60, count=len(events)
+    ):
+        raise HTTPException(status_code=429, detail="too many requests")
     results = []
     for event in events:
+        kind = ""
+        if event.source == "whatsapp":
+            cid = event.conversation.id
+            kind = " kind=" + ("lid" if cid.endswith("@lid") else "grp" if cid.endswith("@g.us") else "jid")
         logger.info(
+            "bridge in bridge=%s src=%s conv=%s from=%s%s outcome=%s",
+            bridge.id, event.source, conv_log_id(event.conversation.id), _from_label(event), kind, outcome,
         )
         results.append({"id": event.id, "outcome": outcome})
     return results

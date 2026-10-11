@@ -1,4 +1,5 @@
 """`heldSms/{MessageSid}`: inbound texts from unapproved numbers, kept until a parent decides.
+Written with `create()` on the message sid, so a redelivered event is `AlreadyExists`."""
 
 from __future__ import annotations
 
@@ -28,6 +29,10 @@ class HeldSms(BaseModel):
     status: HeldStatus = "held"
     decidedAt: datetime | None = None
     alertId: str | None = None
+    # Channel the text arrived on (`sms`|`gvoice`|`whatsapp`) and its Voice thread / WhatsApp
+    # JID; optional.
+    via: str | None = None
+    conv: str | None = None
 
 
 def _col():
@@ -35,7 +40,17 @@ def _col():
 
 
 def create(
+    sid: str,
+    *,
+    family_id: str,
+    to_uid: str,
+    from_phone: str,
+    body: str,
+    alert_id: str | None = None,
+    via: str | None = None,
+    conv: str | None = None,
 ) -> bool:
+    """False when `sid` is already stored (a redelivered event)."""
     try:
         _col().document(sid).create(
             {
@@ -47,6 +62,8 @@ def create(
                 "status": "held",
                 "decidedAt": None,
                 "alertId": alert_id,
+                "via": via,
+                "conv": conv,
             }
         )
     except AlreadyExists:

@@ -48,13 +48,27 @@ class BridgeBackend:
         bridge = bridges_store.get(config.bridgeId)
         if bridge is None or not bridge.paired:
             return DeliverResult(ok=False, state="failed", error="no_bridge")
+        row = (
+            bridge_conversations.get(bridge.id, config.conversationId)
+            if config.conversationId
+            else None
+        )
+        if row is not None and row.status == "paused":
+            return DeliverResult(ok=False, state="failed", error="paused")
         if msg.kind != "text" or not msg.body:
             return DeliverResult(ok=False, state="failed", error="unsupported")
+        to: dict[str, str | None] = {"conversationId": config.conversationId, "link": config.link}
+        if config.conversationId:
+            # Tier 2 finds a conversation by its title (all chat sources).
+            title = row.title if row is not None else None
+            if title:
+                to["title"] = title
         item = bridge_outbox.enqueue_send(
             bridge,
             msg.id,
             backend.id,
             source=config.source,
+            to=to,
             text=msg.body,
             reply_hint=config.conversationId,
         )

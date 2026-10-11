@@ -68,6 +68,8 @@ class User(BaseModel):
     notify: Notify = Field(default_factory=Notify)
     disabled: bool = False
     createdAt: datetime | None = None
+    # The person's SMS number (E.164), set from the paired bridge; `smsNumbers/{e164}` is its
+    # reverse index.
     smsNumber: str | None = None
     # Set on an external standing for a subscribed Google Chat conversation: `{bridgeId,
     # conversationId, source, link, isGroup, title, canReply}`.

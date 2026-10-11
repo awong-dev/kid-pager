@@ -198,8 +198,23 @@ def fail_pending(bridge_id: str, reason: str) -> list[OutboxItem]:
     return out
 
 
+def list_stale_pending_all(older_than: datetime) -> list[OutboxItem]:
+    """Pending rows older than `older_than` on every bridge (collection-group query)."""
+    out: list[OutboxItem] = []
+    query = get_db().collection_group("outbox").where(filter=FieldFilter("state", "==", "pending"))
+    for snap in query.stream():
+        bridge_id = snap.reference.parent.parent.id
+        item = _from_snap(bridge_id, snap)
+        if item.createdAt is not None and item.createdAt < older_than:
+            out.append(item)
+    return out
 
 
 def delete_acked_before(cutoff: datetime) -> int:
+    """Acked rows older than `cutoff` on every bridge (collection-group query)."""
     deleted = 0
+    query = get_db().collection_group("outbox").where(filter=FieldFilter("ackedAt", "<", cutoff))
+    for snap in query.stream():
+        snap.reference.delete()
+        deleted += 1
     return deleted

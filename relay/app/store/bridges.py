@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 
 from google.api_core.exceptions import AlreadyExists, NotFound
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter, Transaction
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.db.firestore import get_db, run_transaction
 from app.ids import new_id
+
+logger = logging.getLogger("relay.bridges")
 
 PAIR_CODE_TTL = timedelta(minutes=10)
 
@@ -19,7 +23,9 @@ PHONE_STATUS_KEYS = (
     "battery",
     "listenerBound",
     "smsDefault",
+    "smsCapable",
     "accessibility",
+    "whatsapp",
     "accounts",
     "simNumber",
     "voiceNumber",
@@ -33,7 +39,12 @@ class BridgeStatus(BaseModel):
     battery: int | None = None
     listenerBound: bool = False
     smsDefault: bool = False
+    # The phone's own "I can send SMS" bit; `caps.sms` also requires a SIM
+    # (`bridge_numbers.caps_for`).
+    smsCapable: bool = False
     accessibility: bool = False
+    # WhatsApp installed and its notifications listened to (the phone's bit; `caps.whatsapp`).
+    whatsapp: bool = False
     accounts: list[str] = Field(default_factory=list)
     simNumber: str | None = None
     voiceNumber: str | None = None
@@ -49,6 +60,7 @@ class BridgeCaps(BaseModel):
     sms: bool = False
     gchat: bool = False
     gvoice: bool = False
+    whatsapp: bool = False
 
 
 class Bridge(BaseModel):
@@ -83,6 +95,19 @@ def _codes():
 
 
 def _from_snap(snap) -> Bridge:
+    """A row that fails validation is logged and read as an unpaired bridge instead of raising."""
+    data = snap.to_dict() or {}
+    try:
+        return Bridge.model_validate({"id": snap.id, **data})
+    except ValidationError:
+        logger.exception("bridge row %s fails validation; treating it as unpaired", snap.id)
+        return Bridge(
+            id=snap.id,
+            ownerUid=str(data.get("ownerUid") or ""),
+            familyId=str(data.get("familyId") or ""),
+            label=str(data.get("label") or ""),
+            tokenHash=None,
+        )
 
 
 def create(owner_uid: str, family_id: str, label: str, created_by: str) -> Bridge:
@@ -133,12 +158,19 @@ def list_all() -> list[Bridge]:
 _EPOCH = datetime.fromtimestamp(0, tz=UTC)
 
 
+def get_by_sms_number(e164: str, *, prefer_owner: str | None = None) -> Bridge | None:
     """The paired bridge with accepted `simNumber` or `voiceNumber` `e164`; `prefer_owner` wins."""
+    matches: list[Bridge] = []
     for field in ("simNumber", "voiceNumber"):
         for snap in _bridges().where(filter=FieldFilter(field, "==", e164)).stream():
             bridge = _from_snap(snap)
             if bridge.paired:
+                matches.append(bridge)
+    if prefer_owner is not None:
+        for bridge in matches:
+            if bridge.ownerUid == prefer_owner:
                 return bridge
+    return matches[0] if matches else None
 
 
 def _update(bridge_id: str, updates: dict[str, Any]) -> None:
@@ -174,6 +206,10 @@ def set_numbers(
     if caps is not None:
         updates["caps"] = caps.model_dump()
     _update(bridge_id, updates)
+
+
+def set_caps(bridge_id: str, caps: BridgeCaps) -> None:
+    _update(bridge_id, {"caps": caps.model_dump()})
 
 
 def set_sim_number(bridge_id: str, sim_number: str | None) -> None:
@@ -247,6 +283,16 @@ def consume_pair_code(code: str, *, now: datetime | None = None) -> str | None:
         return data.get("bridgeId")
 
     return run_transaction(_txn)
+
+
+def peek_pair_code(code: str, *, now: datetime | None = None) -> str | None:
+    """Read-only twin of `consume_pair_code`: the bridge id for a live code, else None."""
+    now = now or datetime.now(UTC)
+    data = _codes().document(code).get().to_dict() or {}
+    expires_at = data.get("expiresAt")
+    if expires_at is None or expires_at <= now:
+        return None
+    return data.get("bridgeId")
 
 
 def list_expired_pair_codes(now: datetime) -> list[str]:

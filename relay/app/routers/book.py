@@ -41,6 +41,8 @@ class BookEntryOut(BaseModel):
     onPager: bool
     # `{source}` for a Google Chat / Voice contact.
     chat: dict | None = None
+    # The owner added this entry from the pager.
+    added: bool = False
 
 
 class BookOut(BaseModel):
@@ -97,6 +99,7 @@ def _view(owner_uid: str) -> BookOut:
             sendable=e.sendable,
             reason=e.reason,
             chat=e.chat,
+            added=e.added,
             onPager=bool(e.onPager)
             if e.kind == "external" and not e.chat
             else (e.sendable and e.alias in on_pager),
@@ -165,3 +168,19 @@ def delete_nick(
     book_module.set_nick(owner_uid, peer_uid, None, authed.uid)
     book_module.push_only(owner_uid, broker)
     return _entry_out(owner_uid, peer_uid)
+
+
+@router.delete("/{owner_uid}/added/{peer_uid}")
+def delete_added(
+    owner_uid: str,
+    peer_uid: str,
+    authed: Annotated[AuthedUser, Depends(require_user)],
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+) -> BookOut:
+    """Clear the `added` marker (404 if absent), bump the book and push; returns the book."""
+    _authorize(authed, owner_uid)
+    _rate_limit(authed)
+    if not book_module.clear_added(owner_uid, peer_uid, authed.uid):
+        raise HTTPException(status_code=404, detail="no such entry")
+    book_module.push_only(owner_uid, broker)
+    return _view(owner_uid)

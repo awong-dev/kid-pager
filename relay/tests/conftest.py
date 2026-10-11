@@ -77,6 +77,45 @@ def _default_person_family(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(users_store, "create_user", _create_user)
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "real_device_ids: do not honour a `deviceId` in create-device request bodies"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _honour_test_device_ids(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Stages a `deviceId` from a create body so the next `new_device_id()` returns it."""
+    if request.node.get_closest_marker("real_device_ids"):
+        return
+    from fastapi.testclient import TestClient
+
+    from app.routers import admin as admin_router
+
+    staged: list[str] = []
+    original_request = TestClient.request
+    original_new = admin_router.new_device_id
+
+    def _request(self, method, url, *args, **kwargs):  # type: ignore[no-untyped-def]
+        body = kwargs.get("json")
+        if (
+            method.upper() == "POST"
+            and str(url).split("?")[0] in ("/api/admin/devices", "/api/family/devices")
+            and isinstance(body, dict)
+            and "deviceId" in body
+        ):
+            staged.append(body["deviceId"])
+        return original_request(self, method, url, *args, **kwargs)
+
+    def _new() -> str:
+        return staged.pop(0) if staged else original_new()
+
+    monkeypatch.setattr(TestClient, "request", _request)
+    monkeypatch.setattr(admin_router, "new_device_id", _new)
+
+
 @pytest.fixture
 def broker() -> FakeBrokerClient:
     return FakeBrokerClient()

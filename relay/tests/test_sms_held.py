@@ -1,3 +1,5 @@
+"""Held texts, their approval, and bridge-only SMS, through `app/inbound_text.handle_text` and the
+`sms` backend's bridge branch. Only FCM is stubbed."""
 
 from __future__ import annotations
 
@@ -11,8 +13,10 @@ from firebase_admin import auth as fb_auth
 
 from app import alerts as alerts_module
 from app import jobs
+from app.backends.sms import SmsBackend
 from app.config import Settings
 from app.db.firestore import get_db
+from app.inbound_text import handle_text
 from app.main import create_app
 from app.routing import Routing
 from app.store import alerts as alerts_store
@@ -57,13 +61,19 @@ class RecordingFCM:
 
 @dataclass
 class OutboundSms:
+    """Texts `handle_text` asked to send back to the sender (the `too_long` hint)."""
+
     sent: list[dict] = field(default_factory=list)
+    last_outcome: str = ""
 
 
+_OUT: list[OutboundSms] = []
 
 
 @pytest.fixture
+def outbound() -> OutboundSms:
     out = OutboundSms()
+    _OUT[:] = [out]
     return out
 
 
@@ -134,10 +144,30 @@ def _inbound(
     from_: str = MOM_NUMBER,
     to: str = KID_NUMBER,
     sid: str | None = None,
+    attachments: tuple[str, ...] = (),
+) -> str:
+    """One inbound text to the member holding `to`, as the bridge event
+    handler would deliver it; returns the outcome label."""
     global _sid_counter
     _sid_counter += 1
+    target = users_store.get_user(users_store.get_uid_for_sms_number(to))
+    out = _OUT[0]
+    from_number = externals_store.normalize_phone(from_)
+    outcome = handle_text(
+        target,
+        from_number,
+        body,
+        sid or f"SM{_sid_counter:032d}",
+        client.app.state.routing,
+        reply=lambda text: out.sent.append({"to": from_number, "body": text, "from": to}),
+        attachments=attachments,
+    )
+    out.last_outcome = outcome
+    return outcome
 
 
+def _outcome(_caplog: pytest.LogCaptureFixture | None = None) -> str:
+    return _OUT[0].last_outcome
 
 
 def _kid_inbox() -> list:
@@ -149,7 +179,9 @@ def _open_alerts(world: World):
 
 
 def test_blocked_number_stores_nothing(client: TestClient, world: World, caplog):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     families_store.add_blocked_number(world.family_id, STRANGER)
+    _inbound(client, "buy now", from_=STRANGER)
     assert _outcome(caplog) == "blocked"
     assert get_db().collection("heldSms").get() == []
     assert _open_alerts(world) == []
@@ -158,7 +190,9 @@ def test_blocked_number_stores_nothing(client: TestClient, world: World, caplog)
 def test_known_approved_contact_is_delivered_with_wire_id(
     client: TestClient, world: World, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     ext = _approved_contact(world)
+    _inbound(client, "hi from mom", sid="SMdeliver1")
     assert _outcome(caplog) == "delivered"
     (msg,) = messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))
     assert msg.body == "hi from mom"
@@ -169,6 +203,7 @@ def test_known_approved_contact_is_delivered_with_wire_id(
     assert get_db().collection("heldSms").get() == []
     # No FCM alert push (an alert push carries alertKind), no reply.
     # A retry of the same sid is a duplicate and creates nothing.
+    _inbound(client, "hi from mom", sid="SMdeliver1")
     assert _outcome(caplog) == "duplicate"
     assert len(messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))) == 1
 
@@ -176,24 +211,29 @@ def test_known_approved_contact_is_delivered_with_wire_id(
 def test_inbound_any_delivers_a_known_contact_without_an_edge(client: TestClient, world: World):
     ext = externals_store.get_or_create(world.family_id, MOM_NUMBER, "Mom")
     _set_policy("kid", "people_sms", "any")
+    _inbound(client, "no edge needed")
     assert len(messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))) == 1
 
 
 def test_unknown_number_even_under_any_is_held_not_delivered(
     client: TestClient, world: World, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     _set_policy("kid", "people_sms", "any")
+    _inbound(client, "who dis", from_=STRANGER)
     assert _outcome(caplog) == "held"
     assert _kid_inbox() == []
 
 
 @pytest.mark.parametrize("scenario", ["no_contact", "contact_without_edge", "rule_none"])
 def test_otherwise_is_held(client: TestClient, world: World, caplog, scenario: str):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     if scenario == "contact_without_edge":
         externals_store.get_or_create(world.family_id, MOM_NUMBER, "Mom")
     elif scenario == "rule_none":
         _approved_contact(world)
         _set_policy("kid", "people_sms", "people")  # numbers: none
+    _inbound(client, "hello")
     assert _outcome(caplog) == "held"
     assert _kid_inbox() == []
     (row,) = held_sms_store.list_held(world.family_id, MOM_NUMBER, "kid")
@@ -202,18 +242,22 @@ def test_otherwise_is_held(client: TestClient, world: World, caplog, scenario: s
 
 def test_photo_without_body_becomes_photo_marker(client: TestClient, world: World):
     ext = _approved_contact(world)
+    _inbound(client, "", attachments=("image",))
     (msg,) = messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))
     assert msg.body == "[photo]"
 
 
     client: TestClient, world: World, outbound: OutboundSms, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     ext = _approved_contact(world)
+    _inbound(client, "x" * 161)
 
 
 def test_too_long_from_unknown_number_is_held_without_reply(
     client: TestClient, world: World, outbound: OutboundSms
 ):
+    _inbound(client, "y" * 400, from_=STRANGER)
     assert outbound.sent == []
     (row,) = held_sms_store.list_held(world.family_id, STRANGER, "kid")
     assert len(row.body) == 400
@@ -222,6 +266,8 @@ def test_too_long_from_unknown_number_is_held_without_reply(
 def test_two_held_texts_make_one_alert_and_two_pushes(
     client: TestClient, world: World, fcm: RecordingFCM
 ):
+    _inbound(client, "first one", from_=STRANGER)
+    _inbound(client, "second one", from_=STRANGER)
     (alert,) = _open_alerts(world)
     assert alert.kind == "sms_unknown" and alert.subjectUid == "kid"
     assert alert.peerPhone == STRANGER
@@ -231,16 +277,19 @@ def test_two_held_texts_make_one_alert_and_two_pushes(
     assert bodies == [f"{STRANGER} → @kid: first one", f"{STRANGER} → @kid: second one"]
     assert all(data["alertKind"] == "sms_unknown" for _t, data in fcm.calls)
     # A different number is a different alert.
+    _inbound(client, "other", from_="+12065550333")
     assert len(_open_alerts(world)) == 2
 
 
 def test_held_cap_drops_the_26th_without_a_push(
     client: TestClient, world: World, fcm: RecordingFCM, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     for i in range(held_sms_store.HELD_CAP):
         assert held_sms_store.create(
             f"SMpre{i}", family_id=world.family_id, to_uid="kid", from_phone=STRANGER, body="x"
         )
+    _inbound(client, "one too many", from_=STRANGER)
     assert _outcome(caplog) == "held_cap"
     assert held_sms_store.count_held(world.family_id, STRANGER, "kid") == held_sms_store.HELD_CAP
     assert fcm.calls == []
@@ -249,12 +298,17 @@ def test_held_cap_drops_the_26th_without_a_push(
 def test_held_duplicate_sid_is_not_stored_or_pushed_twice(
     client: TestClient, world: World, fcm: RecordingFCM, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
+    _inbound(client, "once", from_=STRANGER, sid="SMdup")
+    _inbound(client, "once", from_=STRANGER, sid="SMdup")
     assert _outcome(caplog) == "duplicate"
     assert held_sms_store.count_held(world.family_id, STRANGER, "kid") == 1
     assert len(fcm.calls) == 1
 
 
 def _hold_two(client: TestClient) -> None:
+    _inbound(client, "first", from_=STRANGER, sid="SMa1")
+    _inbound(client, "second", from_=STRANGER, sid="SMa2")
 
 
 def test_get_held_lists_rows_oldest_first_with_iso_timestamps(client: TestClient, world: World):
@@ -288,6 +342,7 @@ def test_approve_delivers_backlog_in_order_and_is_idempotent(client: TestClient,
     assert [r.status for r in rows] == ["delivered", "delivered"]
 
     # Crash-retry: put the rows and the alert back and approve again -- the
+    # wire_id dedup (the event id) keeps the thread at two messages.
     held_sms_store.set_status(["SMa1", "SMa2"], "held")
     get_db().collection("families").document(world.family_id).collection("alerts").document(
         alert.id
@@ -299,6 +354,8 @@ def test_approve_delivers_backlog_in_order_and_is_idempotent(client: TestClient,
     assert [m.body for m in messages_store.list_thread(key)] == ["first", "second"]
 
 
+    _inbound(client, "z" * 200, from_=STRANGER, sid="SMb1")
+    _inbound(client, "short", from_=STRANGER, sid="SMb2")
     (alert,) = _open_alerts(world)
     resp = client.post(
         f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
@@ -327,6 +384,7 @@ def test_approve_refused_when_inbound_policy_is_none_and_writes_nothing(
 
 
 def test_block_marks_rows_blocked_and_blocks_the_number(client: TestClient, world: World, caplog):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     _hold_two(client)
     (alert,) = _open_alerts(world)
     resp = client.post(f"/api/family/alerts/{alert.id}/block", json={}, headers=world.admin_headers)
@@ -334,6 +392,7 @@ def test_block_marks_rows_blocked_and_blocks_the_number(client: TestClient, worl
     assert resp.json()["status"] == "handled"
     rows = held_sms_store.list_held(world.family_id, STRANGER, None, status=None)
     assert [r.status for r in rows] == ["blocked", "blocked"]
+    _inbound(client, "again", from_=STRANGER)
     assert _outcome(caplog) == "blocked"
 
 
@@ -366,15 +425,29 @@ def test_sender_without_number_is_rejected_no_sms_number(world: World, broker: F
     assert get_db().collection("messages").get() == []
 
 
+def test_sender_without_a_bridge_number_fails_no_bridge(world: World, broker: FakeBrokerClient):
+    """SMS is bridge-only: KID_NUMBER is set but belongs to no paired bridge."""
     ext = _approved_contact(world)
     result = _routing(broker).send(
+        sender_uid="kid", recipient_alias=ext.alias, kind="text", body="hi", origin_backend_kind="pager"
     )
+    assert result.rejected == []
     (msg,) = result.messages
+    (d,) = messages_store.get_message(msg.id).deliveries.values()
+    assert (d.kind, d.state, d.error) == ("sms", "failed", "no_bridge")
+    assert get_db().collection("bridgeOutbox").get() == []
 
 
+def test_deliver_fails_at_once_when_sender_loses_number(world: World, broker: FakeBrokerClient):
     ext = _approved_contact(world)
+    result = _routing(broker).send(
         sender_uid="kid", recipient_alias=ext.alias, kind="text", body="a", origin_backend_kind="pager"
     )
+    (msg,) = result.messages
+    row = backends_store.list_backends(ext.uid)[0]
+    users_store.set_sms_number("kid", None)
+    out = SmsBackend().deliver(messages_store.get_message(msg.id), next(iter(msg.deliveries.values())), row)
+    assert out.ok is False and out.state == "failed" and out.error == "no_sms_number"
 
 
 def test_external_gets_an_sms_backend_row_and_ensure_is_idempotent(world: World):
@@ -389,22 +462,36 @@ def test_external_gets_an_sms_backend_row_and_ensure_is_idempotent(world: World)
 def test_render_state_sent_by_sms():
     from app.store.messages import Delivery
 
+    backend = SmsBackend()
     assert backend.render_state(Delivery(kind="sms", state="sent")) == "sent by SMS"
     assert backend.render_state(Delivery(kind="sms", state="queued")) == "queued"
     assert backend.start_link(None, None) is None  # type: ignore[arg-type]
     assert backend.complete_link(None, "123") is False  # type: ignore[arg-type]
 
 
+def test_sms_number_unique_per_person_clear_frees_it(world: World):
     users_store.create_user(uid="kid2", alias="kid2", display_name="Kid2", family_id=world.family_id)
+    with pytest.raises(users_store.SmsNumberTaken) as exc:
+        users_store.set_sms_number("kid2", KID_NUMBER)
+    assert exc.value.holder_uid == "kid"
+    users_store.set_sms_number("kid", None)
     assert users_store.get_uid_for_sms_number(KID_NUMBER) is None
+    users_store.set_sms_number("kid2", KID_NUMBER)
     assert users_store.get_uid_for_sms_number(KID_NUMBER) == "kid2"
 
 
+def test_admin_and_family_patches_ignore_sms_number(client: TestClient, world: World):
+    h = world.admin_headers
+    resp = client.patch("/api/family/members/kid", json={"smsNumber": "+12065550444"}, headers=h)
+    assert resp.status_code == 200 and resp.json()["smsNumber"] == KID_NUMBER
     fb_auth.create_user(uid="root", email="root@example.com")
     users_store.create_user(uid="root", alias="root", display_name="root", role="super", family_id=world.family_id)
     fb_auth.set_custom_user_claims("root", {"role": "super", "fam": ""})
     resp = client.patch(
+        "/api/admin/users/kid", json={"smsNumber": None, "displayName": "K"}, headers=auth_header("root")
     )
+    assert resp.status_code == 200 and resp.json()["smsNumber"] == KID_NUMBER
+    assert users_store.get_uid_for_sms_number("+12065550444") is None
 
 
 def test_sweep_deletes_old_held_sms_only(world: World):
@@ -422,16 +509,20 @@ def test_sweep_deletes_old_held_sms_only(world: World):
 
 def test_inbound_control_chars_become_spaces(client: TestClient, world: World):
     ext = _approved_contact(world)
+    _inbound(client, "a\nb\x00c\x7f")
     (msg,) = messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))
     assert msg.body == "a b c"
 
 
     client: TestClient, world: World, outbound: OutboundSms, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.inbound_text")
     ext = _approved_contact(world)
 
 
 def test_approve_uses_pager_body_and_keeps_raw_in_held_row(client: TestClient, world: World):
+    _inbound(client, "x\ny", from_=STRANGER, sid="SMc1")
+    _inbound(client, "\U0001F600" * 100, from_=STRANGER, sid="SMc2")
     assert held_sms_store.get("SMc1").body == "x\ny"
     (alert,) = _open_alerts(world)
     resp = client.post(
@@ -494,6 +585,7 @@ def test_disabled_contact_is_sms_contact_reject(world: World, broker: FakeBroker
 
 
 def test_external_default_recipient_is_ignored_for_broadcast(
+    world: World, broker: FakeBrokerClient
 ):
     from app.store import devices as devices_store
 
@@ -515,6 +607,8 @@ def test_block_decides_other_open_alerts_for_the_same_number(client: TestClient,
     users_store.create_user(uid="kid2", alias="kid2", display_name="K2", family_id=world.family_id)
     _set_policy("kid2", "people_sms", "people_sms")
     users_store.set_sms_number("kid2", "+12065550999")
+    _inbound(client, "to kid", from_=STRANGER)
+    _inbound(client, "to kid2", from_=STRANGER, to="+12065550999")
     first, second = _open_alerts(world)
     resp = client.post(f"/api/family/alerts/{first.id}/block", json={}, headers=world.admin_headers)
     assert resp.status_code == 200, resp.text

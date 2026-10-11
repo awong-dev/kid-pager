@@ -76,6 +76,28 @@ starting.
 
 The first admin (`python -m app.bootstrap --admin-email you@example.com`,
 run inside the `relay` container or against the emulators from the host)
+creates a Firebase Auth user + `users/{uid}` doc with `role: 'super'` + the
+`{role, fam}` custom claims — idempotent, safe to re-run.
+
+## OTA firmware
+
+`FW_INDEX_URL` and `FW_BUCKET_BASE` point at the public firmware bucket
+(`tools/fwpub.py` publishes it). A super admin's push picks the published delta
+for the device's running image, else the full image. If the device runs some
+other published build, the relay generates the delta itself: it fetches
+both `full.z` images, builds and round-trip checks a `detools` patch and
+writes it to `fw-cache/<target16>/from-<base16>.dz` (7-day bucket lifecycle,
+owned by Terraform). The Cloud Run service account needs object create/read on
+the bucket; any failure falls back to the full image. The Docker image builds
+`detools` in a builder stage because it has no manylinux wheel.
+
+## Soracom SIM enrollment
+
+The admin UI lists the account's Soracom SIMs and enrolls them into the Beam group
+(`/api/admin/soracom/*`). Set `SORACOM_AUTH_KEY_ID` and `SORACOM_AUTH_KEY` (a SAM
+user's auth key; Secret Manager in production). Optional: `SORACOM_BEAM_GROUP`
+(default `pager-beam`) and `SORACOM_BEAM_DESTINATION` (default set in `app/config.py`). Without the key the routes answer 503 (the list answers `configured:
+false`). Enroll a SIM before the pager first boots on it.
 
 ## Tests
 
@@ -124,6 +146,7 @@ EMQX, the Firestore/Auth emulators, and the relay — configures EMQX's rule eng
 `tools/pager_client.py`'s combined device+server client):
 
 ```bash
+relay/.venv/bin/python tools/e2e_v2.py                                       # all 14 scenarios
 relay/.venv/bin/python tools/e2e_v2.py bootstrap text_roundtrip              # named scenarios
 relay/.venv/bin/python tools/e2e_v2.py --wire cbor                           # repeat in CBOR encoding
 ```
@@ -139,6 +162,19 @@ Scenarios available (see `tools/e2e_v2.py`'s module docstring for details):
 - **bytes**: data budget accounting and SIM constraints
 - **setup_code**: real admin-create → code → bootstrap → provisioned flow
 - **address_book**: device requests contact approval, book/cfg ingest and ack
+- **sms_log**: the modem's device-direct SMS log: an outbound text logged `sent`, an inbound one from an
+  unlisted number logged `blocked`
+- **bridge**: a bridge phone against the `bridge-sim` compose service (see "Bridge phones" below): pair,
+  a SIM text held and approved, a pager reply through the outbox with an ack, a Voice text on the same
+  contact with the reply on gvoice, an unknown Google Chat group held behind one alert, subscribed and
+  replied to, inspected by link, and ignored
+- **bridge_voice**: a Voice-only bridge: a cold outbound on gvoice with the Voice thread link, and an
+  inbound text delivered
+- **bridge_whatsapp**: WhatsApp as a bridge source, DMs keyed by conversation id: a LID DM held as a
+  `chat_unknown` alert, subscribed, and answered with `to.conversationId` + `to.title` and no phone; a
+  phone-JID DM on the same path whose reply also carries the `wa.me` `to.link`; a group held behind one
+  alert, subscribed and replied to (conversation id and title in the outbox item); and a `wa.me` inspect
+  refused with 400
 
 ## Message backends
 
@@ -154,8 +190,122 @@ Google account. One account-level step is needed before a real deployment can us
   (provisioned by `infra/`, ADC, no separate secret) the `chat.bot` scope / "Chat Bot" role so
   outbound `spaces.messages.create` sends work.
 
+### SMS (bridge phones only)
+
+`sms` (`app/backends/sms.py`, docs/BRIDGE_PHONE_DESIGN.md) is the SMS adapter.
+Its backend row lives on an SMS contact (an external). SMS exists **only through bridge phones**: a
+member's `smsNumber` is set by the relay when a bridge pairs (SIM number, else Google Voice number,
+`app/bridge_numbers.py`) and cleared on unpair or reassign; it is not editable through the admin or
+family APIs (the field stays readable). A member without a bridge has no relay SMS (their pager still
+uses the modem path, `cfg.sms`): sending to an SMS contact from such a member is rejected
+`no_sms_number`, and a number that is not a usable bridge number fails delivery `no_bridge`. Neither is
+retried. Inbound texts arrive as bridge events (`/bridge/events`, source `sms`/`gvoice`) and go through
+`app/inbound_text.py`; a number the family has no approved contact for is stored in `heldSms` and raised
+as an `sms_unknown` alert to the family admins, delivered only when an admin approves (or dropped on
+block). There are no consent keywords (STOP/START/HELP), welcome texts or opted-out registry, and no
+SMS environment variables. Text helpers (control-character stripping, the 160-code-point / 320-byte limit,
+the Voice thread link) are in `app/sms_text.py`. Log lines to watch:
+`sms out to=...1234 from=...5678 sid=ob_... status=queued code=bridge` and the bridge `events` lines.
+
 ### Bridge phones
 
+A member's texts can also go through a headless Android phone (`bridge-android/`) 
+(the only SMS transport): the SIM's texts, Google Voice texts, and subscribed Google Chat conversations. Design:
+`docs/BRIDGE_PHONE_DESIGN.md`. Members without a bridge phone have no
+relay SMS. Bridges need no environment variables: the bearer token is minted at pairing and only its
+hash is stored.
+
+**Pair a phone (web).** Family → Devices → *Add bridge phone*: pick the member and a label. The panel
+shows an 8-digit code, valid for 10 minutes. The phone's setup screen takes the code and *Pair*; a code
+that has expired or was used is refused (404), so use *New code*. The member's `smsNumber` becomes the
+SIM number, else the Voice number. The row shows *last seen* after the first heartbeat (every 5 min).
+*Reassign*, *Edit numbers* (SIM and Voice, either optional), *Accept SIM* and *Unpair* are on the same
+row. Unpair fails the phone's pending outbox items and clears the member's number; contacts and
+conversations are kept.
+
+**WhatsApp.** `whatsapp` is a third source next to `gchat` and `gvoice` (docs/BRIDGE_PHONE_DESIGN.md).
+It needs no number: `caps.whatsapp` is whatever the phone reports at pair
+(`caps.whatsapp`) and on every heartbeat (`status.whatsapp`, WhatsApp installed and the listener bound).
+A DM (`isGroup=false`, LID `<digits>@lid` or phone JID `<digits>@s.whatsapp.net`) is a chat conversation
+keyed by its conversation id, the same path as a Google Chat DM (`POST /bridge/events`; design:
+`docs/BRIDGE_WHATSAPP_LID_DESIGN.md`): unknown -> held with one `chat_unknown` alert; subscribe makes it a chat
+contact, and pager replies go out as `source whatsapp` with `to {conversationId, title}` (plus `link` when the
+row has one). A conversation id of any other shape gets `dropped_bad_conv`. WhatsApp is not an SMS channel, so
+its replies never fall back to sms or gvoice. A group
+(`<id>@g.us`) is a Chat-style conversation: one `chat_unknown` alert, subscribe/ignore/roster as for Google
+Chat, a leading `~ ` stripped from sender names, replies carry `to.conversationId` and `to.title` (the
+phone finds the group by title in tier 2). There is no deep link to a group, so `POST
+/api/family/bridges/{id}/inspect` with a `wa.me` / `whatsapp.com` / `whatsapp://` link returns 400 `whatsapp
+links cannot be inspected; wait for a message`. A held Voice text stores its channel and conversation on the held row, and approval records
+them as a live inbound would, so the first reply goes back on that channel.
+
+**Phone setup checklist** (copied from `bridge-android/README.md`; the setup screen has a button or
+status row for each step). Build and install first:
+
+```sh
+cd bridge-android
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17      # AGP 8.7 refuses the default JDK 25
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n app.kidpager.bridge/.SetupActivity
+```
+
+On the phone, in this order:
+
+1. Sign the phone into the bridge member's own Google account; install Google Chat and Google Voice,
+   sign both in, notifications **on** for both. **Keep this account's contacts list empty** so Voice
+   shows the peer's number, not a name.
+2. Open Pager Bridge → *Grant runtime permissions* (SMS, phone, accounts, notifications).
+3. *Open notification access settings* → enable Pager Bridge.
+4. *Make default SMS app* (only if the phone has a SIM you want to text through).
+5. *Exempt from battery optimisation*.
+6. *Open accessibility settings* → enable Pager Bridge. Without it, outbox items that need tier 2 ack
+   `failed no_accessibility`.
+7. Fill *Relay URL*, check the auto-filled *SIM number* (blank = no SIM), enter the *Google Voice
+   number* if the account has one, optionally the account emails, then *Save fields*.
+8. Paste the 8-digit code from Family → Devices and tap *Pair*. The token is stored encrypted and the
+   service starts.
+9. Phone hygiene: screen lock **None** (a PIN leaves the phone before first unlock after a power cut;
+   no app runs and no notification fires), Do Not Disturb off, never leave Chat open on a thread,
+   charge limiter or smart-plug duty cycle, and `adb tcpip 5555` for maintenance over Wi-Fi.
+
+**Latency.** The app polls `GET /bridge/outbox` every 60 s (30–300 s on the setup screen) and again on
+every FCM push. Push needs the Firebase setup in `bridge-android/README.md`; without it, outbound
+takes up to 60 s.
+
+**Limits (in code).** 10 `/bridge/pair` calls a minute, globally. 120 events a minute per bridge; a
+batch over the limit gets 429. 50 new Chat conversations a day per bridge. 25 held Chat messages per
+conversation. A pending outbox item older than 24 h fails with `bridge_offline`.
+
+**Simulator (no phone).** `tools/bridge_sim.py` speaks the phone's `/bridge/*` contract, with a control
+plane on `localhost:8020` (the compose service `bridge-sim`):
+
+```sh
+cd relay
+docker compose up -d --build bridge-sim
+python3 -I ../tools/bridge_sim.py --help
+```
+
+- `POST /_pair {code, simNumber?, voiceNumber?, whatsapp?}` pairs with a code from Devices (`null` for none;
+  `whatsapp` defaults to true, `BRIDGE_SIM_WHATSAPP=0` flips the default). `bridge_sim.whatsapp_dm_event()` and
+  `whatsapp_group_event()` build JID-shaped WhatsApp events for `/_inject`.
+- `POST /_inject {event}` (or `{events: [...]}`) posts an inbound event to `/bridge/events` and returns
+  the relay's result.
+- `GET /_outbox` lists what the sim "sent". Each item is acked `sent` (tier 1) unless a failure is armed.
+- `POST /_fail_next {times}` acks the next N items `failed` (`sim_failed`).
+- `POST /_reset` and `GET /_status`.
+
+**End to end.** With the stack up (`docker compose up -d --build` in `relay/`), from the repo root:
+
+```sh
+python3 tools/e2e_v2.py bridge bridge_voice bridge_whatsapp
+```
+
+Scenario descriptions are in the list above.
+
+**Tests.** `relay/tests/test_bridge_*.py`, `test_chat_subscribe.py` and `test_family_bridges.py` (the
+rules for the bridge collections are in `test_rules.py`). The Android unit tests are in
+`bridge-android/app/src/test`, run with `./gradlew testDebugUnitTest`.
 
 ## CLI Tools
 

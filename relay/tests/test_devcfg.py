@@ -35,6 +35,7 @@ from tests.conftest import (
     up_topic,
 )
 from tests.fake_transport import FakeBrokerClient
+from tests.firebase_test_utils import auth_header, seed_legacy_contact_request
 
 
 def _make_user(uid: str, alias: str, display_name: str | None = None) -> None:
@@ -107,6 +108,7 @@ def test_build_book_basic_shape():
     assert obj["bv"] == 1
     assert obj["d"] == "mom1"
     assert obj["c"] == [{"a": "mom1", "n": "Mom", "t": "web"}]
+    assert "p" not in obj
     assert obj["ack"] is None
     assert obj["id"].startswith("m_")
 
@@ -180,9 +182,13 @@ def test_build_book_caps_approved_contacts_at_ten():
     assert len(obj["c"]) == 10
 
 
+def test_build_book_no_longer_carries_p():
     _make_user("student5", "student5")
     _make_pager_device("pgr-b-5", "student5")
+    seed_legacy_contact_request("pgr-b-5", "student5", "u_b5", "Req", "+15550001111")
 
+    assert "p" not in devcfg.build_book("pgr-b-5")
+    assert "p" not in devcfg.build_book_body("pgr-b-5")
 
 
 def test_build_book_lists_owners_group_as_grp_contact():
@@ -697,6 +703,9 @@ def test_approve_contact_publishes_book(
     users_store.create_user(
         uid="student20", alias="student20", display_name="student20", family_id=family.id
     )
+    get_db().collection("users").document("student20").update(
+        {"policy": {"out": "people_sms", "in": "people"}}
+    )
     _make_pager_device("pgr-b-20", "student20")
     ingest = Ingest(broker)
     ingest.handle_up(
@@ -714,6 +723,7 @@ def test_approve_contact_publishes_book(
             separators=(",", ":"),
         ).encode("utf-8"),
     )
+    assert devices_store.get_device("pgr-b-20").smsContacts == []
     broker.clear()
 
     alert = alerts_store.list_alerts(family.id, "open")[0]
@@ -730,6 +740,7 @@ def test_approve_contact_publishes_book(
         json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
     ]
     assert len(books) == 1
+    assert books[0]["bv"] == 2  # the add's bump, then the approval's
     _uid, alias = externals_store.contact_ids(family.id, "+15550009999")
     assert alias not in [c["a"] for c in books[0]["c"]]
     cfgs = [
@@ -894,3 +905,54 @@ def test_build_book_body_default_first_then_groups_then_people():
     assert aliases_in_order[0] == "zzz-mom"
     assert aliases_in_order[1] == "bbb-grp-body4"  # the group, despite sorting after "aaa-friend"
     assert aliases_in_order[2] == "aaa-friend"
+
+
+def test_nudge_replaces_stored_full_book_wholesale():
+    _make_user("student-pw1", "student-pw1")
+    _make_pager_device("pgr-pw-1", "student-pw1")
+    stale = {
+        "v": 1, "id": "m_stale001", "ts": 1, "kind": "book", "bv": 1, "d": "x",
+        "c": [{"a": "a", "n": "A", "t": "web"}], "p": [{"n": "Q", "s": "pend"}], "ack": None,
+    }
+    devcfg._set_pending("pgr-pw-1", "pendingBook", stale)
+    nudge = {"v": 1, "id": "m_nudge001", "ts": 2, "kind": "book", "bv": 2, "url": "https://x/y", "ack": None}
+
+    devcfg._set_pending("pgr-pw-1", "pendingBook", nudge)
+
+    obj = _raw_device("pgr-pw-1")["pendingBook"]["obj"]
+    assert obj == nudge
+    assert not {"c", "p", "d"} & set(obj)
+
+
+def test_hybrid_stored_nudge_is_republished_clean():
+    _make_user("student-pw2", "student-pw2")
+    _make_pager_device("pgr-pw-2", "student-pw2")
+    hybrid = {
+        "v": 1, "id": "m_hybrid01", "ts": 2, "kind": "book", "bv": 2, "url": "https://x/y",
+        "d": "x", "c": [{"a": "a", "n": "A", "t": "web"}], "p": [], "more": True, "ack": None,
+    }
+    get_db().collection("devices").document("pgr-pw-2").set(
+        {"pendingBook": {"id": hybrid["id"], "obj": hybrid, "acked": False}, "bookVersion": 2},
+        merge=True,
+    )
+    broker = FakeBrokerClient()
+
+    devcfg.republish_pending("pgr-pw-2", broker)
+
+    (sent,) = [json.loads(m.payload) for m in broker.published]
+    assert sent["id"] == "m_hybrid01" and sent["url"] == "https://x/y"
+    assert not {"c", "p", "d", "more"} & set(sent)
+
+
+def test_pending_cfg_replaced_wholesale():
+    _make_user("student-pw3", "student-pw3")
+    _make_pager_device("pgr-pw-3", "student-pw3")
+    devcfg._set_pending(
+        "pgr-pw-3", "pendingCfg",
+        {"v": 1, "id": "m_cfg00001", "kind": "cfg", "cfg": {"lock": {"clear": True}}, "ack": None},
+    )
+    newer = {"v": 1, "id": "m_cfg00002", "kind": "cfg", "cfg": {"ota": {"u": "x"}}, "ack": None}
+
+    devcfg._set_pending("pgr-pw-3", "pendingCfg", newer)
+
+    assert _raw_device("pgr-pw-3")["pendingCfg"]["obj"] == newer

@@ -562,6 +562,7 @@ def test_external_to_external_is_rejected_sms_contact(routing: Routing):
     assert [r.reason for r in result.rejected] == ["sms_contact"]
 
 
+def test_dm_to_external_without_a_bridge_number_fails_no_bridge(routing: Routing):
     fam = families_store.create_family(name="F", created_by="root").id
     _make_user("alice", "alice", family_id=fam)
     get_db().collection("users").document("alice").update(
@@ -580,6 +581,8 @@ def test_external_to_external_is_rejected_sms_contact(routing: Routing):
 
     assert result.rejected == []
     (msg,) = result.messages
+    (d,) = messages_store.get_message(msg.id).deliveries.values()
+    assert (d.kind, d.state, d.error) == ("sms", "failed", "no_bridge")
 
 
 def test_broadcast_skips_externals(routing: Routing):

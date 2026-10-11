@@ -24,6 +24,9 @@ dependencies = [
     "cryptography",
     # Parses typed SMS contact numbers with a default region ("US").
     "phonenumbers",
+    # `app/firmware.py` builds OTA deltas on demand and writes them to the firmware bucket.
+    "detools",
+    "google-cloud-storage",
 ]
 
 [project.optional-dependencies]
@@ -39,3 +42,4 @@ testpaths = ["tests"]
 "tests/test_bridge*.py" = ["F811"]
 "tests/test_chat*.py" = ["F811"]
 "tests/test_family_bridges.py" = ["F811"]
+"tests/test_whatsapp.py" = ["F811"]

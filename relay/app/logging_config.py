@@ -49,3 +49,5 @@ def configure_logging(level: str | int = "INFO") -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(JsonLogFormatter())
     root.handlers = [handler]
+    # httpx logs request URLs at INFO; the Soracom enrollment URL carries the full IMSI.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

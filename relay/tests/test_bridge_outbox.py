@@ -1,3 +1,4 @@
+"""Bridge outbox, the `bridge` backend kind and the `sms` backend's bridge transport."""
 
 from __future__ import annotations
 
@@ -100,13 +101,17 @@ def test_list_pending_oldest_first_capped(client: TestClient, world: World):
     assert [i.text for i in items] == [str(n) for n in range(20)]
 
 
+def test_bridge_transport_sends_the_raw_body_and_stays_queued(
     client: TestClient, world: World, broker: FakeBrokerClient, monkeypatch, caplog
 ):
+    caplog.set_level(logging.INFO, logger="relay.backends.sms")
     bridge, _ = pair_bridge(client, world)
+    ext = _contact(world)
     msg = _send(broker, ext.alias, "on my way")
     d = _delivery(msg.id)
     assert d.state == "queued" and d.externalId == f"ob_{msg.id}_sms"
     (item,) = bridge_outbox.list_pending(bridge.id)
+    assert item.text == "on my way"  # raw body: no wrapper, no disclosure
     assert item.source == "sms" and item.to == {"phone": MOM}
     assert item.msgId == msg.id and item.bid == "sms"
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("sms out"))
@@ -170,12 +175,16 @@ def test_outbox_from_another_bridge_is_invisible(client: TestClient, world: Worl
     assert other.id != bridge.id
 
 
+def test_a_number_that_is_not_a_bridge_number_fails_no_bridge(
+    client: TestClient, world: World, broker: FakeBrokerClient
 ):
     from app.store import users as users_store
 
     users_store.set_sms_number("kid", "+12065550444")
     ext = _contact(world)
     msg = _send(broker, ext.alias, "hello")
+    d = _delivery(msg.id)
+    assert d.state == "failed" and d.error == "no_bridge"
     assert bridge_outbox.list_pending("b_none") == []
 
 
@@ -310,11 +319,14 @@ def test_tick_fails_a_stale_row_and_its_delivery(
     assert bridge_outbox.list_pending(bridge.id) == []
 
 
+def test_tick_does_not_touch_bridge_queued_sms(
+    client: TestClient, world: World, broker: FakeBrokerClient
 ):
     bridge, _ = pair_bridge(client, world)
     ext = _contact(world)
     for i in range(11):
         _send(broker, ext.alias, f"b{i}")
+    jobs.tick(Routing(broker), task_queue=InlineTaskQueue())
     assert len(bridge_outbox.list_pending(bridge.id)) == 11
 
 

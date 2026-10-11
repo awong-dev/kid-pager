@@ -51,6 +51,9 @@ def _base_alert(kind: str) -> dict:
     }
 
 
+def new_conversation(
+    sender: User, recipient: User, conv_key: str, body: str | None = None
+) -> str | None:
     """Fired when `routing.send()` creates a DM with no approving edge; `None` if no family."""
     if sender.familyId is None:
         return None
@@ -63,7 +66,11 @@ def _base_alert(kind: str) -> dict:
             "subjectAlias": sender.alias,
             "peerUid": recipient.uid,
             "peerAlias": recipient.alias,
+            "peerName": recipient.displayName,
             "peerPhone": peer_phone,
+            "preview": (
+                body or f"@{sender.alias} started a chat with @{recipient.alias}"
+            )[:PREVIEW_MAX_CHARS],
             "convKey": conv_key,
         }
     )
@@ -127,14 +134,34 @@ def sms_held_upsert(family_id: str, target: User, phone: str, body: str) -> str:
     return alert_id
 
 
+def approval_upsert(owner: User, peer: User) -> alerts_store.ApprovalOutcome:
+    """The one `contact_request` alert per `(owner, peer)`; pushed on `created`/`reopened`."""
+    if owner.familyId is None:
+        return "open"
     alert = _base_alert("contact_request")
     alert.update(
         {
             "status": "open",
             "subjectUid": owner.uid,
             "subjectAlias": owner.alias,
+            "peerUid": peer.uid,
+            "peerAlias": peer.alias,
+            "peerName": peer.displayName,
+            "peerPhone": peer.phone if peer.kind == "external" else None,
+            "preview": f"wants to text {peer.displayName}"[:PREVIEW_MAX_CHARS],
         }
     )
+    outcome = alerts_store.upsert_approval(owner.familyId, owner.uid, peer.uid, alert)
+    if outcome in ("created", "reopened"):
+        _push_alert(
+            owner.familyId,
+            {**alert, "id": alerts_store.approval_alert_id(owner.uid, peer.uid)},
+            fcm_client=_fcm_client,
+        )
+    return outcome
+
+
+_SOURCE_LABELS = {"whatsapp": "WhatsApp", "gchat": "Google Chat", "gvoice": "Google Voice"}
 
 
 def chat_held_upsert(family_id: str, target: User, row, body: str, sender_name: str) -> str:
@@ -142,6 +169,12 @@ def chat_held_upsert(family_id: str, target: User, row, body: str, sender_name: 
     count = held_chat_store.count_held(row.id)
     preview = body[:PREVIEW_MAX_CHARS]
     title = row.title or "a conversation"
+    if row.isGroup:
+        push_body = f"{title} ({sender_name}) \u2192 @{target.alias}: {body}"
+    else:
+        # A DM push names the app, not the sender twice.
+        label = _SOURCE_LABELS.get(row.source, "Chat")
+        push_body = f"{label}: {row.title or sender_name} \u2192 @{target.alias}: {body}"
     fields = {
         "preview": preview,
         "heldCount": count,

@@ -76,6 +76,7 @@ _ALERT_TITLES = {
 
 
 def push_alert(family_id: str, alert: dict, fcm_client: FCMClient | None = None) -> None:
+    """Pushes an alert to the family's admins (FCM per token, Web Push per subscription)."""
     fcm = fcm_client or NullFCMClient()
     title_fn = _ALERT_TITLES.get(alert["kind"])
     if title_fn is None:
@@ -93,6 +94,15 @@ def push_alert(family_id: str, alert: dict, fcm_client: FCMClient | None = None)
         ),
         "url": ALERT_URL,
     }
+    recipients = [
+        u
+        for u in users_store.list_users()
+        if u.familyId == family_id and u.role in ("admin", "super") and u.notify.alerts is not False
+    ]
+    logger.info(
+        "alert push kind=%s family=%s recipients=%d", alert["kind"], family_id, len(recipients)
+    )
+    for user in recipients:
         try:
         except Exception:
             # The alert doc already exists; one admin's failure must not skip the rest.

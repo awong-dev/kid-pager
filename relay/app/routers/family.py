@@ -250,6 +250,16 @@ def create_device(
     return admin_router._create_device_impl(req, broker, emqx, settings)
 
 
+@router.patch("/devices/{device_id}", dependencies=[Depends(require_family_write_rate_limit)])
+def patch_device(
+    device_id: str, req: admin_router.PatchDeviceRequest, scope: FamilyScope
+) -> Device:
+    """Edit the free-text `label`; the pager shows it after the next `rotate-credentials`."""
+    _, family_id = scope
+    _require_family_device(device_id, family_id)
+    return admin_router._patch_device_impl(device_id, req)
+
+
 @router.post(
     "/devices/{device_id}/rotate-credentials",
     dependencies=[Depends(require_family_write_rate_limit)],
@@ -301,6 +311,48 @@ def push_ca(
     _, family_id = scope
     _require_family_device(device_id, family_id)
     return admin_router._push_ca_impl(device_id, req, broker, settings)
+
+
+@router.get("/firmware")
+def list_firmware(
+    scope: FamilyScope,
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    device: str,
+) -> dict[str, list[dict[str, object]]]:
+    """Published builds as seen by one in-family device."""
+    _, family_id = scope
+    _require_family_device(device, family_id)
+    return admin_router._list_firmware_impl(settings, device)
+
+
+@router.post("/devices/{device_id}/ota", dependencies=[Depends(require_family_write_rate_limit)])
+def push_ota(
+    device_id: str,
+    req: admin_router.OtaRequest,
+    scope: FamilyScope,
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> dict[str, object]:
+    """Push or cancel an OTA for an in-family device."""
+    principal, family_id = scope
+    _require_family_device(device_id, family_id)
+    return admin_router._push_ota_impl(device_id, req, principal.uid, broker, settings)
+
+
+@router.get("/apn-presets")
+def list_apn_presets(scope: FamilyScope) -> list[apn_presets.ApnPreset]:
+    """Carrier APN choices for the device forms."""
+    return admin_router._list_apn_presets_impl()
+
+
+@router.put("/devices/{device_id}/apn", dependencies=[Depends(require_family_write_rate_limit)])
+def set_device_apn(
+    device_id: str, req: admin_router.SetApnRequest, scope: FamilyScope
+) -> dict[str, str | None]:
+    """Set the stored APN of an in-family device."""
+    _, family_id = scope
+    _require_family_device(device_id, family_id)
+    return admin_router._set_device_apn_impl(device_id, req)
 
 
 @router.delete("/devices/{device_id}", dependencies=[Depends(require_family_write_rate_limit)])
@@ -715,7 +767,12 @@ def _approve_sms_unknown(
     # (e) the backlog, oldest first.
     delivered = undelivered = 0
     bid = externals_store.ensure_sms_backend(external)
+    # The newest held row's channel is recorded as a live inbound would, so the first reply uses it.
+    channel_row = next((r for r in reversed(held) if r.via), None)
+    if channel_row is not None and channel_row.via is not None:
+        inbound_text.record_channel(external.uid, bid, target_uid, channel_row.via, channel_row.conv)
     for row in held:
+        pager_text = sms_text.pager_body(row.body)
             continue
         result = routing.send(
             sender_uid=external.uid,
@@ -743,8 +800,26 @@ def _approve_new_conversation(alert: Alert) -> None:
     allow_store.recompute_locatable_by_for_owner(alert.peerUid)
 
 
+def _approve_contact_request(alert: Alert, req: ApproveAlertRequest, broker: BrokerClient) -> None:
+    """The entry already exists, so approving grants the `message` edge (keeping `locate`)."""
     if req.mode == "create":
         raise HTTPException(status_code=400, detail="new people are added under Family > People")
+    if alert.contactRequestKey is not None:
+        raise HTTPException(status_code=409, detail="superseded; add again from the pager")
+    if alert.subjectUid is None or alert.peerUid is None:
+        raise HTTPException(status_code=400, detail="alert has no subject/peer to approve")
+    owner = users_store.get_user(alert.subjectUid)
+    peer = users_store.get_user(alert.peerUid)
+    if owner is None or peer is None:
+        raise HTTPException(status_code=409, detail="the contact no longer exists")
+    existing = allow_store.get_edge(owner.uid, peer.uid)
+    allow_store.set_edge(
+        owner.uid,
+        peer.uid,
+        message=True,
+        locate=existing.locate if existing is not None else False,
+    )
+    if peer.kind == "external" and owner.familyId is not None:
         rederive_family_sms_contacts(owner.familyId, broker)
     book.bump_and_push({owner.uid}, broker, reason="contact_approve")
 
@@ -800,6 +875,7 @@ def approve_alert(
             status_code=400, detail="subscribe this conversation under People \u2192 Google Chat"
         )
     else:  # "contact_request"
+        _approve_contact_request(alert, req, broker)
 
     return alerts_store.decide(family_id, alert_id, "handled", principal.uid)
 
@@ -873,5 +949,8 @@ def dismiss_alert(
     if alert.kind == "sms_unknown":
         _mark_held(family_id, alert, "dismissed")
     if alert.kind == "chat_unknown" and alert.bridgeId and alert.conversationId:
+        # the conversation row stays `seen`, so a later text raises a fresh alert
+        chat_subscribe.dismiss_alert_conversation(
+            family_id, alert.bridgeId, alert.conversationId, principal.uid
         )
     return alerts_store.decide(family_id, alert_id, "dismissed", principal.uid)

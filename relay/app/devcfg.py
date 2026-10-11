@@ -9,6 +9,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from google.api_core.exceptions import NotFound
+
 from app import ca_resolve
 from app.broker import BrokerClient
 from app.config import Settings
@@ -23,6 +25,7 @@ from app.wirecbor import to_json_safe
 
 logger = logging.getLogger("relay.devcfg")
 
+# The cap for the legacy full `/down book` envelope (`build_book`, non-bpull devices,
 # docs/PROTOCOL.md §3.7's gate).
 MAX_APPROVED_CONTACTS = 10
 # docs/PROTOCOL.md §3.7: the §14.7 fetch response's own `c[]` cap (the device's stored
@@ -99,6 +102,7 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
     ]
 
 
+    """Every contact the device book may list (sendable or `added`), uncapped and unordered."""
     from app import book
 
     return [
@@ -114,6 +118,7 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
             ),
         }
         for e in book.entries_for(owner_uid)
+        if book.listed_on_pager(e)
     ]
 
 
@@ -222,6 +227,20 @@ def build_nudge(device_id: str, url: str) -> dict[str, Any]:
 
 
 def _set_pending(device_id: str, field: str, obj: dict[str, Any]) -> None:
+    """Replaces the whole slot; `set(merge=True)` would keep stale `c`/`p`/`d` in a map."""
+    value = {field: {"id": obj["id"], "obj": obj, "acked": False}}
+    ref = _devices().document(device_id)
+    try:
+        ref.update(value)
+    except NotFound:
+        ref.set(value, merge=True)
+
+
+def _clean_pending_obj(obj: dict[str, Any]) -> dict[str, Any]:
+    """A stored `book` carrying `url` is a nudge: drop leftover full-book keys."""
+    if obj.get("kind") == "book" and "url" in obj:
+        return {k: v for k, v in obj.items() if k not in ("c", "p", "d", "more")}
+    return obj
 
 
 def push_book(
@@ -273,6 +292,7 @@ def renudge_if_behind(
                 reported_bv,
                 current_bv,
             )
+            return broker.publish_down(device_id, _clean_pending_obj(obj))
     return push_book(device_id, broker, settings=settings)
 
 
@@ -476,3 +496,4 @@ def republish_pending(device_id: str, broker: BrokerClient) -> None:
         logger.info(
             "re-publishing unacked %s %s to device %s", obj.get("kind"), obj.get("id"), device_id
         )
+        broker.publish_down(device_id, _clean_pending_obj(obj))

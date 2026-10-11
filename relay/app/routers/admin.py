@@ -6,16 +6,19 @@ Write routes carry a per-uid rate limit (`RATE_LIMIT_ADMIN_WRITE_LIMIT` per wind
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from firebase_admin import auth as fb_auth
 
 from app.auth import AuthedUser, principal_for, require_super, set_claims
 from app.broker import BrokerClient
 from app.db.firestore import get_db
+from app.device_ids import DEVICE_ID_ATTEMPTS, new_device_id
 from app.ingest import Ingest
 from app.store import allow as allow_store
 from app.store import backends as backends_store
@@ -34,9 +37,12 @@ from app.store.families import Family
 from app.store.settings import RetentionSetting, RetentionSettings
 from app.store.users import User
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_super)])
 
 MQTT_PASSWORD_BYTES = 24
+LABEL_MAX_BYTES = 32
 
 DEFAULT_ADMIN_WRITE_LIMIT = 60
 DEFAULT_ADMIN_WRITE_WINDOW_S = 60
@@ -192,6 +198,8 @@ def _patch_user_impl(
             | {uid}
         )
         book.bump_and_push(owners, broker, reason="member_patch")
+    if family_changed:
+        # the owner's family contacts (and so `cfg.sms`) changed
         book.rederive_sms_contacts(uid, broker)
     # a displayName change rewrites `participants` in every conversation of this uid
     if name_changed:
@@ -303,6 +311,8 @@ def get_allowlist() -> list[AllowEdge]:
 
 
 class CreateDeviceRequest(BaseModel):
+    """No `deviceId`: the relay issues it; a stale client's value is ignored."""
+
     ownerAlias: str
     label: str
     defaultToAlias: str | None = None
@@ -360,6 +370,18 @@ def _broker_push_outcome(
     return "manual", _manual_acl_lines(device_id)
 
 
+def _issue_device_id() -> str:
+    """A fresh `pgr-xxxxxxxx` id with no `devices/` or `deviceSecrets/` doc."""
+    for _ in range(DEVICE_ID_ATTEMPTS):
+        candidate = new_device_id()
+        if (
+            devices_store.get_device(candidate) is None
+            and device_secrets_store.get(candidate) is None
+        ):
+            return candidate
+    raise HTTPException(status_code=500, detail="could not allocate a device id")
+
+
 def _create_device_impl(
     req: CreateDeviceRequest,
     broker: BrokerClient,
@@ -379,6 +401,7 @@ def _create_device_impl(
         apn = apn_presets.validate_apn(req.apn)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    device_id = _issue_device_id()
 
     # generate the MQTT password and HMAC key; the plaintext exists only here
     password = secrets.token_urlsafe(MQTT_PASSWORD_BYTES)
@@ -386,29 +409,37 @@ def _create_device_impl(
     hmac_key = secrets.token_bytes(HMAC_KEY_BYTES)
 
     devices_store.create_device(
+        device_id=device_id,
         owner_uid=owner_uid,
         label=req.label,
         # a device's family is copied from its owner
         family_id=owner.familyId if owner is not None else None,
+        mqtt_username=device_id,
         mqtt_password_hash=password_hash,
         default_to_uid=default_to_uid,
         apn=apn,
     )
+    device_secrets_store.create(device_id, hmac_key=hmac_key, mqtt_password_hash=password_hash)
     # the pager is a delivery backend of its owner; without this it is undeliverable
     backends_store.create_backend(
+        owner_uid, kind="pager", config={"deviceId": device_id}, enabled=True
     )
     # pick up incoming `locate` edges that predate this device
     allow_store.recompute_locatable_by_for_owner(owner_uid)
 
     # PROTOCOL.md §3.7: device creation bumps and pushes the new device's book. Best-effort.
+    contacts_store.bump_book_version(device_id)
+    devcfg.push_book(device_id, broker)
     # seed `cfg.sms` (implied contacts for an open owner)
     book.rederive_sms_contacts(owner_uid, broker)
 
     # push the broker credential and ACL before handing out a setup code
+    emqx_result = emqx.ensure_device(device_id, password, device_id)
     host, ca = _bootstrap_host_and_ca(settings)
     now = datetime.now(UTC)
     try:
         setup_code = devsetup.issue(
+            device_id,
             mqtt_password=password,
             hmac_key=hmac_key,
             host=host,
@@ -425,7 +456,9 @@ def _create_device_impl(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     expires_at = now + timedelta(minutes=devsetup.EXPIRY_MINUTES)
 
+    device = devices_store.get_device(device_id)
     assert device is not None
+    broker_push, manual_acl = _broker_push_outcome(device_id, emqx_result)
     return DeviceSetupCodeResponse(
         device=device,
         setupCode=setup_code,
@@ -442,6 +475,35 @@ def create_device(
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> DeviceSetupCodeResponse:
     return _create_device_impl(req, broker, emqx, settings)
+
+
+class PatchDeviceRequest(BaseModel):
+    label: str
+
+    @field_validator("label")
+    @classmethod
+    def _check_label(cls, v: str) -> str:
+        v = v.strip()
+        # the pager's label buffer is 32 bytes
+        if not 1 <= len(v.encode("utf-8")) <= LABEL_MAX_BYTES:
+            raise ValueError(f"label must be 1..{LABEL_MAX_BYTES} bytes of UTF-8")
+        return v
+
+
+def _patch_device_impl(device_id: str, req: PatchDeviceRequest) -> Device:
+    """Rename a device; the pager learns it from the next `rotate-credentials` bundle."""
+    if devices_store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    devices_store.set_label(device_id, req.label)
+    device = devices_store.get_device(device_id)
+    assert device is not None
+    return device
+
+
+@router.patch("/devices/{device_id}", dependencies=[Depends(require_admin_write_rate_limit)])
+def patch_device(device_id: str, req: PatchDeviceRequest) -> Device:
+    """Edit the free-text `label`; the pager shows it after the next `rotate-credentials`."""
+    return _patch_device_impl(device_id, req)
 
 
 @router.get("/devices")
@@ -580,11 +642,17 @@ class PushCaRequest(BaseModel):
     action: Literal["push", "unpin"]
 
 
+def _list_apn_presets_impl() -> list[apn_presets.ApnPreset]:
+    return apn_presets.PRESETS
+
+
 @router.get("/apn-presets")
 def list_apn_presets() -> list[apn_presets.ApnPreset]:
     """Carrier APN choices for the device forms."""
+    return _list_apn_presets_impl()
 
 
+def _set_device_apn_impl(device_id: str, req: SetApnRequest) -> dict[str, str | None]:
     if devices_store.get_device(device_id) is None:
         raise HTTPException(status_code=404, detail="no such device")
     try:
@@ -593,6 +661,12 @@ def list_apn_presets() -> list[apn_presets.ApnPreset]:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     devices_store.set_apn(device_id, apn)
     return {"apn": apn}
+
+
+@router.put("/devices/{device_id}/apn", dependencies=[Depends(require_admin_write_rate_limit)])
+def set_device_apn(device_id: str, req: SetApnRequest) -> dict[str, str | None]:
+    """Store the carrier APN for setup codes and bundles; nothing is pushed to the pager."""
+    return _set_device_apn_impl(device_id, req)
 
 
 def _push_ca_impl(
@@ -642,6 +716,8 @@ def _load_firmware_index(settings: Settings) -> firmware.FirmwareIndex:
         raise HTTPException(status_code=502, detail="firmware index unavailable") from None
 
 
+def _list_firmware_impl(
+    settings: Settings, device: str | None
 ) -> dict[str, list[dict[str, object]]]:
     index = _load_firmware_index(settings)
     img: str | None = None
@@ -653,11 +729,42 @@ def _load_firmware_index(settings: Settings) -> firmware.FirmwareIndex:
     builds: list[dict[str, object]] = []
     for b in sorted(index.builds, key=lambda b: b.published, reverse=True):
         c = firmware.choose(index, b.id16, img)
+        entry: dict[str, object] = {
+            "id16": b.id16,
+            "version": b.version,
+            "size": b.size,
+            "published": b.published,
+        }
+        on_demand = False
+        if c.kind == "full" and img is not None:
+            img16 = img.strip().lower()[:16]
+            cached = firmware.cached_delta(index, img16, b.id16, settings)
+            if cached is not None:
+                c = firmware.Choice("delta", b, cached, on_demand=True)
+            else:
+                on_demand = firmware.can_delta_on_demand(index, img16, b.id16)
+        entry.update(kind=c.kind, osz=c.obj.osz, estBytes=firmware.estimate_bytes(c.obj.osz))
+        if on_demand:
+            entry["onDemandDelta"] = True
+        builds.append(entry)
     return {"builds": builds}
 
 
+@router.get("/firmware")
+def list_firmware(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    device: str | None = Query(default=None),
+) -> dict[str, list[dict[str, object]]]:
+    """Published builds, newest first, each with the object this device would get."""
+    return _list_firmware_impl(settings, device)
+
+
+def _push_ota_impl(
     device_id: str,
     req: OtaRequest,
+    by_uid: str,
+    broker: BrokerClient,
+    settings: Settings,
 ) -> dict[str, object]:
     if (req.target is None) == (not req.cancel):
         raise HTTPException(status_code=422, detail="send exactly one of target or cancel")
@@ -679,6 +786,12 @@ def _load_firmware_index(settings: Settings) -> firmware.FirmwareIndex:
     if dev.status.img and dev.status.img.strip().lower()[:16] == target_build.id16:
         raise HTTPException(status_code=409, detail="already running that build")
     choice = firmware.choose(index, req.target, dev.status.img)
+    if choice.kind == "full" and dev.status.img:
+        img16 = dev.status.img.strip().lower()[:16]
+        if firmware.can_delta_on_demand(index, img16, target_build.id16):
+            made = firmware.delta_on_demand(index, img16, target_build.id16, settings)
+            if made is not None:
+                choice = firmware.Choice("delta", target_build, made, on_demand=True)
     est = firmware.estimate_bytes(choice.obj.osz)
     ok = devcfg.push_ota(
         device_id,
@@ -689,8 +802,31 @@ def _load_firmware_index(settings: Settings) -> firmware.FirmwareIndex:
             "kind": choice.kind,
             "osz": choice.obj.osz,
             "estBytes": est,
+            "onDemand": choice.on_demand,
+            "by_uid": by_uid,
         },
     )
+    resp: dict[str, object] = {
+        "ok": ok,
+        "kind": choice.kind,
+        "osz": choice.obj.osz,
+        "estBytes": est,
+    }
+    if choice.on_demand:
+        resp["onDemand"] = True
+    return resp
+
+
+@router.post("/devices/{device_id}/ota", dependencies=[Depends(require_admin_write_rate_limit)])
+def push_ota(
+    device_id: str,
+    req: OtaRequest,
+    authed: Annotated[AuthedUser, Depends(require_super)],
+    broker: Annotated[BrokerClient, Depends(get_broker)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> dict[str, object]:
+    """`{"target": "<16 hex>"}` pushes `cfg.ota` (delta if `img` matches a base); `{"cancel": true}` cancels."""
+    return _push_ota_impl(device_id, req, authed.uid, broker, settings)
 
 
 class PutSettingsRequest(BaseModel):
@@ -737,3 +873,104 @@ def patch_family(fid: str, req: PatchFamilyRequest) -> Family:
         return families_store.update_family(fid, name=name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+ImsiPath = Annotated[str, Path(pattern=r"^\d{14,15}$")]
+
+
+def _soracom_client(settings: Settings) -> soracom.SoracomClient:
+    if not settings.soracom_configured:
+        raise HTTPException(status_code=503, detail="Soracom not configured")
+    assert settings.soracom_auth_key_id and settings.soracom_auth_key
+    return soracom.SoracomClient(settings.soracom_auth_key_id, settings.soracom_auth_key)
+
+
+def _soracom_502(exc: soracom.SoracomError) -> HTTPException:
+    return HTTPException(status_code=502, detail=f"soracom: {exc.detail}")
+
+
+@router.get("/soracom/sims")
+def list_soracom_sims(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> dict[str, object]:
+    out: dict[str, object] = {
+        "configured": settings.soracom_configured,
+        "group": settings.soracom_beam_group,
+        "groupId": None,
+        "sims": [],
+    }
+    if not settings.soracom_configured:
+        return out
+    try:
+        with _soracom_client(settings) as client:
+            gid = soracom.find_group(client, settings.soracom_beam_group)
+            sims = soracom.list_sims(client)
+    except soracom.SoracomError as exc:
+        raise _soracom_502(exc) from None
+    out["groupId"] = gid
+    out["sims"] = [
+        {
+            "imsi": s.imsi,
+            "iccid": s.iccid,
+            "status": s.status,
+            "groupId": s.groupId,
+            "enrolled": gid is not None and s.groupId == gid,
+            "name": s.name,
+            "subscription": s.subscription,
+        }
+        for s in sims
+    ]
+    return out
+
+
+@router.post(
+    "/soracom/sims/{imsi}/enroll", dependencies=[Depends(require_admin_write_rate_limit)]
+)
+def enroll_soracom_sim(
+    imsi: ImsiPath,
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    authed: Annotated[AuthedUser, Depends(require_super)],
+) -> dict[str, object]:
+    try:
+        with _soracom_client(settings) as client:
+            gid = soracom.ensure_group(
+                client, settings.soracom_beam_group, settings.soracom_beam_destination
+            )
+            soracom.enroll(client, imsi, gid)
+    except soracom.SoracomError as exc:
+        raise _soracom_502(exc) from None
+    log.info("soracom enroll imsi=%s group=%s by=%s", soracom.mask_imsi(imsi), gid, authed.uid)
+    return {"ok": True, "imsi": imsi, "groupId": gid}
+
+
+@router.post("/soracom/enroll-all", dependencies=[Depends(require_admin_write_rate_limit)])
+def enroll_all_soracom_sims(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    authed: Annotated[AuthedUser, Depends(require_super)],
+) -> dict[str, object]:
+    enrolled: list[str] = []
+    already: list[str] = []
+    try:
+        with _soracom_client(settings) as client:
+            gid = soracom.find_group(client, settings.soracom_beam_group)
+            todo: list[str] = []
+            for s in soracom.list_sims(client):
+                if not s.imsi:
+                    continue
+                if gid is not None and s.groupId == gid:
+                    already.append(s.imsi)
+                else:
+                    todo.append(s.imsi)
+            if todo:
+                gid = soracom.ensure_group(
+                    client, settings.soracom_beam_group, settings.soracom_beam_destination
+                )
+            for imsi in todo:
+                soracom.enroll(client, imsi, str(gid))
+                enrolled.append(imsi)
+                log.info(
+                    "soracom enroll imsi=%s group=%s by=%s", soracom.mask_imsi(imsi), gid, authed.uid
+                )
+    except soracom.SoracomError as exc:
+        raise _soracom_502(exc) from None
+    return {"ok": True, "enrolled": enrolled, "already": already}

@@ -180,6 +180,8 @@ def test_open_members_first_dm_to_a_stranger_writes_one_new_conversation_alert(r
     assert alerts[0].subjectAlias == "mom"
     assert alerts[0].peerAlias == "stranger"
     assert alerts[0].peerUid == "stranger"
+    assert alerts[0].preview == "hi"
+    assert alerts[0].peerName == "Stranger"
     assert alerts[0].convKey == messages_store.conv_key("mom", "stranger")
 
     # A second message to the same peer creates no second alert.
@@ -192,6 +194,21 @@ def test_open_members_first_dm_to_a_stranger_writes_one_new_conversation_alert(r
     )
     assert result2.ok
     assert len(list_alerts(family.id, "all")) == 1
+
+
+def test_new_conversation_to_an_external_shows_text_name_and_phone():
+    family = _make_family("ExtNC")
+    kid = users_store.create_user(
+        uid="alice", alias="alice", display_name="Alice", family_id=family.id, role="admin"
+    )
+    peer = externals_store.get_or_create(family.id, "+15551230000", "Friend")
+    alerts_module.new_conversation(kid, peer, "alice_x", "hello there")
+    (a,) = list_alerts(family.id, "all")
+    assert a.preview == "hello there"
+    assert a.peerName == "Friend"
+    assert a.peerPhone == "+15551230000"
+    alerts_module.new_conversation(kid, peer, "alice_x2", None)
+    assert any(x.preview.startswith("@alice started a chat with") for x in list_alerts(family.id, "all"))
 
 
 def test_send_with_an_existing_edge_writes_no_alert_even_if_open(routing: Routing):
@@ -340,13 +357,65 @@ def test_dismiss_marks_alert_dismissed(client: TestClient):
     assert resp.json()["status"] == "dismissed"
 
 
+def _approval_pair(family_id: str):
+    users_store.create_user(uid="owner1", alias="owner1", display_name="Owner", family_id=family_id)
+    peer = externals_store.get_or_create(family_id, "+15551230000", "Friend")
+    owner = users_store.get_user("owner1")
+    assert owner is not None
+    return owner, peer
 
 
+def test_approval_upsert_creates_one_alert_with_a_fixed_id(monkeypatch):
+    pushed: list[dict] = []
+    monkeypatch.setattr(
+        alerts_module, "_push_alert", lambda fid, alert, fcm_client=None: pushed.append(alert)
     )
+    family = _make_family("ContactReq")
+    owner, peer = _approval_pair(family.id)
+
+    assert alerts_module.approval_upsert(owner, peer) == "created"
+    assert alerts_module.approval_upsert(owner, peer) == "open"
+
+    alerts = list_alerts(family.id, "all")
+    assert [a.id for a in alerts] == [f"cr_owner1_{peer.uid}"]
+    alert = alerts[0]
+    assert alert.kind == "contact_request" and alert.status == "open"
+    assert alert.contactRequestKey is None
+    assert (alert.subjectUid, alert.peerUid, alert.peerPhone) == ("owner1", peer.uid, "+15551230000")
+    assert alert.peerName == "Friend"
+    assert len(pushed) == 1 and pushed[0]["id"] == alert.id
 
 
+def test_approval_upsert_declined_then_reopened(monkeypatch):
+    pushed: list[dict] = []
+    monkeypatch.setattr(
+        alerts_module, "_push_alert", lambda fid, alert, fcm_client=None: pushed.append(alert)
+    )
+    family = _make_family("ContactReq2")
+    owner, peer = _approval_pair(family.id)
+    alert_id = f"cr_owner1_{peer.uid}"
+    alerts_module.approval_upsert(owner, peer)
+    alerts_store.decide(family.id, alert_id, "dismissed", "parent")
+
+    assert alerts_module.approval_upsert(owner, peer) == "declined"
+    assert alerts_store.get(family.id, alert_id).status == "dismissed"
+
+    get_db().collection("families").document(family.id).collection("alerts").document(
+        alert_id
+    ).update({"decidedAt": datetime.now(UTC) - timedelta(hours=25)})
+    assert alerts_module.approval_upsert(owner, peer) == "reopened"
+    reopened = alerts_store.get(family.id, alert_id)
+    assert reopened.status == "open" and reopened.decidedAt is None
+    assert len(pushed) == 2 and len(list_alerts(family.id, "all")) == 1
+
+
+def test_approve_contact_request_alert_grants_the_edge_only(client: TestClient):
+    """The entry already exists; approving writes only the owner's edge (no person, no contact)."""
     family = _make_family("ContactApprove")
     headers = _make_family_admin("admin6", "admin6", family.id)
+    owner, peer = _approval_pair(family.id)
+    alerts_module.approval_upsert(owner, peer)
+    alert_id = f"cr_owner1_{peer.uid}"
 
     resp = client.post(
         f"/api/family/alerts/{alert_id}/approve",
@@ -361,8 +430,12 @@ def test_dismiss_marks_alert_dismissed(client: TestClient):
     assert resp.json()["status"] == "handled"
 
     assert users_store.get_uid_for_alias("newpal") is None
+    assert allow_store.is_message_allowed("owner1", peer.uid)
+    assert not allow_store.is_message_allowed(peer.uid, "owner1")
+    assert [u.uid for u in externals_store.list_family_contacts(family.id)] == [peer.uid]
     raw_kinds = [
         snap.to_dict()["kind"]
+        for snap in get_db().collection("users").document(peer.uid).collection("backends").stream()
     ]
     assert raw_kinds == ["sms"]
 
