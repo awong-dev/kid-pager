@@ -71,6 +71,15 @@ WIRE_MODE: str = "json"
 # `disconnect()`/`connect()` models a warm reconnect; only `crash()` (§1) models a cold boot.
 _DEVICE_CLIENTS: dict[str, pager_client.DeviceClient] = {}
 
+# The relay issues device ids (`pgr-` + 8 hex); scenarios name devices by a stable label
+# (e.g. "pgr-e2e-1") and look the issued id up here. `_DEVICE_CLIENTS` is keyed by issued id.
+_ISSUED_IDS: dict[str, str] = {}
+
+
+def issued_id(label: str) -> str:
+    """The relay-issued device id for a device this run created under `label`."""
+    return _ISSUED_IDS[label]
+
 
 def create_device_with_secret(
     admin: pager_client.ServerClient,
@@ -81,13 +90,21 @@ def create_device_with_secret(
 ) -> dict:
     """Creates a device via `POST /api/admin/devices` and runs the real bootstrap fetch
     (`pager_client.bootstrap_device`); caches the signed `DeviceClient` in `_DEVICE_CLIENTS`."""
+    label = device_id  # the scenario's name for the device; the relay issues the real id
+    info = admin.admin_device_add(label, owner_alias, default_to_alias=default_to_alias)
+    issued = info["device"]["id"]
+    _ISSUED_IDS[label] = issued
+    print(f"device created: label={label!r} issued id={issued}")
     device = pager_client.bootstrap_device(info["setupCode"], port=MQTT_PORT, wire=WIRE_MODE)
+    assert device.device_id == issued, (device.device_id, issued)
+    _DEVICE_CLIENTS[issued] = device
     return info
 
 
 def make_device(device_id: str) -> pager_client.DeviceClient:
     """Returns the cached `DeviceClient` for `device_id` (see `_DEVICE_CLIENTS`); an unprovisioned
     id gets an unsigned device speaking this run's `--wire` encoding."""
+    device_id = _ISSUED_IDS.get(device_id, device_id)  # accept a label or an issued id
     existing = _DEVICE_CLIENTS.get(device_id)
     if existing is not None:
         return existing
@@ -309,7 +326,9 @@ def scenario_bootstrap() -> None:
     admin.admin_set_allow("parent", "student", message=True, locate=True, one_way=False)
 
     device_info = create_device_with_secret(admin, "pgr-e2e-1", "student", default_to_alias="parent")
+    assert device_info["device"]["mqttUsername"] == device_info["device"]["id"] == issued_id("pgr-e2e-1")
     assert device_info["setupCode"]
+    print(f"bootstrap: admin, parent, student, allow-edge and device pgr-e2e-1 created as {issued_id('pgr-e2e-1')}")
 
 
 def scenario_text_roundtrip() -> None:
@@ -665,6 +684,7 @@ def scenario_location_on_demand() -> None:
     print(f"location_on_demand: waiting {LOC_REQ_TTL_S + 3}s for the loc_req to go stale...")
     time.sleep(LOC_REQ_TTL_S + 3)
     assert tick_json.get("locReqsCleared", 0) >= 1, tick_json
+    assert not oracle.loc_req_exists(issued_id("pgr-e2e-locd4"))
     print(f"location_on_demand: tick() cleared the stale locReqs row -- {tick_json}")
 
     fresh = parent.locate("locdemo4")
@@ -687,6 +707,8 @@ def scenario_retention() -> None:
     create_device_with_secret(admin, "pgr-e2e-retloc", "retloc")
     admin.admin_set_retention(messages="4w", locations="1d")
 
+    fresh_loc_id = _backdate_location(issued_id("pgr-e2e-retloc"), days_ago=0.02)  # ~30 min old
+    stale_loc_id = _backdate_location(issued_id("pgr-e2e-retloc"), days_ago=3)  # well past 1 day
     fresh_msg_id = parent.say("student", "retention: still here after a locations-only sweep")["id"]
 
 
@@ -828,14 +850,18 @@ def scenario_setup_code() -> None:
 
     # --- happy path: create -> code -> real bootstrap -> provisioned -> boot user gone ---
     result = admin.admin_device_add("pgr-e2e-setup", "scowner")
+    setup_id = result["device"]["id"]
     assert result["brokerPush"] == "pushed", result  # BROKER_MANAGES_AUTH=1 (default) in this stack
     code = result["setupCode"]
+    print(f"setup_code: admin created pgr-e2e-setup as {setup_id}, brokerPush={result['brokerPush']}, code={code!r}")
 
     token_bytes, _host, _port, _apn = devsetup.parse(code)
     bid, _bpw, _bkey = devsetup.derive(token_bytes)
     boot_username = devsetup.boot_username(bid)
 
     device = pager_client.bootstrap_device(code, port=MQTT_PORT, wire=WIRE_MODE)
+    assert device.device_id == setup_id, (device.device_id, setup_id)
+    print(f"setup_code: real §3.2 bootstrap fetch complete, now holding {setup_id}'s real credentials")
 
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="bootstrapped device to connect signed")
@@ -855,12 +881,14 @@ def scenario_setup_code() -> None:
 
     # --- expired code: patch expiresAt, call devsetup.expire() directly, confirm no retained bundle ---
     result2 = admin.admin_device_add("pgr-e2e-setup-exp", "scowner")
+    setup_exp_id = result2["device"]["id"]
     code2 = result2["setupCode"]
     token_bytes2, _h2, _p2, _a2 = devsetup.parse(code2)
     bid2, _bpw2, _bkey2 = devsetup.derive(token_bytes2)
     boot_username2 = devsetup.boot_username(bid2)
     down_topic2 = devsetup.boot_topic_down(bid2)
 
+    print(f"setup_code: pgr-e2e-setup-exp ({setup_exp_id})'s bootstrap credential and retained bundle both exist before expiry")
 
     assert expired_count == 1, expired_count
     print(
@@ -888,31 +916,67 @@ def scenario_address_book() -> None:
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
     family_id = admin.me()["user"]["familyId"] or "default"
+    abstudent = admin.admin_user_add(
+        "abstudent", "ABStudent", email="abstudent@example.com", phone=None
+    )
     create_device_with_secret(admin, "pgr-e2e-book", "abstudent")
 
     device = make_device("pgr-e2e-book")
     device.connect()
     wait_until(lambda: device.connected, timeout=10, description="address_book device to connect")
 
+    # A `contact_req` adds the entry at once (no pending row). The default policy refuses numbers
+    # outright; with `out: people_sms` the add replies "added; needs a parent's OK to text" and
+    # raises one alert with the deterministic id `cr_{owner}_{peer}`.
+    resp = admin._http.patch(
+        f"{admin.api_url}/api/family/members/{abstudent['uid']}?family={family_id}",
+        json={"policy": {"out": "people_sms", "in": "people_sms"}},
+        headers=admin._headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    device.inbox.clear()
     req_id = device.publish_contact_req("Grandma", "+15550001111")
+
+    from app.store import externals as externals_store
+
+    wait_until(
+        lambda: any(
+            e.data.get("from") == "system" and e.data.get("body") == "Grandma: added; needs a parent's OK to text"
+            for e in device.inbox
+        ),
+        timeout=10,
+        description="the 'Grandma: added; needs a parent's OK to text' system reply",
+    )
+    assert row is not None and row.status == "added", row
+    contact_uid, contact_alias = externals_store.contact_ids(family_id, "+15550001111")
+    expected_alert_id = f"cr_{abstudent['uid']}_{contact_uid}"
 
     def _pending_alert() -> dict | None:
         alerts = admin.family_list_alerts(family_id, status="open")
         return next(
+            (a for a in alerts if a["kind"] == "contact_request" and a["id"] == expected_alert_id),
             None,
         )
 
     wait_until(
         lambda: _pending_alert() is not None,
         timeout=10,
+        description="the refused add to raise the open contact_request alert cr_{owner}_{peer}",
     )
     alert = _pending_alert()
     assert alert is not None
     assert alert["peerPhone"] == "+15550001111", alert
+    assert not alert.get("contactRequestKey"), alert
+    print(f"address_book: contact_req added the entry and raised one open alert (id={alert['id']})")
+
+    # Not on cfg.sms until a parent approves: permission is policy, not membership.
+    assert {"name": "Grandma", "phone": "+15550001111"} not in device.sms_contacts, device.sms_contacts
 
     approved = admin.family_approve_alert(family_id, alert["id"])
     assert approved["status"] == "handled", approved
+    print(f"address_book: admin approved in one click (edge written); SMS contact alias={contact_alias}")
 
+    # The contact reaches the pager as `cfg.sms`.
     wait_until(
         lambda: {"name": "Grandma", "phone": "+15550001111"} in device.sms_contacts,
         timeout=10,
@@ -924,11 +988,14 @@ def scenario_address_book() -> None:
         description="device to receive and apply a book",
     )
     assert device.book is not None
+    assert device.book["p"] == [], device.book  # p[] retired
     print(
         f"address_book: device applied sms_contacts={device.sms_contacts}; book bv={device.book['bv']} "
+        f"contacts={[c['a'] for c in device.book['c']]}"
     )
 
     wait_until(
+        lambda: _pending_book_or_cfg_acked(issued_id("pgr-e2e-book"), "pendingBook"),
         timeout=10,
         description="device's book 'shown' ack to land at the relay",
     )
@@ -948,6 +1015,7 @@ def scenario_address_book() -> None:
     assert oracle.thread("abstudent", contact_alias) == [], "no relay message to an SMS contact"
     print("address_book: message to the SMS contact -> 'sms not set up', no thread written")
 
+    admin.admin_push_cfg(issued_id("pgr-e2e-book"), auto=2)
     wait_until(
         lambda: device.lock_auto_min == 2,
         timeout=10,
@@ -956,6 +1024,7 @@ def scenario_address_book() -> None:
     print("address_book: device applied cfg lock.auto=2")
 
     wait_until(
+        lambda: _pending_book_or_cfg_acked(issued_id("pgr-e2e-book"), "pendingCfg"),
         timeout=10,
         description="device's cfg 'shown' ack to land at the relay",
     )
@@ -999,6 +1068,7 @@ def scenario_sms_log() -> None:
     print(f"sms_log: device applied sms_contacts={device.sms_contacts}")
 
     wait_until(
+        lambda: _pending_book_or_cfg_acked(issued_id("pgr-e2e-sms"), "pendingCfgSms"),
         timeout=10,
         description="device's cfg.sms 'shown' ack to land at the relay",
     )
@@ -1008,6 +1078,7 @@ def scenario_sms_log() -> None:
     in_id = device.sms_receive(stranger_phone, "who is this")
 
     def _log_entries() -> list[dict]:
+        return admin.sms_log_get(issued_id("pgr-e2e-sms"))["entries"]
 
     wait_until(
         lambda: len(_log_entries()) >= 2,
@@ -1127,6 +1198,7 @@ def scenario_bridge() -> None:
         timeout=10,
         description="the approved held SMS to reach the pager",
     )
+    print("bridge: SMS held, approved, delivered")
 
     contact = next(
         c for c in admin.family_list_contacts(family_id) if c["phone"] == neighbor
@@ -1343,6 +1415,145 @@ def scenario_bridge_voice() -> None:
     device.disconnect()
 
 
+def scenario_bridge_whatsapp() -> None:
+    """WhatsApp as a bridge source. A LID DM (`<digits>@lid`, name only) is held behind a
+    `chat_unknown` alert; subscribe delivers the backlog; the pager's reply carries
+    `to.conversationId` + `to.title` and no phone. A phone-JID DM takes the same path and its
+    reply also carries `to.link`. A group is held behind one alert, subscribe delivers the
+    backlog with `sndr` (`~ ` stripped), and the reply carries conversationId and title.
+    Inspect by a wa.me link is a 400."""
+    import bridge_sim
+
+    bootstrap_admin()
+    oracle = Oracle()
+    admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
+    admin.login("admin")
+    family_id = admin.me()["user"]["familyId"] or "default"
+    sim = bridge_sim.BridgeSimClient(BRIDGE_SIM_URL)
+
+    kid, device = _bridge_member(admin, family_id, "wkid", "pgr-e2e-brw")
+    wa_sim_number = "+15550003333"  # the default SIM number belongs to the `bridge` scenario's member
+    bridge = _pair_sim(
+        admin, sim, family_id, kid["uid"], "WhatsApp phone",
+        simNumber=wa_sim_number, voiceNumber=None, whatsapp=True,  # the sim keeps bridge_voice's Voice number otherwise
+    )
+    assert bridge["caps"]["whatsapp"] is True, bridge
+    bridge_id = bridge["id"]
+    wait_until(
+        timeout=10,
+        description="the bridge SIM to become the member's smsNumber",
+    )
+
+    def dm_round(digits_phone: str, name: str, pager_name: str, *, lid: bool) -> tuple[str, dict[str, Any]]:
+        """Hold one DM, subscribe it, check the backlog, send a pager reply; return (conv id, outbox item)."""
+        conv = digits_phone.lstrip("+") + ("@lid" if lid else "@s.whatsapp.net")
+        text, reply = f"hey from {name}", f"hi back {name}"
+        device.inbox.clear()
+        out = sim.inject(bridge_sim.whatsapp_dm_event(digits_phone, text, name=name, lid=lid))
+        assert out["results"][0]["outcome"] == "held", out
+        alerts = [
+            a
+            for a in admin.family_list_alerts(family_id)
+            if a["kind"] == "chat_unknown" and a.get("source") == "whatsapp" and not a.get("isGroup")
+        ]
+        assert len(alerts) == 1, alerts
+        assert not any(
+            a["kind"] == "sms_unknown" and a.get("subjectUid") == kid["uid"]
+            for a in admin.family_list_alerts(family_id)
+        ), "DM took the SMS path"  # scoped to this kid: earlier scenarios leave their own sms_unknown alerts
+        assert not any(e.data.get("body") == text for e in device.inbox), "held text leaked"
+        tab = admin.family_member_chat(family_id, kid["uid"])
+        (seen,) = [r for r in tab["seen"] if r["conversationId"] == conv]
+        assert seen["source"] == "whatsapp" and seen["title"] == name and not seen.get("isGroup"), seen
+        result = admin.family_chat_subscribe(family_id, bridge_id, seen["ref"], pager_name=pager_name)
+        assert result["delivered"] == 1 and result["undelivered"] == 0, result
+        wait_until(
+            lambda: any(e.data.get("body") == text for e in device.inbox),
+            timeout=10,
+            description="the subscribed WhatsApp DM backlog to reach the pager",
+        )
+        device.publish_msg(reply, to=result["alias"])
+        wait_until(
+            lambda: any(i["text"] == reply for i in _sim_sent(sim)),
+            timeout=15,
+            description="the pager reply to reach the bridge outbox",
+        )
+        item = next(i for i in _sim_sent(sim) if i["text"] == reply)
+        assert item["source"] == "whatsapp" and item["ackState"] == "sent", item
+        assert item["to"]["conversationId"] == conv and item["to"]["title"] == name, item
+        assert "phone" not in item["to"], item
+        return conv, item
+
+    # LID DM (no number): held as chat_unknown -> subscribe -> backlog -> reply by conversation id + title.
+    _, item = dm_round("+9876543210", "WaLid", "WaLid WA", lid=True)
+    assert item["to"].get("link") is None, item
+    print("bridge_whatsapp: LID DM held as chat_unknown, subscribed, reply carried conversationId and title")
+
+    # Phone-JID DM: the same path; the reply also carries the wa.me link from the event.
+    friend = "+15550004444"
+    _, item = dm_round(friend, "WaFriend", "WaFriend WA", lid=False)
+    assert item["to"]["link"] == f"https://wa.me/{friend.lstrip('+')}", item
+    print("bridge_whatsapp: phone-JID DM took the same path, reply carried the wa.me link")
+
+    # Group -> one chat_unknown alert -> subscribe -> backlog with sndr.
+    group_jid = "120363999111@g.us"
+    device.inbox.clear()
+    for sender, text in (("~ Devon P", "who is driving?"), ("~Logan", "I can")):
+        out = sim.inject(
+            bridge_sim.whatsapp_group_event("120363999111", "Soccer WA", sender, text)
+        )
+        assert out["results"][0]["outcome"] == "held", out
+    chat_alerts = [
+        a for a in admin.family_list_alerts(family_id) if a["kind"] == "chat_unknown" and a.get("isGroup")
+    ]
+    assert len(chat_alerts) == 1 and chat_alerts[0]["people"] == ["Devon P", "Logan"], chat_alerts
+    assert chat_alerts[0]["source"] == "whatsapp", chat_alerts[0]
+    tab = admin.family_member_chat(family_id, kid["uid"])
+    (seen,) = [r for r in tab["seen"] if r["conversationId"] == group_jid]
+    assert seen["source"] == "whatsapp" and seen["title"] == "Soccer WA", seen
+    result = admin.family_chat_subscribe(
+        family_id,
+        bridge_id,
+        seen["ref"],
+        pager_name="SoccerWA",
+        roster=[{"name": "Devon P", "nick": "devon"}, {"name": "Logan", "nick": "logan"}],
+    )
+    assert result["delivered"] == 2 and result["undelivered"] == 0, result
+    group_alias = result["alias"]
+    wait_until(
+        lambda: sum(1 for e in device.inbox if e.data.get("sndr")) >= 2,
+        timeout=10,
+        description="the WhatsApp group backlog to reach the pager with sndr",
+    )
+    pages = [e.data for e in device.inbox if e.data.get("sndr")]
+    assert [(p["from"], p["sndr"], p["body"]) for p in pages[:2]] == [
+        (group_alias, "devon", "who is driving?"),
+        (group_alias, "logan", "I can"),
+    ], pages
+    print("bridge_whatsapp: group held behind one alert, subscribe delivered the backlog with sndr")
+
+    device.publish_msg("I will drive", to=group_alias)
+    wait_until(
+        lambda: any(i["text"] == "I will drive" for i in _sim_sent(sim)),
+        timeout=15,
+        description="the group reply to reach the bridge outbox",
+    )
+    item = next(i for i in _sim_sent(sim) if i["text"] == "I will drive")
+    assert item["source"] == "whatsapp" and item["to"]["conversationId"] == group_jid, item
+    assert item["to"]["title"] == "Soccer WA", item
+    print("bridge_whatsapp: group reply carries conversationId and title")
+
+    # Inspect by a wa.me link is refused.
+    resp = admin.api_post(
+        f"/api/family/bridges/{bridge_id}/inspect?family={family_id}",
+        {"link": "https://wa.me/15550004444"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == "whatsapp links cannot be inspected; wait for a message", resp.text
+    print("bridge_whatsapp: inspect of a wa.me link is a 400")
+    device.disconnect()
+
+
 SCENARIOS: dict[str, Callable[[], None]] = {
     "bootstrap": scenario_bootstrap,
     "text_roundtrip": scenario_text_roundtrip,
@@ -1357,6 +1568,7 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "sms_log": scenario_sms_log,
     "bridge": scenario_bridge,
     "bridge_voice": scenario_bridge_voice,
+    "bridge_whatsapp": scenario_bridge_whatsapp,
 }
 
 

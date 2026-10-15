@@ -25,8 +25,27 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "relay"))
+
+from app.soracom import (
+    BASE_URL,
+    BEAM_KEY,
+    DEFAULT_DESTINATION,
+    GROUP_ID_PLACEHOLDER,
+    Call,
+    SoracomClient,
+    SoracomError,
+    beam_entry,
+    build_auth_call,
+    build_calls,
+    enroll,
+    ensure_group_created,
+)
+
+__all__ = ["BASE_URL", "BEAM_KEY", "GROUP_ID_PLACEHOLDER", "beam_entry"]
 REDACTED = "<redacted>"
 
 
@@ -52,6 +71,17 @@ def run(group: str, imsi: str, destination: str) -> int:
     if not key_id or not key:
         print("SORACOM_AUTH_KEY_ID and SORACOM_AUTH_KEY must be set in the environment", file=sys.stderr)
         return 2
+    try:
+        with SoracomClient(key_id, key) as client:
+            group_id, created = ensure_group_created(client, group, destination)
+            print(f"{'created' if created else 'reusing'} group {group} ({group_id})")
+            enroll(client, imsi, group_id)
+            final: Any = client.send(Call("GET", f"/groups/{group_id}"))
+    except SoracomError as e:
+        print(f"soracom: {e.detail}", file=sys.stderr)
+        return 1
+    beam = ((final or {}).get("configuration") or {}).get("SoracomBeam")
+    print(json.dumps(beam, indent=2))
     return 0
 
 

@@ -37,6 +37,7 @@ Commands:
           sms out <phone> <text...> | sms in <phone> <text...>
   Server: login, contacts, chat, say, watch, tick, sweep, locate <alias>,
           locations <alias> [n],
+          admin user-add / allow / deny / device-add <label> / ca push|unpin <device_id> /
           alerts <family> [open|all] / approve <family> <alert_id> [link|create] [alias] /
           block <family> <alert_id> / dismiss <family> <alert_id> /
           cfg <device_id> [--auto <min>] [--clear],
@@ -947,7 +948,10 @@ class ServerClient:
         return resp.json()
 
     def admin_device_add(
+        self, label: str, owner_alias: str, *, default_to_alias: str | None = None
     ) -> dict[str, Any]:
+        """The relay issues the device id (`pgr-` + 8 hex): `result["device"]["id"]`."""
+        body = {"ownerAlias": owner_alias, "label": label}
         if default_to_alias:
             body["defaultToAlias"] = default_to_alias
         resp = self.api_post("/api/admin/devices", body)
@@ -1737,12 +1741,15 @@ class PagerShell(cmd.Cmd):
 
     def _admin_device_add(self, args: list[str]) -> None:
         parser = argparse.ArgumentParser(prog="admin device-add", add_help=False)
+        parser.add_argument("label", help="display name; the relay issues the device id")
         parser.add_argument("--owner", required=True)
         parser.add_argument("--default-to")
         try:
             ns = parser.parse_args(args)
         except SystemExit:
             return
+        result = self.server.admin_device_add(ns.label, ns.owner, default_to_alias=ns.default_to)
+        print(f"device {result['device']['id']} created; setup code: {result['setupCode']}")
         self._out(result)
 
     def _admin_allow(self, args: list[str]) -> None:

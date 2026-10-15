@@ -7,6 +7,7 @@
       `SETUP error: <msg>` line appears, or the device logs `SETUP done` and reboots. The code
       contains a literal space (" @ "); quote it in the shell.
 
+  --from-api --relay <url> --admin-token <token>
       --owner <alias> --label <text> [--default-to <alias>]
       Calls `POST /api/admin/devices` with a Firebase ID token for an admin user and extracts
       `setupCode` from the JSON response (`{device, setupCode, expiresAt, brokerPush, manualAcl}`).
@@ -62,6 +63,7 @@ def fetch_setup_code(
     """`POST /api/admin/devices`; returns `setupCode`, prints the other fields to stderr."""
     httpx = _httpx()
     endpoint = f"{relay.rstrip('/')}/api/admin/devices"
+    body: dict[str, str] = {"ownerAlias": owner, "label": label}
     if default_to:
         body["defaultToAlias"] = default_to
     try:
@@ -83,6 +85,7 @@ def fetch_setup_code(
         raise SystemExit(f"error: relay response missing 'setupCode': {data!r}") from exc
 
     print(
+        f"setup code issued for {data.get('device', {}).get('id')!r} "
         f"(brokerPush={data.get('brokerPush')!r}, expiresAt={data.get('expiresAt')!r})",
         file=sys.stderr,
     )
@@ -174,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: --from-api requires {', '.join(missing)}", file=sys.stderr)
             return 2
         code = fetch_setup_code(
+            args.relay, args.admin_token, args.owner, args.label, args.default_to
         )
         print(f"setup code: {code}")
     elif args.code:

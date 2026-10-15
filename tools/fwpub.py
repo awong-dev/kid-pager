@@ -4,13 +4,25 @@
 
   fwpub.py publish <release-app.bin> --bucket <name> [--base <bin>]... [--k 3]
                    [--allow-large] [--dry-run --out <dir>]
+  fwpub.py withdraw <id16|version> --bucket <name> --reason <text>
   fwpub.py probe --bucket <name>
+  fwpub.py assets-publish <assets.bin> --bucket <name> --label <text> [--dry-run --out <dir>]
+  fwpub.py assets-withdraw <id16|label> --bucket <name> --reason <text> [--dry-run --out <dir>]
+
+Font (assets) images live under the same bucket:
+  as/<id16>/full.z, as/<id16>/manifest.json   (immutable)
+  as/index.json (no-store)  {v:1, builds:[{id,label,lang,fv,size,published,
+                             full:{path,osz,osha}}], withdrawn:[]}
+id = sha256(whole file). Full images only.
 
 Image id = the SHA-256 esptool appends to every app .bin (last 32 bytes);
 id16 = its first 16 hex chars. Objects (content-addressed, immutable):
   fw/<id16>/full.z               zlib(bin, level 9, 32 KB window)
   fw/<id16>/from-<base16>.dz     zlib(detools sequential patch, no compression)
   fw/<id16>/manifest.json        this build's index entry
+and fw/index.json (no-store), newest build first. A withdrawn (bad) build is
+moved from `builds` to `withdrawn` (objects kept, so a pager running it still
+takes a delta off it); publish refuses a withdrawn id. Needs `pip install detools`
 and `gcloud` (not needed with --dry-run).
 """
 
@@ -27,6 +39,9 @@ import urllib.request
 import zlib
 
 MAX_APP = 0x200000
+# assets_ota is 2 MiB; its last 4 KiB sector holds the commit record.
+MAX_ASSETS = 0x200000 - 4096
+ASSETS_FV_MAX = 1  # == gfx.h GFX_ASSETS_VER_MAX
 LARGE = 1_000_000
 IMMUTABLE = "public, max-age=31536000, immutable"
 NO_STORE = "no-store"
@@ -52,6 +67,55 @@ def check_image(data: bytes, allow_large: bool = False) -> dict:
     ident = data[-32:].hex()
     version = data[0x30:0x50].split(b"\0", 1)[0].decode("ascii", "replace")
     return {"id": ident, "id16": ident[:16], "version": version, "size": len(data)}
+
+
+def check_assets(data: bytes) -> dict:
+    """Validate a PGFA font image (tools/mkassets.py header: magic, u8 version,
+    3-byte lang, u32 total, ...). Returns {id, id16, fv, lang, size}."""
+    if len(data) < 16:
+        raise ValueError("assets image too short")
+    if data[:4] != b"PGFA":
+        raise ValueError("bad magic (expected PGFA)")
+    if not 1 <= data[4] <= ASSETS_FV_MAX:
+        raise ValueError(f"unknown assets format version {data[4]} (max {ASSETS_FV_MAX})")
+    total = int.from_bytes(data[8:12], "little")
+    if total != len(data):
+        raise ValueError(f"header total {total} != file length {len(data)}")
+    if len(data) > MAX_ASSETS:
+        raise ValueError(f"image {len(data)} B exceeds {MAX_ASSETS} B")
+    ident = hashlib.sha256(data).hexdigest()
+    lang = data[5:8].replace(b"\0", b"").decode("ascii", "replace")
+    return {"id": ident, "id16": ident[:16], "fv": data[4], "lang": lang, "size": len(data)}
+
+
+def assets_entry(info: dict, label: str, full: bytes, published: int) -> dict:
+    return {
+        "id": info["id"], "label": label, "lang": info["lang"], "fv": info["fv"],
+        "size": info["size"], "published": published,
+        "full": {"path": f"as/{info['id16']}/full.z", "osz": len(full),
+                 "osha": hashlib.sha256(full).hexdigest()},
+    }
+
+
+def assets_merge_index(index: dict | None, entry: dict) -> dict:
+    builds = [b for b in (index or {}).get("builds", []) if b["id"] != entry["id"]]
+    builds.append(entry)
+    builds.sort(key=lambda b: b["published"], reverse=True)
+    return {"v": 1, "builds": builds, "withdrawn": list((index or {}).get("withdrawn", []))}
+
+
+def assets_withdraw_index(index: dict, key: str, reason: str, at: int) -> dict:
+    """Moves the build whose id16 or label is `key` to `withdrawn`. Raises KeyError."""
+    hit = [b for b in index.get("builds", []) if b["id"][:16] == key or b["label"] == key]
+    if len(hit) != 1:
+        raise KeyError(f"{len(hit)} assets builds match {key!r}")
+    b = hit[0]
+    return {
+        "v": 1,
+        "builds": [x for x in index["builds"] if x is not b],
+        "withdrawn": list(index.get("withdrawn", []))
+        + [{"id": b["id"], "label": b["label"], "reason": reason, "at": at}],
+    }
 
 
 def make_full(data: bytes) -> bytes:
@@ -90,6 +154,22 @@ def merge_index(index: dict | None, entry: dict) -> dict:
     builds = [b for b in (index or {}).get("builds", []) if b["id"] != entry["id"]]
     builds.append(entry)
     builds.sort(key=lambda b: b["published"], reverse=True)
+    out = {"v": 1, "builds": builds}
+    if (index or {}).get("withdrawn"):
+        out["withdrawn"] = index["withdrawn"]
+    return out
+
+
+def withdraw_index(index: dict, key: str, reason: str, at: int) -> dict:
+    """Moves the build whose id16 or version is `key` to `withdrawn`. Raises KeyError."""
+    hit = [b for b in index.get("builds", []) if b["id"][:16] == key or b["version"] == key]
+    if len(hit) != 1:
+        raise KeyError(f"{len(hit)} builds match {key!r}")
+    b = hit[0]
+    out = {"v": 1, "builds": [x for x in index["builds"] if x is not b]}
+    out["withdrawn"] = list(index.get("withdrawn", [])) + [
+        {"id": b["id"], "version": b["version"], "reason": reason, "at": at}]
+    return out
 
 
 class Gcs:
@@ -143,6 +223,10 @@ def publish(args) -> int:
     raw_index = store.get("fw/index.json")
     index = json.loads(raw_index) if raw_index else None
 
+    if any(w["id"] == info["id"] for w in (index or {}).get("withdrawn", [])):
+        print(f"refusing: {info['version']} {info['id16']} is withdrawn", file=sys.stderr)
+        return 1
+
     full = make_full(data)
     existing = store.get(f"fw/{info['id16']}/full.z")
     if existing is not None and existing != full:
@@ -182,6 +266,64 @@ def publish(args) -> int:
     return 0
 
 
+def withdraw(args) -> int:
+    store = Gcs(args.bucket)
+    raw = store.get("fw/index.json")
+    if not raw:
+        print("no fw/index.json", file=sys.stderr)
+        return 1
+    try:
+        new_index = withdraw_index(json.loads(raw), args.build, args.reason, int(time.time()))
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    store.put("fw/index.json", json.dumps(new_index, indent=1).encode(), NO_STORE)
+    w = new_index["withdrawn"][-1]
+    print(f"withdrew {w['version']} id16={w['id'][:16]}")
+    return 0
+
+
+def assets_publish(args) -> int:
+    data = open(args.image, "rb").read()
+    info = check_assets(data)
+    store = Local(args.out) if args.dry_run else Gcs(args.bucket)
+    raw_index = store.get("as/index.json")
+    index = json.loads(raw_index) if raw_index else None
+    if any(w["id"] == info["id"] for w in (index or {}).get("withdrawn", [])):
+        print(f"refusing: assets {info['id16']} is withdrawn", file=sys.stderr)
+        return 1
+    full = make_full(data)
+    existing = store.get(f"as/{info['id16']}/full.z")
+    if existing is not None and existing != full:
+        print(f"refusing: as/{info['id16']}/full.z exists with different bytes", file=sys.stderr)
+        return 1
+    entry = assets_entry(info, args.label, full, int(time.time()))
+    i16 = info["id16"]
+    store.put(f"as/{i16}/full.z", full, IMMUTABLE)
+    store.put(f"as/{i16}/manifest.json", json.dumps(entry, indent=1).encode(), IMMUTABLE)
+    store.put("as/index.json", json.dumps(assets_merge_index(index, entry), indent=1).encode(),
+              NO_STORE)
+    print(f"published assets {args.label!r} id16={i16} size={info['size']} full={len(full)} B")
+    return 0
+
+
+def assets_withdraw(args) -> int:
+    store = Local(args.out) if args.dry_run else Gcs(args.bucket)
+    raw = store.get("as/index.json")
+    if not raw:
+        print("no as/index.json", file=sys.stderr)
+        return 1
+    try:
+        new_index = assets_withdraw_index(json.loads(raw), args.build, args.reason, int(time.time()))
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    store.put("as/index.json", json.dumps(new_index, indent=1).encode(), NO_STORE)
+    w = new_index["withdrawn"][-1]
+    print(f"withdrew assets {w['label']!r} id16={w['id'][:16]}")
+    return 0
+
+
 def probe(args) -> int:
     data = os.urandom(4096)
     Gcs(args.bucket).put("fw/probe-4k.bin", data, NO_STORE)
@@ -200,6 +342,22 @@ def main(argv=None) -> int:
     p.add_argument("--allow-large", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--out")
+    w = sub.add_parser("withdraw")
+    w.add_argument("build")
+    w.add_argument("--bucket", required=True)
+    w.add_argument("--reason", required=True)
+    ap_ = sub.add_parser("assets-publish")
+    ap_.add_argument("image")
+    ap_.add_argument("--bucket", required=True)
+    ap_.add_argument("--label", required=True)
+    ap_.add_argument("--dry-run", action="store_true")
+    ap_.add_argument("--out")
+    aw = sub.add_parser("assets-withdraw")
+    aw.add_argument("build")
+    aw.add_argument("--bucket", required=True)
+    aw.add_argument("--reason", required=True)
+    aw.add_argument("--dry-run", action="store_true")
+    aw.add_argument("--out")
     q = sub.add_parser("probe")
     q.add_argument("--bucket", required=True)
     args = ap.parse_args(argv)
@@ -211,6 +369,16 @@ def main(argv=None) -> int:
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+    if args.cmd in ("assets-publish", "assets-withdraw"):
+        if args.dry_run and not args.out:
+            ap.error("--dry-run needs --out DIR")
+        try:
+            return assets_publish(args) if args.cmd == "assets-publish" else assets_withdraw(args)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    if args.cmd == "withdraw":
+        return withdraw(args)
     return probe(args)
 
 
