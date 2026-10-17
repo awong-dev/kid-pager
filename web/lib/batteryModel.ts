@@ -5,6 +5,11 @@ export type Cause = "timer" | "attn" | "hot" | "ui" | "modem" | "fetch";
 export const CAUSES: Cause[] = ["timer", "attn", "hot", "ui", "modem", "fetch"];
 
 export const USB_MV = 4300;
+
+/** Modem temperature in tenths of a degree C -> "23.5 °C". */
+export function formatTempDc(dc: number): string {
+  return `${(dc / 10).toFixed(1)} °C`;
+}
 export const GNSS_FLOOR_MV = 3550;
 export const OTA_FLOOR_MV = 3600;
 
@@ -16,6 +21,7 @@ export interface BatterySample {
   session?: string;
   sq?: number;
   battMv?: number;
+  tempDc?: number;
   minMv?: number;
   rssi?: number;
   mode?: string;
@@ -34,6 +40,9 @@ export interface BatterySample {
   connects?: number;
   modemS?: { off?: number; search?: number; gnss?: number };
   radioEvents?: number;
+  shakesAccepted?: number;
+  shakesRejected?: number;
+  shakePendingS?: number;
 }
 
 export interface BatteryModel {
@@ -267,6 +276,7 @@ export function bucketAwake(samples: BatterySample[], unit: BucketUnit): AwakeBu
 }
 
 export const CSV_HEADER =
+  "ts,iso,session,sq,battMv,tempDc,minMv,rssi,mode,fw,img,rst,link,hasBs,dtS,sleepS,aw_timer,aw_attn,aw_hot,aw_ui,aw_modem,aw_fetch,sleeps,ext1,railS,rf_full,rf_partial,rf_upgraded,connects,md_off,md_search,md_gnss,radioEvents,shakesAccepted,shakesRejected,shakePendingS,model_mAh";
 
 function cell(v: string | number | boolean | undefined | null): string {
   if (v === undefined || v === null) return "";
@@ -282,6 +292,7 @@ export function toCsv(samples: BatterySample[], m: BatteryModel): string {
     const row = [
       s.ts,
       new Date(s.ts * 1000).toISOString(),
+      s.session, s.sq, s.battMv, s.tempDc, s.minMv, s.rssi, s.mode, s.fw, s.img, s.rst, s.link,
       s.hasBs,
       s.dtS, s.sleepS,
       s.awakeS?.timer, s.awakeS?.attn, s.awakeS?.hot, s.awakeS?.ui, s.awakeS?.modem, s.awakeS?.fetch,
@@ -290,6 +301,7 @@ export function toCsv(samples: BatterySample[], m: BatteryModel): string {
       s.connects,
       s.modemS?.off, s.modemS?.search, s.modemS?.gnss,
       s.radioEvents,
+      s.shakesAccepted, s.shakesRejected, s.shakePendingS,
       mah === null ? undefined : mah.toFixed(4),
     ];
     lines.push(row.map(cell).join(","));

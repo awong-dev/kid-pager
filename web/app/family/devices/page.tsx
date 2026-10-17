@@ -19,6 +19,7 @@ import Typography from "@mui/material/Typography";
 import AppShell from "@/components/AppShell";
 import DeviceCard, { type DeviceRow, type PendingCfgDoc, type ProvisionState } from "@/components/DeviceCard";
 import FirmwareUpdateDialog from "@/components/FirmwareUpdateDialog";
+import FontsUpdateDialog from "@/components/FontsUpdateDialog";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useNewestBuild } from "@/lib/firmware";
@@ -56,6 +57,7 @@ function FamilyDevicesInner() {
   const { byUid, contacts } = useDirectory();
   const { familyId } = useFamily();
   const [fwDeviceId, setFwDeviceId] = useState<string | null>(null);
+  const [fontsDeviceId, setFontsDeviceId] = useState<string | null>(null);
   // the build list is the same for every device of the family, so use the first
   const newestBuild = useNewestBuild(true, "family", devices[0]?.id);
   const [error, setError] = useState<string | null>(null);
@@ -206,6 +208,7 @@ function FamilyDevicesInner() {
             onRevoke={() => void revoke(d.id)}
             onDelete={() => void deleteDevice(d.id)}
             onFirmware={() => setFwDeviceId(d.id)}
+            onFonts={() => setFontsDeviceId(d.id)}
             onCa={(action) => setCaConfirm({ deviceId: d.id, label: d.label, action })}
             onSetAutoLock={(m) => void setAutoLock(d.id, m)}
             onClearPasscode={() => void clearPasscode(d.id)}
@@ -319,6 +322,15 @@ function FamilyDevicesInner() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {fontsDeviceId !== null && (
+        <FontsUpdateDialog
+          device={devices.find((x) => x.id === fontsDeviceId) ?? null}
+          scope="family"
+          open
+          onClose={() => setFontsDeviceId(null)}
+        />
+      )}
 
       {fwDeviceId !== null && (
         <FirmwareUpdateDialog

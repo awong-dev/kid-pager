@@ -98,6 +98,7 @@ export interface DeviceStatusDoc {
   state: string | null;
   mode: string | null;
   battMv: number | null;
+  tempDc?: number | null;
   rssi: number | null;
   session: string | null;
   ts: number | null;
@@ -119,6 +120,10 @@ export interface DeviceStatusDoc {
   otaState?: "wait" | "dl" | "ready" | "inst" | "ok" | "fail" | "rb" | null;
   otaPct?: number | null;
   otaErr?: string | null;
+  // `/status` keys 72/73: 0 = font OTA supported but no assets_ota row, 1 = factory fonts
+  // active, 2 = the OTA partition is active (`assetsId` = its 16-hex id).
+  assetsSrc?: number | null;
+  assetsId?: string | null;
   // Audit-queue SMS entries dropped on the pager before upload.
   smsLost?: number | null;
   // Carrier label (e.g. "Soracom").
@@ -149,6 +154,8 @@ export interface OtaJob {
   osz: number;
   estBytes: number;
   onDemand?: boolean;
+  /** "assets" for a font job; absent = app. */
+  part?: "assets" | null;
   by_uid: string;
   at: number;
 }

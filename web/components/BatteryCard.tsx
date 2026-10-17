@@ -26,6 +26,7 @@ import { ApiError } from "@/lib/api";
 import { fetchBattery } from "@/lib/battery";
 import {
   USB_MV,
+  formatTempDc,
   bucketAwake,
   sampleMah,
   termBreakdown,
@@ -103,9 +104,11 @@ export default function BatteryCard({ deviceId }: { deviceId: string }) {
   const withBs = useMemo(() => samples.filter((s) => s.hasBs), [samples]);
   const buckets = useMemo(() => bucketAwake(samples, bucketUnit), [samples, bucketUnit]);
   const last = samples.length > 0 ? samples[samples.length - 1] : null;
+  const lastTemp = [...samples].reverse().find((s) => s.tempDc != null)?.tempDc;
   const lastMv = [...samples].reverse().find((s) => s.battMv != null)?.battMv;
 
   const totals = useMemo(() => {
+    const t = { off: 0, search: 0, gnss: 0, ext1: 0, sleeps: 0, connects: 0, dt: 0, shA: 0, shR: 0, shP: 0, shSeen: false };
     for (const s of withBs) {
       t.off += s.modemS?.off ?? 0;
       t.search += s.modemS?.search ?? 0;
@@ -114,6 +117,10 @@ export default function BatteryCard({ deviceId }: { deviceId: string }) {
       t.sleeps += s.sleeps ?? 0;
       t.connects += s.connects ?? 0;
       t.dt += s.dtS ?? 0;
+      t.shA += s.shakesAccepted ?? 0;
+      t.shR += s.shakesRejected ?? 0;
+      t.shP += s.shakePendingS ?? 0;
+      if (s.shakesAccepted !== undefined || s.shakesRejected !== undefined) t.shSeen = true;
     }
     return t;
   }, [withBs]);
@@ -198,6 +205,7 @@ export default function BatteryCard({ deviceId }: { deviceId: string }) {
             <>
               <Typography variant="body2">
                 {lastMv != null ? (lastMv >= USB_MV ? `${lastMv} mV (on USB)` : `${lastMv} mV`) : "no voltage"}
+                {lastTemp != null && ` · ${formatTempDc(lastTemp)}`}
                 {last && ` · last sample ${new Date(last.ts * 1000).toLocaleString()}`}
                 {withBs.length < samples.length &&
                   ` · ${withBs.length} of ${samples.length} samples carry counters`}
@@ -213,6 +221,13 @@ export default function BatteryCard({ deviceId }: { deviceId: string }) {
                     {(totals.gnss / 60).toFixed(1)} min
                     <br />
                     ext1 wakes {totals.ext1} · sleeps {totals.sleeps} · reconnects {totals.connects}
+                    {totals.shSeen && (
+                      <>
+                        <br />
+                        shakes {totals.shA} accepted · {totals.shR} rejected · pending{" "}
+                        {fmtHours(totals.shP)}
+                      </>
+                    )}
                   </Typography>
 
                   <Typography variant="subtitle2">Display refreshes per day</Typography>
