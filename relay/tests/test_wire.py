@@ -233,6 +233,9 @@ def test_status_accepts_link_zero():
 # /status key 52 `xport` is retired: old firmware may still send it; it is ignored, not rejected.
 
 
+def test_status_ignores_retired_xport():
+    env = StatusEnvelope.model_validate(_online_status(xport="wifi"))
+    assert not hasattr(env, "xport")
 # Crash diagnostics: /status `rst`/`stage`/`abn` (PROTOCOL.md §5.1).
 
 
@@ -1035,7 +1038,10 @@ def test_ota_status_keys_on_the_cbor_wire():
     assert wirecbor.CFG_KEYMAP["ota"] == 4
     assert wirecbor.OTA_KEYMAP == {
         "img": 0, "isz": 1, "url": 2, "osz": 3, "osha": 4,
+        "fmt": 5, "base": 6, "psz": 7, "cancel": 8, "fv": 9,
     }
+    assert wirecbor.CFG_KEYMAP["ast"] == 6
+    assert (wirecbor.KEYMAP["ast"], wirecbor.KEYMAP["ast_id"]) == (72, 73)
     status = {
         "v": 1, "state": "online", "mode": "sleep", "batt_mv": 3300, "session": "s_00000001",
         "ts": 1_700_000_000, "img": "0123456789abcdef", "ota": 1, "ota_t": "fedcba9876543210",
@@ -1084,3 +1090,34 @@ def test_status_car_is_key_70_on_the_cbor_wire():
     assert names == {"car": "Soracom", "tls": "proxy"}
     env = StatusEnvelope.model_validate(_online_status(**names))
     assert (env.car, env.tls) == ("Soracom", "proxy")
+
+
+def test_status_batt_mv_raw_range():
+    for ok in (0, 5203, 10000):
+        assert StatusEnvelope.model_validate(_online_status(batt_mv=ok)).batt_mv == ok
+    for bad in (-1, 10001):
+        with pytest.raises(ValidationError):
+            StatusEnvelope.model_validate(_online_status(batt_mv=bad))
+
+
+def test_online_status_without_batt_mv_accepted():
+    d = _online_status()
+    d.pop("batt_mv", None)
+    assert StatusEnvelope.model_validate(d).batt_mv is None
+    for req in ("mode", "ts"):
+        d2 = {k: v for k, v in d.items() if k != req}
+        with pytest.raises(ValidationError):
+            StatusEnvelope.model_validate(d2)
+
+
+def test_status_temp_dc_range_and_cbor_key_71():
+    for ok in (235, -400, 1250):
+        assert StatusEnvelope.model_validate(_online_status(temp_dc=ok)).temp_dc == ok
+    for bad in (-401, 1251):
+        with pytest.raises(ValidationError):
+            StatusEnvelope.model_validate(_online_status(temp_dc=bad))
+    assert wirecbor.KEYMAP["temp_dc"] == 71
+    status = {"v": 1, "state": "online", "mode": "sleep", "session": "s_00000001",
+              "ts": 1_700_000_000, "temp_dc": -35}
+    assert wirecbor.translate_to_int(status)[71] == -35
+    assert wirecbor.decode(wirecbor.encode(status)) == status

@@ -626,12 +626,18 @@ def test_status_with_loc_move_s_stores_loc_move_s():
     assert devices_store.get_device("pgr-locmove-1").status.locMoveS == 3600
 
 
+def test_status_with_retired_xport_is_accepted_and_not_stored():
+    _make_user("xportuser1", "xportuser1")
+    _make_pager_device("pgr-xport-1", "xportuser1")
     ingest, _broker = _ingest()
 
     ingest.handle_status(
         status_topic("pgr-xport-1"), online_status_payload("s_00000001", xport="wifi")
     )
 
+    dev = devices_store.get_device("pgr-xport-1")
+    assert dev.status.state == "online"
+    assert not hasattr(dev.status, "xport")
 
 
 def test_status_persists_rst_stage_abn_and_logs_accepted_status(caplog):

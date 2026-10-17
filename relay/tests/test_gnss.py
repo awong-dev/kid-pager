@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import devcfg, wirecbor
+from app.config import Settings
 from app.main import create_app
 from app.store import backends as backends_store
 from app.store import devices as devices_store
@@ -17,6 +18,19 @@ from app.store import users as users_store
 from app.wire import StatusEnvelope
 from tests.fake_transport import FakeBrokerClient
 from tests.firebase_test_utils import auth_header
+
+
+def make_settings() -> Settings:
+    return Settings(
+        broker_api_url="http://unused.invalid/api/v5",
+        broker_api_key=None,
+        broker_api_secret=None,
+        webhook_key="test-webhook-key",
+        dev_mode=True,
+        google_cloud_project=None,
+        firestore_emulator_host=None,
+        firebase_auth_emulator_host=None,
+    )
 
 
 def _make_user(uid: str) -> None:

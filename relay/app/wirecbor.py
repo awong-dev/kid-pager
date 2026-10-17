@@ -67,6 +67,7 @@ KEYMAP: dict[str, int] = {
     "link": 50,
     # `/down msg` group-author alias, absent on one-to-one pages.
     "sndr": 51,
+    # 52 (`xport`) is retired; do not reuse.
     # Crash diagnostics (optional): `rst` = esp_reset_reason_t of the last reset, `stage` =
     # main-loop stage index, `abn` = abnormal resets since power-on.
     "rst": 53,
@@ -98,6 +99,12 @@ KEYMAP: dict[str, int] = {
     "gnss": 69,
     # `/status` carrier name (tstr <= 24).
     "car": 70,
+    # PROTOCOL.md §5.1: `/status`'s modem temperature, tenths of a degree C.
+    "temp_dc": 71,
+    # `/status` font-partition state (uint 0 = no assets_ota row, 1 = factory fonts, 2 = assets_ota
+    # active) and the active assets_ota id (16 lowercase hex, only when ast == 2).
+    "ast": 72,
+    "ast_id": 73,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
@@ -107,6 +114,7 @@ LOC_KEYMAP: dict[str, int] = {"lat": 0, "lon": 1, "acc": 2, "fix_ts": 3, "src": 
 BS_KEYMAP: dict[str, int] = {
     "sq": 0, "dt": 1, "sl": 2, "aw": 3, "ns": 4, "x1": 5,
     "rl": 6, "rf": 7, "mvn": 8, "cn": 9, "md": 10, "re": 11,
+    "sa": 12, "sr": 13, "sp": 14,
 }  # fmt: skip
 _REVERSE_BS: dict[int, str] = {v: k for k, v in BS_KEYMAP.items()}
 CONTACT_KEYMAP: dict[str, int] = {"a": 0, "n": 1, "t": 2}
@@ -118,6 +126,11 @@ CA_KEYMAP: dict[str, int] = {"url": 0, "sha": 1}
 # `CONTACT_KEYMAP` though both use `n`.
 SMS_CONTACT_KEYMAP: dict[str, int] = {"n": 0, "p": 1}
 # PROTOCOL.md §10's `cfg` sub-map: `lock=0`, `ca=1`, `sms=2`; 3 (`wifi`) is retired, do not reuse.
+CFG_KEYMAP: dict[str, int] = {
+    "lock": 0, "ca": 1, "sms": 2, "ota": 4, "loc": 5,
+    # `cfg.ast`, the font-image job.
+    "ast": 6,
+}  # fmt: skip
 # `cfg.ota`: `img`/`osha`/`base` are 64-hex digests in JSON and 32-byte bstr in CBOR; `fmt` is
 # "full"/"delta" in JSON and 0/1 in CBOR.
 OTA_KEYMAP: dict[str, int] = {
@@ -130,6 +143,8 @@ OTA_KEYMAP: dict[str, int] = {
     "base": 6,
     "psz": 7,
     "cancel": 8,
+    # Asset-format version: required in `cfg.ast`, ignored by the firmware in `cfg.ota`.
+    "fv": 9,
 }
 _OTA_HASH_KEYS = ("img", "osha", "base")
 _OTA_FMT_TO_INT: dict[str, int] = {"full": 0, "delta": 1}
@@ -203,6 +218,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
                 ]
             elif k == "ota" and isinstance(v, dict):
                 out[CFG_KEYMAP["ota"]] = _ota_to_int(v)
+            elif k == "ast" and isinstance(v, dict):
+                out[CFG_KEYMAP["ast"]] = _ota_to_int(v)
             elif k == "loc" and isinstance(v, dict):
                 out[CFG_KEYMAP["loc"]] = {CFG_LOC_KEYMAP[lk]: lv for lk, lv in v.items()}
             else:
@@ -238,6 +255,8 @@ def _value_to_names(name: str, value: Any) -> Any:
                 ]
             elif k == CFG_KEYMAP["ota"] and isinstance(v, dict):
                 out["ota"] = _ota_to_names(v)
+            elif k == CFG_KEYMAP["ast"] and isinstance(v, dict):
+                out["ast"] = _ota_to_names(v)
             elif k == CFG_KEYMAP["loc"] and isinstance(v, dict):
                 # Unknown sub-keys are ignored.
                 out["loc"] = {_REVERSE_CFG_LOC[lk]: lv for lk, lv in v.items() if lk in _REVERSE_CFG_LOC}

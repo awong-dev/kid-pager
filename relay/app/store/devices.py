@@ -48,6 +48,7 @@ class DeviceStatus(BaseModel):
     state: str | None = None
     mode: str | None = None
     battMv: int | None = None
+    tempDc: int | None = None
     rssi: int | None = None
     session: str | None = None
     ts: int | None = None
@@ -89,6 +90,10 @@ class DeviceStatus(BaseModel):
     otaState: str | None = None
     otaPct: int | None = None
     otaErr: str | None = None
+    # `ast`: 1 factory fonts, 2 assets_ota active, 0 no assets_ota row, None no font OTA; `ast_id`
+    # (16 hex) only when 2. `/assets` is pushed only when `assetsSrc` is 1 or 2.
+    assetsSrc: int | None = None
+    assetsId: str | None = None
     updatedAt: datetime | None = None
     # Set once `sigFailures` crosses AUTH_ALARM_THRESHOLD within AUTH_ALARM_WINDOW_S; cleared on
     # key rotation.
@@ -150,6 +155,9 @@ class OtaJob(BaseModel):
     by_uid: str
     onDemand: bool = False
     at: datetime | None = None
+    # Partition the job targets; old documents have no `part` and are app jobs. For "assets",
+    # `kind` is "full" and `target16` is the font image id.
+    part: Literal["app", "assets"] = "app"
 
 
 class Device(BaseModel):
@@ -184,6 +192,7 @@ class Device(BaseModel):
     # Written directly via `get_db()` by the contacts store; modelled so `get_device()` returns it.
     bookVersion: int = 0
     # The "newest unacked" pending-push slots (book/lock/ca/sms/loc/ota/ast), written directly
+    # by `app/devcfg.py`.
     pendingBook: PendingPush | None = None
     pendingCfg: PendingPush | None = None
     pendingCfgCa: PendingPush | None = None

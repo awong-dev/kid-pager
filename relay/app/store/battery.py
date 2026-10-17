@@ -34,6 +34,11 @@ class BattStats(BaseModel):
     cn: U32
     md: list[U32] = Field(min_length=3)
     re: U32
+    # Shake detector (optional): accepted shakes, rejected candidates, seconds awake with a shake
+    # pending and no hot window open.
+    sa: U32 | None = None
+    sr: U32 | None = None
+    sp: U32 | None = None
 
 
 def parse_bs(raw: Any, device_id: str = "?") -> BattStats | None:
@@ -59,6 +64,7 @@ def add_sample(
         "createdAt": datetime.now(UTC),
         "session": env.session,
         "battMv": env.batt_mv,
+        "tempDc": env.temp_dc,
         "rssi": env.rssi,
         "mode": env.mode,
         "fw": env.fw,
@@ -84,6 +90,9 @@ def add_sample(
             connects=bs.cn,
             modemS=dict(zip(("off", "search", "gnss"), md, strict=True)),
             radioEvents=bs.re,
+            shakesAccepted=bs.sa,
+            shakesRejected=bs.sr,
+            shakePendingS=bs.sp,
         )
     doc = {k: v for k, v in doc.items() if v is not None}
     col = _battery(device_id)

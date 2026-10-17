@@ -267,6 +267,11 @@ def _bid_from_boot_up_topic(topic: str) -> str | None:
     return parts[2]
 
 
+def _ota_job_finished(target16: str, env: StatusEnvelope, part: str = "app") -> bool:
+    # A font job also finishes when the device reports the target as its active assets_ota id.
+    if part == "assets" and env.ast_id == target16:
+        return True
+    if part == "app" and env.img == target16:
         return True
     return env.ota_st in ("ok", "fail", "rb") and env.ota_t in (None, target16)
 
@@ -893,12 +898,26 @@ class Ingest:
         # docs/PROTOCOL.md §5.1: `ota_t`/`ota_st` are present only while the device holds a job, so
         # an online status without them clears the OTA group.
         ota_clear = ("otaTarget", "otaState", "otaPct", "otaErr") if env.state == "online" and env.ota_t is None and env.ota_st is None else ()
+        # batt_mv/temp_dc are omitted until the modem has a reading this boot; an online status
+        # without them must not leave the last boot's value.
+        if env.state == "online":
+            ota_clear += tuple(
+                k
+                for k, v in (
+                    ("battMv", env.batt_mv),
+                    ("tempDc", env.temp_dc),
+                    ("assetsSrc", env.ast),
+                    ("assetsId", env.ast_id),
+                )
+                if v is None
+            )
         devices_store.update_status(
             device_id,
             clear=ota_clear,
             state=env.state,
             mode=env.mode,
             battMv=env.batt_mv,
+            tempDc=env.temp_dc,
             rssi=env.rssi,
             session=env.session,
             ts=resolved_ts,
@@ -924,7 +943,16 @@ class Ingest:
             otaState=env.ota_st,
             otaPct=env.ota_pct,
             otaErr=env.ota_err,
+            assetsSrc=env.ast,
+            assetsId=env.ast_id,
         )
+
+        # An online status without `ast` is firmware without font OTA, so drop the pending font job
+        # and its web job.
+        if env.state == "online" and env.ast is None:
+            devcfg.drop_pending_ast(device_id)
+            if device.otaJob is not None and device.otaJob.part == "assets":
+                devcfg.clear_ota_job(device_id)
 
         # One time-series sample per online /status; a malformed `bs` is dropped alone.
         if env.state == "online":
@@ -936,6 +964,9 @@ class Ingest:
 
         # The web's `otaJob` lives until the device reports the job finished (`ok`/`fail`/`rb` for
         # that target) or the new image is running.
+        if device.otaJob is not None and _ota_job_finished(
+            device.otaJob.target16, env, device.otaJob.part
+        ):
             devcfg.clear_ota_job(device_id)
 
         # On a transition into `broken`, log a security event.

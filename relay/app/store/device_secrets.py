@@ -7,6 +7,7 @@ import base64
 from datetime import datetime
 
 from google.cloud.firestore import SERVER_TIMESTAMP, Transaction
+from pydantic import BaseModel, ConfigDict
 
 from app.db.firestore import get_db, run_transaction
 

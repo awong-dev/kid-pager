@@ -199,6 +199,10 @@ def _ota_field_ok(name: str | None, value: object) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
     if name == "ota":
         return isinstance(value, int) and not isinstance(value, bool) and value == 1
+    if name == "ast":
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2
+    if name == "ast_id":
+        return isinstance(value, str) and _HEX16_RE.fullmatch(value) is not None
     return False
 
 
@@ -215,6 +219,8 @@ class StatusEnvelope(BaseModel):
     state: Literal["online", "offline"]
     mode: str | None = None
     batt_mv: int | None = None
+    # PROTOCOL.md §5.1 (key 71): modem temperature, tenths of a degree C.
+    temp_dc: int | None = None
     rssi: int | None = None
     session: str
     ts: int | None = None
@@ -233,6 +239,7 @@ class StatusEnvelope(BaseModel):
     # MQTT-session generation within a boot, bumped on each silent modem session resume; a change
     # triggers the online-edge republish, since a resume drops QoS 1 `/down` in the <=10 s gap.
     link: int | None = None
+    # /status key 52 (`xport`) is retired; do not reuse.
     # Crash diagnostics (optional, display only): `rst` is the last esp_reset_reason_t, `stage`
     # indexes `STAGE_NAMES`, `abn` counts abnormal resets since power-on.
     rst: int | None = None
@@ -258,9 +265,16 @@ class StatusEnvelope(BaseModel):
     ota_st: str | None = None
     ota_pct: int | None = None
     ota_err: str | None = None
+    # Font-partition state (keys 72/73): 0 no assets_ota row, 1 factory fonts, 2 assets_ota active
+    # (`ast_id` is its 16-hex id); a bad value drops to `None`.
+    ast: int | None = None
+    ast_id: str | None = None
     # §14.2: present on every signed envelope; absent on the unsigned LWT (§14.6) and "password".
     n: int | None = None
 
+    @field_validator(
+        "img", "ota", "ota_t", "ota_st", "ota_pct", "ota_err", "ast", "ast_id", mode="before"
+    )
     @classmethod
     def _drop_bad_ota_field(cls, value: object, info: ValidationInfo) -> object:
         return value if _ota_field_ok(info.field_name, value) else None
@@ -353,7 +367,17 @@ class StatusEnvelope(BaseModel):
     @field_validator("batt_mv")
     @classmethod
     def _check_batt(cls, value: int | None) -> int | None:
+        # Raw AT+SQNVMON millivolts, unclamped by the device (~5200 on USB);
+        # sanity range only.
+        if value is not None and not (0 <= value <= 10000):
             raise ValueError("batt_mv out of range")
+        return value
+
+    @field_validator("temp_dc")
+    @classmethod
+    def _check_temp(cls, value: int | None) -> int | None:
+        if value is not None and not (-400 <= value <= 1250):
+            raise ValueError("temp_dc out of range")
         return value
 
     @field_validator("rssi")
@@ -366,6 +390,7 @@ class StatusEnvelope(BaseModel):
     @model_validator(mode="after")
     def _check_online_fields(self) -> StatusEnvelope:
         if self.state == "online" and (
+            self.mode is None or self.ts is None
         ):
             raise ValueError("online status missing a required field")
         return self
