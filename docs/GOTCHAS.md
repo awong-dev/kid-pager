@@ -57,6 +57,12 @@ explained; a bare `AT` right after wake was not tested as a way to allow a short
 
 **Symptom:** the web app shows the pager online; new pages vanish; the pager's log shows no disconnect; the session comes back by itself several minutes later.
 
+**Cause:** the modem pings at the keepalive, but **a carrier NAT can silently kill an idle flow first**
+(AT&T: between 240 and 360 s idle). No RST reaches the modem and it raises no URC, so it never
+notices; only a host-level round trip detects it. At keepalive 480 s the session was dropped while
+idle, and at 1800 s sessions died after 10-13 minutes for the same reason. Soracom
+direct keeps an idle flow for at least 1200 s. So the keepalive alone is not a cure: nothing tells
+the pager its flow is gone. The evaluation behind these numbers is in `MODEM_KEEPALIVE_EVAL.md`.
 
 Worse, after the modem resumes the session by itself (`+SQNSMQTTONCONNECT:0,0`, no connect command
 from us) the pager is **subscribed to nothing**: the AT manual requires the host to re-subscribe, and
@@ -64,7 +70,14 @@ from us) the pager is **subscribed to nothing**: the AT manual requires the host
 `AT+SQNSMQTTSUBSCRIBE` was sent for either resume in a 40-minute log. No `+SQNSMQTTONDISCONNECT` is
 ever raised either, so the firmware never notices any of it.
 
+**Rule:** the host keeps the flow warm. After 240 s of uplink silence (840 s on the Soracom preset;
+keepalive 480 / 1200 s) the ESP32 re-subscribes to `pager/{id}/down` with a raw
+`AT+SQNSMQTTSUBSCRIBE`. The SUBACK proves the round trip and re-arms the subscription after a silent
+resume. No SUBACK in 30 s means the session is dead: reconnect. Estimated cost: about 36 mAh/day on
+AT&T (360 pings x ~0.1 mAh), about 10 on Soracom (~103 pings). See `V02_DESIGN.md` §9.
 
+Limitations: the per-ping energy is an estimate; the new values through Beam and on other carriers
+such as T-Mobile are not verified.
 
 ## The pager dies after losing signal
 

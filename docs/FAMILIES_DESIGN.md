@@ -279,6 +279,7 @@ they hold an edge (§1.5, §9).
      pager itself lists at most 8 numbers.
 - **Devices** (`/family/devices`): the admin device table scoped to the family (owner picker = family members),
   the `SetupCodePanel`, and a link to `/devices/{id}`. On `/devices/[id]` the SMS-contacts editor is read-only
+  ("managed from People → @kid → Approved numbers"). The log stays.
 - **Contacts** (`/family/contacts`): the family's externals (name, number, approved for which members, last
   message), with rename and add. A read-only "Linked families" list shows cross-family edges, with the note "ask
   your superadmin to link a person from another family".

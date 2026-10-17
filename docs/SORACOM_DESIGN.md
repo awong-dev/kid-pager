@@ -5,6 +5,8 @@ Status: built, and verified on the bench end to end (section 6). The evaluation 
 point in front of the existing EMQX broker. The UDP downlink design in the evaluation (its step 3)
 is not built.
 
+Terms: **transport** is the radio, LTE-M, the only one. **Bearer** is how the MQTT session reaches
+the broker: `direct` (TLS from the modem to EMQX, the path used for every other SIM) or `beam` (plain
 MQTT from the modem to `beam.soracom.io:1883`; Soracom Beam opens the MQTTS leg to EMQX). The bearer
 is a property of the SIM. It is picked by the carrier detection the firmware already does
 (`firmware/main/carrier.[ch]`), not by a build.
@@ -33,6 +35,9 @@ on the pager. The bench unit is driven over USB and through the production relay
 - Devices authenticate to EMQX with a per-device username and password (username = device id;
   `relay/app/emqx_admin.py`). Beam's MQTT entry point (version 201912) has a credential
   **pass-through** mode (`useClientCredentials`): the pager's own username and password go through to
+  the broker unchanged. Keepalive must be 0 or 5–1200 s. The Soracom preset uses 1200 s, and the
+  host-side liveness re-SUBSCRIBE after 840 s of uplink silence sits inside Beam's 1.5 × 1200 =
+  1800 s idle cut. Beam does not limit payload size and keeps no session state, so the pager's clean
   session assumption still holds.
 - The relay sees only `topic`, `payload` and `qos` from the webhook, and authenticates the device by
   the HMAC in the envelope (`ingest.py`). A Beam-relayed session that publishes the same topics is
@@ -102,6 +107,7 @@ In `configure_session()` and the bootstrap path:
 | Host, port | NVS `ident` host/port (from the bundle) | `PAGER_BEAM_HOST "beam.soracom.io"`, `PAGER_BEAM_PORT 1883` (compile-time constants) |
 | TLS profile | 2, slot 12, VALIDATION_CA or NONE per catrust | **none**: `mqttConfig(dev_id, dev_id, mqtt_pw, 0)`; no `tlsConfigProfile`, no CA slot write |
 | Client id / username / password | dev_id / dev_id / mqtt_pw | identical (pass-through) |
+| Keepalive / re-SUBSCRIBE | 480 / 240 (Soracom direct: 1200 / 840) | 1200 / 840 (Soracom preset) |
 | catrust / cafetch | as designed in `V02_DESIGN.md` §4 | skipped. A `ca_url`/`ca_sha` in the bundle is ignored: `ident` has no field for the pointer, so the identity is stored unpinned. `/status.tls` = `proxy` |
 | `cfg.ca` push | two-phase apply | refused with a failure ack, nothing fetched. A trial reconnect over the plaintext hop would "validate" the scratch-slot CA without using it, and then commit it |
 | Bootstrap (`setup <code>`) | TLS none-validation to `host:port` from the code | plain MQTT to Beam as `boot-<bid>` with the bootstrap password, keepalive 60; same topics. The code's host is logged and ignored, because Beam's group destination decides the broker |
@@ -141,6 +147,12 @@ splash's network status line says `via Beam` when the bearer is beam.
 
 ### 3.6 Sleep, eDRX and liveness
 
+Unchanged in design. A modem does send PINGREQ, but a carrier can drop an idle flow silently (see
+`docs/MODEM_KEEPALIVE_EVAL.md`). The host re-SUBSCRIBE after 840 s of uplink silence on the Soracom
+preset (`carrier.c`, `xport_lte.cpp` `lte_service_session()`) runs from the bounded light-sleep timer
+wake and crosses both Beam legs, inside 1.5 × 1200 = 1800 s. Soracom direct holds an idle flow for at
+least 1800 s. Beam at 1200 / 840 needs a 1 h idle soak, with `link` key 50 not incrementing.
+
 Modem MO SMS is gated in one place, `net_sms_send()`, which returns false when `sms_mo` is false.
 Both callers (`sms.c` send queue and `smstest`) already audit a failure.
 
@@ -160,6 +172,7 @@ The data path is unchanged (section 2). What changes:
   column renders `proxy` as "via Beam", and the SMS panel is hidden or annotated for a device whose
   `tls` is `proxy` (the device cannot originate SMS; relay SMS still works).
 - `PROTOCOL.md` §5.1 (`car`, `tls: proxy`), §6.1 (bearer row: Beam plain MQTT, keepalive 1200 inside
+  Beam's 5–1200 range) and §10 keymap (key 70).
 - Tools: `tools/pager_client.py` already speaks plain MQTT on 1883 and is the local stand-in for a
   Beam-side client. `tools/soracom_beam.py` (section 5) does the Soracom-side setup.
 

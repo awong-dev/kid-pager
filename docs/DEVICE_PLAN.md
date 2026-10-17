@@ -337,6 +337,7 @@ no subscription in normal operation, and needs nothing from the person but typin
 | **Typed on the CardKB** | any device, SIM only | **primary** |
 | SMS to the SIM, auto-read in setup mode | any deployment whose SIM plan delivers MT SMS | **rejected** (decided): the carrier would hold the token, it needs a messaging provider in every household's stack, and it would be the first device-side SMS path `PROTOCOL.md` §7.3 forbids. §3.6 records the shape in case it is ever revisited |
 | USB serial console (`tools/provision.py`) | developers and CI | kept; same code, same decoder |
+| Wi-Fi SoftAP + captive portal | every phone | **not needed** once the code is 40 characters; would add ~450 kB of Wi-Fi stack to the binary and a second radio to reason about. Wi-Fi is no longer part of the firmware. |
 | BLE / Web Bluetooth | not iOS | rejected |
 | A project-wide public bootstrap server baked into the firmware | — | rejected: the whole point is that each household runs its own stack |
 
@@ -1236,3 +1237,4 @@ Listed here so the diff to the authoritative document is reviewable on its own. 
 | 5.8 | PBKDF2-HMAC-SHA256 at 10 000 iterations takes ≈ 50–100 ms on the S3 | Time it in the host-side test first, then on the device; adjust iterations to land near 100 ms |
 | 3.2 | `walter-modem` v1.5.0 lets a second TLS profile use `WALTER_MODEM_TLS_VALIDATION_NONE`, and a retained message is delivered on subscribe through the modem's client | Read `tlsConfigProfile()`; phase 3's first bootstrap against the local broker |
 | 3.2 | The hosted broker's REST publish honours `retain: true` | One call against the real account |
+| 3.1 | Typing ~50 mixed characters on the CardKB is acceptable to a non-developer | First bring-up, with a stopwatch; if not, USB provisioning (`tools/provision.py`) is the fallback. The Wi-Fi portal is no longer part of the firmware. |

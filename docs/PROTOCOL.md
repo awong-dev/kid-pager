@@ -135,6 +135,7 @@ Base envelope:
 | `d` | string | `book` only | same regex as `from` | Default recipient alias (`DEVICE_PLAN.md` §4.3). |
 | `p` | array of objects | `book` only | ≤4 pending requests | Pending `contact_req`; each has `n` (name), `s` (status: `pend`/`no`) (`DEVICE_PLAN.md` §4.3). *(Not sent, §3.2; an absent `p` is empty.)* |
 | `more` | bool | `book` only | — | Reserved for chunking if the cap moves (`DEVICE_PLAN.md` §4.3). |
+| `cfg` | object | `/down` `cfg` kind only | — | Configuration map carrying `lock` (object with `clear` bool and `auto` int minutes; full shape in `DEVICE_PLAN.md` §5.8), `ca` (`V02_DESIGN.md` §4.4), and `sms` (§3.6 — the SMS contact allow-list). *(CFG key 3, formerly `wifi`, is retired and never reused, §10.)* *(Also `loc`, §3.2 `cfg.loc`, §10 — `{gnss}`, the GNSS enable flag.)* |
 | `peer` | string | `sms_log` only | E.164 | The other party's phone number (§3.6). |
 | `dir` | string | `sms_log` only | `out` \| `in` | Direction of the SMS this entry audits (§3.6). |
 | `sms_ts` | int | `sms_log` only | ≥ 0, epoch s | When the SMS itself was sent/received, which may differ from the envelope's own `ts` if the pager was offline and queued the audit entry (§3.6). |
@@ -179,6 +180,7 @@ Additional rules:
 | Group request (device → relay) | `/up` | `{"v":1,"id":"u_…","ts":…,"kind":"grp_req","name":"Cousins","m":["mom","carol"],"ack":null,"n":…,"sig":"…"}` — ≤380 bytes signed JSON, ≤250 signed CBOR; no `from`/`to`/`body` | Asks the relay to create a group with the owner as creator (§3.8); deduped on `id`, 1 per minute per device; no reply on the wire. *(See `docs/CHAT_UI_DESIGN.md`.)* **Not implemented:** no firmware sends it, and the relay has no handler, so it is dropped as an unknown `kind` (§3.4). |
 | Config (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"lock":{"clear":true,"auto":5}},"ack":null,"n":…,"sig":"…"}` | Not a thread entry; carries device settings; acked `shown` on apply (the `lock` shape is in `DEVICE_PLAN.md` §5.8); only newest re-published. |
 | Config, OTA job (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"ota":{"img":"<64 hex>","isz":685168,"url":"https://storage.googleapis.com/<bucket>/fw/<id16>/full.z","osz":338784,"osha":"<64 hex>","fmt":"full"}},"ack":null,"n":…,"sig":"…"}` — ≤523 bytes signed JSON, ≤296 signed CBOR with the default bucket name (§3.3) | A `cfg` carrying `ota` (below). Sent only to a device whose last online `/status` carried `ota:1`; acked `shown` on acceptance **or** rejection; progress travels in `/status` (§5.1), not in acks. *(OTA firmware update, `docs/OTA_DESIGN.md`.)* |
+| Config, GNSS disable (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"loc":{"gnss":false}},"ack":null,"n":…,"sig":"…"}` — ≤141 bytes signed JSON | A `cfg` carrying `loc` (below). Applied and acked `shown` at once, like `lock`; the device's resulting state travels in `/status` `gnss` (§5.1). *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`.)* |
 | Ack (device → relay) | `/up` | `{"v":1,"id":"m_7f3a","ts":…,"ack":"shown"}` — **51 bytes**; no `from`, no `body` | — |
 | Up message (device reply) | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","body":"ok coming","ack":null}` — **84 bytes** | Thread entry, routed to default recipient. |
 | Up message, addressed | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","to":"mom","body":"ok coming","ack":null}` — **95 bytes** | Thread entry, routed to named recipient. |
@@ -255,6 +257,8 @@ carrying the approved contacts and pending requests for this device:
 timing, CA trust, the SMS contact allow-list, etc.). Fields: `cfg` is an object that currently
 holds `lock` (see `DEVICE_PLAN.md` §5.8 for structure), `ca` (`V02_DESIGN.md` §4.4), `sms` (§3.6/§10 — an array of
 `{n, p}` objects, the device's *whole* SMS contact allow-list, replaced wholesale on every push;
+`[]` is a legal push meaning "no SMS contacts"). Unknown members of `cfg` are ignored, making
+this the home for future settings. *(CFG key 3, formerly `wifi`, is retired and never reused, §10.)*
 - **Not a thread entry:** the device MUST NOT render it in the message thread, and MUST NOT
   `shown`- or `read`-ack it in the normal sense. Instead, the device acks with `shown` **once the
   config has been applied**.
@@ -287,11 +291,28 @@ holding either a job or a cancel:
   `ota_err` (§5.1). A newer `cfg.ota` replaces the stored job. In airplane mode the job stays
   parked and costs nothing. Newest only and re-published on an online edge like any `cfg`.
 
+**`cfg.ast` (relay → device, font OTA).** *(`docs/ASSETS_OTA_DESIGN.md` §3; the font image
+goes to the `assets_ota` partition, never to `assets`.)* A seventh `cfg` member, CFG key 6 (§10),
+the same shape as `cfg.ota` (full image only) plus a required `fv`:
+`{"img":"<64 hex>","isz":736237,"url":"https://storage.googleapis.com/<bucket>/as/<id16>/full.z","osz":379008,"osha":"<64 hex>","fmt":"full","fv":1}`
+(`fv` = the image's format version, uint 1…255, OTA sub-key 9). `img` is the SHA-256 of the whole
+font image; the other members are as `cfg.ota`. `{"cancel":true}` cancels a stored font job only.
+- Device: ack `shown` once the job is stored, or once it is rejected. Rejected with `ota_err`
+  `nopart` (no `assets_ota` partition), `fmt` (`fv` above the firmware's maximum, a delta, or a
+  missing `fv`), `size` (`isz` above partition size − 4 KiB) or `run` (`img` already active).
+  The app-only gates (`nobl`, `pv`, `bad`) do not apply. Firmware without font OTA skips key 6
+  and does not ack it. Progress is the ordinary `ota_t`/`ota_st`/`ota_pct`/`ota_err` (§5.1);
+  states are `wait`, `dl`, `ok`, `fail` (no reboot).
+- Relay: only to a device whose last online `/status` carried `ast` 1 or 2; one job (app or
+  font) at a time. Own pending slot `pendingCfgAst`, re-published on the online edge, dropped
+  when an online `/status` lacks `ast`.
+
 **`cfg.loc` (relay → device, GNSS disable).** *(a module with a damaged GNSS antenna must be able
 to stop powering the receiver while location keeps working from the serving cell;
 `docs/GNSS_DISABLE_DESIGN.md`.)* A sixth `cfg` member, CFG key 5 (§10), a map `{gnss}`:
 - `gnss` (bool): `false` stops the device from ever powering its GNSS receiver; `true` re-enables
   it. Absent means no change, so `{}` is a legal no-op. Unknown sub-keys are ignored.
+- Device: persist the flag, then ack `shown` immediately, like `lock`. While it is
   `false`, every location attempt (on-demand `loc_req` or scheduled) skips GNSS and sends a cell
   report (§13.2), and the scheduled GNSS-while-moving attempt never starts; `loc_move_s` (§5.1) is
   still reported as configured. A device that has never received `cfg.loc` behaves as `gnss:true`.
@@ -692,6 +713,8 @@ broker-generated LWT.
 | `v` | int | no (default 1) | `1` | Schema version |
 | `state` | string | **yes** | `online` \| `offline` | See §5.2 for the precise meaning |
 | `mode` | string | yes when `online` | `sleep` \| `active` | Device mode (firmware/README.md) |
+| `batt_mv` | int | no | 0…10000 | Raw `AT+SQNVMON` modem-rail millivolts, unclamped (~5200 on USB); omitted until the modem has a reading this boot (no placeholder). *(raw mV, not percent; LiPo discharge curve is relatively steep so any percent mapping belongs in the UI where it can be changed without a firmware flash.)* |
+| `temp_dc` | int | no | −400…1250 | Modem temperature in tenths of a degree Celsius (235 = 23.5 °C). CBOR key 71. Omitted when unknown. |
 | `rssi` | int | yes when `online` | −140…0 | RSSI in dBm (published at every `/status` for field debugging and status bar rendering). |
 | `session` | string | **yes** | `^s_[0-9a-f]{8}$` | Cold-boot session id (§1). Lets the relay tell a reboot from a deep-sleep cycle. |
 | `ts` | int | yes when `online` | epoch s, or 0 | Same rule as §3.5 |
@@ -704,6 +727,7 @@ broker-generated LWT.
 | `loc_backoff_s` | int | no | 0…86400 | *(§13.3)* Seconds until the device's own growing location-attempt backoff next allows a fresh fix attempt; `0` = an attempt is allowed now. See §13.3's amendment for how this relates to `loc_min_s`. |
 | `sms_lost` | int | no | ≥ 0 | *(§3.6 — device-direct SMS)* Count of `sms_log` audit entries dropped from the device's NVS queue for lack of space; normally 0. |
 | `link` | int | no | ≥ 0 | *(§9.5 — MQTT session liveness)* Counter incremented on every MQTT session restart within the current boot (starts at 1 per boot); `session` alone cannot tell a silent modem-initiated resume from an unbroken session. Absent means firmware older than §9. The relay treats a changed `link` exactly like a changed `session` for §5.3's online-edge re-publish. |
+| `xport` | string | no | — | *(retired: LTE-M is the only transport, so there is nothing to report.)* Formerly `lte` \| `wifi`, the transport carrying the session. Older firmware may still send it; a relay ignores it (§3.1). The name and CBOR key 52 are not reused. |
 | `rst` | int | no | 0…255 | *(crash diagnostics)* ESP-IDF `esp_reset_reason_t` of the device's last reset: `1` poweron, `2` ext, `3` sw, `4` panic, `5` int_wdt, `6` task_wdt, `7` wdt, `8` deepsleep, `9` brownout. Absent means firmware that predates this field. **Display and diagnosis only.** |
 | `stage` | int | no | 0…255 | *(crash diagnostics)* Index into the firmware's main-loop stage table, naming where execution was when this status was sent (or, after a crash, roughly where it last got to): `0` "?", `1` boot, `2` network init, `3` loop top, `4` entering light sleep, `5` just woke from light sleep, `6` input/ui, `7` render, `8` mqtt status/retry, `9` message pump, `10` modem health check, `11` location, `12` sms, `13` ca trust, `14` saving state, `15` deliberate restart. An index outside this table (future firmware) is logged as the raw int. Absent means firmware that predates this field. **Display and diagnosis only.** |
 | `bpull` | int | no | `1` | *(§3.7: the gate that keeps a book nudge away from firmware that would read it as an empty book.)* Present with value `1` when the firmware fetches its book over HTTPS; absent means it takes the full `/down` `book`. The relay stores it and sends nudges only while the last online `/status` carried it. |
@@ -715,10 +739,15 @@ broker-generated LWT.
 | `ota_t` | string | no | 16 lowercase hex chars | *(OTA)* Short id of the stored job's target image; present only while the device holds a job. **Display only.** |
 | `ota_st` | string | no | `wait` \| `dl` \| `ready` \| `inst` \| `ok` \| `fail` \| `rb` | *(OTA)* Job state: waiting for a download window, downloading, verified and waiting to install, installing, done, failed (see `ota_err`), rolled back. Present with `ota_t`. The relay ends its job record on `ok`, `fail` or `rb` for that target; otherwise **display only.** |
 | `ota_pct` | int | no | 0…100 | *(OTA)* Download progress. **Display only.** |
+| `ota_err` | string | no | 1–8 lowercase letters | *(OTA)* Why the job failed or was rejected: `base`, `hash`, `osha`, `http`, `budget`, `flash`, `nobl`, `pv`, `size`, `expired`; font jobs add `nopart`, `fmt`, `run`. A relay accepts any code in the range, since the list can grow. **Display only.** |
+| `ast` | int | no | 0, 1 or 2 | *(font OTA, `docs/ASSETS_OTA_DESIGN.md` §3.)* 0 = firmware with font OTA but no `assets_ota` partition, 1 = factory fonts active, 2 = `assets_ota` active. CBOR key 72. Absent means firmware without font OTA. The relay offers a font update only for 1 or 2. |
+| `ast_id` | string | no | 16 lowercase hex chars | *(font OTA)* Short id of the active `assets_ota` image; present only when `ast` is 2. CBOR key 73. The relay treats it equal to a font job's target as that job done. |
 | `bs` | map | no | sub-map below | *(battery stats, `docs/BATTERY_STATS_DESIGN.md`: the breadboard build has no fuel gauge, so drain is modelled from time spent in each state. The carrier board's gauge is read for the battery level, not for this window.)* The battery-stats window, in every online `/status` once the window holds ≥ 1 s. CBOR only (§3.3). **Display and modelling only.** |
 | `gnss` | int | no | `0` \| `1` | *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`: shows whether a `cfg.loc` push took effect.)* `1` when the device may power its GNSS receiver, `0` when `cfg.loc` (§3.2) has disabled it. Present in every `/status` from firmware that supports `cfg.loc`; absent means firmware that predates the field, which the relay treats as unknown. **Display only.** |
 | `car` | string | no | ≤24 printable ASCII chars | *(Soracom bearer, `docs/SORACOM_DESIGN.md` §3.4: shows which carrier preset, and so which bearer, the device chose from its SIM.)* Label of the carrier preset in force, e.g. `Soracom`, `US Mobile Dark Star`; absent when no preset is in force (carrier default or typed custom APN) and in firmware that predates the field. A relay drops a malformed value alone, treating it as absent. **Display only.** |
 
+*(`loc_period_s`, `loc_min_s`, `tls`, `ca_fp`, `loc_backoff_s`, `sms_lost`, `rst`, `stage`,
+`abn`, `stallcmd` and `loc_move_s` — eleven fields — are **display and diagnosis only**; the relay stores the reported
 values and never writes them back. The device owns its location duty cycle because the cost being
 traded is GNSS power on its battery (§12 item 8), which the server cannot see. Making these
 server-settable would need a `/cfg` topic, which §11 still only reserves. `link` is the one
@@ -727,6 +756,7 @@ whether to re-publish unacked `/down` messages, exactly as it already does for `
 *(`gnss` is the one server-set location control, because it is an on/off
 hardware-fitness switch for a damaged or unwanted antenna rather than duty-cycle tuning.)* It is
 carried by `kind:"cfg"` (`cfg.loc`, §3.2) like every other device setting, so the `/cfg` topic
+remark above applies to the location tuning fields only. `gnss` is in addition to the eleven fields
 above and is likewise **display only** in `/status`: it reports the state the device applied.
 They are optional, so
 a `/status` without them remains valid, and a relay MUST treat their absence as "unknown", not as `0`.
@@ -756,6 +786,9 @@ re-sent window must be recognisable and a reset must not lose one, `docs/BATTERY
 | `cn` | MQTT session (re)connects, i.e. TLS handshakes. |
 | `md` | `[off, search, gnss]`: modem-state seconds over the whole window, sleep included; registered idle is `dt − off − search − gnss`. |
 | `re` | Radio events: successful publishes, liveness SUBSCRIBEs and inbound MQTT messages (each costs an RRC tail). |
+| `sa` | Optional (absent on older firmware). Shakes accepted in the window (uint). |
+| `sr` | Optional. Shake candidates rejected in the window (uint). |
+| `sp` | Optional. Whole seconds awake because a shake was pending with no hot window open (uint); a sub-measure of the `aw` `hot` bucket, so the mAh model must not add it again. |
 
 ### 5.2 LWT payload (48 bytes)
 
@@ -802,6 +835,7 @@ keeps the TLS+MQTT session up on eDRX while the ESP32 is in deep sleep; that dev
   `id`), otherwise build and publish a new one. Runs after the online-edge re-publish above, as
   the full-book re-push does.
 - The relay MUST NOT publish anything to `/down` on a timer for liveness. There is no application
+  ping. Liveness is the device's: MQTT keepalive plus its host re-SUBSCRIBE (§6.2).
 
 ### 5.4 Device publish cadence
 
@@ -833,6 +867,7 @@ Status is **never** published on a plain paging wake or on receipt of a down mes
 | LWT | **NOT SETTABLE from the library** | `mqttConfig()` emits `AT+SQNSMQTTCFG=0,"<clientId>"[,"<user>","<pass>"][,<tlsProfileId>]` and stops there (`src/proto/WalterMQTT.cpp:53-75`) — no will topic, message, QoS or retain argument, and grepping the whole of `src/` for `will`/`lastwill` returns nothing. §5.2's LWT contract therefore has no implementation path through the typed API. Fallback: `WalterModem::sendCmd()` (public) can queue a raw `AT+SQNSMQTTCFG=...` carrying the will parameters *before* `mqttConnect()`. Not verified against the Sequans AT manual. If that fails, the relay must fall back to inferring offline from keepalive expiry and §5.2's LWT becomes advisory. Tracked in §12. |
 | TLS (production) | TLS 1.2; server certificate validated **only if the bootstrap bundle carried a CA** (`DEVICE_PLAN.md` §3.3, default: none, validation off); username/password per device; profile 2. **The profile MUST name certificate slot 12 even with validation off** — with no slot named the modem's MQTT engine silently sends plaintext MQTT to the TLS port (verified on hardware, `DEVICE_PLAN.md` §3.3). | Provisioning is the vendor's `examples/mqtts` flow: `tlsWriteCredential(false, 12, ca_pem)` → `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_CA, WALTER_MODEM_TLS_VERSION_12, 12)` → `mqttConfig(client_id, user, pass, 2)`. Both functions are public (`src/WalterModem.h:4147` and `:4404`). **Slot discipline: certificate slots 0–10 and private-key index 1 are reserved for Sequans/BlueCherry — use ≥ 11, and TLS profile ≥ 2 (profile 1 is BlueCherry's).** |
 | TLS (bootstrap) | no server-cert validation; profile 2 (the library caps profile ids at 0–2, and bootstrap and production never share a power cycle) | For the one-time setup fetch (§3.2): `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_NONE, WALTER_MODEM_TLS_VERSION_12, 12)`. **Verified on hardware:** the slot argument is required — `no_cert` makes the MQTT engine send plaintext (see the production row). The bundle is authenticated and encrypted under a token-derived key, so server authentication on this hop adds only DoS resistance. |
+| Bearer (Soracom Beam) | On a SIM whose carrier preset names the Beam bearer (`docs/SORACOM_DESIGN.md` §3.1, §3.3): **plain MQTT** from the modem to `beam.soracom.io:1883`, TLS profile **0** (`mqttConfig(dev_id, dev_id, mqtt_pw, 0)`, no `tlsConfigProfile`, no CA slot); client id, username and password unchanged and passed through to the broker (Beam `useClientCredentials`); Beam opens MQTTS to EMQX. Keepalive **1200 s** (the Soracom preset, §6.2), Beam's ceiling of 0 or 5…1200 s; the 840 s host liveness re-SUBSCRIBE (§6.2) crosses both legs and stays inside Beam's 1.5 × keepalive = 1800 s idle cut. Not yet tested through Beam at 1200 / 840 s. The bootstrap `boot-<bid>` session (§3.2) also goes through Beam (plain MQTT, keepalive 60); the setup code's `host:port` and the identity's stored `host`/`port` are **not used** on this bearer (Beam's group destination decides the broker) and are kept for a later direct bearer. `cfg.ca` is refused and `/status.tls` is `proxy` (§5.1). | *(Soracom bearer: moves TLS off the pager; the topics, QoS, retain flags, envelope and HMAC are unchanged, so the relay cannot tell a Beam session from a direct one.)* *(Keepalive 1200 / re-SUBSCRIBE 840 s because Soracom holds an idle flow ≥1200 s; fewer radio wakes.)* Beam's address is in carrier-grade NAT space, so the firmware selects this bearer only when the SIM's preset names it, never on another operator's network. Hop pager → Beam is plaintext inside Soracom's network; envelope authenticity still rests on §14's HMAC. |
 | Reconnect policy | **Only** on detected session loss. Never on a timer. Backoff 5 s, 15 s, 60 s, 300 s, then 300 s steady. | Each reconnect costs a full TLS handshake ≈ 5 kB (§7) — reconnects are the largest single term in the data budget. |
 
 *(scoping note, no behaviour change.)* Every row above describes the **device's**
@@ -845,9 +880,45 @@ it. The broker must therefore still support an LWT and QoS 1 in both directions 
 
 | Parameter | Value |
 |---|---|
+| MQTT keepalive | **Per carrier preset, fixed per session at connect** (`carrier.h` `mqtt_keepalive_s`), passed as the third argument of `mqttConnect(host, port, keepAlive)`: **1200 s** on Soracom (Beam and direct); **480 s** on US Mobile Dark Star, Automatic, Carrier default and any custom or unknown APN. Bootstrap stays 60 s. The modem does send PINGREQ at this interval when nothing else went up (measured, below), but the host ping normally pre-empts it; its main effect is the broker's "this client is dead" deadline at 1.5 × keepalive = 30 min (Soracom) or 12 min (others). |
+| Host-driven liveness ping | **Required, after `mqtt_ping_s` of uplink silence: 840 s on Soracom, 240 s on every other preset**: a raw `AT+SQNSMQTTSUBSCRIBE` to `pager/{id}/down`, issued from the 5 s wake-and-drain cycle (§8). The SUBACK proves the round trip and re-arms the subscription after a silent modem resume; a missing SUBACK is the only way a flow the carrier killed silently is detected. Specified in `V02_DESIGN.md` §9; ~10 mAh/day on Soracom, ~36 mAh/day on AT&T (estimate). |
 | ESP32 RTC-timer wake for the ping | **None** — it rides the existing 5 s wake (§8), so it adds no wake source. The library exposes no `mqttPing()`, and there is no ping in the Sequans MQTT AT command set at all. |
+| Server Keep Alive override | If the broker documents a lower cap, the **smaller** value wins. Note `WALTER_MODEM_MQTT_MIN_PREF_KEEP_ALIVE` (`src/WalterModem.h:236`, value 20) is still declared but referenced nowhere in v1.5.0, so the library imposes no floor of its own. EMQX granted 480 s and mosquitto took 60–1200 s as sent; whether Beam or EMQX clamps 1200 s is not verified. |
+
+*(per-carrier timing: AT&T kills idle flows between 240 and 360 s and Soracom keeps them ≥1200 s, so one value cannot serve both.)*
+
+**Measured: the modem does send PINGREQ at the keepalive; the
+carrier kills idle flows.** Probe firmware on a bench pager (modem `UE8.2.1.0`, eDRX 0010/0001,
+ESP32 light sleep, idle after SUBSCRIBE) against mosquitto behind a TLS terminator, with a capture:
+
+| Carrier | Keepalive | Result |
+|---|---|---|
+| AT&T (US Mobile Dark Star) | 60, 240 s | PINGREQ every keepalive, answered |
+| AT&T | 360 s (twice), 480 s | no PINGREQ reached the broker; broker drop at 1.5 × keepalive. The capture shows the flow already dead: close_notify retransmitted, no ACK, no RST. Idle cut between 240 and 360 s |
+| Soracom direct (`soracom.io`) | 360, 600, 900, 1200, 1800 s | PINGREQ on the same connection at keepalive, PINGRESP ACKed. Idle survival ≥1800 s |
+
+An earlier run with no PINGREQ (`keepalive=480` on AT&T, EMQX `recv_pkt` stuck at 1) was real, but the cause was AT&T's network dropping the
+idle flow before the ping: no RST reaches the modem and it raises no URC, so it never notices the
+flow is dead. The 10–13 min deaths seen in that run at `keepalive=1800` are the same cut. Still true: after the modem resumes a session by itself it emits `+SQNSMQTTONCONNECT` with no
+`+SQNSMQTTONDISCONNECT` first, and the host **must** re-subscribe or receive nothing.
+
+Hence the host-driven ping stays the single liveness mechanism even though the modem pings: only a
+host-level round trip (SUBSCRIBE → SUBACK) detects a dead flow, and it also repairs a silent resume.
+Each re-SUBSCRIBE resets the modem's keepalive timer, so the modem's own PINGREQ fires only after a
+missed host ping. Per-carrier values: the ping sits under the carrier's idle cut, and
+2 × ping < 1.5 × keepalive so one missed ping is survivable (Soracom 2 × 840 < 1800; others
+2 × 240 < 720). 840 s on Soracom keeps an unnoticed dead session under ~15 min. A custom or unknown
+APN gets the AT&T pair, the smallest cut measured. `V02_DESIGN.md` §9 is the specification. It also
+supersedes §7.3's "48 keepalives 48 × 0.07 kB" line (now ≤360 × ~0.17 kB ≈ 61 kB/day on AT&T,
+~103 × ~0.17 kB ≈ 18 kB/day on Soracom) and §8.4's 0.75 mA keepalive row.
 
 Energy arithmetic, unchanged in form: an uplink packet needs an RRC connection, roughly 3 s at
+~120 mA ≈ 0.1 mAh (estimate, the weakest number in the chain — measure it). Worst case, no other
+uplink: Soracom 86400/840 ≈ 103 pings/day ≈ 10 mAh/day; AT&T
+86400/240 = 360 pings/day ≈ 36 mAh/day. Both values are per-preset constants in `carrier.c`.
+
+Not verified: the per-ping energy, Soracom idle survival beyond 1800 s, the new
+values through Beam, and behaviour on other carriers such as T-Mobile (Google Fi).
 
 
 ### 6.3 eDRX (sleep mode)
@@ -866,6 +937,7 @@ The MQTT session lives **inside the modem** and survives ESP32 deep sleep. There
 1. ESP32 deep sleep MUST NOT power-cycle or reset the modem. Any power-gating of the modem
   would destroy the session and force a ~5 kB TLS handshake on every wake — that alone would be
   ~150 kB/day at 30 wakes/day and would dominate everything else in §7.
+2. eDRX is what makes an 8–20-minute keepalive (§6.2) compatible with 30-second delivery: the network pages
   the modem within one eDRX cycle (≤20.48 s), independent of the keepalive timer.
 3. The ESP32 does **not** wake for the keepalive (§6.2). The only periodic ESP32 wake in sleep mode
   is the **5 s wake-and-drain cycle** of §8 — which exists because the library's incoming-message
@@ -940,9 +1012,11 @@ every 15 min plus 2 on-demand location requests.
 ```
 20 down msgs fully acked 20 x 0.43 kB = 8.6 kB
  5 replies 5 x 0.14 kB = 0.7 kB
+360 host pings 360 x 0.17 kB = 61.2 kB (§6.2: SUBSCRIBE + SUBACK with TLS and IP framing; AT&T 240 s worst case, Soracom 840 s ~103 x 0.17 = 17.5 kB)
 34 status publishes 34 x 0.16 kB = 5.4 kB (24 heartbeat + ~10 event-driven)
  4 reconnects 4 x 5.00 kB = 20.0 kB
   ---------
+  95.9 kB/day -> 2.9 MB / 30 days (signed CBOR)
 96 periodic /loc @15 min 96 x 0.19 kB = 18.2 kB
  2 location requests 2 x 0.33 kB = 0.7 kB
   ---------
@@ -1001,6 +1075,7 @@ bridge network. Traffic sent, matching the "measurable, non-modem" slice of §7.
 over a fixed synthetic load: **20 down messages, each fully acked `shown` then `read`, plus 5
 student replies** (the modem-side keepalives are not reproducible here — there is no modem, and the
 relay's own keepalive is a plain 60 s service keepalive per `RELAY_KEEPALIVE_S`
+(`relay/app/mqtt_transport.py`), not the device's per-carrier 480 / 1200 s figure (§6.2) — so keepalive/status traffic is
 excluded from this measurement, not estimated).
 
 **How.** `docker stats --no-stream --format '{{.NetIO}}' relay-broker-1` before and after the run,
@@ -1244,6 +1319,7 @@ real hardware (`firmware/README.md`).
 | Wake-and-drain overhead, `T` = 5 s | 1.60 mA (estimate) | 200 ms awake at an assumed 40 mA every 5 s (§8.2); the 200 ms is measured, the current is not |
 | Modem eDRX paging | 0.2–0.5 mA (estimate) | 2 paging occasions per 20.48 s cycle, ~50 ms each at ~50 mA RX, plus warm-up |
 | Modem idle floor | 0.01–0.05 mA (estimate) | Sequans GM02SP deep-sleep-between-paging |
+| Host liveness ping, amortised | ~1.5 mA AT&T, ~0.43 mA Soracom (estimate; the total below was computed at 1.2 mA) | 360 or ~103 pings/day × ~0.1 mAh (§6.2); the ESP32 re-subscribes after 240 s (840 s on Soracom) of uplink silence from a wake it takes anyway, because only a host round trip detects a flow the carrier killed silently |
 | Display (gated off via the eInk Friend's ENA, IO12) | ~0 mA | e-paper VCC gated between refreshes |
 | **Sleep-mode total** | **≈ 4.0–4.5 mA → 95–107 mAh/day** | On a ~2500 mAh LiPo cell: **~23–26 days idle** |
 
@@ -1426,6 +1502,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 20 | `more` | bool | `/down` `book` (reserved for chunking); §3.7 fetch response, `true` when `c[]` was truncated at 32 |
 | 21 | `state` | tstr | `/status` (online/offline) |
 | 22 | `mode` | tstr | `/status` (sleep/active) |
+| 23 | `batt_mv` | int | `/status` (raw modem-rail millivolts, optional) |
 | 24 | `rssi` | int | `/status` (signal strength in dBm) |
 | 25 | `session` | tstr | `/status` (session id) |
 | 26 | `fw` | tstr | `/status` (firmware version) |
@@ -1453,6 +1530,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 49 | `cell` | map | `/loc` envelope, optional (§13.2 — cell-tower location fallback) |
 | 50 | `link` | int | `/status` (§9.5 — MQTT-session generation within a boot, optional) |
 | 51 | `sndr` | tstr | `/down` `msg` in a group conversation (§3.1 — the author's alias when `from` names the group) |
+| 52 | — | — | **retired**, do not reuse — was `/status` `xport` (`lte`/`wifi`), §5.1 |
 | 53 | `rst` | uint, 0…255 | `/status` (crash diagnostics, §5.1 — `esp_reset_reason_t`, optional) |
 | 54 | `stage` | uint, 0…255 | `/status` (crash diagnostics, §5.1 — main-loop stage index, optional) |
 | 55 | `abn` | uint, 0…65535 | `/status` (crash diagnostics, §5.1 — abnormal-reset count since power-on, optional) |
@@ -1471,6 +1549,9 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 68 | `bs` | map | `/status` (battery stats, `docs/BATTERY_STATS_DESIGN.md`; optional, CBOR only, §3.3) |
 | 69 | `gnss` | uint 0/1 | `/status` (GNSS disable, §5.1 — `cfg.loc` effective state, optional; `docs/GNSS_DISABLE_DESIGN.md`) |
 | 70 | `car` | tstr, ≤24 B | `/status` (Soracom bearer, §5.1 — carrier preset label, optional, display only; `docs/SORACOM_DESIGN.md` §3.4) |
+| 71 | `temp_dc` | int | `/status` (modem temperature, tenths of °C, −400…1250, optional) |
+| 72 | `ast` | uint 0–2 | `/status` (font OTA, §5.1 — 0 no `assets_ota` row, 1 factory, 2 `assets_ota` active, optional) |
+| 73 | `ast_id` | tstr, 16 hex | `/status` (font OTA, §5.1 — active `assets_ota` id, only when `ast`=2, optional) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1491,19 +1572,25 @@ book parser.)*
 `cfg` object (inside `/down` `cfg`, key 38 above): `lock=0` (map, existing — see below), `ca=1`
 (map, `V02_DESIGN.md` §4.4: `{url=0 tstr, sha=1 bstr(32)}`; `sha` absent on an un-pin push, `url=""`),
 `sms=2` (array, §3.6: the device's whole SMS contact allow-list, `[{n=0 tstr, p=1 tstr}, …]`),
+key `3` **retired**, do not reuse — was `wifi`, the Wi-Fi enable flag and credentials.
 
 `lock` map (inside `/down` `cfg.lock`): `clear=0` (bool), `auto=1` (int minutes).
 
 `ota=4` (map inside `/down` `cfg`, `docs/OTA_DESIGN.md` §5, §3.2): `img=0` (bstr(32)), `isz=1`
 (uint), `url=2` (tstr, `https://`), `osz=3` (uint), `osha=4` (bstr(32)), `fmt=5` (uint, `0` full,
 `1` delta), `base=6` (bstr(32), delta only), `psz=7` (uint, delta only), `cancel=8` (bool; a map
+with `cancel` needs no other key), `fv=9` (uint 1…255, required in `cfg.ast`, ignored in `cfg.ota`). Unknown sub-keys are ignored. *(listed apart from the `cfg`
 line above so that line's existing allocation reads unchanged.)*
+
+`ast=6` (map inside `/down` `cfg`, `docs/ASSETS_OTA_DESIGN.md` §3): the same sub-keys as `ota=4`
+including `fv=9`; `base`/`psz` are never sent.
 
 `loc=5` (map inside `/down` `cfg`, `docs/GNSS_DISABLE_DESIGN.md`, §3.2): `gnss=0` (bool; absent
 means no change). Unknown sub-keys are ignored. *(Listed apart, like `ota=4`; this is `cfg`'s own namespace, distinct from key 8 `loc` in
 the `/loc` envelope.)*
 
 `bs` map (inside `/status`, key 68 above, §5.1): `sq=0, dt=1, sl=2, aw=3` (array of 6 uint)`,
+ns=4, x1=5, rl=6, rf=7` (array of 3 uint)`, mvn=8, cn=9, md=10` (array of 3 uint)`, re=11`, `sa=12`, `sr=13`, `sp=14` (uint each, optional shake counters). Unknown
 sub-keys are ignored.
 
 `ca` map (inside `/down` `cfg.ca`, `V02_DESIGN.md` §4.4): `url=0` (tstr; `""` means un-pin), `sha=1`
@@ -1575,6 +1662,8 @@ the future.
 
 2. **`NEEDS HUMAN DECISION` — broker free-tier limits.** This contract needs,
   per device: QoS 1 both directions, a retained `/status`, an LWT, `cleanSession=false` with a
+  persistent session that outlives a coverage gap, and the §6.2 keepalive (480 s, 1200 s on Soracom). If the chosen free tier
+  caps session expiry below a useful window, caps keepalive below those values, or limits
   credentials/connections such that a second device needs a paid plan, that is a paid-service
   decision. There is a wrinkle: two of those five properties (LWT, clean session) may be
   unreachable from the device side regardless of what the broker allows — see item 3.
@@ -1586,6 +1675,7 @@ the future.
   **(a)** send a raw `AT+SQNSMQTTCFG` with the will parameters via the public `sendCmd()` before
   connecting — free if the Sequans AT manual supports it, needs the manual to confirm;
   **(b)** upgrade the component if a future release exposes them; **(c)** drop the LWT and have the
+  relay infer offline from keepalive expiry, which costs up to 720 s (1.5 × the 480 s keepalive), or 1800 s on Soracom (1.5 × 1200 s), of staleness in the parent UI;
   **(d)** patch the managed component, which this project's dependency rule argues against.
   Someone should pick between (a)-(c). Default if nobody picks: (a) attempted, (c) as the
   fallback, and §5.2 is then advisory rather than binding.
@@ -1610,6 +1700,8 @@ the future.
 
   Instead: `walter-modem` v1.5.0 exposes `configVoltageMonitor()` / `getVoltage()`, mapping to the
   Sequans-specific `AT+SQNVMON` command, which reports the GM02SP modem's own supply-rail voltage
+  in **millivolts** (bench reading on USB: `+SQNVMON: 1,30,30,5203`; the threshold argument is
+  in tenths of a volt, but the reading is not — the Sequans and Walter docs wrongly say tenths for both). Whether that rail tracks the *battery* rather than a fixed regulated rail was
   checked against Walter's public hardware schematics
   (`https://github.com/QuickSpot/walter-hardware`), not just guessed:
   - the GM02SP's power pins sit on a net explicitly named `VBAT`, distinct from Walter's own
@@ -1625,6 +1717,7 @@ the future.
   Taken together this is strong (not certain — Walter's own internal PCB routing from `VIN` to the
   GM02SP's `VBAT` pins is not published, only inferred by elimination) evidence that `getVoltage()`
   tracks real battery voltage on a battery-powered Walter build, not a fixed 3.3V rail. `net.cpp`
+  now calls it and reports the result as `batt_mv` (raw and unclamped, no 2000–5000 range or placeholder; omitted when there is no reading yet; the modem temperature rides alongside as `temp_dc`); §12's unverified-assumptions table below
   carries the one open item this rests on. **Not verified, cheap to confirm**: on first hardware
   bring-up, compare `getVoltage()`'s reported value against a multimeter reading of the actual
   battery — 5 minutes, no code change either way.
@@ -1679,6 +1772,9 @@ the future.
 | 6.1 | A CA can be provisioned from application code | **Yes**, `tlsWriteCredential()` is public in v1.5.0; cert slot ≥ 11, TLS profile ≥ 2 | — |
 | 6.1 | The modem's MQTT session is `cleanSession=false` | **Not verified; load-bearing.** Not settable, so it is whatever the Sequans defaults to — and `mqttConnect()` clearing the subscription table hints at "clean" | §12 item 4, ~20 min on hardware |
 | 6.1 | An LWT can be registered | **Not verified**; no typed API | Raw `AT+SQNSMQTTCFG` with will parameters via `sendCmd()`; check the Sequans AT manual first, 30 min, no hardware |
+| 6.2 | Modem issues PINGREQ autonomously | **Yes, measured**: at the keepalive (60–1200 s seen); the ESP32 keepalive wake stays deleted | — |
+| 6.2 | The per-carrier keepalive (480 / 1200 s) is not silently clamped by modem or broker | **Partly**: EMQX granted 480 s; mosquitto took 60–1200 s as sent. Not verified for 1200 s through Beam to EMQX | Read the granted value from EMQX's connection view on a Soracom pager |
+| 6.2 | Carrier NAT tolerates the idle TCP flow | **AT&T: no beyond 240 s** (survives 240, silently dead by 360; the 10–13 min deaths were this cut). **Soracom direct: ≥1800 s**. Beam and T-Mobile not tested | Probe at the keepalive in question against the capture broker |
 | 6.3 | eDRX API takes seconds vs. the raw 3GPP nibble | **Yes**: raw 4-bit binary nibble strings, spliced verbatim into `AT+SQNEDRX` | — |
 | 6.3 | The granted eDRX/PTW values are readable | **Yes**, `setNetworkEventHandler()` → `WALTER_MODEM_NETWORK_EVENT_EDRX_RECEIVED` → `data.edrx.nwProvidedEdrx` | — |
 | 6.3 | Carrier grants the requested 20.48 s / 2.56 s | Not verified; §6.5 breaks if it grants 40.96 s | Assert on `nwProvidedEdrx` at attach — free, first bring-up |

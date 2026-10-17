@@ -23,6 +23,7 @@ current. Never ship it.
 ```
 idf.py -p /dev/cu.usbmodem101 app-flash                       # application only
 esptool.py --chip esp32s3 write_flash 0x11000 assets.bin      # fonts (tools/mkassets.py)
+# Font OTA images are never USB-flashed to `assets`; the one-time table migration is in docs/ASSETS_OTA_DESIGN.md.
 esptool.py --chip esp32s3 erase_region 0x9000 0x6000          # wipe settings -> Setup mode
 ```
 
@@ -179,6 +180,10 @@ keep each `key` argument to 8 characters until a capture shows longer bursts are
 
 In the order worth testing:
 
+1. **Per-carrier timing keeps a session alive for at least an hour**: AT&T (keepalive 480, re-SUBSCRIBE
+   240 s) and Soracom over Beam (1200 / 840 s). The modem's own PINGREQ behaviour is settled (see
+   `MODEM_KEEPALIVE_EVAL.md`); this checks the production re-SUBSCRIBE end to end. Flash production
+   firmware, idle the pager (no pages sent), and check periodically on the broker's admin console that
    the client remains listed. Minimum overnight run.
 2. **Bisect the post-wake window between 50 and 200 ms** to find the minimum and explain the 136 s
    delivery. Use `sleeptest` with `yield_ms` overrides and log the delivery times against the eDRX

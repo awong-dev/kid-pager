@@ -51,6 +51,14 @@ the full image and all four deltas took 2–3 ms on the host.
 
 ## 3. Decoder budget on the ESP32-S3
 
+**RAM free at runtime.** The `heap at boot` total was **2,170,496 B**. The PSRAM pool is 2048 KiB, and
+its largest free block after startup was 1,998,848 B (= 2 MiB − flightrec's 96 KiB). So PSRAM has
+about 1.9 MB free. Internal SRAM regions total 163 KiB, and 32 KiB of that is reserved for DMA. The
+lowest internal floor on record is **68 KB free, 31.7 KB largest block**. These figures were measured
+with an earlier radio configuration, so treat them as a conservative bound. The OTA path therefore
+puts **all decoder state in PSRAM** (`MALLOC_CAP_SPIRAM`) and adds **< 1 KB of internal RAM** (stack
+depth inside the modes_run task, whose 16 KB stack is internal; flash writes require that). It reuses
+cafetch's existing static 1500 B receive buffer.
 
 | Option | Working set | Code | Patch for keylat→main | Verdict |
 |---|---|---|---|---|
