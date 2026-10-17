@@ -4,6 +4,8 @@ cluster from the Good Display reference circuit, and the JST SH cable
 connector to the carrier."""
 
 
+ZIF_FP = "pager-carrier:Hirose_FH34SRJ-24S-0.5SH_1x24-1MP_P0.50mm_Horizontal"
+FL_ZIF_FP = "pager-carrier:Hirose_FH34SRJ-6S-0.5SH_1x06-1MP_P0.50mm_Horizontal"
 
 FPC_PINS = {
     1: "NC", 2: "EPD_GDR", 3: "EPD_RESE", 4: "NC", 5: "EPD_VSH2", 6: "NC", 7: "NC", 8: "GND",
@@ -22,11 +24,17 @@ def build(prj, lib):
     sh = prj.add_sheet("panel", "panel_main.kicad_sch", paper="A3",
                        title="SSD1680 panel board: ZIF, boost and charge pump, cable to carrier")
     j1 = sh.place("J1", "Connector_Generic:Conn_01x24", 60, 110, value="GDEY029T94 FPC", footprint=ZIF_FP,
+                  fields=fields("FH34SRJ-24S-0.5SH(50)", Note="1.0 mm high, top+bottom contact; FPC folded 180 deg under the glass; confirm pin-1 side on a panel"))
     for p, n in FPC_PINS.items():
         sh.net(j1, p, n, stub=2)
     sh.text("TSCL/TSDA (6/7) open: internal temperature sensor. BS1 (8) low: 4-wire SPI. VPP (19) open, OTP only. VDD (18) is the internal 1.8 V LDO output, cap only.", (20, 175), 1.27)
 
+    j2 = sh.place("J2", "Connector_Generic:Conn_01x10", 60, 220, value="CARRIER", footprint=SH10,
+                  fields=fields("SM10B-SRSS-TB", Note="to carrier J3, 1:1 10-way SH cable"))
+    for p, n in enumerate(PANEL_CABLE, 1):
         sh.net(j2, p, n, stub=2)
+
+        sh.net(j3, p, n, stub=2)
     sh.pwr_flag("3V3_EPD", (200, 30))
     sh.pwr_flag("GND", (210, 30))
 

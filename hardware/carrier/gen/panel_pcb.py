@@ -25,6 +25,7 @@ def main(route=False):
     b.outline_polyline([(0, 0), (W, 0), (W, H), (0, H)], radius=1.0)
     b.edge_keepout([(0, 0), (W, 0), (W, H), (0, H)])
     P = {
+        "J1": (20.0, 17.6, 180),    # display ZIF, contacts toward the bottom edge: the FPC enters from there (glass side)
         "L1": (18.0, 4.5, 0),
         "Q5": (23.0, 4.0, 90),
         "D3": (28.5, 2.5, 0), "D2": (28.5, 4.8, 0), "D1": (28.5, 7.1, 0),
