@@ -23,6 +23,7 @@ The board scripts run under KiCad's python
 
 - `Walter_Module_2x14_THT`: datasheet rev 1.1 (hw 1.6) section 6 plus the
   vendor `walter-solder.kicad_mod`. Rows 17.78 mm
+  apart, 2.54 pitch, pin 1 at 9.72 mm from the USB-C end, 1.02 drill / 1.7 pad.
   The carrier sits above a header-side-up Walter, so the pattern is the
   **mirror** of the vendor's: pin 1 is on the +X row as seen from the carrier
   top. SIM holder, u.FL jacks and USB-C are marked on User.Comments.
@@ -83,6 +84,7 @@ The board scripts run under KiCad's python
 14. **BOM**: SN74LVC2G126DCUR (VSSOP-8) and USB4235 are not stocked by
     LCSC/JLCPCB (hand-place; DCTR is MSOP-8 0.65 mm, a different footprint).
     The BOM carries LCSC numbers; basic parts preferred.
+15. **Routing** is Freerouting's output (GND routed as tracks, then pours on
 
 ## Open questions
 

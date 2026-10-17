@@ -23,6 +23,7 @@ def main(route=False):
     b = Board(prj, d, "pager-panel", thickness=1.0)
     b.load_all()
     b.outline_polyline([(0, 0), (W, 0), (W, H), (0, H)], radius=1.0)
+    b.edge_keepout([(0, 0), (W, 0), (W, H), (0, H)])
     P = {
         "L1": (18.0, 4.5, 0),
         "Q5": (23.0, 4.0, 90),

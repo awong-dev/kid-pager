@@ -49,10 +49,14 @@ def main(route=False):
 
     P = {
         "M1": (WALTER_X, WALTER_Y, 0),
+        "U5": (13.5, 12.5, 0), "U6": (9.8, 23.7, 0), "Q2": (17.0, 23.7, 0), "JP1": (25.4, 44.0, 90), "F1": (25.3, 34.0, 90),
         "U1": (13.5, 31.0, 0),
         "Q1": (9.0, 44.0, 0),
+        "J1": (34.0, 5.0, 0), "D4": (30.5, 10.3, 0),
+        "SW1": (47.5, 5.0, 0),
         "U3": (33.0, 16.0, 0), "L2": (37.5, 16.0, 0),
         "U4": (32.0, 26.0, 0),
+        "U7": (52.0, 20.0, 0),
         "U10": (45.0, 27.0, 0),
         "U9": (56.0, 11.5, 0),
     }
@@ -65,11 +69,18 @@ def main(route=False):
     walter_caps = sorted(groups.pop("M1", []))
     rects = {
         "U5": (6.6, 15.3, 20.6, 20.5, 90),
+        "U6": (6.6, 26.0, 11.8, 29.0, 90), "Q2": (14.5, 26.0, 20.6, 29.0, 90),
         "U1": (6.6, 33.6, 20.6, 41.5, 90),
         "Q1": (11.5, 42.6, 20.6, 47.0, 90),
+        "J1": (27.5, 13.0, 39.5, 15.4, 90), "VBUSDET": (33.0, 9.0, 40.0, 11.6, 90),
         "U3": (27.5, 18.5, 46.0, 22.5, 90),
+        "U4": (27.5, 28.5, 40.0, 31.5, 90), "J3": (36.0, 32.5, 44.0, 35.0, 90),
+        "U7": (47.0, 22.5, 60.0, 25.0, 90),
         "U10": (42.0, 29.5, 48.0, 31.5, 90),
         "U9": (53.0, 14.0, 61.0, 17.5, 90),
+        "J4": (27.5, 38.3, 34.0, 42.0, 90),
+        "D5": (24.2, 0.7, 27.8, 3.8, 90),
+        "J2": (27.5, 33.0, 33.5, 36.0, 90), "F1": (27.5, 33.0, 33.5, 36.0, 90),
     }
     for a, refs in groups.items():
         if not refs:
@@ -81,6 +92,8 @@ def main(route=False):
         b.pack(sorted(refs), x0, y0, x1, y1, rot=rot)
 
     for cx, cy in UFL:
+        b.keepout(Board.circle_pts(cx, cy, 3.0), fps=False, name="u.FL keep-out")
+    b.edge_keepout(pts)
     gx0, gy0, gx1, gy1 = GLASS
     for a, c in (((gx0, gy0), (gx1, gy0)), ((gx1, gy0), (gx1, gy1)), ((gx1, gy1), (gx0, gy1)), ((gx0, gy1), (gx0, gy0))):
         b.seg(a, c, layer=pcbnew.Cmts_User, w=0.15)
@@ -92,6 +105,7 @@ def main(route=False):
     b.text("antenna pigtails", 8.5, 7.2, pcbnew.Cmts_User, 0.8)
     b.text("SIM loads from this edge (Walter beneath)", 13.5, 51.2, pcbnew.Cmts_User, 0.8)
     b.text("pager-carrier rev A", 44, 46.0, pcbnew.F_SilkS, 1.0)
+    b.text("accel X ->", 52.0, 26.2, pcbnew.F_SilkS, 0.8)
     b.text("WALTER UNDERNEATH, header side up", 13.5, 6.9, pcbnew.B_SilkS, 0.8)
 
     if route:
