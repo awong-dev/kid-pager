@@ -29,7 +29,11 @@ uint32_t modes_last_sleep_ext1_wakes(void);
 // Microseconds since the last key/button/ext1 event.
 int64_t modes_debug_last_input_age_us(void);
 
+/* True once a non-zero AT+SQNVMON reading has been taken this boot; until then
+ * modes_get_batt_mv() returns 0 (no reading). The reading is raw, ~5200 mV on USB. */
 bool modes_batt_mv_known(void);
+// Last modem temperature in tenths of C; false until the first reading.
+bool modes_get_temp_dc(int *temp_dc);
 const char *modes_get_fw_version(void);
 const char *modes_get_session_id(void);
 uint32_t modes_get_memfull_count(void);

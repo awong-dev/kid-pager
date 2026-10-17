@@ -175,10 +175,13 @@ typedef struct {
     char id[MSG_ID_MAX];
 } chat_row_src_t;
 
+static chat_row_src_t s_src[MSG_THREAD_DEPTH];
 static int s_rows[MSG_THREAD_DEPTH];
 // Copies of the open peer's messages, parallel to s_src[]/s_rows[].
+static msg_t s_entries[MSG_THREAD_DEPTH];
 
 // Wrapped lines of one message at a time.
+static char s_wrap_scratch[CHAT_MAX_ROWS_PER_MSG][64];
 static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch currently holds lines for
 
 {

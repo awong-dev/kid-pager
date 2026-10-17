@@ -1,3 +1,4 @@
+/* net_xport.h — transport vtable dispatched by net.cpp and implemented by xport_lte.cpp. */
 #ifndef NET_XPORT_H
 #define NET_XPORT_H
 

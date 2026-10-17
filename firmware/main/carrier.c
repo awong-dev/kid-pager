@@ -3,11 +3,21 @@
 #include <string.h>
 
 static const carrier_preset_t k_presets[] = {
+    { "Automatic", "", NULL, "", CARRIER_BEARER_DIRECT, CARRIER_AUTH_NONE, NULL, NULL, true, NULL, 480, 240 },
+    { "Carrier default", "", NULL, "", CARRIER_BEARER_DIRECT, CARRIER_AUTH_NONE, NULL, NULL, true, NULL, 480, 240 },
     // US Mobile "Dark Star" (AT&T reseller): MCC 310 MNC 410 (or 280), GID 20FF. With a blank APN
     // TLS handshakes stall and the requested eDRX is not granted.
+    { "US Mobile Dark Star", "ereseller", "310410 310280", "20FF", CARRIER_BEARER_DIRECT, CARRIER_AUTH_NONE, NULL, NULL, true, NULL, 480, 240 },
     // Soracom global SIM, PLMN 311-588. ICCID issuer prefix 8942310 is shared across its plans.
     { "Soracom", "soracom.io", "311588", "", CARRIER_BEARER_BEAM, CARRIER_AUTH_PAP, "sora", "sora", false,
+      "8942310", 1200, 840 },
 };
+
+void carrier_mqtt_params(const carrier_preset_t *p, uint16_t *keepalive_s, uint16_t *ping_s)
+{
+    if (keepalive_s) *keepalive_s = p ? p->mqtt_keepalive_s : CARRIER_MQTT_KEEPALIVE_DEFAULT_S;
+    if (ping_s) *ping_s = p ? p->mqtt_ping_s : CARRIER_MQTT_PING_DEFAULT_S;
+}
 
 size_t carrier_preset_count(void) { return sizeof(k_presets) / sizeof(k_presets[0]); }
 

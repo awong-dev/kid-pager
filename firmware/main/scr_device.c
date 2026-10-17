@@ -9,6 +9,7 @@
 #include "msg.h"
 #include "book.h"
 #include "net.h"
+#include "devinfo_fmt.h"
 #include "ota.h"
 #include "disp.h"
 
@@ -18,6 +19,8 @@
 #include "esp_system.h"
 
 typedef enum {
+    MROW_INFO = 0, /* opens the Device info screen */
+    MROW_RESYNC,
     MROW_TEXTSIZE,
     MROW_ROTATE,
     MROW_AIRPLANE, /* NVS net/airplane, takes effect at next boot */
@@ -188,6 +191,9 @@ static void device_on_key(input_key_t key)
             ui_show_toast("installing update");
             break;
         }
+        case MROW_INFO:
+            ui_push(&g_scr_devinfo);
+            break;
         case MROW_RESYNC:
             ui_show_toast(modes_publish_status_now() ? "re-sync requested" : "not connected");
             break;
@@ -327,6 +333,10 @@ static void device_render_normal(void)
     snprintf(lines[n], DEVICE_LINE_LEN, "broker %s:%u  sig %s", ident_get_host(),
              (unsigned) ident_get_port(), (ident_get_flags() & IDENT_FLAG_REQ_SIG) ? "on" : "off");
     selectable[n++] = false;
+    {
+        snprintf(lines[n], DEVICE_LINE_LEN, "signal %d dBm  batt %s", modes_get_rssi_dbm(), bv);
+        selectable[n++] = false;
+    }
     snprintf(lines[n], DEVICE_LINE_LEN, "session %s  book v%u", modes_get_session_id(),
              (unsigned) book_get_bv());
     selectable[n++] = false;
@@ -342,6 +352,12 @@ static void device_render_normal(void)
              (unsigned) modes_get_memfull_count(), (unsigned) modes_get_oversize_drop_count(),
              (unsigned) modes_get_modem_resets());
     selectable[n++] = false;
+    {
+        ota_status_t fs;
+        ota_get_status(&fs);
+        snprintf(lines[n], DEVICE_LINE_LEN, "tofu glyphs %u  Fonts: %s", (unsigned) gfx_get_tofu_count(),
+                 fs.ast == 2 ? fs.ast_id : "factory");
+    }
     selectable[n++] = false;
 
     int menu_start = n;
@@ -350,6 +366,8 @@ static void device_render_normal(void)
         selectable[n++] = true;
     }
     }
+    snprintf(lines[n], DEVICE_LINE_LEN, "Device info (battery, SIM, cell)");
+    selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Re-sync address book");
     selectable[n++] = true;
     snprintf(lines[n], DEVICE_LINE_LEN, "Text size: %s",

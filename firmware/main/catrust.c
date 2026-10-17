@@ -364,6 +364,7 @@ static void ack_apply(const char *id, bool shown)
 
 static void begin_unpin(const char *id)
 {
+    // ident_scratch() is one shared 4,460 B buffer; released on every exit path
     ident_t *snap = ident_scratch();
     strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
     strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
@@ -469,6 +470,7 @@ static void service_fetching(void)
 
 static void commit_apply(void)
 {
+    // ident_scratch() released as soon as ident_store() has consumed it
     ident_t *snap = ident_scratch();
     strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
     strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);

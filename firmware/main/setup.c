@@ -654,6 +654,7 @@ bool setup_run(const char *code)
         return fail(ui_ok, "code damaged");
     }
 
+    /* ident_scratch() is one shared buffer; release it on every exit path */
     ident_t *id = ident_scratch();
     static setup_ca_ptr_t ca_ptr;
     if (!decode_and_validate_bundle(plain, plain_len, id, &ca_ptr)) {

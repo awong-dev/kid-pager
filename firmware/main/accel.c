@@ -60,6 +60,27 @@ accel_shake_verdict_t accel_shake_step(accel_shake_t *s, const accel_shake_cfg_t
     return s->n > 0 ? ACCEL_SHAKE_PENDING : ACCEL_SHAKE_IDLE;
 }
 
+accel_rec_act_t accel_rec_step(accel_rec_t *r, bool read_ok, bool reboot_ok)
+{
+    if (read_ok) {
+        r->fails = 0;
+        r->resets = 0;
+        return ACCEL_REC_NONE;
+    }
+    if (r->fails < 255) {
+        r->fails++;
+    }
+    if (r->fails < ACCEL_REC_FAILS) {
+        return ACCEL_REC_NONE;
+    }
+    if (r->resets > 0) {
+        return reboot_ok ? ACCEL_REC_REBOOT : ACCEL_REC_HALT;
+    }
+    r->fails = 0;
+    r->resets = 1;
+    return ACCEL_REC_BUS_RESET;
+}
+
 #ifdef ESP_PLATFORM
 
 #include <string.h>
@@ -68,10 +89,17 @@ accel_shake_verdict_t accel_shake_step(accel_shake_t *s, const accel_shake_cfg_t
 #include "net.h"
 #include "pins.h"
 
+#include "watchdog.h"
+
+#include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "accel";
@@ -119,6 +147,43 @@ static const char *TAG = "accel";
 
 static bool s_present = false;
 
+// re-probe period while the chip is absent
+#define ACCEL_PROBE_RETRY_US (60LL * 1000000)
+static accel_rec_t s_rec;
+// for the halt screen
+static uint32_t s_consec_fails = 0, s_bus_resets = 0;
+static const char *s_fail_reg = "-";
+static esp_err_t s_who_err = ESP_OK;
+static uint8_t s_who = 0;
+static int64_t s_next_probe_us = 0;
+
+// Reboot budget in RTC RAM; HALT resets it, a healthy ACCEL_HEALTHY_US restores it.
+#define ACCEL_RTC_MAGIC 0x41434301u
+#define ACCEL_REBOOT_MAX 2
+#define ACCEL_HEALTHY_US (10LL * 60 * 1000000)
+static RTC_DATA_ATTR struct {
+    uint32_t magic, n, crc;
+} s_rtc;
+
+static uint32_t rtc_crc(void) { return esp_rom_crc32_le(0, (const uint8_t *) &s_rtc.n, sizeof(s_rtc.n)); }
+
+static void rtc_set(uint32_t n)
+{
+    s_rtc.magic = ACCEL_RTC_MAGIC;
+    s_rtc.n = n;
+    s_rtc.crc = rtc_crc();
+}
+
+static bool reboot_allowed(void) { return s_rtc.n < ACCEL_REBOOT_MAX; }
+
+static SemaphoreHandle_t s_bus_mtx; // serializes I2C_NUM_1 users against bus reset
+static StaticSemaphore_t s_bus_mtx_buf;
+
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+static uint32_t s_inject_fails = 0;
+static bool s_inject_only_pending = false;
+#endif
+
 // Refractory state; s_refr_until_us is when CTRL_REG3 I1_IA1 is re-enabled.
 static int64_t s_refractory_us = (int64_t) ACCEL_REFRACTORY_S * 1000000;
 static int64_t s_last_reported_us = 0;
@@ -156,17 +221,62 @@ static void accel_bus_init(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_ACCEL_SCL);
 }
 
+// Frees a bus held by a slave: delete driver, 9 SCL clocks + STOP, reinstall.
+static bool accel_bus_reset(void)
+{
+    if (xSemaphoreTake(s_bus_mtx, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return false;
+    }
+    i2c_driver_delete(I2C_NUM_1);
+    const gpio_num_t sda = (gpio_num_t) PAGER_PIN_ACCEL_SDA, scl = (gpio_num_t) PAGER_PIN_ACCEL_SCL;
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << sda) | (1ULL << scl),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(sda, 1);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(scl, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level(scl, 1);
+        esp_rom_delay_us(5);
+    }
+    gpio_set_level(sda, 0); // STOP: SDA rises while SCL is high
+    esp_rom_delay_us(5);
+    gpio_set_level(sda, 1);
+    esp_rom_delay_us(5);
+    accel_bus_init();
+    xSemaphoreGive(s_bus_mtx);
+    return true;
+}
+
 static bool reg_write(uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
+    xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
+    esp_err_t e = i2c_master_write_to_device(I2C_NUM_1, PAGER_I2C_ADDR_LIS3DH, buf, sizeof(buf),
+                                             pdMS_TO_TICKS(50));
+    xSemaphoreGive(s_bus_mtx);
+    return e == ESP_OK;
 }
 
 static esp_err_t s_last_err = ESP_OK; // for acceltest triage
 
 static bool reg_read(uint8_t reg, uint8_t *out)
 {
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    if (s_inject_fails > 0 && (reg == LIS3DH_REG_INT1_SRC || reg == LIS3DH_REG_INT2_SRC) &&
+        (!s_inject_only_pending || s_shake.n > 0)) {
+        s_inject_fails--;
+        s_last_err = ESP_ERR_TIMEOUT;
+        return false;
+    }
+#endif
+    xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
     s_last_err = i2c_master_write_read_device(I2C_NUM_1, PAGER_I2C_ADDR_LIS3DH, &reg, 1, out, 1,
                                               pdMS_TO_TICKS(50));
+    xSemaphoreGive(s_bus_mtx);
     return s_last_err == ESP_OK;
 }
 
@@ -176,6 +286,11 @@ esp_err_t accel_debug_last_err(void) { return s_last_err; }
 static bool reg_read_multi(uint8_t reg, uint8_t *out, size_t n)
 {
     uint8_t addr = reg | 0x80;
+    xSemaphoreTake(s_bus_mtx, portMAX_DELAY);
+    esp_err_t e = i2c_master_write_read_device(I2C_NUM_1, PAGER_I2C_ADDR_LIS3DH, &addr, 1, out, n,
+                                               pdMS_TO_TICKS(50));
+    xSemaphoreGive(s_bus_mtx);
+    return e == ESP_OK;
 }
 
 // Writes the fixed config; on success marks the chip present and arms the wake.
@@ -214,21 +329,99 @@ static bool configure_and_arm(uint8_t who)
     return true;
 }
 
+static bool probe_and_configure(void)
 {
     uint8_t who = 0;
-        ESP_LOGI(TAG,
-                 "this is the expected/likely case if the accelerometer is not wired yet",
-        s_present = false;
+    bool read_ok = reg_read(LIS3DH_REG_WHO_AM_I, &who);
+    s_who_err = s_last_err;
+    s_who = who;
         return false;
     }
+    return configure_and_arm(who);
+}
+
+bool accel_init(void)
+{
+    if (s_rtc.magic != ACCEL_RTC_MAGIC || s_rtc.crc != rtc_crc()) {
+        rtc_set(0);
+    } else if (s_rtc.n > 0) {
+        ESP_LOGW(TAG, "boot after %u accel-recovery reboot(s)", (unsigned) s_rtc.n);
+    }
+    accel_bus_init();
+    if (!probe_and_configure()) {
+        // Expected with no accelerometer wired; retried every ACCEL_PROBE_RETRY_US.
+        ESP_LOGI(TAG,
+                 "LIS3DH not found at 0x%02x (i2c %s) - motion trigger disabled, retrying every 60 s; "
+                 "this is the expected/likely case if the accelerometer is not wired yet",
+                 (unsigned) PAGER_I2C_ADDR_LIS3DH, esp_err_to_name(s_last_err));
+        s_present = false;
+        s_next_probe_us = esp_timer_get_time() + ACCEL_PROBE_RETRY_US;
+        return false;
+    }
+    return true;
+}
+
+static void probe_retry(void)
+{
+    bool ok = accel_bus_reset() && probe_and_configure();
+    ESP_LOGD(TAG, "LIS3DH re-probe: %s (i2c %s)", ok ? "found" : "absent", esp_err_to_name(s_last_err));
+}
+
+// Rung 2: bus reset and reconfigure.
+static void recover_bus(esp_err_t err)
+{
+    s_bus_resets++;
+    bool ok = accel_bus_reset() && probe_and_configure();
+    ESP_LOGW(TAG, "i2c read failed x%d (%s): bus reset, reconfigure %s", ACCEL_REC_FAILS, esp_err_to_name(err),
+             ok ? "ok" : "FAILED");
+    s_present = true;
+    if (!ok) {
+        s_rec.fails = ACCEL_REC_FAILS - 1;
+    }
+}
+
+// Rung 3: chip reset (esp_restart() leaves USB dead). Power effect: reboot.
+static void recover_reboot(esp_err_t err)
+{
+    rtc_set(s_rtc.n + 1);
+    ESP_LOGW(TAG, "i2c still failing after bus reset (%s): rebooting (accel reboot %u of %u)",
+             esp_err_to_name(err), (unsigned) s_rtc.n, (unsigned) ACCEL_REBOOT_MAX);
+    vTaskDelay(pdMS_TO_TICKS(100)); // let the log line out
+    watchdog_hard_reset_as(WD_ACCEL_RESTART);
+}
+
+// Rung 4: halt. Power effect: see modes_accel_halt().
+static void recover_halt(esp_err_t err)
+{
+    rtc_set(0);
+    ESP_LOGW(TAG, "i2c still failing, reboot budget spent (%s): halting", esp_err_to_name(err));
+    accel_halt_info_t h = {
+        .err = (int) err,
+        .reg = s_fail_reg,
+        .consec_fails = s_consec_fails,
+        .bus_resets = s_bus_resets,
+        .reboots_used = ACCEL_REBOOT_MAX,
+        .reboot_budget = ACCEL_REBOOT_MAX,
+        .who_err = (int) s_who_err,
+        .who = s_who,
+        .uptime_us = esp_timer_get_time(),
+    };
+    modes_accel_halt(&h);
 }
 
 bool accel_poll(void)
 {
+    int64_t now_us = esp_timer_get_time();
     if (!s_present) {
+        if (now_us >= s_next_probe_us) {
+            s_next_probe_us = now_us + ACCEL_PROBE_RETRY_US;
+            probe_retry();
+        }
         return false;
     }
     uint8_t src = 0;
+    bool ok = reg_read(LIS3DH_REG_INT1_SRC, &src);
+    if (ok && (src & LIS3DH_INT1_SRC_IA)) {
         if (accel_edge_wanted(now_us, s_last_reported_us, s_refractory_us)) {
             s_last_reported_us = now_us;
             s_edges_reported++;
@@ -241,6 +434,19 @@ bool accel_poll(void)
     }
 
     uint8_t src2 = 0;
+    bool ia2 = false;
+    const char *failed_reg = ok ? "INT2_SRC" : "INT1_SRC";
+    if (ok) {
+        ok = reg_read(LIS3DH_REG_INT2_SRC, &src2);
+        ia2 = ok && s_shake_enabled && (src2 & LIS3DH_INT2_SRC_IA);
+    }
+    if (ok) {
+        s_consec_fails = 0;
+    } else {
+        s_consec_fails++;
+        s_fail_reg = failed_reg;
+    }
+    // a failed read steps the classifier with ia2=false so a chain still expires
     bool was_idle = (s_shake.n == 0);
     bool fired = false;
     accel_shake_verdict_t v = accel_shake_step(&s_shake, &s_shake_cfg, now_us, ia2);
@@ -261,10 +467,23 @@ bool accel_poll(void)
 
     uint8_t want3 = (now_us >= s_refr_until_us ? LIS3DH_CTRL_REG3_I1_IA1 : 0) |
                     ((s_shake_enabled && now_us >= s_shake.holdoff_until_us) ? LIS3DH_CTRL_REG3_I1_IA2 : 0);
+    if (ok && want3 != s_ctrl3 && reg_write(LIS3DH_REG_CTRL_REG3, want3)) {
         s_ctrl3 = want3;
+    }
+
+    if (ok && s_rtc.n != 0 && now_us >= ACCEL_HEALTHY_US) {
+        rtc_set(0); // healthy for 10 min: reboot budget restored
+    }
+    switch (accel_rec_step(&s_rec, ok, reboot_allowed())) {
+    case ACCEL_REC_BUS_RESET: recover_bus(s_last_err); break;
+    case ACCEL_REC_REBOOT: recover_reboot(s_last_err); break;
+    case ACCEL_REC_HALT: recover_halt(s_last_err); break;
+    default: break;
     }
     return fired;
 }
+
+uint32_t accel_shake_rejected_total(void) { return s_shake_rejected; }
 
 bool accel_shake_pending(void)
 {
@@ -438,6 +657,19 @@ bool accel_debug_set_cfg(uint8_t ctrl1, uint8_t ctrl4)
     return reg_read(LIS3DH_REG_CTRL_REG1, &r1) && reg_read(LIS3DH_REG_CTRL_REG4, &r4) &&
            r1 == ctrl1 && r4 == ctrl4;
 }
+
+void accel_debug_inject_fail(uint32_t n, bool only_pending)
+{
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    s_inject_only_pending = only_pending;
+    s_inject_fails = n;
+#else
+    (void) n;
+    (void) only_pending;
+#endif
+}
+
+void accel_debug_set_budget_spent(bool spent) { rtc_set(spent ? ACCEL_REBOOT_MAX : 0); }
 
 void accel_debug_set_refractory_s(uint32_t seconds)
 {

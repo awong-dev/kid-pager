@@ -52,8 +52,20 @@ typedef enum {
 #define GFX_ICON_H 12
 
 /* Highest assets format version read; v1 must stay readable (factory partition is never rewritten). */
+#define GFX_ASSETS_VER_MAX 1
+
+/* True if `d` is an assets image of version 1..GFX_ASSETS_VER_MAX with header total == len. */
+bool gfx_assets_check(const uint8_t *d, size_t len, uint8_t *ver_out);
+
+/* gfx_init() = gfx_select(GFX_ASSETS_OTA); false (logged once) if no source is usable (all tofu). */
 #ifdef ESP_PLATFORM
+typedef enum { GFX_ASSETS_NONE, GFX_ASSETS_FACTORY, GFX_ASSETS_OTA } gfx_assets_src_t;
 bool gfx_init(void);
+/* Switches the font source (OTA if valid, else factory); true iff active == want. modes_run only. */
+bool gfx_select(gfx_assets_src_t want);
+gfx_assets_src_t gfx_assets_source(void);
+bool gfx_assets_ota_present(void);     /* the assets_ota row exists */
+const char *gfx_assets_ota_id16(void); /* 16 hex of the record sha when source==OTA, else "" */
 #else
 /* Host build: maps an assets.bin file read-only. */
 bool gfx_init_from_file(const char *path);

@@ -11,8 +11,10 @@
 #define CFG_KEY_LOCK 0
 #define CFG_KEY_CA 1
 #define CFG_KEY_SMS 2
+// cfg key 3 is retired: never reuse it
 #define CFG_KEY_OTA 4
 #define CFG_KEY_LOC 5 /* loc */
+#define CFG_KEY_AST 6 /* font image job */
 
 // Skips one value and reports its [start,len) span so callers get the raw sub-map bytes.
 static bool skip_capture(cbor_r_t *r, size_t *off, size_t *len)
@@ -66,6 +68,12 @@ static bool parse_cfg_submap(cbor_r_t *r, cfg_dispatch_t *out)
                 return false;
             }
             out->have_loc = true;
+            break;
+        case CFG_KEY_AST:
+            if (!skip_capture(r, &out->ast_off, &out->ast_len)) {
+                return false;
+            }
+            out->have_ast = true;
             break;
         default:
             // unknown cfg keys are skipped, not malformed
@@ -169,6 +177,10 @@ bool cfg_ingest_cbor(const uint8_t *buf, uint16_t len)
     if (d.have_ota) {
         // acks on accept or reject; the download runs from ota_service()
         ota_apply_cfg_submap(buf + d.ota_off, (uint16_t) d.ota_len, d.id);
+    }
+    if (d.have_ast) {
+        // acks on accept or reject; the download runs from ota_service()
+        ota_apply_ast_submap(buf + d.ast_off, (uint16_t) d.ast_len, d.id);
     }
     if (d.have_loc) {
         // applied and acked immediately

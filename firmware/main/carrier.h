@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,7 +34,15 @@ typedef struct {
     bool sms_mo;
     // ICCID prefixes (space-separated): a second detection rule, NULL = none
     const char *iccid_prefixes;
+    // MQTT keepalive and host-liveness ping, seconds; 2 x ping must stay under 1.5 x keepalive
+    uint16_t mqtt_keepalive_s;
+    uint16_t mqtt_ping_s;
 } carrier_preset_t;
+
+// Fallback for a custom APN or unknown carrier (an AT&T flow survived 240 s idle, died by 360 s).
+#define CARRIER_MQTT_KEEPALIVE_DEFAULT_S 480
+#define CARRIER_MQTT_PING_DEFAULT_S 240
+void carrier_mqtt_params(const carrier_preset_t *p, uint16_t *keepalive_s, uint16_t *ping_s);
 
 // Preset 0 is "Automatic", preset 1 is "Carrier default" (blank APN).
 #define CARRIER_PRESET_AUTO 0

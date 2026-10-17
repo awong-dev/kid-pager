@@ -180,11 +180,14 @@ Numbers the firmware assumes or logs but that need a device to confirm. See `doc
 | Whether the modem/broker clamp a long MQTT keepalive, and whether the carrier NAT tolerates the idle flow | PROTOCOL.md §6.2 |
 | Clean-session behaviour across an ESP32-only reset (does the modem session survive?) | PROTOCOL.md §12 item 4; decides whether deep sleep with forced redelivery (§8.3(b)) is worth revisiting |
 | CardKB I2C polling across repeated 100 ms light-sleep cycles | Whether the CardKB and its bus survive `net_sleep()`'s light-sleep re-entry without a dropped or garbled byte |
+| UI-awake window current (active mode, composer open, `PAGER_UI_AWAKE_S` = 30 s) | Validates the per-wake AT round trip (signal + battery, ≈ 100 ms at 40 mA) |
 | `bars_from_rssi_dbm()` thresholds (`ui.c`: dBm ≥ -85/-95/-105/-115 → 4/3/2/1/0 bars) | The dBm conversion is fixed (`dBm = -113 + raw*2`, `raw == 99` = no reading); the bucket boundaries are estimates |
 | `segs_from_batt_mv()` thresholds (`ui.c`: 4000/3850/3700/3550 mV → 4/3/2/1/0 segments) | Picked, not derived from a discharge curve under the device's own load |
 | Font legibility on the panel at 12 px and 16 px (Latin, Cyrillic, CJK) | Host PNGs (`make png`, `make emoji_png ASSETS=<image>`) show the rasterisation, not the panel. `tools/mkassets.py` documents how to build the asset images |
+| SSD1680 `0x22` update-control values (`0xF7` full, `0xFF` partial) | Carried from PROTOCOL.md §6 as inferred, not verified against the datasheet |
 | BUSY pin polarity (assumed active-high) | `ui.c`'s `disp_wait_busy()` assumes BUSY = 1 means busy; if wrong, refreshes return at once or hit the 15 s timeout and mark the display dead |
 | Partial-refresh RAM continuity across a panel power cycle | `ui.c` keeps the panel powered after `ui_init()` because a power cycle would likely wipe the controller RAM planes that partial refresh diffs against; the display-domain current is higher than §8.4's "~0 mA" by an unquantified amount |
+| CardKB byte stream during real typing | `input_decode_key()` maps `0x08` backspace, `0x09` tab, `0x0D` enter, `0x1B` esc, `0x20`-`0x7E` printable, `0xB4`/`0xB5`/`0xB6`/`0xB7` left/up/down/right; confirm arrows, held keys, and that the CardKB never emits multi-byte sequences (§9.4) |
 | Partial-refresh timing and ghosting up to the scheduled full refresh | Partial refresh must complete in under 1.5 s (§6.5) |
 | `getVoltage()` / `AT+SQNVMON` reading against a multimeter across the battery | `batt_mv` in `/status` is inferred to track the battery rail (PROTOCOL.md §12 item 6); the reading is in mV |
 | PBKDF2-HMAC-SHA256 time on the S3, 10 000 iterations (`lock_pbkdf2()`) | Host CPU takes about 20 ms; the iteration count should be tuned to land near 100 ms on the S3 |

@@ -6,6 +6,7 @@
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "astpart.h"
 static const char *TAG = "gfx";
 #else
 #include <fcntl.h>
@@ -120,8 +121,15 @@ static uint32_t rd_u32(const uint8_t *p)
            ((uint32_t) p[3] << 24);
 }
 
+/* Parses an assets image into `blocks` (caller-supplied; zeroed here). Accepts header version
+ * 1..GFX_ASSETS_VER_MAX and total <= len (the factory partition is larger than its image). */
+static bool parse_assets(const uint8_t *data, size_t len, gfx_block_t blocks[2], uint8_t *ver_out,
+                         uint32_t *total_out)
 {
+    memset(blocks, 0, 2 * sizeof(gfx_block_t));
 
+    /* header: "PGFA", u8 version, char[3] lang, u32 LE total at 8, u8 block count at 12 */
+    if (len < 16 || memcmp(data, "PGFA", 4) != 0 || data[4] < 1 || data[4] > GFX_ASSETS_VER_MAX) {
         return false;
     }
     uint32_t total = rd_u32(data + 8);
@@ -157,25 +165,182 @@ static uint32_t rd_u32(const uint8_t *p)
             const uint8_t *codepoints = data + pos + 12;
             const uint8_t *records = codepoints + (size_t) num_glyphs * 4;
             const uint8_t *bitmaps = records + (size_t) num_glyphs * 10;
+            blocks[slot].valid = true;
+            blocks[slot].size_px = size_px;
+            blocks[slot].baseline = baseline;
+            blocks[slot].num_glyphs = num_glyphs;
+            blocks[slot].codepoints = codepoints;
+            blocks[slot].records = records;
+            blocks[slot].bitmaps = bitmaps;
         }
         pos += block_bytes;
+    }
+    if (ver_out) {
+        *ver_out = data[4];
+    }
+    if (total_out) {
+        *total_out = total;
     }
     return true;
 }
 
-#ifdef ESP_PLATFORM
+bool gfx_assets_check(const uint8_t *d, size_t len, uint8_t *ver_out)
 {
+    gfx_block_t tmp[2];
+    uint8_t ver = 0;
+    uint32_t total = 0;
+    if (d == NULL || !parse_assets(d, len, tmp, &ver, &total) || total != len) {
+        return false;
+    }
+    if (ver_out) {
+        *ver_out = ver;
+    }
+    return true;
+}
+
+static void install_assets(const gfx_block_t blocks[2])
+{
+    memcpy(s_blocks, blocks, sizeof(s_blocks));
+}
+
+#ifdef ESP_PLATFORM
+static esp_partition_mmap_handle_t s_map_handle; /* mapping behind the current s_blocks */
+static bool s_map_have;
+static gfx_assets_src_t s_src = GFX_ASSETS_NONE;
+static char s_id16[17];
+
+gfx_assets_src_t gfx_assets_source(void)
+{
+    return s_src;
+}
+
+bool gfx_assets_ota_present(void)
+{
+    return astpart_find() != NULL;
+}
+
+const char *gfx_assets_ota_id16(void)
+{
+    return s_src == GFX_ASSETS_OTA ? s_id16 : "";
+}
+
+/* Maps [0, len) of `part` and parses it into `blocks`. On success the mapping is returned in
+ * *h (caller owns it); on failure nothing stays mapped. */
+static bool map_and_parse(const esp_partition_t *part, size_t len, bool strict, uint8_t want_fv,
+                          gfx_block_t blocks[2], esp_partition_mmap_handle_t *h, const char **why)
+{
+    const void *mapped;
+    if (esp_partition_mmap(part, 0, len, ESP_PARTITION_MMAP_DATA, &mapped, h) != ESP_OK) {
+        *why = "mmap";
+        return false;
+    }
+    uint8_t ver = 0;
+    bool ok;
+    if (strict) { /* OTA: total == len and version == the record's fv */
+        ok = gfx_assets_check((const uint8_t *) mapped, len, &ver) &&
+             parse_assets((const uint8_t *) mapped, len, blocks, NULL, NULL);
+        if (!ok) {
+            *why = "parse";
+        } else if (ver != want_fv) {
+            ok = false;
+            *why = "version";
+        }
+    } else {
+        ok = parse_assets((const uint8_t *) mapped, len, blocks, NULL, NULL);
+        if (!ok) {
+            *why = "parse";
+        }
+    }
+    if (!ok) {
+        esp_partition_munmap(*h);
+    }
+    return ok;
+}
+
+// Call only on the modes_run task (the renderer), so no glyph lookup is in flight during the swap.
+// Power effect: none.
+bool gfx_select(gfx_assets_src_t want)
+{
+    if (want != GFX_ASSETS_OTA && want != GFX_ASSETS_FACTORY) {
+        return false;
+    }
+    gfx_block_t blocks[2];
+    esp_partition_mmap_handle_t h;
+    const char *why = "";
+
+    if (want == GFX_ASSETS_OTA) {
+        const esp_partition_t *p = astpart_find();
+        astpart_rec_t rec;
+        if (p == NULL) {
+            why = "no row";
+        } else if (!astpart_read_rec(p, &rec)) {
+            /* distinguish a blank commit sector from a damaged one, for the log only */
+            uint8_t raw[ASTPART_REC_SIZE];
+            why = "bad record";
+            if (esp_partition_read(p, p->size - ASTPART_SECTOR, raw, sizeof raw) == ESP_OK) {
+                bool blank = true;
+                for (size_t i = 0; i < sizeof raw; i++) {
+                    blank = blank && raw[i] == 0xFF;
+                }
+                if (blank) {
+                    why = "no record";
+                }
+            }
+        } else if (rec.fv > GFX_ASSETS_VER_MAX) {
+            why = "version";
+        } else if (map_and_parse(p, rec.len, true, rec.fv, blocks, &h, &why)) {
+            install_assets(blocks);
+            if (s_map_have) {
+                esp_partition_munmap(s_map_handle);
+            }
+            s_map_handle = h;
+            s_map_have = true;
+            s_src = GFX_ASSETS_OTA;
+            static const char hex[] = "0123456789abcdef";
+            for (int i = 0; i < 8; i++) {
+                s_id16[2 * i] = hex[rec.sha[i] >> 4];
+                s_id16[2 * i + 1] = hex[rec.sha[i] & 15];
+            }
+            s_id16[16] = '\0';
+            ESP_LOGI(TAG, "assets source=ota id=%s fv=%u len=%u", s_id16, (unsigned) rec.fv,
+                     (unsigned) rec.len);
+            return true;
+        }
+        ESP_LOGI(TAG, "assets_ota unusable (%s); using factory", why);
+    }
+
+    if (s_src == GFX_ASSETS_FACTORY) {
+        return want == GFX_ASSETS_FACTORY;
+    }
     const esp_partition_t *part =
         esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "assets");
     if (part == NULL) {
         ESP_LOGI(TAG, "no 'assets' partition found; every codepoint will draw as tofu");
         return false;
     }
+    if (!map_and_parse(part, part->size, false, 0, blocks, &h, &why)) {
+        ESP_LOGI(TAG, "assets partition unusable (%s); every codepoint will draw as tofu", why);
         return false;
     }
+    install_assets(blocks);
+    if (s_map_have) {
+        esp_partition_munmap(s_map_handle);
     }
+    s_map_handle = h;
+    s_map_have = true;
+    s_src = GFX_ASSETS_FACTORY;
+    s_id16[0] = '\0';
+    ESP_LOGI(TAG, "assets source=factory: %u bytes, sizes 12px=%s 16px=%s", (unsigned) part->size,
              s_blocks[GFX_FONT_NORMAL].valid ? "ok" : "missing",
              s_blocks[GFX_FONT_LARGE].valid ? "ok" : "missing");
+    return want == GFX_ASSETS_FACTORY;
+}
+
+bool gfx_init(void)
+{
+    /* Power effect: none (flash-cache mapping). True if any source is usable. */
+    gfx_select(GFX_ASSETS_OTA);
+    return s_src != GFX_ASSETS_NONE;
 }
 #else
 bool gfx_init_from_file(const char *path)
@@ -196,9 +361,12 @@ bool gfx_init_from_file(const char *path)
         fprintf(stderr, "gfx_init_from_file: mmap(%s) failed\n", path);
         return false;
     }
+    gfx_block_t blocks[2];
+    if (!parse_assets((const uint8_t *) mapped, (size_t) st.st_size, blocks, NULL, NULL)) {
         fprintf(stderr, "gfx_init_from_file: %s header invalid\n", path);
         return false;
     }
+    install_assets(blocks);
     return true;
 }
 #endif

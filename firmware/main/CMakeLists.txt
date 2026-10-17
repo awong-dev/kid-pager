@@ -1,4 +1,5 @@
                         INCLUDE_DIRS "."
+                        REQUIRES driver esp_timer nvs_flash mbedtls console esp_partition esp_hw_support app_update esp_app_format esp_rom detools dptechnics__walter-modem)
 
 # Debug only: `PAGER_DEBUG_NO_LIGHT_SLEEP=1 idf.py reconfigure build` makes
 # modes_run() never light-sleep, so RTS stays asserted and the USB serial log

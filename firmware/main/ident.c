@@ -12,6 +12,7 @@ static const char *NVS_NS = "ident";
 
 static ident_t s_ident;
 
+/* Shared scratch for ident_scratch(). */
 static ident_t s_scratch;
 static bool s_scratch_busy;
 
@@ -137,6 +138,7 @@ bool ident_load(void)
         return false;
     }
 
+    /* Shared scratch, not a stack local: ident_t carries a 4 kB `ca` buffer and overflowed the main
      * task stack. Boot is single-threaded; released on every exit path. */
     ident_t *tmp = ident_scratch();
 

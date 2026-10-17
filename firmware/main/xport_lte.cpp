@@ -1,6 +1,8 @@
+// LTE-M MQTT transport: session up/down, publish, liveness re-SUBSCRIBE and the modem MQTT event
 // handler. PROTOCOL.md §6, §8. C++ because the walter-modem library is a C++ class.
 
 #include "net.h"
+#include "carrier.h"
 #include "net_xport.h"
 #include "net_internal.h"
 #include "ident.h"
@@ -20,6 +22,15 @@
 
 static const char *TAG = "net";
 
+// Per-carrier MQTT timing (carrier.h), fixed per session. AT&T silently drops an idle flow between
+// 240 s and 360 s; Soracom Beam needs keepalive 0 or 5..1200 s and drops after 1.5 x keepalive.
+//
+// The liveness re-SUBSCRIBE after ping_s of uplink silence replaces the modem's own ping; a missing
+// SUBACK detects a dead session. One missed ping must be survivable (2 x ping < 1.5 x keepalive):
+//   Soracom (Beam and direct): ping 840, keepalive 1200 (1680 < 1800)
+//   everything else:           ping 240, keepalive 480  (480 < 720)
+static uint16_t s_mqtt_keepalive_s = CARRIER_MQTT_KEEPALIVE_DEFAULT_S;
+static uint32_t s_mqtt_ping_s = CARRIER_MQTT_PING_DEFAULT_S;
 
 // One attempt each: at the library's 30 s x 3 default two stacked commands exceed the 95 s
 // watchdog feed budget. Worst case 10 + 15 = 25 s.
@@ -375,6 +386,15 @@ static bool lte_session_up(void)
     const bool beam = net_bearer_beam();
     const char *conn_host = beam ? PAGER_BEAM_HOST : ident_get_host();
     const uint16_t conn_port = beam ? (uint16_t) PAGER_BEAM_PORT : (uint16_t) ident_get_port();
+    {
+        uint16_t ka = 0, ping = 0;
+        net_carrier_mqtt_params(&ka, &ping);
+        s_mqtt_keepalive_s = ka;
+        s_mqtt_ping_s = ping;
+        ESP_LOGI(TAG, "mqtt keepalive %u s, liveness ping %u s (carrier %s)", (unsigned) ka, (unsigned) ping,
+                 net_carrier_label()[0] ? net_carrier_label() : "none");
+    }
+    if (!WalterModem::mqttConnect(conn_host, conn_port, s_mqtt_keepalive_s)) {
         ESP_LOGI(TAG, "mqttConnect() call could not be queued");
         // if the modem lost its client configuration the next attempt redoes it
         s_session_configured = false;
@@ -535,8 +555,10 @@ static void lte_service_session(void)
 
     bool resume_repair = s_resub_pending;
     // net_liveness_ping_now() forces an early ping through the idle-timeout path; the send resets
+    // the idle clock either way. Gated on !s_resub_wait like idle_ping.
     bool ping_now = s_ping_now_requested && !s_resub_wait;
     bool idle_ping = s_mqtt_connected && !s_resub_wait &&
+                      (now - s_last_uplink_us) >= (int64_t) s_mqtt_ping_s * 1000000LL;
     if (!resume_repair && !idle_ping && !ping_now) {
         return;
     }

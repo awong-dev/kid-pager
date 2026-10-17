@@ -342,3 +342,20 @@ necessarily the application's TZ-owning task.
 bytes actually copied, so `bytesReceived < bytesClaimed` is a short copy, which patch 1.7's lost
 final `\n` byte produces on about 1 binary read in 256. A streaming caller can treat it as a
 transport error and resume from the last good offset.
+
+## 1.23 Raw `+SQNTMON` line in the temperature response (`src/WalterModem.h`, `src/WalterModem.cpp`)
+
+`WalterModemTempData` gains `char raw[48]`, filled in the `+SQNTMON:` handler with the response
+line verbatim (CR/LF trimmed, truncated to 47 bytes) whenever a command with a response struct is
+pending, even if the six-field `sscanf` does not match. The stock parser reads the temperature with
+`%d` into an `int8_t`, which cannot carry the tenths of a degree the modem may report (`23.5`
+parses as 23); the application parses `raw` itself. The existing `temperature` and `status` fields
+are unchanged. Used through `sendCmd()` (1.20 budget), not `getTemperature()`.
+
+## 1.24 Keep the `+COPS:` and `+CNUM:` response lines (`src/WalterModem.h`, `src/WalterModem.cpp`)
+
+Same shape as 1.8: `_processModemRSP()` stores the last `+COPS: ...` line and the first
+`+CNUM: ...` line (63 bytes max each) in `_lastCops` / `_lastCnum`, readable with `lastCOPS()` /
+`lastCNUM()` and reset with `clearCOPSCNUM()`. The library parses neither command. The application
+sends `AT+COPS?` and `AT+CNUM` through `sendCmd()` (1.20 budget) to show the operator name and the
+SIM's own number.

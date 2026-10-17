@@ -134,6 +134,8 @@ static void test_sms_only(void)
     CHECK(cbor_r_array(&r, &count) && count == 2, "captured sms span must decode as a 2-item array");
 }
 
+/* Key 3 (once `wifi`) is ignored: such a cfg is well-formed and sets no have_* flag. */
+static void test_retired_key3(void)
 {
     uint8_t buf[192];
     cbor_w_t w;
@@ -142,11 +144,16 @@ static void test_sms_only(void)
     cbor_w_tstr(&w, 1, "m_77777777", 10);
     cbor_w_tstr(&w, 6, "cfg", 3);
     cbor_w_map_key(&w, 38, 1);
+    cbor_w_map_key(&w, 3, 1); /* ignored key 3: { en: true } */
     cbor_w_bool(&w, 0, true);
+    CHECK(!w.err, "test setup: encoding the retired-key fixture must not overflow");
 
     cfg_dispatch_t d;
     bool ok = cfg_parse(buf, (uint16_t) w.len, false, &d);
+    CHECK(ok, "a cfg envelope with only the retired key 3 must still be accepted as cfg");
     CHECK(strcmp(d.id, "m_77777777") == 0, "id mismatch: %s", d.id);
+    CHECK(!d.have_lock && !d.have_ca && !d.have_sms && !d.have_ota && !d.have_loc && !d.have_ast,
+          "the retired key must set no have_* flag");
 }
 
 /* An empty `sms` array (clearing the allow-list) is a recognised, well-formed push. */
@@ -253,6 +260,7 @@ static void test_not_cfg_rejected(void)
     CHECK(!cfg_parse(buf, (uint16_t) w.len, false, &d), "a kind:\"msg\" envelope must not be accepted as cfg");
 }
 
+/* `ota`=4: a recognised span next to an ignored key 3 that decodes standalone. */
 static void test_ota_span(void)
 {
     uint8_t buf[256];
@@ -262,6 +270,7 @@ static void test_ota_span(void)
     cbor_w_tstr(&w, 1, "m_88888888", 10);
     cbor_w_tstr(&w, 6, "cfg", 3);
     cbor_w_map_key(&w, 38, 2);
+    cbor_w_map_key(&w, 3, 1); /* ignored key 3: { en: true } */
     cbor_w_bool(&w, 0, true);
     cbor_w_map_key(&w, 4, 2); /* ota: { isz: 685168, cancel: true } (shape only) */
     cbor_w_uint(&w, 1, 685168);
@@ -271,6 +280,7 @@ static void test_ota_span(void)
     cfg_dispatch_t d;
     CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d), "a cfg envelope with `ota` must be accepted");
     CHECK(strcmp(d.id, "m_88888888") == 0, "id mismatch: %s", d.id);
+    CHECK(d.have_ota, "have_ota must be true");
     CHECK(!d.have_lock && !d.have_ca && !d.have_sms, "no other sub-map");
 
     cbor_r_t r;
@@ -279,6 +289,7 @@ static void test_ota_span(void)
     uint64_t u;
     CHECK(cbor_r_map(&r, &count) && count == 2, "captured ota span must decode as a 2-pair map");
     CHECK(cbor_r_key(&r, &key) && key == 1 && cbor_r_uint(&r, &u) && u == 685168, "first ota pair");
+    /* the span ends exactly at the end of the ota map (the stale key 3 comes first, so ota is the last bytes) */
     CHECK(d.ota_off + d.ota_len == w.len, "ota span must end at the end of the buffer");
 
     /* without ota: have_ota stays false */
@@ -292,6 +303,45 @@ static void test_ota_span(void)
     CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d) && !d.have_ota, "have_ota must be false when absent");
 }
 
+/* `ast`=6: a recognised span next to `ota` that decodes standalone; absent keeps have_ast false. */
+static void test_ast_span(void)
+{
+    uint8_t buf[256];
+    cbor_w_t w;
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 1, "m_77777777", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_map_key(&w, 38, 2);
+    cbor_w_map_key(&w, 4, 1); /* ota: { cancel: true } */
+    cbor_w_bool(&w, 8, true);
+    cbor_w_map_key(&w, 6, 2); /* ast: { isz: 736237, fv: 1 } (shape only) */
+    cbor_w_uint(&w, 1, 736237);
+    cbor_w_uint(&w, 9, 1);
+    CHECK(!w.err, "test setup: encoding the ast fixture must not overflow");
+    cfg_dispatch_t d;
+    CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d), "a cfg envelope with `ast` must be accepted");
+    CHECK(d.have_ast && d.have_ota && !d.have_lock && !d.have_loc, "have_ast and have_ota, nothing else");
+    cbor_r_t r;
+    cbor_r_init(&r, buf + d.ast_off, d.ast_len);
+    uint32_t count, key;
+    uint64_t u;
+    CHECK(cbor_r_map(&r, &count) && count == 2, "captured ast span must decode as a 2-pair map");
+    CHECK(cbor_r_key(&r, &key) && key == 1 && cbor_r_uint(&r, &u) && u == 736237, "first ast pair");
+    CHECK(cbor_r_key(&r, &key) && key == 9 && cbor_r_uint(&r, &u) && u == 1, "second ast pair (fv)");
+    CHECK(d.ast_off + d.ast_len == w.len, "ast span must end at the end of the buffer");
+
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 1, "m_66666666", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_map_key(&w, 38, 1);
+    cbor_w_map_key(&w, 4, 1);
+    cbor_w_bool(&w, 8, true);
+    CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d) && d.have_ota && !d.have_ast, "have_ast false when absent");
+}
+
+/* `loc`=5: a recognised span next to an ignored key 3 that decodes standalone; absent keeps
  * have_loc false. */
 static void test_loc_span(void)
 {
@@ -302,6 +352,7 @@ static void test_loc_span(void)
     cbor_w_tstr(&w, 1, "m_77777777", 10);
     cbor_w_tstr(&w, 6, "cfg", 3);
     cbor_w_map_key(&w, 38, 2);
+    cbor_w_map_key(&w, 3, 1); /* ignored key 3: { en: true } */
     cbor_w_bool(&w, 0, true);
     cbor_w_map_key(&w, 5, 1); /* loc: { gnss: false } */
     cbor_w_bool(&w, 0, false);
@@ -310,6 +361,7 @@ static void test_loc_span(void)
     cfg_dispatch_t d;
     CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d), "a cfg envelope with `loc` must be accepted");
     CHECK(strcmp(d.id, "m_77777777") == 0, "id mismatch: %s", d.id);
+    CHECK(d.have_loc, "have_loc must be true");
     CHECK(!d.have_lock && !d.have_ca && !d.have_sms && !d.have_ota, "no other sub-map");
 
     cbor_r_t r;
@@ -328,6 +380,7 @@ static void test_loc_span(void)
     cbor_w_map_key(&w, 38, 1);
     cbor_w_map_key(&w, 3, 1);
     cbor_w_bool(&w, 0, true);
+    CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d) && !d.have_loc,
           "have_loc must be false when absent");
 }
 
@@ -335,10 +388,12 @@ int main(void)
 {
     test_loc_span();
     test_ota_span();
+    test_ast_span();
     test_lock_only();
     test_ca_only();
     test_sms_only();
     test_sms_empty_array();
+    test_retired_key3();
     test_both_lock_and_ca();
     test_unknown_key_skipped();
     test_unpin_form();

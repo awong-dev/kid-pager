@@ -26,9 +26,11 @@ CONFIG_WALTER_MODEM_MAX_TLS_PROFILES=6
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 
+# mbedtls is used only for HKDF/HMAC/SHA/GCM; TLS runs inside the modem, so no certificate bundle.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 
 # The Walter's ESP32-S3-WROOM-1 has 2 MiB quad PSRAM. Allocations under 16 kB stay internal;
+# IGNORE_NOTFOUND lets a module without PSRAM boot; MEMTEST off saves boot time.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_TYPE_AUTO=y

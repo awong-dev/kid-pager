@@ -34,6 +34,10 @@ typedef struct {
     // `loc`=5
     bool have_loc;
     size_t loc_off, loc_len;
+
+    // `ast`=6
+    bool have_ast;
+    size_t ast_off, ast_len;
 } cfg_dispatch_t;
 
 // Decodes a verified /down envelope (`sig_pair_present`: trailing sig pair already trimmed).

@@ -35,6 +35,7 @@ TEST_BINS := $(TESTS:%=$(BUILD)/%)
 # Asset image for render_png (built by tools/mkassets.py).
 ASSETS ?= ../../build/assets.bin
 
+.PHONY: all test png emoji_png clean
 all: $(TEST_BINS)
 
 test: $(TEST_BINS)
@@ -128,6 +129,21 @@ $(BUILD)/test_cafetch.o: test_cafetch.c $(MAIN_SRC)/cafetch.h | $(BUILD)
 $(BUILD)/test_cafetch: $(BUILD)/cafetch.o $(BUILD)/test_cafetch.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/cafetch.o $(BUILD)/test_cafetch.o $(MBEDTLS_LIBS)
 
+$(BUILD)/test_gfx_assets.o: test_gfx_assets.c $(MAIN_SRC)/gfx.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_gfx_assets.c
+
+$(BUILD)/test_gfx_assets: $(BUILD)/gfx.o $(BUILD)/test_gfx_assets.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD)/astpart.o: $(MAIN_SRC)/astpart.c $(MAIN_SRC)/astpart.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/astpart.c
+
+$(BUILD)/test_astpart.o: test_astpart.c $(MAIN_SRC)/astpart.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_astpart.c
+
+$(BUILD)/test_astpart: $(BUILD)/astpart.o $(BUILD)/test_astpart.o
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(BUILD)/catrust.o: $(MAIN_SRC)/catrust.c $(MAIN_SRC)/catrust.h $(MAIN_SRC)/cbor.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/catrust.c
 
@@ -154,6 +170,7 @@ $(BUILD)/test_otapipe.o: test_otapipe.c $(MAIN_SRC)/otapipe.h | $(BUILD)
 $(BUILD)/test_otapipe: $(BUILD)/otapipe.o $(BUILD)/detools.o $(BUILD)/miniz_tinfl.o $(BUILD)/test_otapipe.o
 	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS) -lz
 
+$(BUILD)/ota.o: $(MAIN_SRC)/ota.c $(MAIN_SRC)/gfx.h $(MAIN_SRC)/ota.h $(MAIN_SRC)/cafetch.h $(MAIN_SRC)/cbor.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/ota.c
 
 $(BUILD)/test_ota.o: test_ota.c $(MAIN_SRC)/ota.h | $(BUILD)
@@ -190,6 +207,18 @@ $(BUILD)/gfx.o: $(MAIN_SRC)/gfx.c $(MAIN_SRC)/gfx.h | $(BUILD)
 $(BUILD)/render_png.o: render_png.c $(MAIN_SRC)/gfx.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) $(ZLIB_CFLAGS) -c -o $@ render_png.c
 
+$(BUILD)/render_png: $(BUILD)/gfx.o $(BUILD)/render_png.o $(BUILD)/devinfo_fmt.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/gfx.o $(BUILD)/render_png.o $(BUILD)/devinfo_fmt.o $(ZLIB_LIBS)
+
+# `make emoji_png ASSETS=<emoji image>` renders the emoji sheet.
+$(BUILD)/render_emoji.o: render_emoji.c render_png.c $(MAIN_SRC)/gfx.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(ZLIB_CFLAGS) -c -o $@ render_emoji.c
+
+$(BUILD)/render_emoji: $(BUILD)/gfx.o $(BUILD)/render_emoji.o $(BUILD)/devinfo_fmt.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/gfx.o $(BUILD)/render_emoji.o $(BUILD)/devinfo_fmt.o $(ZLIB_LIBS)
+
+emoji_png: $(BUILD)/render_emoji
+	./$(BUILD)/render_emoji $(ASSETS)
 
 png: $(BUILD)/render_png
 	./$(BUILD)/render_png $(ASSETS)
@@ -334,3 +363,21 @@ $(BUILD)/test_refreshpol.o: test_refreshpol.c $(MAIN_SRC)/refreshpol.h | $(BUILD
 
 $(BUILD)/test_refreshpol: $(BUILD)/refreshpol.o $(BUILD)/test_refreshpol.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/refreshpol.o $(BUILD)/test_refreshpol.o
+
+$(BUILD)/temp_parse.o: $(MAIN_SRC)/temp_parse.c $(MAIN_SRC)/temp_parse.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/temp_parse.c
+
+$(BUILD)/test_temp.o: test_temp.c $(MAIN_SRC)/temp_parse.h $(MAIN_SRC)/cbor.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_temp.c
+
+$(BUILD)/test_temp: $(BUILD)/temp_parse.o $(BUILD)/cbor.o $(BUILD)/test_temp.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/temp_parse.o $(BUILD)/cbor.o $(BUILD)/test_temp.o
+
+$(BUILD)/devinfo_fmt.o: $(MAIN_SRC)/devinfo_fmt.c $(MAIN_SRC)/devinfo_fmt.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/devinfo_fmt.c
+
+$(BUILD)/test_devinfo.o: test_devinfo.c $(MAIN_SRC)/devinfo_fmt.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_devinfo.c
+
+$(BUILD)/test_devinfo: $(BUILD)/devinfo_fmt.o $(BUILD)/test_devinfo.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/devinfo_fmt.o $(BUILD)/test_devinfo.o

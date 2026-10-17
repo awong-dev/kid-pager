@@ -26,6 +26,7 @@ typedef enum {
     WD_CATRUST,
     WD_SAVE,
     WD_DELIBERATE_RESTART,
+    WD_ACCEL_RESTART, /* accel.c: LIS3DH I2C still failing after a bus reset */
 } wd_stage_t;
 
 /* Logs why the chip last reset and where the main loop was, then arms the RTC watchdog. Call early
@@ -43,6 +44,8 @@ const char *watchdog_last_reset_reason_str(void);
 int watchdog_last_reset_reason(void);
 /* Stage the main loop reached in the previous boot; 0 if none. For /status. */
 int watchdog_last_reset_stage(void);
+/* Overrides the value watchdog_last_reset_stage() reports. */
+void watchdog_set_reported_stage(wd_stage_t stage);
 /* Abnormal reset count since power-on. For /status. */
 unsigned watchdog_abnormal_reset_count(void);
 
@@ -59,6 +62,9 @@ void watchdog_feed(void);
 /* Resets the whole chip through the RTC watchdog. Unlike esp_restart() this also resets the
  * USB-Serial-JTAG block, which was seen to stay dead after light sleep. Does not return. */
 void watchdog_hard_reset(void);
+/* As watchdog_hard_reset(), recording `stage` (WD_DELIBERATE_RESTART or WD_ACCEL_RESTART) as the
+ * next boot's last-stage breadcrumb. */
+void watchdog_hard_reset_as(wd_stage_t stage);
 
 /* Overrides the walter-modem weak hook, called once a second from its command wait. One stalled
  * command (90 s) fits the 95 s per-stage feed budget, two do not. Logs the stalled command at 5 s. */

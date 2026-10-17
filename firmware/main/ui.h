@@ -35,6 +35,7 @@ typedef struct ui_screen_s {
 extern const ui_screen_t g_scr_home;
 extern const ui_screen_t g_scr_chat;
 extern const ui_screen_t g_scr_device;
+extern const ui_screen_t g_scr_devinfo;
 extern const ui_screen_t g_scr_setup;
 extern const ui_screen_t g_scr_lock;
 /* Locked screen idle -> entering; no-op if already entering. */
@@ -161,6 +162,7 @@ void ui_show_toast(const char *text);
 /* rail.c calls this once the rail state is final: wakes the kbd task. Safe before ui_init(). */
 void ui_kb_rail_changed(void);
 
+/* net_sleep() brackets esp_light_sleep_start() with these. Park takes the kbd bus mutex (100 ms
  * bound, then sleeps anyway) so sleep never starts mid-transaction; unpark releases it. */
 void ui_kb_sleep_park(void);
 void ui_kb_sleep_unpark(void);

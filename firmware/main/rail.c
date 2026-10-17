@@ -32,6 +32,7 @@ static void rail_delay_at_least_ms(uint32_t ms)
 }
 
 // In a rail-off sleep the display pads would back-power the unpowered SSD1680 through its clamp
+// diodes: set them to input-off, no pull (the Friend's 100k pull-ups hold RESET/ECS/SRAMCS high).
 static const gpio_num_t s_disp_bus_pins[] = {
     (gpio_num_t) PAGER_PIN_DISP_RST, (gpio_num_t) PAGER_PIN_DISP_DC,
     (gpio_num_t) PAGER_PIN_DISP_CS, (gpio_num_t) PAGER_PIN_DISP_MOSI,
@@ -40,8 +41,13 @@ static const gpio_num_t s_disp_bus_pins[] = {
 static void rail_disp_bus_release(void)
 {
     for (size_t i = 0; i < sizeof(s_disp_bus_pins) / sizeof(s_disp_bus_pins[0]); i++) {
+        gpio_sleep_set_direction(s_disp_bus_pins[i], GPIO_MODE_DISABLE);
+        gpio_sleep_set_pull_mode(s_disp_bus_pins[i], GPIO_FLOATING);
         gpio_sleep_sel_en(s_disp_bus_pins[i]);
     }
+    gpio_sleep_set_direction((gpio_num_t) PAGER_PIN_DISP_BUSY, GPIO_MODE_DISABLE);
+    gpio_sleep_set_pull_mode((gpio_num_t) PAGER_PIN_DISP_BUSY, GPIO_FLOATING);
+    gpio_sleep_sel_en((gpio_num_t) PAGER_PIN_DISP_BUSY);
 }
 
 static void rail_disp_bus_restore(void)
@@ -49,6 +55,7 @@ static void rail_disp_bus_restore(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_RST);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_DC);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_CS);
+    gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_BUSY); // back to disp.c's isolation-exempt input
 }
 
 uint32_t rail_debug_get_settle_ms(void) { return s_settle_ms; }
@@ -57,6 +64,7 @@ void rail_init(void)
 {
     // ENA (active-high) gates the panel regulator, 3V3_EN (active-low) the CardKB. A modes_accel_halt()
     // deep sleep holds both pads and a RESET keeps it: release first. The carrier has no display gate.
+    gpio_hold_dis((gpio_num_t) PAGER_PIN_3V3_EN);
     gpio_config_t cfg = {
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,

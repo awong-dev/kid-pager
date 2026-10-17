@@ -15,6 +15,8 @@
 #include "input.h"
 #include "ui.h"
 extern "C" {
+#include "devinfo_fmt.h"
+#include "temp_parse.h"
 #include "battstat.h"
 }
 #include "flightrec.h"
@@ -142,6 +144,7 @@ static constexpr int PAGER_CA_FETCH_SOCKET_ID = 4;
 // caps profiles at 0-2 and profile 1 is reserved for BlueCherry: using it hangs the MQTT connect.
 static constexpr int PAGER_TLS_BOOTSTRAP_PROFILE_ID = PAGER_TLS_PROFILE_ID;
 
+static constexpr int PAGER_ATTACH_POLL_CAP_S = 300; // single-attempt cap
 
 // The bootstrap session lasts a few seconds, so a short keepalive suffices.
 static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
@@ -149,6 +152,7 @@ static constexpr uint16_t PAGER_BOOT_MQTT_KEEPALIVE_S = 60;
 // State: plain static storage, retained across light sleep. Not mutex-protected: the only writer
 // besides the caller's task is the MQTT event handler, and all shared fields are single words.
 
+// The MQTT message callback; not `static` because xport_lte.cpp invokes it.
 void (*s_msg_cb)(const char *, const char *, uint16_t) = nullptr;
 
 static net_uplink_window_cb_t s_uplink_window_cb = nullptr;
@@ -158,6 +162,7 @@ static net_uplink_window_cb_t s_uplink_window_cb = nullptr;
 static const net_xport_ops_t *s_xport_ops = xport_lte_ops();
 static bool s_lte_suppressed = false;
 
+// Written by configure_session() and net_bootstrap_connect(), read by xport_lte.cpp; not `static`.
 char s_down_topic[48];
 static char s_granted_edrx[16] = { 0 };
 
@@ -207,6 +212,7 @@ static bool s_cell_info_stale = true;
 // Arms IO16 (LIS3DH INT1) as an ext1 wake source once accel.c confirmed the chip is present.
 static bool s_accel_wake_enabled = false;
 
+// Event handlers run on WalterModem's _eventProcessingTask, not the RX task or an ISR. Keep them short.
 
 // Copies the vendor's WMGNSSFixEvent into s_gnss_event; all modem calls happen on loc.c's task.
 static void pager_gnss_event_handler(WMGNSSEventType event, const WMGNSSEventData *data, void *args)
@@ -397,6 +403,10 @@ static carrier_bearer_t s_bearer = CARRIER_BEARER_DIRECT; // resolved once per a
 
 extern "C" bool net_bearer_beam(void) { return s_bearer == CARRIER_BEARER_BEAM; }
 extern "C" const char *net_carrier_label(void) { return s_carrier ? s_carrier->label : ""; }
+extern "C" void net_carrier_mqtt_params(uint16_t *keepalive_s, uint16_t *ping_s)
+{
+    carrier_mqtt_params(s_carrier, keepalive_s, ping_s);
+}
 
 // setPDPAuthParams() never emits while auth_proto is NONE, so write AT+CGAUTH raw (after
 // definePDPContext(), before FULL). The modem keeps it across resets; NVS carrier/auth tracks it.
@@ -456,6 +466,10 @@ static const char *effective_apn(const char *typed, const char *stored)
             }
         }
     }
+    if (have_sim) {
+        snprintf(s_di.imsi, sizeof(s_di.imsi), "%s", imsi);
+        snprintf(s_di.iccid, sizeof(s_di.iccid), "%s", iccid);
+    }
     const carrier_preset_t *p = carrier_effective(imsi, gid1, iccid, typed);
     s_carrier = p;
     if (typed_set) {
@@ -473,6 +487,7 @@ static const char *effective_apn(const char *typed, const char *stored)
         why = "from the setup bundle";
     }
     s_bearer = carrier_bearer_resolve(p, carrier_bearer_override_get());
+    snprintf(s_di.apn, sizeof(s_di.apn), "%s", apn ? apn : "");
     ESP_LOGI(TAG, "APN: '%s' (%s); carrier %s, bearer %s", apn ? apn : "", why, p ? p->label : "(none)",
              s_bearer == CARRIER_BEARER_BEAM ? "beam" : "direct");
     return apn;
@@ -945,6 +960,7 @@ extern "C" void net_set_uplink_window_cb(net_uplink_window_cb_t cb)
     s_uplink_window_cb = cb;
 }
 
+// xport_lte.cpp's trampoline to s_uplink_window_cb (a static in this file).
 extern "C" void net_dispatch_uplink_window(void)
 {
     if (s_uplink_window_cb) {
@@ -1086,6 +1102,8 @@ extern "C" bool net_urc_probe(void)
     if (net_airplane()) {
         return false;
     }
+    if (!s_modem_begun) {
+        // Nothing to probe before begin() or mid-reset.
         s_probe_skip_down++;
         return false;
     }
@@ -1234,7 +1252,158 @@ extern "C" bool net_get_battery_mv(int *batt_mv)
         return false;
     }
     if (batt_mv) {
+        // The reading is millivolts, unlike the threshold (tenths): +SQNVMON: 1,30,30,5203 is a 3.0 V
+        // threshold, 30 s, 5.203 V.
+        *batt_mv = (int) rsp.data.voltage.voltage;
     }
+    return true;
+}
+
+#define PAGER_TMON_ATTEMPTS 1
+#define PAGER_TMON_TIMEOUT_MS 5000u
+
+extern "C" bool net_get_temp_dc(int *temp_dc)
+{
+    if (net_airplane()) {
+        return false;
+    }
+    // Power effect: one AT round trip, no RRC. The vendored library keeps the raw "+SQNTMON: ..." line in
+    // rsp.data.temperature.raw; the stock int8_t field cannot hold tenths.
+    WalterModemRsp rsp = {};
+    if (!WalterModem::sendCmd(PAGER_TEMP_CMD, "OK", &rsp, NULL, NULL, PAGER_TMON_ATTEMPTS,
+                              pdMS_TO_TICKS(PAGER_TMON_TIMEOUT_MS))) {
+        return false;
+    }
+    if (rsp.type != WALTER_MODEM_RSP_DATA_TYPE_TEMPERATURE) {
+        return false;
+    }
+    int dc = 0;
+    const bool parsed = temp_parse_dc(rsp.data.temperature.raw, &dc);
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        if (parsed) {
+            ESP_LOGI(TAG, "temp: raw \"%s\" -> %d dC", rsp.data.temperature.raw, dc);
+        } else {
+            ESP_LOGI(TAG, "temp: raw \"%s\" -> unparsed", rsp.data.temperature.raw);
+        }
+    }
+    if (!parsed) {
+        return false;
+    }
+    if (temp_dc) {
+        *temp_dc = dc;
+    }
+    return true;
+}
+
+static bool is_nanp_mcc(uint16_t mcc);
+static bool s_di_requested = false;
+static bool s_di_cnum_tried = false;
+
+extern "C" void net_devinfo_get(net_devinfo_t *out)
+{
+    if (out) {
+        *out = s_di;
+    }
+}
+
+extern "C" void net_devinfo_request(void) { s_di_requested = true; }
+
+extern "C" bool net_devinfo_take_request(void)
+{
+    const bool r = s_di_requested;
+    s_di_requested = false;
+    return r;
+}
+
+#define PAGER_DI_TIMEOUT_MS 3000u
+
+// One bounded query: 1 attempt, 3 s, response captured into *rsp and the library's line buffers.
+static bool di_cmd(const char *cmd, WalterModemRsp *rsp)
+{
+    return WalterModem::sendCmd(cmd, "OK", rsp, NULL, NULL, 1, pdMS_TO_TICKS(PAGER_DI_TIMEOUT_MS));
+}
+
+extern "C" bool net_devinfo_refresh(void)
+{
+    if (net_airplane()) {
+        return false;
+    }
+    int fails = 0;
+    // Power effect of the whole function: up to six AT round trips, no RRC.
+    if (s_di.imei[0] == '\0' && fails < 2) {
+        WalterModemRsp rsp = {};
+        if (di_cmd("AT+CGSN=2", &rsp) && rsp.type == WALTER_MODEM_RSP_DATA_TYPE_IDENTITY) {
+            snprintf(s_di.imei, sizeof(s_di.imei), "%s", rsp.data.identity.imei);
+            fails = 0;
+        } else {
+            fails++;
+        }
+    }
+    if (s_di.imsi[0] == '\0' && fails < 2) {
+        WalterModemRsp rsp = {};
+        if (di_cmd("AT+CIMI", &rsp) && rsp.data.imsi[0] != '\0') {
+            snprintf(s_di.imsi, sizeof(s_di.imsi), "%s", rsp.data.imsi);
+            fails = 0;
+        } else {
+            fails++;
+        }
+    }
+    if (s_di.iccid[0] == '\0' && fails < 2) {
+        WalterModemRsp rsp = {};
+        if (di_cmd("AT+SQNCCID", &rsp) && rsp.data.simCardID.iccid[0] != '\0') {
+            snprintf(s_di.iccid, sizeof(s_di.iccid), "%s", rsp.data.simCardID.iccid);
+            fails = 0;
+        } else {
+            fails++;
+        }
+    }
+    if (!s_di_cnum_tried && fails < 2) {
+        s_di_cnum_tried = true; // many SIMs have no number; one try per boot, an error is not a fault
+        WalterModem::clearCOPSCNUM();
+        WalterModemRsp rsp = {};
+        if (di_cmd("AT+CNUM", &rsp)) {
+            devinfo_parse_cnum(WalterModem::lastCNUM(), s_di.msisdn, sizeof(s_di.msisdn));
+        }
+    }
+    if (fails < 2) {
+        WalterModem::clearCOPSCNUM();
+        WalterModemRsp rsp = {};
+        if (di_cmd("AT+COPS?", &rsp)) {
+            char nm[sizeof(s_di.opname)];
+            if (devinfo_parse_cops(WalterModem::lastCOPS(), nm, sizeof(nm))) {
+                snprintf(s_di.opname, sizeof(s_di.opname), "%s", nm);
+            }
+            fails = 0;
+        } else {
+            fails++;
+        }
+    }
+    if (fails < 2) {
+        char cmd[20];
+        snprintf(cmd, sizeof(cmd), "AT+SQNMONI=%d", (int) WALTER_MODEM_SQNMONI_REPORTS_SERVING_CELL);
+        WalterModemRsp rsp = {};
+        if (di_cmd(cmd, &rsp) && rsp.type == WALTER_MODEM_RSP_DATA_TYPE_CELL_INFO) {
+            const WalterModemCellInformation &ci = rsp.data.cellInformation;
+            uint8_t nd = ci.ncDigits;
+            if (nd != 2 && nd != 3) {
+                nd = is_nanp_mcc(ci.cc) ? 3 : 2;
+            }
+            snprintf(s_di.mcc, sizeof(s_di.mcc), "%03u", (unsigned) (ci.cc % 1000u));
+            snprintf(s_di.mnc, sizeof(s_di.mnc), "%0*u", (int) nd, (unsigned) (ci.nc % 1000u));
+            s_di.tac = ci.tac;
+            s_di.ci = ci.cid & 0x0FFFFFFFu;
+            s_di.band = ci.band;
+            s_di.have_rsrp = (ci.rsrp <= -30.0f && ci.rsrp >= -156.0f);
+            s_di.rsrp = s_di.have_rsrp ? (int) (ci.rsrp - 0.5f) : 0;
+            s_di.have_rsrq = (ci.rsrq <= 0.0f && ci.rsrq >= -40.0f);
+            s_di.rsrq_dtenths = s_di.have_rsrq ? (int) (ci.rsrq * 10.0f + (ci.rsrq < 0 ? -0.5f : 0.5f)) : 0;
+            s_di.have_cell = true;
+        }
+    }
+    ESP_LOGI(TAG, "devinfo refreshed: imei %s, sim %s, cell %s", s_di.imei[0] ? "ok" : "--",
+             s_di.imsi[0] ? "ok" : "--", s_di.have_cell ? "ok" : "--");
     return true;
 }
 
@@ -1262,11 +1431,13 @@ extern "C" bool net_get_rssi(int *dbm)
     return true;
 }
 
+// Applies the LTE suppression before dispatching.
 extern "C" void net_service_session(void)
 {
     if (net_airplane()) {
         return;
     }
+    if (s_lte_suppressed) {
         return;
     }
     s_xport_ops->service();

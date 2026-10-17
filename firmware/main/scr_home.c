@@ -135,6 +135,7 @@ typedef enum {
 
 static int s_sel = 0;
 
+static msg_t s_msg_scratch[MSG_THREAD_DEPTH];
 // Larger than the visible cap: archived peers take slots before filtering.
 static home_peer_t s_peers[HOME_MAX_PEERS + ARCHIVE_MAX];
 static int s_peer_count = 0;

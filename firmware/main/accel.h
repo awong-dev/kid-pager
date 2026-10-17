@@ -48,8 +48,22 @@ typedef enum {
 // Feeds one poll at now_us. out_n/out_span_ms are valid only after FIRED or REJECTED.
 accel_shake_verdict_t accel_shake_step(accel_shake_t *s, const accel_shake_cfg_t *c, int64_t now_us, bool ia2);
 
+// I2C failure ladder: bus reset, then reboot (or HALT), each after ACCEL_REC_FAILS failures.
+#define ACCEL_REC_FAILS         4
+
+typedef struct {
+    uint8_t fails, resets;
+} accel_rec_t; // zero-init = healthy
+
+typedef enum { ACCEL_REC_NONE, ACCEL_REC_BUS_RESET, ACCEL_REC_REBOOT, ACCEL_REC_HALT } accel_rec_act_t;
+
+accel_rec_act_t accel_rec_step(accel_rec_t *r, bool read_ok, bool reboot_ok);
+
 // True while a shake chain is open (the loop must not light-sleep).
 bool accel_shake_pending(void);
+
+// Shake candidates rejected since boot.
+uint32_t accel_shake_rejected_total(void);
 
 // Probes WHO_AM_I (expect 0x33), configures 25 Hz low-power sensing and arms the INT1 wake.
 bool accel_init(void);
@@ -109,7 +123,26 @@ bool accel_debug_set_cfg(uint8_t ctrl1, uint8_t ctrl4);
 // Refractory window in seconds (0 = off).
 void accel_debug_set_refractory_s(uint32_t seconds);
 
+// Makes the next n INT1/INT2_SRC reads fail; if only_pending, only while a chain is pending.
+void accel_debug_inject_fail(uint32_t n, bool only_pending);
+
+// Marks the reboot budget spent or full.
+void accel_debug_set_budget_spent(bool spent);
+
 #ifdef ESP_PLATFORM
+// Terminal ladder state: passed to modes_accel_halt().
+typedef struct {
+    int err;                   // esp_err_t of the last failed read
+    const char *reg;           // "INT1_SRC" or "INT2_SRC"
+    uint32_t consec_fails, bus_resets, reboots_used, reboot_budget;
+    int who_err;               // esp_err_t of the last probe
+    uint8_t who;               // 0x33 expected
+    int64_t uptime_us;
+} accel_halt_info_t;
+
+// Does not return. Power effect: deep sleep with no wake source.
+void modes_accel_halt(const accel_halt_info_t *info) __attribute__((noreturn));
+
 // esp_err_t of the last I2C read
 esp_err_t accel_debug_last_err(void);
 #endif

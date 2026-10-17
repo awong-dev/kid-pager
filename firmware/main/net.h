@@ -190,6 +190,38 @@ bool net_get_clock(int64_t *epoch_s);
 /* Battery millivolts via AT+SQNVMON? (PROTOCOL.md §12 item 6); false on failure. */
 bool net_get_battery_mv(int *batt_mv);
 
+/* Modem temperature in tenths of a degree C via PAGER_TEMP_CMD; false on failure. */
+bool net_get_temp_dc(int *temp_dc);
+
+/* Device-info cache for the Device info screen; strings are "" until known. */
+typedef struct {
+    char imei[16];
+    char imsi[20];
+    char iccid[24];
+    char msisdn[24]; /* AT+CNUM; "" if not exposed */
+    char opname[32]; /* AT+COPS? long name */
+    char apn[32];    /* APN the last attach used */
+    bool have_cell;
+    char mcc[4];
+    char mnc[4];
+    uint16_t tac;
+    uint32_t ci;
+    uint8_t band;
+    bool have_rsrp;
+    int rsrp;
+    bool have_rsrq;
+    int rsrq_dtenths;
+} net_devinfo_t;
+
+/* Plain RAM copy of the cache; no AT traffic. */
+void net_devinfo_get(net_devinfo_t *out);
+/* Asks modes_run() to refresh after its next render. */
+void net_devinfo_request(void);
+/* True once per request. */
+bool net_devinfo_take_request(void);
+/* Fills the cache with bounded queries (<= ~6 AT commands); never call ahead of a render. */
+bool net_devinfo_refresh(void);
+
 /* Signal strength in dBm via AT+CSQ; false on failure or "not known" (CSQ 99). */
 bool net_get_rssi(int *dbm);
 
@@ -202,6 +234,7 @@ void net_ack_disconnect_edge(void);
 /* Liveness ping and silent-resume repair; no SUBACK in 30s or a stuck connect marks it dead. */
 void net_service_session(void);
 
+/* Suppresses the LTE transport's service tick (coverage duty cycle, CA-apply trial). */
 void net_set_lte_suppressed(bool suppressed);
 
 /* Clears the session_restart_edge. */
@@ -237,6 +270,8 @@ bool net_check_sim(void);
 bool net_bearer_beam(void);
 /* Label of the carrier preset in force from the last attach ("" if none). */
 const char *net_carrier_label(void);
+/* MQTT keepalive and liveness re-SUBSCRIBE interval (s) for the carrier in force. */
+void net_carrier_mqtt_params(uint16_t *keepalive_s, uint16_t *ping_s);
 
 /* IMSI, EF_GID1 (hex) and ICCID for the `carrier` console; "" if the SIM has none. */
 bool net_sim_identity(char *imsi, size_t imsi_cap, char *gid1_hex, size_t gid_cap, char *iccid, size_t iccid_cap);

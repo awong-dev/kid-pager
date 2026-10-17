@@ -51,6 +51,7 @@ static const char *watchdog_stage_name(uint32_t stage)
     static const char *const k_names[] = {
         "?", "boot", "network init", "loop top", "entering light sleep", "just woke from light sleep",
         "input/ui", "render", "mqtt status/retry", "message pump", "modem health check", "location",
+        "sms", "ca trust", "saving state", "deliberate restart", "accel i2c restart",
     };
     return (stage < sizeof(k_names) / sizeof(k_names[0])) ? k_names[stage] : "?";
 }
@@ -78,6 +79,7 @@ void watchdog_boot(void)
     bool valid = (s_magic == WD_MAGIC);
     bool abnormal = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT ||
                      r == ESP_RST_WDT || r == ESP_RST_BROWNOUT);
+    if (valid && (s_stage == (uint32_t) WD_DELIBERATE_RESTART || s_stage == (uint32_t) WD_ACCEL_RESTART)) {
         abnormal = false; // deliberate watchdog_hard_reset()
     }
     if (!valid) {
@@ -129,6 +131,8 @@ const char *watchdog_last_reset_reason_str(void) { return s_last_reason_str; }
 int watchdog_last_reset_reason(void) { return s_last_reset_reason; }
 
 int watchdog_last_reset_stage(void) { return (int) s_last_reset_stage; }
+
+void watchdog_set_reported_stage(wd_stage_t stage) { s_last_reset_stage = (uint32_t) stage; }
 
 unsigned watchdog_abnormal_reset_count(void) { return (unsigned) s_resets; }
 
@@ -206,7 +210,11 @@ void walter_modem_block_tick(void)
     // past the budget nothing is fed, so a wedged modem trips the task watchdog
 }
 
+void watchdog_hard_reset(void) { watchdog_hard_reset_as(WD_DELIBERATE_RESTART); }
+
+void watchdog_hard_reset_as(wd_stage_t stage)
 {
+    s_stage = (uint32_t) stage;
     wdt_hal_context_t ctx = RWDT_HAL_CONTEXT_DEFAULT();
     uint32_t ticks = (uint32_t) ((uint64_t) 200 * rtc_clk_slow_freq_get_hz() / 1000ULL); // 200 ms
     wdt_hal_write_protect_disable(&ctx);

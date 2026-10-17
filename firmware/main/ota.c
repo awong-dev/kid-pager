@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "cbor.h"
+#include "gfx.h"
 
 #define OK_IMG 0
 #define OK_ISZ 1
@@ -15,6 +16,7 @@
 #define OK_BASE 6
 #define OK_PSZ 7
 #define OK_CANCEL 8
+#define OK_FV 9 /* cfg.ast only: assets format version */
 
 static bool read_hash(cbor_r_t *r, uint8_t out[32])
 {
@@ -27,8 +29,15 @@ static bool read_hash(cbor_r_t *r, uint8_t out[32])
     return true;
 }
 
+/* `ast`: accept key 9 (`fv`, uint 1..255) into *fv and require it unless this is a cancel. For
+ * cfg.ota key 9 is skipped as unknown. */
+static bool parse_submap(const uint8_t *cbor, uint16_t len, ota_cfg_t *out, bool ast, uint8_t *fv)
 {
     memset(out, 0, sizeof(*out));
+    bool have_fv = false;
+    if (fv) {
+        *fv = 0;
+    }
     cbor_r_t r;
     cbor_r_init(&r, cbor, len);
     uint32_t count;
@@ -111,6 +120,21 @@ static bool read_hash(cbor_r_t *r, uint8_t out[32])
             }
             break;
         }
+        case OK_FV:
+            if (ast) {
+                if (!cbor_r_uint(&r, &u) || u < 1 || u > 255) {
+                    return false;
+                }
+                if (fv) {
+                    *fv = (uint8_t) u;
+                }
+                have_fv = true;
+                break;
+            }
+            if (!cbor_r_skip(&r)) {
+                return false;
+            }
+            break;
         default:
             if (!cbor_r_skip(&r)) {
                 return false;
@@ -121,6 +145,9 @@ static bool read_hash(cbor_r_t *r, uint8_t out[32])
     if (out->cancel) {
         return true; /* nothing else is needed to abort a job */
     }
+    if (ast && !have_fv) {
+        return false;
+    }
     const uint32_t required = (1u << OK_IMG) | (1u << OK_ISZ) | (1u << OK_URL) | (1u << OK_OSZ) |
                               (1u << OK_OSHA) | (1u << OK_FMT);
     if ((have & required) != required) {
@@ -130,6 +157,35 @@ static bool read_hash(cbor_r_t *r, uint8_t out[32])
         return false;
     }
     return true;
+}
+
+bool ota_parse_cfg_submap(const uint8_t *cbor, uint16_t len, ota_cfg_t *out)
+{
+    return parse_submap(cbor, len, out, false, NULL);
+}
+
+bool ota_parse_ast_submap(const uint8_t *cbor, uint16_t len, ota_cfg_t *out, uint8_t *fv)
+{
+    uint8_t dummy;
+    return parse_submap(cbor, len, out, true, fv ? fv : &dummy);
+}
+
+ota_reject_t ota_check_accept_assets(const ota_cfg_t *cfg, uint8_t fv, bool have_part, uint32_t part_size,
+                                     const uint8_t *active_sha)
+{
+    if (!have_part) {
+        return OTA_REJECT_NOPART;
+    }
+    if (fv > GFX_ASSETS_VER_MAX || cfg->fmt == OTA_FMT_DELTA) {
+        return OTA_REJECT_FMT;
+    }
+    if (part_size < 4096u || cfg->isz > part_size - 4096u) {
+        return OTA_REJECT_SIZE;
+    }
+    if (active_sha && memcmp(active_sha, cfg->img, 32) == 0) {
+        return OTA_REJECT_RUNNING;
+    }
+    return OTA_ACCEPT_OK;
 }
 
 ota_reject_t ota_check_accept(const ota_cfg_t *cfg, const uint8_t running[32], bool pending_verify,
@@ -166,6 +222,12 @@ ota_err_t ota_reject_err(ota_reject_t r)
         return OTA_ERR_NOBL;
     case OTA_REJECT_BAD:
         return OTA_ERR_BAD;
+    case OTA_REJECT_NOPART:
+        return OTA_ERR_NOPART;
+    case OTA_REJECT_FMT:
+        return OTA_ERR_FMT;
+    case OTA_REJECT_SIZE:
+        return OTA_ERR_SIZE;
     default:
         return OTA_ERR_NONE;
     }
@@ -275,6 +337,10 @@ const char *ota_err_str(ota_err_t e)
         return "run";
     case OTA_ERR_BAD:
         return "bad";
+    case OTA_ERR_NOPART:
+        return "nopart";
+    case OTA_ERR_FMT:
+        return "fmt";
     default:
         return "";
     }
@@ -322,6 +388,7 @@ void ota_ui_text(ota_state_t s, ota_err_t err, unsigned pct, char *out, size_t c
 
 #ifdef ESP_PLATFORM
 
+#include "astpart.h"
 #include "cafetch.h"
 #include "modes.h"
 #include "msg.h"
@@ -333,6 +400,7 @@ void ota_ui_text(ota_state_t s, ota_err_t err, unsigned pct, char *out, size_t c
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "mbedtls/sha256.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -353,6 +421,9 @@ typedef struct {
     uint32_t size;
     ota_job_t job;
 } job_blob_t;
+/* A different blob size makes job_load() drop an in-flight app job. */
+_Static_assert(sizeof(ota_job_t) == 544, "ota_job_t size is part of the persisted job blob");
+_Static_assert(sizeof(job_blob_t) == 552, "job_blob_t size is the NVS blob size job_load() checks");
 
 static void lock_noop(void) {}
 static ota_lock_fn s_lock = lock_noop;
@@ -377,15 +448,21 @@ static uint8_t s_bad[32];
 static bool s_have_job = false;
 static ota_job_t s_job;
 static uint32_t s_unsaved_bytes = 0;
+/* Target partition and (assets) format version, in NVS key "jast" ({u8 part; u8 fv}, absent = app). */
+static uint8_t s_job_part = OTA_PART_APP;
+static uint8_t s_job_fv = 0;
 
 /* cfg.ota handoff (MQTT event task -> modes_run task), guarded by s_lock. */
 static bool s_pend_present = false;
 static ota_cfg_t s_pend_cfg;
 static char s_pend_id[OTA_ID_MAX];
+static uint8_t s_pend_part = OTA_PART_APP;
+static uint8_t s_pend_fv = 0;
 
 static volatile bool s_mark_valid_req = false;
 static volatile bool s_install_now = false;
 static volatile bool s_status_req = false;
+static volatile bool s_redraw_req = false;   /* the font source changed under the screen */
 static volatile bool s_end_inflight = false; /* an ok/rb status was handed out; clear the job once it is published */
 static volatile bool s_clear_req = false;    /* set by ota_on_status_published(), consumed by ota_service() */
 
@@ -404,6 +481,15 @@ static bool s_write_err = false;
 static uint32_t s_in_total = 0;      /* object bytes handed to the pipe */
 static uint8_t s_resumes = 0;
 static bool s_pub50 = false;
+/* Assets jobs: write offset, end of the erased region (partition-relative), and the readback
+ * verify (one <= 64 KB slice per ota_service() call). */
+static uint32_t s_wr_off = 0;
+static uint32_t s_erased_end = 0;
+static bool s_verifying = false;
+static const uint8_t *s_ver_map = NULL;
+static uint32_t s_ver_off = 0;
+static mbedtls_sha256_context *s_ver_sha = NULL; /* PSRAM, allocated per verify */
+#define OTA_VERIFY_SLICE 65536u
 
 static uint32_t pct_now(void)
 {
@@ -419,7 +505,14 @@ static void job_persist(void)
     }
     if (!s_have_job) {
         nvs_erase_key(h, "job");
+        nvs_erase_key(h, "jast");
     } else {
+        if (s_job_part == OTA_PART_ASSETS) {
+            uint8_t a[2] = {s_job_part, s_job_fv};
+            nvs_set_blob(h, "jast", a, sizeof(a));
+        } else {
+            nvs_erase_key(h, "jast"); /* absent = app */
+        }
         job_blob_t b;
         memset(&b, 0, sizeof(b));
         b.ver = OTA_JOB_VER;
@@ -446,6 +539,14 @@ static void job_load(void)
         s_job = b.job;
         s_job.last_attempt_us = 0; /* RAM-only field */
         s_have_job = s_job.state != OTA_ST_NONE;
+        s_job_part = OTA_PART_APP;
+        s_job_fv = 0;
+        uint8_t a[2];
+        size_t an = sizeof(a);
+        if (s_have_job && nvs_get_blob(h, "jast", a, &an) == ESP_OK && an == sizeof(a) && a[0] == OTA_PART_ASSETS) {
+            s_job_part = OTA_PART_ASSETS;
+            s_job_fv = a[1];
+        }
     }
     nvs_close(h);
 }
@@ -492,6 +593,8 @@ static void clear_job(void)
     s_lock();
     s_have_job = false;
     memset(&s_job, 0, sizeof(s_job));
+    s_job_part = OTA_PART_APP;
+    s_job_fv = 0;
     s_unlock();
     job_persist();
 }
@@ -543,6 +646,21 @@ void ota_boot(void)
     ESP_LOGI(TAG, "running img=%s state=%d pending_verify=%d nobl=%d job=%s", id16, (int) st,
              (int) s_pending_verify, (int) s_nobl, s_have_job ? ota_state_str((ota_state_t) s_job.state) : "none");
 
+    if (s_have_job && s_job_part == OTA_PART_ASSETS) {
+        /* Font job, no reboot: a power loss mid-download leaves factory fonts (the commit record is
+         * erased first) and restarts the job; a record already at the target settles it as ok. */
+        astpart_rec_t rec;
+        const esp_partition_t *ap = astpart_find();
+        ota_state_t st0 = (ota_state_t) s_job.state;
+        if (ap && astpart_read_rec(ap, &rec) && memcmp(rec.sha, s_job.cfg.img, 32) == 0 &&
+            (st0 == OTA_ST_WAIT || st0 == OTA_ST_DL || st0 == OTA_ST_READY || st0 == OTA_ST_INST)) {
+            set_state(OTA_ST_OK, OTA_ERR_NONE);
+            ESP_LOGI(TAG, "font job target %s is already active: ok", id16);
+        } else if (st0 == OTA_ST_DL || st0 == OTA_ST_READY || st0 == OTA_ST_INST) {
+            set_state(OTA_ST_WAIT, OTA_ERR_NONE);
+        }
+        job_persist();
+    } else if (s_have_job) {
         bool is_target = memcmp(s_job.cfg.img, s_running, 32) == 0;
         switch ((ota_state_t) s_job.state) {
         case OTA_ST_INST:
@@ -592,11 +710,33 @@ void ota_apply_cfg_submap(const uint8_t *cbor, uint16_t len, const char *id)
     }
     s_lock();
     s_pend_cfg = cfg;
+    s_pend_part = OTA_PART_APP;
+    s_pend_fv = 0;
     strncpy(s_pend_id, id ? id : "", sizeof(s_pend_id) - 1);
     s_pend_id[sizeof(s_pend_id) - 1] = '\0';
     s_pend_present = true;
     s_unlock();
     ESP_LOGI(TAG, "cfg.ota recorded (%s), id=%s - ota_service() decides", cfg.cancel ? "cancel" : "job",
+             id ? id : "");
+}
+
+void ota_apply_ast_submap(const uint8_t *cbor, uint16_t len, const char *id)
+{
+    ota_cfg_t cfg;
+    uint8_t fv = 0;
+    if (!ota_parse_ast_submap(cbor, len, &cfg, &fv)) {
+        ESP_LOGI(TAG, "malformed cfg.ast sub-map dropped (id=%s)", id ? id : "");
+        return;
+    }
+    s_lock();
+    s_pend_cfg = cfg;
+    s_pend_part = OTA_PART_ASSETS;
+    s_pend_fv = fv;
+    strncpy(s_pend_id, id ? id : "", sizeof(s_pend_id) - 1);
+    s_pend_id[sizeof(s_pend_id) - 1] = '\0';
+    s_pend_present = true;
+    s_unlock();
+    ESP_LOGI(TAG, "cfg.ast recorded (%s), id=%s - ota_service() decides", cfg.cancel ? "cancel" : "job",
              id ? id : "");
 }
 
@@ -616,8 +756,15 @@ static void teardown_transfer(void)
         s_pipe = NULL;
     }
     if (s_mmapped) {
+        esp_partition_munmap(s_mmap); /* also the readback mapping of an interrupted verify */
         s_mmapped = false;
     }
+    if (s_ver_sha) {
+        mbedtls_sha256_free(s_ver_sha);
+        heap_caps_free(s_ver_sha);
+        s_ver_sha = NULL;
+    }
+    s_verifying = false;
     s_transfer_active = false;
     s_fetch_done = false;
     s_resume_pending = false;
@@ -684,6 +831,33 @@ static int write_cb(void *arg, const uint8_t *buf, size_t len)
     return 0;
 }
 
+/* Assets target: sequential writes; each 4 KiB sector is erased just before its first byte. The
+ * last (commit) sector is excluded. */
+static int write_cb_assets(void *arg, const uint8_t *buf, size_t len)
+{
+    (void) arg;
+    uint32_t end = s_wr_off + (uint32_t) len;
+    if (s_target == NULL || end > s_target->size - ASTPART_SECTOR) {
+        s_write_err = true;
+        return -1;
+    }
+    if (end > s_erased_end) {
+        uint32_t new_end = (end + ASTPART_SECTOR - 1u) & ~(ASTPART_SECTOR - 1u);
+        /* Power effect: up to 4 x 4 KiB sector erases per call (~45 ms each at flash current). */
+        if (esp_partition_erase_range(s_target, s_erased_end, new_end - s_erased_end) != ESP_OK) {
+            s_write_err = true;
+            return -1;
+        }
+        s_erased_end = new_end;
+    }
+    if (esp_partition_write(s_target, s_wr_off, buf, len) != ESP_OK) {
+        s_write_err = true;
+        return -1;
+    }
+    s_wr_off = end;
+    return 0;
+}
+
 static bool open_connection(void)
 {
     s_job.bytes_spent += OTA_CONN_COST;
@@ -698,6 +872,43 @@ static bool open_connection(void)
 
 static void start_transfer(const ota_env_t *env)
 {
+    const bool assets = s_job_part == OTA_PART_ASSETS;
+    if (assets) {
+        s_target = astpart_find();
+        if (s_target == NULL) {
+            fail_job(OTA_ERR_NOPART);
+            return;
+        }
+        if (s_job.cfg.fmt != OTA_FMT_FULL || s_job_fv > GFX_ASSETS_VER_MAX) {
+            fail_job(OTA_ERR_FMT);
+            return;
+        }
+        if (s_job.cfg.isz > s_target->size - ASTPART_SECTOR) {
+            fail_job(OTA_ERR_SIZE);
+            return;
+        }
+        /* (1) Stop using assets_ota (unmaps it) before erasing; factory fonts show until the commit. */
+        if (gfx_assets_source() == GFX_ASSETS_OTA) {
+            gfx_select(GFX_ASSETS_FACTORY);
+            s_redraw_req = true;
+        }
+        /* (2) Invalidate the partition. Power: one 4 KiB sector erase (~45 ms). */
+        if (astpart_invalidate(s_target) != ESP_OK) {
+            fail_job(OTA_ERR_FLASH);
+            return;
+        }
+        s_wr_off = 0;
+        s_erased_end = 0;
+    } else {
+        s_target = esp_ota_get_next_update_partition(NULL);
+        if (s_target == NULL || s_target->size < s_job.cfg.isz) {
+            fail_job(OTA_ERR_SIZE);
+            return;
+        }
+        if (s_job.cfg.fmt == OTA_FMT_DELTA && memcmp(s_job.cfg.base, s_running, 32) != 0) {
+            fail_job(OTA_ERR_BASE);
+            return;
+        }
     }
     s_pipe = (otapipe_t *) heap_caps_malloc(otapipe_sizeof(), MALLOC_CAP_SPIRAM);
     if (!s_pipe) {
@@ -718,8 +929,16 @@ static void start_transfer(const ota_env_t *env)
         base_len = run->size;
     }
     s_write_err = false;
+    if (!assets) {
+        if (esp_ota_begin(s_target, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle) != ESP_OK) {
+            fail_job(OTA_ERR_FLASH);
+            return;
+        }
+        s_ota_open = true;
     }
     bool delta = s_job.cfg.fmt == OTA_FMT_DELTA;
+    if (otapipe_init(s_pipe, delta, delta ? s_job.cfg.psz : s_job.cfg.isz, base, base_len,
+                     assets ? write_cb_assets : write_cb, NULL) != 0) {
         fail_job(OTA_ERR_MEM);
         return;
     }
@@ -741,6 +960,8 @@ static void start_transfer(const ota_env_t *env)
     set_state(OTA_ST_DL, OTA_ERR_NONE);
     char t[17];
     ota_hex16(s_job.cfg.img, t);
+    ESP_LOGI(TAG, "download start: part=%s target=%s fmt=%s object=%u B attempt %u today",
+             assets ? "assets" : "app", t, delta ? "delta" : "full", (unsigned) s_job.cfg.osz, (unsigned) s_job.attempts_day);
     if (!open_connection()) {
         ESP_LOGI(TAG, "could not open the download connection; will retry in a later window");
         teardown_transfer();
@@ -749,6 +970,70 @@ static void start_transfer(const ota_env_t *env)
         return;
     }
     job_persist();
+    request_status();
+}
+
+/* (5) Maps [0, isz) of assets_ota for the readback hash; verify_step() hashes it. */
+static void begin_verify(void)
+{
+    const void *p = NULL;
+    s_ver_sha = (mbedtls_sha256_context *) heap_caps_malloc(sizeof(*s_ver_sha), MALLOC_CAP_SPIRAM);
+    if (s_ver_sha == NULL) {
+        fail_job(OTA_ERR_MEM);
+        return;
+    }
+    mbedtls_sha256_init(s_ver_sha);
+    if (mbedtls_sha256_starts(s_ver_sha, 0) != 0 ||
+        esp_partition_mmap(s_target, 0, s_job.cfg.isz, ESP_PARTITION_MMAP_DATA, &p, &s_mmap) != ESP_OK) {
+        fail_job(OTA_ERR_MEM);
+        return;
+    }
+    s_mmapped = true;
+    s_ver_map = (const uint8_t *) p;
+    s_ver_off = 0;
+    s_verifying = true;
+}
+
+/* (5)-(7) Hashes <= OTA_VERIFY_SLICE bytes per call; at the end checks sha == img and the gfx
+ * header, writes the commit record and switches the live fonts. */
+static void verify_step(void)
+{
+    uint32_t isz = s_job.cfg.isz;
+    uint32_t n = isz - s_ver_off;
+    if (n > OTA_VERIFY_SLICE) {
+        n = OTA_VERIFY_SLICE;
+    }
+    if (n > 0) {
+        mbedtls_sha256_update(s_ver_sha, s_ver_map + s_ver_off, n);
+        s_ver_off += n;
+    }
+    if (s_ver_off < isz) {
+        return;
+    }
+    uint8_t got[32];
+    if (mbedtls_sha256_finish(s_ver_sha, got) != 0 || memcmp(got, s_job.cfg.img, 32) != 0) {
+        fail_job(OTA_ERR_HASH);
+        return;
+    }
+    uint8_t ver = 0;
+    if (!gfx_assets_check(s_ver_map, isz, &ver) || ver != s_job_fv) {
+        fail_job(OTA_ERR_FMT);
+        return;
+    }
+    astpart_rec_t rec = {.len = isz, .fv = s_job_fv};
+    memcpy(rec.sha, s_job.cfg.img, 32);
+    /* (6) Commit: one 64 B flash program. Until it lands the fonts stay factory. */
+    if (astpart_write_rec(s_target, &rec) != ESP_OK) {
+        fail_job(OTA_ERR_FLASH);
+        return;
+    }
+    teardown_transfer(); /* unmaps the readback, frees the pipe and the hash context */
+    gfx_select(GFX_ASSETS_OTA); /* (7) */
+    s_redraw_req = true;
+    set_state(OTA_ST_OK, OTA_ERR_NONE);
+    job_persist();
+    ESP_LOGI(TAG, "fonts updated: id=%s, source now %s (%u B on air est.)", gfx_assets_ota_id16(),
+             gfx_assets_source() == GFX_ASSETS_OTA ? "assets_ota" : "factory", (unsigned) s_job.bytes_spent);
     request_status();
 }
 
@@ -766,6 +1051,10 @@ static void complete_transfer(void)
     }
     if (out_len != s_job.cfg.isz) {
         fail_job(OTA_ERR_HASH);
+        return;
+    }
+    if (s_job_part == OTA_PART_ASSETS) {
+        begin_verify();
         return;
     }
     esp_err_t e = esp_ota_end(s_ota_handle); /* re-verifies the image (appended digest) */
@@ -815,6 +1104,10 @@ static void drain_step(void)
 
 static void transfer_step(const ota_env_t *env)
 {
+    if (s_verifying) { /* local flash readback: no radio, so airplane mode does not park it */
+        verify_step();
+        return;
+    }
     if (env->airplane) {
         park_job("airplane mode");
         return;
@@ -891,6 +1184,8 @@ static void take_pending(const ota_env_t *env)
     s_lock();
     bool present = s_pend_present;
     ota_cfg_t cfg = s_pend_cfg;
+    const uint8_t part = s_pend_part;
+    const uint8_t fv = s_pend_fv;
     char id[OTA_ID_MAX];
     strncpy(id, s_pend_id, sizeof(id) - 1);
     id[sizeof(id) - 1] = '\0';
@@ -903,6 +1198,12 @@ static void take_pending(const ota_env_t *env)
     }
 
     if (cfg.cancel) {
+        if (s_have_job && s_job_part != part) {
+            /* A cfg.ota cancel cannot drop a font job and vice versa: ack only. */
+            ESP_LOGI(TAG, "cancel for the other partition ignored");
+            msg_mark_shown(id);
+            return;
+        }
         ESP_LOGI(TAG, "cancel: job dropped");
         teardown_transfer();
         s_install_now = false;
@@ -914,6 +1215,7 @@ static void take_pending(const ota_env_t *env)
         return;
     }
     /* The same target pushed again while it is still live is a duplicate delivery: ack only. */
+    if (s_have_job && s_job_part == part && memcmp(s_job.cfg.img, cfg.img, 32) == 0 &&
         (s_job.state == OTA_ST_WAIT || s_job.state == OTA_ST_DL || s_job.state == OTA_ST_READY ||
          s_job.state == OTA_ST_INST)) {
         msg_mark_shown(id);
@@ -922,12 +1224,38 @@ static void take_pending(const ota_env_t *env)
     teardown_transfer(); /* a newer cfg.ota replaces the job */
     s_install_now = false;
     revert_ready_boot();
+    ota_reject_t rj;
+    ota_err_t err;
+    if (part == OTA_PART_ASSETS) {
+        /* Fonts: no rollback gate (nobl/pv/bad do not apply). The active sha is only known while
+         * gfx maps assets_ota. */
+        const esp_partition_t *ap = astpart_find();
+        astpart_rec_t arec;
+        const uint8_t *active = NULL;
+        if (ap && gfx_assets_source() == GFX_ASSETS_OTA && astpart_read_rec(ap, &arec)) {
+            active = arec.sha;
+        }
+        rj = ota_check_accept_assets(&cfg, fv, ap != NULL, ap ? ap->size : 0, active);
+        err = ota_reject_err(rj);
+    } else {
+        rj = ota_check_accept(&cfg, s_running, s_pending_verify, !s_nobl, s_have_bad ? s_bad : NULL);
 #ifndef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+        if (rj == OTA_ACCEPT_OK) {
+            rj = OTA_REJECT_NOBL;
+        }
 #endif
+        err = ota_reject_err(rj);
+        if (rj == OTA_ACCEPT_OK) {
+            const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+            if (next == NULL || next->size < cfg.isz) {
+                err = OTA_ERR_SIZE;
+            }
         }
     }
     s_lock();
     memset(&s_job, 0, sizeof(s_job));
+    s_job_part = part;
+    s_job_fv = part == OTA_PART_ASSETS ? fv : 0;
     s_job.cfg = cfg;
     strncpy(s_job.id, id, sizeof(s_job.id) - 1);
     s_job.created_epoch = env->epoch;
@@ -939,6 +1267,8 @@ static void take_pending(const ota_env_t *env)
     msg_mark_shown(id);
     char t[17];
     ota_hex16(cfg.img, t);
+    ESP_LOGI(TAG, "cfg.%s %s: target=%s fmt=%s %s%s", part == OTA_PART_ASSETS ? "ast" : "ota",
+             err == OTA_ERR_NONE ? "accepted" : "rejected", t,
              cfg.fmt == OTA_FMT_DELTA ? "delta" : "full", err == OTA_ERR_NONE ? "" : "err=", ota_err_str(err));
     if (err != OTA_ERR_NONE) {
         request_status();
@@ -1047,6 +1377,11 @@ void ota_get_status(ota_status_t *out)
             : (uint8_t) (s_transfer_active ? pct_now() : 0);
     }
     s_unlock();
+    /* STK_AST / STK_AST_ID: plain reads of gfx.c's RAM state (0 = no assets_ota row on this table). */
+    out->ast = !gfx_assets_ota_present() ? 0 : (gfx_assets_source() == GFX_ASSETS_OTA ? 2 : 1);
+    if (out->ast == 2) {
+        strncpy(out->ast_id, gfx_assets_ota_id16(), sizeof(out->ast_id) - 1);
+    }
 }
 
 void ota_status_included(void)
@@ -1062,6 +1397,13 @@ bool ota_install_ready(void)
 void ota_install_now(void)
 {
     s_install_now = true;
+}
+
+bool ota_take_redraw_request(void)
+{
+    bool r = s_redraw_req;
+    s_redraw_req = false;
+    return r;
 }
 
 bool ota_take_status_request(void)

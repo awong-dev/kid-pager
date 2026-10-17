@@ -11,6 +11,8 @@
 #include "pins.h"
 #include "battstat.h"
 #include "refreshpol.h"
+#include "gfx.h"
+#include <time.h>
 #include "rail.h"
 
 #include "input.h"
@@ -53,6 +55,7 @@
 #include "esp_random.h"
 #include "esp_rom_crc.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "esp_private/esp_clk.h"
 #include "esp_timer.h"
@@ -358,11 +361,13 @@ static void on_auth_epoch_wrap(void)
 #define STK_LOC_MIN_S 28
 #define STK_LOC_BACKOFF_S 43
 #define STK_CAR 70 // carrier preset label (<= 24 B)
+#define STK_TEMP_DC 71 // modem temperature, tenths of a degree C (signed), omitted until a reading exists
 #define STK_GNSS 69 // cfg.loc.gnss as applied (0/1)
 #define STK_LOC_MOVE_S 61 // `locmove` tunable (0 = GNSS-while-moving off)
 #define STK_TLS 39           // "unpinned"/"pinned"/"broken"/"proxy"
 #define STK_CA_FP 42         // absent when unpinned
 #define STK_SMS_LOST 48      // sms_log audit entries dropped for lack of NVS space
+#define STK_LINK 50           // MQTT-session generation within this boot
 // Key 52 is retired; do not reuse.
 #define STK_RST 53             // esp_reset_reason_t of this boot (watchdog_last_reset_reason())
 #define STK_STAGE 54           // previous boot's stage breadcrumb, 0 if none (watchdog_last_reset_stage())
@@ -378,11 +383,16 @@ static void on_auth_epoch_wrap(void)
 #define STK_OTA_ST 65  // wait/dl/ready/inst/ok/fail/rb
 #define STK_OTA_PCT 66 // 0-100
 #define STK_OTA_ERR 67 // short error code, omitted when none
+#define STK_AST 72     // font source: 0 = no assets_ota row, 1 = factory, 2 = assets_ota
+#define STK_AST_ID 73  // 16 hex chars of the active font image, only when ast == 2
 
 #define PAGER_RSSI_UNSET (-1000) // outside net_get_rssi()'s valid [-113,-51] range
 
 // Last good battery/RSSI readings, so one failed AT command does not block a /status publish.
 // RAM only; reset on reboot.
+static int s_last_batt_mv = 0;              // 0 = no good reading yet this boot (raw mV, unclamped: ~5200 on USB)
+static int s_last_temp_dc = 0;              // modem temperature, tenths of C; valid only if s_have_temp
+static bool s_have_temp = false;
 static int s_last_rssi_dbm = PAGER_RSSI_UNSET; // unset = no good reading yet this boot
 
 // `v` MUST be non-negative for cbor_w_uint(); dBm readings are not, so
@@ -393,9 +403,24 @@ static bool cbor_w_int(cbor_w_t *w, uint32_t key, int64_t v)
 }
 
 // Shared fetch-with-fallback for /status and the UI-wake status refresh.
+static void refresh_batt_mv(void)
 {
+    // Raw AT+SQNVMON millivolts; a failed or zero read never overwrites the last good value.
     int batt_mv;
+    if (net_get_battery_mv(&batt_mv) && batt_mv > 0) {
         s_last_batt_mv = batt_mv;
+        battstat_note_mv(batt_mv); // window minimum for `bs.mvn` (battstat ignores values outside 2000..5000)
+    }
+}
+
+// Modem temperature, tenths of C, same cadence and failure rule as the battery (one bounded AT
+// round trip; a failure keeps the last good value, and none yet means key 71 is omitted).
+static void refresh_temp_dc(void)
+{
+    int dc;
+    if (net_get_temp_dc(&dc)) {
+        s_last_temp_dc = dc;
+        s_have_temp = true;
     }
 }
 
@@ -414,6 +439,7 @@ static int refresh_rssi_dbm(void)
 static void ui_wake_status_refresh(void)
 {
     refresh_batt_mv();
+    refresh_temp_dc();
     refresh_rssi_dbm();
 }
 
@@ -437,7 +463,16 @@ int64_t modes_debug_last_input_age_us(void)
 }
 
 int modes_get_rssi_dbm(void) { return (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : -113; }
+int modes_get_batt_mv(void) { return s_last_batt_mv; } // raw mV; 0 = no reading yet
+// s_last_batt_mv stays 0 until AT+SQNVMON returns a non-zero reading; 0 means unknown.
 bool modes_batt_mv_known(void) { return s_last_batt_mv != 0; }
+bool modes_get_temp_dc(int *temp_dc)
+{
+    if (temp_dc && s_have_temp) {
+        *temp_dc = s_last_temp_dc;
+    }
+    return s_have_temp;
+}
 const char *modes_get_fw_version(void) { return fw_version_str(); }
 const char *modes_get_session_id(void) { return g_rtc.session_id; }
 uint32_t modes_get_memfull_count(void) { return g_rtc.mqtt_memfull_count; }
@@ -458,12 +493,19 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
 
     // The refresh_*() calls fall back to the last good value and then a placeholder; they never
     // block or fail the publish.
+    refresh_batt_mv();
+    refresh_temp_dc();
+    const bool have_batt = s_last_batt_mv != 0;
+    const int batt_mv = s_last_batt_mv;
+    const bool have_temp = s_have_temp;
+    const int temp_dc = s_last_temp_dc;
     int rssi_dbm = refresh_rssi_dbm();
 
     bool signed_env = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
 
     // `tls` is always present; `ca_fp` only when a CA is pinned (PINNED or BROKEN). Over the Beam
     // bearer TLS ends at Beam ("proxy").
+    const bool via_beam = net_bearer_beam();
     const char *tls_str = via_beam ? "proxy" : catrust_state_name(catrust_get_state());
     char ca_fp[17];
     bool have_ca_fp = !via_beam && catrust_get_ca_fp(ca_fp);
@@ -477,6 +519,12 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     bool have_stall_cmd = stall_cmd[0] != '\0';
 
     uint32_t nfields = 8 + 3 + 1 + 1 + 1 + 1 + 3 + 1; // fixed fields; optional ones are added below
+    if (have_batt) {
+        nfields += 1; // key 23 batt_mv: omitted until a reading exists
+    }
+    if (have_temp) {
+        nfields += 1; // key 71 temp_dc: likewise
+    }
     if (have_ca_fp) {
         nfields += 1;
     }
@@ -495,6 +543,10 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     }
     if (ost.gate) {
         nfields += 1;
+    }
+    nfields += 1; // key 72 ast: always sent
+    if (ost.ast == 2) {
+        nfields += 1; // key 73 ast_id
     }
     if (ost.have_job) {
         nfields += 3; // ota_t, ota_st, ota_pct
@@ -517,6 +569,12 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_uint(&w, STK_V, 1);
     cbor_w_tstr(&w, STK_STATE, state, strlen(state));
     cbor_w_tstr(&w, STK_MODE, mode_str, strlen(mode_str));
+    if (have_batt) {
+        cbor_w_uint(&w, STK_BATT_MV, (uint64_t) batt_mv);
+    }
+    if (have_temp) {
+        cbor_w_int(&w, STK_TEMP_DC, temp_dc);
+    }
     cbor_w_int(&w, STK_RSSI, rssi_dbm);
     cbor_w_tstr(&w, STK_SESSION, g_rtc.session_id, strlen(g_rtc.session_id));
     cbor_w_uint(&w, STK_TS, (uint64_t) ts);
@@ -550,6 +608,10 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     }
     if (ost.gate) {
         cbor_w_uint(&w, STK_OTA, 1);
+    }
+    cbor_w_uint(&w, STK_AST, ost.ast);
+    if (ost.ast == 2) {
+        cbor_w_tstr(&w, STK_AST_ID, ost.ast_id, strlen(ost.ast_id));
     }
     if (ost.have_job) {
         const char *ost_st = ota_state_str(ost.state);
@@ -634,6 +696,92 @@ static void publish_status_online(void)
         ota_on_status_published(true); // rollback confirmation + end-of-job bookkeeping
     } else {
         ESP_LOGI(TAG, "publish /status online failed");
+    }
+}
+
+// Halt screen text lines (see modes_accel_halt()). Power effect: none.
+static void halt_screen_paint(const accel_halt_info_t *h)
+{
+    char l[80];
+    gfx_clear();
+    gfx_text(4, 2, GFX_FONT_LARGE, "Shake sensor failed (I2C)");
+    gfx_hline(0, GFX_SCREEN_W - 1, 21);
+    int y = 25;
+    snprintf(l, sizeof(l), "read %s failed: %s (0x%x)", h->reg, esp_err_to_name((esp_err_t) h->err), (unsigned) h->err);
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    snprintf(l, sizeof(l), "consecutive fails %u   bus resets %u", (unsigned) h->consec_fails, (unsigned) h->bus_resets);
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    snprintf(l, sizeof(l), "accel reboots used %u of %u", (unsigned) h->reboots_used, (unsigned) h->reboot_budget);
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    if (h->who_err == ESP_OK) {
+        snprintf(l, sizeof(l), "last WHO_AM_I 0x%02x (expect 0x33)", (unsigned) h->who);
+    } else {
+        snprintf(l, sizeof(l), "last WHO_AM_I read failed: %s", esp_err_to_name((esp_err_t) h->who_err));
+    }
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    unsigned up = (unsigned) (h->uptime_us / 1000000);
+    int64_t epoch = approx_epoch();
+    char wall[28] = "clock unknown";
+    if (epoch > 0) {
+        time_t t = (time_t) epoch;
+        struct tm tm;
+        gmtime_r(&t, &tm);
+        strftime(wall, sizeof(wall), "%Y-%m-%d %H:%M UTC", &tm);
+    }
+    snprintf(l, sizeof(l), "up %uh%02um%02us   %s", up / 3600, (up / 60) % 60, up % 60, wall);
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    snprintf(l, sizeof(l), "fw %s   id %s", fw_version_str(), ident_get_dev_id());
+    gfx_text(4, y, GFX_FONT_NORMAL, l);
+    y += 13;
+    gfx_text(4, y, GFX_FONT_NORMAL, "Press RESET to retry.");
+}
+
+static void halt_publish_task(void *arg)
+{
+    publish_status_online();
+    xSemaphoreGive((SemaphoreHandle_t) arg);
+    vTaskDelete(NULL);
+}
+
+#define HALT_PUBLISH_WAIT_MS 5000
+
+// Last rung of the accel I2C ladder. Power effect: one full refresh (~2-4 s), an optional /status
+// publish (<= 5 s), then radio and rails off and deep sleep with no wake source (~uA).
+void modes_accel_halt(const accel_halt_info_t *h)
+{
+    ESP_LOGI(TAG, "accel halt: drawing error screen");
+    ui_ensure_powered();
+    halt_screen_paint(h);
+    disp_full_refresh(); // the panel keeps the image unpowered
+    watchdog_feed();
+
+    net_mqtt_status_t st;
+    net_get_mqtt_status(&st);
+    if (st.mqtt_connected) {
+        watchdog_set_reported_stage(WD_ACCEL_RESTART); // /status STK_STAGE shows the accel stage
+        SemaphoreHandle_t done = xSemaphoreCreateBinary();
+        if (done && xTaskCreate(halt_publish_task, "halt_pub", 6144, done, 5, NULL) == pdPASS) {
+            bool sent = xSemaphoreTake(done, pdMS_TO_TICKS(HALT_PUBLISH_WAIT_MS)) == pdTRUE;
+            ESP_LOGI(TAG, "accel halt: /status %s", sent ? "attempted" : "not finished in 5 s, giving up");
+        }
+    }
+    watchdog_feed();
+
+    ESP_LOGI(TAG, "accel halt: powering down (RESET or power cycle to retry)");
+    net_session_down();
+    net_radio_off();
+    rail_off();
+    gpio_hold_en((gpio_num_t) PAGER_PIN_3V3_EN); // keep both rails off through deep sleep; rail_init() releases
+    gpio_deep_sleep_hold_en();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_deep_sleep_start();
+    for (;;) {
+        vTaskDelay(portMAX_DELAY); // unreachable
     }
 }
 
@@ -1621,6 +1769,13 @@ static bs_cause_t loop_cause(bool attentive, bool btn_busy, bool btn_stuck, bool
     return BS_TIMER;
 }
 
+// Power effect: none. Feeds battstat cause + `sp` (HOT held by accel_shake_pending() alone).
+static void bs_raise_loop(bool attentive, bool btn_busy, bool btn_stuck, bool ui_awake)
+{
+    bs_cause_t c = loop_cause(attentive, btn_busy, btn_stuck, ui_awake);
+    battstat_raise_ex(c, c == BS_HOT && !input_hot());
+}
+
 void modes_run(void)
 {
     uint32_t backoff_index = 0;
@@ -1686,6 +1841,7 @@ void modes_run(void)
         bool skip_sleep = btn_busy || btn_stuck || ui_awake || net_modem_busy() || net_connect_in_flight() ||
                            net_publish_in_flight() || bookpull_fetch_in_progress() || net_resub_hold() ||
                            accel_shake_pending() || input_hot() || ota_transfer_active();
+        bs_raise_loop(attentive, btn_busy, btn_stuck, ui_awake);
         // Once per 60 s while the loop has not slept for >= 60 s and no input window is open, name every
         // term holding it awake.
         {
@@ -2054,6 +2210,12 @@ void modes_run(void)
 #endif
         }
 
+        // Device info screen fill (scr_devinfo.c requests it): after this pass's render. Power effect: up
+        // to six bounded AT round trips (3 s timeouts), no RRC.
+        if (net_devinfo_take_request()) {
+            net_devinfo_refresh();
+        }
+
         // Deferred mode-edge /status publish (set_mode()): after this
         // iteration's render, and only once the UI is idle, or after the cap.
         // Power effect: one small MQTT publish on an already-up session.
@@ -2258,6 +2420,7 @@ void modes_run(void)
         if (accel_poll()) {
             ui_ensure_powered(); // rail on + panel power-loss note so the first render is a correct partial
             input_note_shake_wake(esp_timer_get_time());
+            battstat_note_shake(); // accepted shake -> bs.sa (counter only)
         }
         loc_service();
 
@@ -2294,12 +2457,18 @@ void modes_run(void)
             oe.mqtt_usable = st.mqtt_connected;
             oe.other_fetch = (cafetch_in_progress() && !ota_transfer_active()) || catrust_apply_in_progress();
             oe.sleep_mode = g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP;
+            oe.batt_mv = modes_batt_mv_known() ? modes_get_batt_mv() : OTA_MIN_BATT_MV; // unknown battery does not block OTA
             oe.rssi = (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : 0;
             int64_t age_ms = (esp_timer_get_time() - s_last_input_us) / 1000;
             oe.input_age_ms = age_ms < 0 ? 0 : (age_ms > 0xFFFFFFF0LL ? 0xFFFFFFF0u : (uint32_t) age_ms);
             oe.now_us = esp_timer_get_time();
             oe.epoch = (uint32_t) approx_epoch();
             ota_service(&oe);
+            if (ota_take_redraw_request()) {
+                // The font source changed (font download start / commit): the next refresh of any kind
+                // is a full one (ghosting reset). A flag only: no render, no rail, no panel work here.
+                disp_request_full();
+            }
             if (ota_take_status_request() && st.mqtt_connected) {
                 publish_status_online(); // dl start, 50 %, ready, fail, rb
             }
@@ -2318,6 +2487,7 @@ void modes_run(void)
         rtc_lock();
         rtc_save();
         rtc_unlock();
+        bs_raise_loop(attentive, input_button_busy(), input_button_stuck(), input_awake());
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
         ST_MARK(7);
         // Longest single iteration's awake work (excludes light-sleep time).

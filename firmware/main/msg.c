@@ -451,6 +451,7 @@ void msg_count_malformed(void)
 
 // RAM-resident state (docs/PROTOCOL.md §9.5), guarded by the same lock as the RTC struct.
 
+static msg_t s_thread[MSG_THREAD_DEPTH];
 
 static bool s_history_lost_pending = false;
 static char s_last_ingest_id[MSG_ID_MAX] = "";
@@ -532,6 +533,9 @@ static uint32_t s_hist_next_seq = 1;
 // once from msg_init().
 static void history_mount(void)
 {
+    int64_t t0 = esp_timer_get_time();
+    size_t int0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t ps0 = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     esp_err_t err = nvs_flash_init_partition(MSGHIST_PART);
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         if (nvs_flash_erase_partition(MSGHIST_PART) == ESP_OK) {
@@ -546,6 +550,10 @@ static void history_mount(void)
         return;
     }
     s_hist_available = true;
+    ESP_LOGI(TAG, "msghist mounted in %lld ms, internal free %u->%u, psram free %u->%u",
+             (long long) ((esp_timer_get_time() - t0) / 1000), (unsigned) int0,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned) ps0,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 // Next persisted-history sequence number, or 0 ("do not persist") if msghist is unavailable.
