@@ -2,6 +2,17 @@
 
 KiCad 10 projects for the carrier board that replaces the Adafruit breakouts
 around the Walter module, and for the small panel board that drives the
+2.9" SSD1680 e-ink glass. The panel board sits between the glass and the
+battery and is cabled to the carrier over a JST SH cable.
+
+**Carrier: hand-edited.** The carrier `.kicad_sch` files are the source of
+truth; `gen/carrier.py` / `gen/carrier_pcb.py` / `gen/build.py` describe an
+earlier generated revision and must NOT be re-run (they overwrite the hand
+edits). The sections below describe that generated revision; reference
+designators and some parts differ in the hand-edited schematic.
+
+**Panel: generated.** `gen/panel.py` + `gen/panel_pcb.py`; regenerate only the
+panel with a driver that calls `build.build_panel(True)` (never `build.py`'s
 main, which rebuilds the carrier too), then `panel_pcb.py --route` and
 `finish_pcb.py panel` with KiCad's python.
 
@@ -112,6 +123,20 @@ tail end), and the USB-C at 6.5 is the only thing taller than 3.5 mm.
    15 Ω source resistor with an MMBT3904 base-emitter across it, a ~45 mA
    clamp that is independent of SYS and of firmware; the 1 k gate resistor
    lets the BJT pull the gate down. Dim with FL_PWM. Fits both the FL03
+   (60 mA max) and the Orient AEZ122250A00 light (3 LEDs, 45 mA at Vf 3.3 V).
+8b. **Two front-light ZIF positions on the panel board.** The 6-pin
+   light flex pinout (1-2 anode, 3-4 NC, 5-6 cathode) is the same on both
+   panels, but where the tail leaves the glass is not. J3 "FL-A" (fitted)
+   is for the FL03 tail; J4 "FL-B" (DNP) is for the Orient
+   AEZ122250A00-2.13ENRWS tail. The Orient light's pin numbers run opposite
+   to its display tail's, so J4 is wired 1-2 cathode / 5-6 anode. The cable's
+   FL_P / FL_N reach FL_A / FL_K through two bridged solder jumpers JP1/JP2
+   (1-2 bridged = straight; cut and bridge 2-3 = crossover), so a tail whose
+   polarity turns out mirrored is a jumper change. The display ZIF J1 and its
+   reference circuit (47 µH, 2.2 Ω, MBR0530, 1 µF/25 V, BS1 low) are
+   identical in the Good Display and Orient sheets, so the same panel board
+   takes either glass.
+   From the drawings (GDEY029T94-FL03-CAD.pdf and AEZ122250A00-2.13ENRWS
    RTC GPIO so it can be an ext1 wake), 100 k pull-up to 3V3, 100 nF, switch to
    GND. TP13 is on the same net.
 10. **Fuel gauge** U10 is populated. CELL and VDD both on VBAT,
@@ -167,6 +192,11 @@ output with the VSET resistor. The 267 k 0603 stays.
   face mirrors the pin order (1↔24). The footprint uses the FH12
   bottom-contact convention; confirm on a physical panel
   before ordering. Same for the 6-pin front-light tail (a mirror there only
+  swaps anode and cathode: no light, no damage; fix = change JP1/JP2 on the
+  panel board).
+- UC8151 / IL0373 panels (Good Display GDEW series, Waveshare non-V2) use a
+  different RESE value; if those must fit, give R4 a second parallel 0603
+  footprint and confirm the value from a specific sheet.
 - Walter header geometry against a physical module before ordering.
 - Battery lead polarity (Adafruit 328) versus J2 pin 1.
 - LTE peak current at VIN, to confirm 100 µF + 10 µF and the
