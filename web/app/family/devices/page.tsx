@@ -3,6 +3,7 @@
 /** `/family/devices`: the family-scoped counterpart of `/admin/devices`; reads the family's devices
  * and writes to `/api/family/devices*` with `familyQuery()` appended. */
 
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Dialog from "@mui/material/Dialog";
@@ -25,6 +26,8 @@ import { ApiError, api } from "@/lib/api";
 import { useNewestBuild } from "@/lib/firmware";
 import { useDirectory } from "@/lib/directory";
 import { familyQuery, useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { familyDevicesQuery } from "@/lib/live/queries";
 import type { DeviceDoc } from "@/lib/types";
 
 import BridgePhonesSection from "@/components/BridgePhonesSection";
@@ -58,6 +61,11 @@ function FamilyDevicesInner() {
   const { familyId } = useFamily();
   const [fwDeviceId, setFwDeviceId] = useState<string | null>(null);
   const [fontsDeviceId, setFontsDeviceId] = useState<string | null>(null);
+  // No family in scope yet: `useLive` keeps what it held.
+  const { docs: deviceDocs } = useLive<
+    DeviceDoc & { provisionState?: ProvisionState; pendingCfg?: PendingCfgDoc }
+  >(familyId ? familyDevicesQuery(familyId) : null);
+  const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
   // the build list is the same for every device of the family, so use the first
   const newestBuild = useNewestBuild(true, "family", devices[0]?.id);
   const [error, setError] = useState<string | null>(null);

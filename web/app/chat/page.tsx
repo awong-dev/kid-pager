@@ -3,6 +3,7 @@
 /** `/chat`: conversation list (last message, unread badge) and device status, all live reads. */
 
 import { useRouter } from "next/navigation";
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Badge from "@mui/material/Badge";
 import Box from "@mui/material/Box";
@@ -37,6 +38,8 @@ import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { familyConversationsQuery, familyDevicesOwnedByQuery, myConversationsQuery } from "@/lib/live/queries";
 import { formatRelativeAge, tsToMillis } from "@/lib/time";
 import { peerLabel } from "@/lib/names";
 import type { ConversationDoc, DeviceDoc } from "@/lib/types";
@@ -73,10 +76,44 @@ function ChatListInner() {
   // the "Family" tab is admin only
   const [tab, setTab] = useState<"mine" | "family">("mine");
 
+  // the queries need `familyId` for the rules' `sameFam` clause
+  const ready = Boolean(me && familyId);
+  const { docs: conversationDocs } = useLive<ConversationDoc>(
+    me && ready ? myConversationsQuery(me.uid) : null
+  );
+  const conversations = useMemo(() => {
+    if (!me) return [];
+    const rows: ConversationRow[] = conversationDocs.map((d) => {
+      const data = d.data;
+      // a group has no single peer
+      const peerUid =
+        data.kind === "group" ? null : (data.uids.find((u) => u !== me.uid) ?? data.uids[0] ?? null);
+      return { ...data, convKey: d.id, peerUid };
+    });
+    rows.sort((a, b) => (tsToMillis(b.lastMessageAt) ?? 0) - (tsToMillis(a.lastMessageAt) ?? 0));
+    return rows;
+  }, [conversationDocs, me]);
 
+  const { docs: deviceDocs } = useLive<DeviceDoc>(
+    me && familyId ? familyDevicesOwnedByQuery(familyId, me.uid) : null
+  );
+  const device = deviceDocs[0]?.data ?? null;
 
   // Family tab: conversations of this family that I am not a party to; the rules' family-admin
   // clause makes the query legal for admins only.
+  const { docs: familyConversationDocs } = useLive<ConversationDoc>(
+    me && isFamilyAdmin && familyId ? familyConversationsQuery(familyId) : null
+  );
+  const familyConversations = useMemo(() => {
+    if (!me) return [];
+    const rows: (ConversationDoc & { convKey: string })[] = [];
+    for (const d of familyConversationDocs) {
+      if (d.data.uids.includes(me.uid)) continue;
+      rows.push({ ...d.data, convKey: d.id });
+    }
+    rows.sort((a, b) => (tsToMillis(b.lastMessageAt) ?? 0) - (tsToMillis(a.lastMessageAt) ?? 0));
+    return rows;
+  }, [familyConversationDocs, me]);
 
   // Name DM peers from the conversation's `participants`, falling back to the directory; a DM
   // with neither is dropped. A group routes by its own `alias`.

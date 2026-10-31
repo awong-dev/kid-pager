@@ -23,15 +23,23 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import { AUTH_BACKEND } from "@/lib/auth";
 import { useAuth } from "@/lib/auth-context";
 import { getFirebaseAuth } from "@/lib/firebase";
+
+import HomeLogin from "./HomeLogin";
 
 const EMAIL_LINK_STORAGE_KEY = "pager.signInEmail";
 const E164_RE = /^\+[1-9]\d{1,14}$/;
 
 type Mode = "enter-identifier" | "email-sent" | "enter-code" | "completing";
 
+/** The home build (`NEXT_PUBLIC_BACKEND=home`) renders `HomeLogin` instead of the Firebase form. */
 export default function LoginPage() {
+  return AUTH_BACKEND === "home" ? <HomeLogin /> : <FirebaseLogin />;
+}
+
+function FirebaseLogin() {
   const { status, notRegisteredMessage } = useAuth();
   const router = useRouter();
 

@@ -16,6 +16,8 @@ import MessageList, { type MessageRow } from "@/components/MessageList";
 import RequireAuth from "@/components/RequireAuth";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { conversationQuery, monitorMessagesQuery } from "@/lib/live/queries";
 import { peerLabel } from "@/lib/names";
 import type { ConversationDoc, MessageDoc } from "@/lib/types";
 import { threadHeightSx } from "@/lib/layout";
@@ -74,7 +76,19 @@ function MonitorThreadInner({ convKey }: { convKey: string }) {
   const prevScrollHeightRef = useRef<number | null>(null);
   const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
 
+  const { docs: conversationDocs } = useLive<ConversationDoc>(conversationQuery(convKey));
+  const conversation = conversationDocs[0]?.data ?? null;
 
+  // The admin is not in `uids`, so the query carries the family-admin half of the rules' `messages`
+  // predicate (`familyId`).
+  const { docs: messageDocs } = useLive<MessageDoc>(
+    familyId ? monitorMessagesQuery(convKey, familyId, pageSize) : null
+  );
+  const messages = useMemo(() => {
+    const rows: MessageRow[] = messageDocs.map((d) => ({ id: d.id, ...d.data }));
+    rows.sort((a, b) => a.seq - b.seq);
+    return dedupeByGroupMsgId(rows);
+  }, [messageDocs]);
 
   function scrollToBottom(behavior: ScrollBehavior) {
     const el = listRef.current;

@@ -9,6 +9,8 @@ import { useEffect, useRef } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { subscribeLive } from "@/lib/live";
+import { myConversationsQuery, openAlertsQuery } from "@/lib/live/queries";
 import {
   notificationPermission,
   notificationsSupported,
@@ -71,11 +73,14 @@ export default function NotificationWatcher() {
     byUidRef.current = byUid;
   }, [byUid]);
 
+  // Refresh the push registration once per page load, only when permission is already
+  // "granted" so registerForPush()'s requestPermission() cannot show a prompt.
   const pushRefreshed = useRef(false);
   useEffect(() => {
     if (!me || pushRefreshed.current) return;
     if (!notificationsSupported() || notificationPermission() !== "granted") return;
     pushRefreshed.current = true;
+    registerForPush().catch((err: unknown) => console.warn("push registration refresh failed", err));
   }, [me]);
 
   useEffect(() => {
@@ -83,6 +88,9 @@ export default function NotificationWatcher() {
     const previousUnread = new Map<string, number>();
     let initialized = false;
 
+    const unsubscribe = subscribeLive<ConversationDoc>(myConversationsQuery(me.uid), (docs) => {
+      docs.forEach((d) => {
+        const data = d.data;
         const unread = data.unread?.[me.uid] ?? 0;
         const prevUnread = previousUnread.get(d.id) ?? 0;
 
@@ -124,7 +132,10 @@ export default function NotificationWatcher() {
     const seen = new Set<string>();
     let initialized = false;
 
+    const unsubscribe = subscribeLive<AlertDoc>(openAlertsQuery(familyId), (docs) => {
+      docs.forEach((d) => {
         if (initialized && !seen.has(d.id)) {
+          const data = d.data;
           const onAlertsPage = pathnameRef.current?.startsWith("/family/alerts") ?? false;
           if (document.visibilityState !== "visible" || !onAlertsPage) {
             showForegroundAlertNotification(data.preview);

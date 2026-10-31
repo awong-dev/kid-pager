@@ -22,6 +22,8 @@ import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useFamily } from "@/lib/family-context";
+import { subscribeLive, useLive } from "@/lib/live";
+import { allAllowQuery, allUsersQuery } from "@/lib/live/queries";
 import type { AllowEdgeDoc, UserDoc } from "@/lib/types";
 import { responsiveTableSx } from "@/lib/tableSx";
 
@@ -46,11 +48,22 @@ function AllowlistInner() {
   const [saving, setSaving] = useState(false);
   const [showAllFamilies, setShowAllFamilies] = useState(false);
 
+  const { docs: userDocs } = useLive<UserDoc>(allUsersQuery());
+  const users = useMemo(() => {
+    const rows: UserRow[] = userDocs.map((d) => ({ uid: d.id, ...d.data }));
+    rows.sort((a, b) => a.alias.localeCompare(b.alias));
+    return rows;
+  }, [userDocs]);
+
   useEffect(() => {
+    return subscribeLive<AllowEdgeDoc>(allAllowQuery(), (docs) => {
       setMatrix((prev) => {
         // keep unsaved local edits
         if (dirty) return prev;
         const next = new Map<string, Cell>();
+        for (const d of docs) {
+          next.set(pairKey(d.data.fromUid, d.data.toUid), { message: d.data.message, locate: d.data.locate });
+        }
         return next;
       });
     });

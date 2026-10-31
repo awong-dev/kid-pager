@@ -28,7 +28,10 @@ import AppShell from "@/components/AppShell";
 import MemberDrawer, { type MemberDrawerMember } from "@/components/MemberDrawer";
 import RequireAuth from "@/components/RequireAuth";
 import { deviceName } from "@/lib/devices";
+import { AUTH_BACKEND } from "@/lib/auth";
 import { familyQuery, useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { familyDevicesQuery, familyMembersQuery } from "@/lib/live/queries";
 import { inboundLabel, outboundLabel } from "@/lib/policy";
 import type { DeviceDoc, FamilyDoc, Role, UserDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
@@ -55,6 +58,7 @@ function FamilyPeopleInner() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [invite, setInvite] = useState<{ name: string; code: string; expiresAt: string } | null>(null);
 
   const loadFamily = useCallback(async () => {
     try {
@@ -94,6 +98,15 @@ function FamilyPeopleInner() {
   const renameTrimmed = renameValue.trim();
   const renameValid = renameTrimmed.length >= 1 && [...renameTrimmed].length <= 40;
 
+  // No family in scope yet: `useLive` keeps what it held.
+  const { docs: memberDocs } = useLive<UserDoc>(familyId ? familyMembersQuery(familyId) : null);
+  const members = useMemo(() => {
+    const rows: MemberRow[] = memberDocs.map((d) => ({ uid: d.id, ...d.data }));
+    rows.sort((a, b) => a.alias.localeCompare(b.alias));
+    return rows;
+  }, [memberDocs]);
+  const { docs: deviceDocs } = useLive<DeviceDoc>(familyId ? familyDevicesQuery(familyId) : null);
+  const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
 
   const devicesByOwner = useMemo(() => {
     const map = new Map<string, DeviceRow[]>();
@@ -131,6 +144,22 @@ function FamilyPeopleInner() {
     }
   }
 
+  async function createInvite(m: MemberRow) {
+    setError(null);
+    try {
+      const res = await api.post<{ code: string; expiresAt: string }>(
+        `/family/people/${m.uid}/invite${familyQuery()}`
+      );
+      setInvite({ name: m.displayName, ...res });
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to create invite code");
+    }
+  }
+
+  const formValid =
+    form.alias.trim() &&
+    form.displayName.trim() &&
+    (AUTH_BACKEND === "home" || form.email.trim() || form.phone.trim());
 
   return (
     <Stack spacing={2}>
@@ -167,6 +196,7 @@ function FamilyPeopleInner() {
               <TableCell>Devices</TableCell>
               <TableCell>Policy</TableCell>
               <TableCell>Enabled</TableCell>
+              {AUTH_BACKEND === "home" && <TableCell />}
             </TableRow>
           </TableHead>
           <TableBody>
@@ -205,6 +235,15 @@ function FamilyPeopleInner() {
                 <TableCell onClick={(e) => e.stopPropagation()}>
                   <Switch checked={!m.disabled} onChange={() => void toggleDisabled(m)} />
                 </TableCell>
+                {AUTH_BACKEND === "home" && (
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    {m.kind !== "external" && (
+                      <Button size="small" onClick={() => void createInvite(m)}>
+                        Invite code
+                      </Button>
+                    )}
+                  </TableCell>
+                )}
               </TableRow>
             ))}
           </TableBody>
@@ -285,6 +324,27 @@ function FamilyPeopleInner() {
           <Button onClick={() => void saveRename()} disabled={!renameValid}>
             Save
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog fullScreen={fullScreen} open={invite !== null} onClose={() => setInvite(null)} fullWidth maxWidth="xs">
+        <DialogTitle>Invite code</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Typography variant="h4" sx={{ fontFamily: "monospace", textAlign: "center" }}>
+              {invite?.code}
+            </Typography>
+            <Typography variant="body2">
+              Valid until {invite ? new Date(invite.expiresAt).toLocaleString() : ""}
+            </Typography>
+            <Typography variant="body2">
+              Give this code to {invite?.name}. On the sign-in page they choose &quot;Have an invite code?&quot; and set
+              their own password or passkey. It works once.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setInvite(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 

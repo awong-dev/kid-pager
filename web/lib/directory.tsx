@@ -15,6 +15,8 @@ import {
 import { api } from "./api";
 import { useAuth } from "./auth-context";
 import { useFamily } from "./family-context";
+import { useLive } from "./live";
+import { familyMembersQuery, myConversationsQuery } from "./live/queries";
 import type { ConversationDoc, Role, UserDoc, UserKind } from "./types";
 
 // `GET /api/directory` entry shape, also used (minus `phone`) for `users` listener rows.
@@ -79,7 +81,23 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   const [apiLoaded, setApiLoaded] = useState(false);
 
   // Live: every member of the family in scope. With no family in scope `useLive` keeps the
+  // previous map until the new snapshot fires.
+  const familyLive = useLive<UserDoc>(familyId ? familyMembersQuery(familyId) : null);
+  const familyEntries = useMemo(() => {
+    const next = new Map<string, DirectoryEntry>();
+    for (const { id, data } of familyLive.docs) {
+      next.set(id, {
+        uid: id,
+        alias: data.alias,
+        displayName: data.displayName,
+        kind: data.kind,
+        familyId: data.familyId,
+        role: data.role,
       });
+    }
+    return next;
+  }, [familyLive.docs]);
+  const familyLoaded = familyId !== null && !familyLive.loading;
 
   // One-shot fetch of cross-family peers and externals, on sign-in and on every family switch.
   useEffect(() => {
@@ -109,7 +127,22 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   }, [me, familyId]);
 
   // Group conversations this member belongs to; a DM doc has no `alias` and is skipped.
+  const { docs: convDocs } = useLive<ConversationDoc>(me ? myConversationsQuery(me.uid) : null);
+  const groupsByAlias = useMemo(() => {
+    const next = new Map<string, GroupInfo>();
+    for (const { id, data } of convDocs) {
+      if (data.kind === "group" && data.alias) {
+        next.set(data.alias, {
+          convKey: id,
+          alias: data.alias,
+          name: data.name ?? data.alias,
+          uids: data.uids,
+          bridged: Boolean(data.bridge),
+        });
+      }
     }
+    return next;
+  }, [convDocs]);
 
   // Merge: the live listener wins over the API fetch for any uid both name; the fetch is the
   // only source for cross-family peers and externals. Self always resolves from `me`.

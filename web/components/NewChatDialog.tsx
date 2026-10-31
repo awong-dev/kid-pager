@@ -2,6 +2,7 @@
 
 /** "New chat" dialog: search select over the address book; only navigates to `/chat/{alias}`. */
 
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import Alert from "@mui/material/Alert";
@@ -15,7 +16,10 @@ import TextField from "@mui/material/TextField";
 import PhoneIcon from "@mui/icons-material/Phone";
 
 import { useAuth } from "@/lib/auth-context";
+import { useLive } from "@/lib/live";
+import { userQuery } from "@/lib/live/queries";
 import { BOOK_GROUP_ORDER, type BookGroup, bookGroup, useBook } from "@/lib/book";
+import type { UserDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 interface ChatOption {
@@ -69,6 +73,8 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   const { isFamilyAdmin, me } = useAuth();
   // Live, so an admin setting the number takes effect without a reload.
   const meUid = me?.uid;
+  const { docs: meDocs } = useLive<UserDoc>(meUid ? userQuery(meUid) : null);
+  const hasSmsNumber = Boolean(meDocs[0]?.data.smsNumber);
   const { data } = useBook();
   const [inputValue, setInputValue] = useState("");
   const [value, setValue] = useState<ChatOption | string | null>(null);

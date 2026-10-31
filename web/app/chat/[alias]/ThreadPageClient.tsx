@@ -27,6 +27,13 @@ import { useDirectory } from "@/lib/directory";
 import { peerLabel } from "@/lib/names";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import type { SmsLogEntry, SmsLogResponse } from "@/lib/smsContacts";
+import { getLiveOnce, useLive } from "@/lib/live";
+import {
+  familyDevicesLocatableByQuery,
+  familyDevicesOwnedByQuery,
+  messageQuery,
+  threadMessagesQuery,
+} from "@/lib/live/queries";
 import { threadHeightSx } from "@/lib/layout";
 
 const PAGE_SIZE_STEP = 50;
@@ -165,9 +172,33 @@ function ThreadInner({ alias }: { alias: string }) {
   const convKey = group ? group.convKey : me && peerUid ? [me.uid, peerUid].sort().join("_") : null;
 
   // `pageSize` grows on "load older" and the listener re-subscribes with the bigger limit.
+  const { docs: messageDocs } = useLive<MessageDoc>(
+    convKey && me ? threadMessagesQuery(convKey, me.uid, pageSize) : null
+  );
+  const messages = useMemo(() => {
+    const rows: MessageRow[] = messageDocs.map((d) => ({ id: d.id, ...d.data }));
+    rows.sort((a, b) => a.seq - b.seq);
+    return dedupeByGroupMsgId(rows);
+  }, [messageDocs]);
 
   // Peer's pager device, for the status line and "View location" link. An admin queries any device;
   // a member must filter on their own uid in `locatableBy`. Both need `familyId` for the rules.
+  const isAdmin = me?.role === "admin";
+  const { docs: deviceDocs, loading: deviceLoading } = useLive<DeviceDoc>(
+    !me || !peerUid || !familyId
+      ? null
+      : isAdmin
+        ? familyDevicesOwnedByQuery(familyId, peerUid)
+        : familyDevicesLocatableByQuery(familyId, me.uid)
+  );
+  const deviceMatch = isAdmin ? deviceDocs[0] : deviceDocs.find((d) => d.data.ownerUid === peerUid);
+  const device: (DeviceDoc & { id: string }) | null = deviceMatch
+    ? { id: deviceMatch.id, ...deviceMatch.data }
+    : null;
+  // An empty answer is authoritative only for an admin; a member's `locatableBy` query is not.
+  const peerDeviceKnownNone = Boolean(
+    isAdmin && me && peerUid && familyId && !deviceLoading && deviceDocs.length === 0
+  );
 
   const canViewLocation = Boolean(me && device?.locatableBy.includes(me.uid));
 
@@ -274,6 +305,9 @@ function ThreadInner({ alias }: { alias: string }) {
       setComposer("");
       // learn the peer uid from the sent message; not for a group (copies name arbitrary members)
       if (!peerUid && !group) {
+        const found = await getLiveOnce<MessageDoc>(messageQuery(resp.id));
+        if (found[0]) {
+          learn(found[0].data.recipientUid, alias);
         }
       }
     } catch (err) {

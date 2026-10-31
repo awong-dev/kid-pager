@@ -3,6 +3,7 @@
 /** `/admin/users`: create (alias, name, email/phone, role), disable, delete via the users API. */
 
 import Link from "next/link";
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
@@ -27,7 +28,10 @@ import IconButton from "@mui/material/IconButton";
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
+import { AUTH_BACKEND } from "@/lib/auth";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { allUsersQuery } from "@/lib/live/queries";
 import type { Role, UserDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 import { responsiveTableSx } from "@/lib/tableSx";
@@ -52,10 +56,20 @@ function AdminUsersInner() {
   const { familyId: scopeFamilyId, families } = useFamily();
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [invite, setInvite] = useState<{ name: string; code: string; expiresAt: string } | null>(null);
+  const [pwUser, setPwUser] = useState<UserRow | null>(null);
+  const [pwValue, setPwValue] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm);
   // "All" only when the switcher has no family selected.
   const [filterFamily, setFilterFamily] = useState<string>(scopeFamilyId ?? ALL_FAMILIES);
 
+  const { docs: userDocs } = useLive<UserDoc>(allUsersQuery());
+  const users = useMemo(() => {
+    const rows: UserRow[] = userDocs.map((d) => ({ uid: d.id, ...d.data }));
+    rows.sort((a, b) => a.alias.localeCompare(b.alias));
+    return rows;
+  }, [userDocs]);
 
   function openCreate() {
     // default the dialog's family picker to the switcher's family unless already picked
@@ -107,9 +121,36 @@ function AdminUsersInner() {
     }
   }
 
+  async function createInvite(u: UserRow) {
+    if (!u.familyId) return;
+    setError(null);
+    try {
+      const res = await api.post<{ code: string; expiresAt: string }>(
+        `/family/people/${u.uid}/invite?family=${encodeURIComponent(u.familyId)}`
+      );
+      setInvite({ name: u.displayName, ...res });
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to create invite code");
+    }
+  }
+
+  async function savePassword() {
+    if (!pwUser) return;
+    setError(null);
+    try {
+      await api.post(`/admin/users/${pwUser.uid}/password`, { password: pwValue });
+      setNotice(`Password set for @${pwUser.alias}`);
+      setPwUser(null);
+      setPwValue("");
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to set password");
+    }
+  }
+
   const formValid =
     form.alias.trim() &&
     form.displayName.trim() &&
+    (AUTH_BACKEND === "home" || form.email.trim() || form.phone.trim()) &&
     (form.role === "super" || form.familyId.trim().length > 0);
 
   return (
@@ -136,6 +177,11 @@ function AdminUsersInner() {
         ))}
       </TextField>
       {error && <Alert severity="error">{error}</Alert>}
+      {notice && (
+        <Alert severity="success" onClose={() => setNotice(null)}>
+          {notice}
+        </Alert>
+      )}
 
       <TableContainer sx={responsiveTableSx([3,4,5])}>
         <Table size="small">
@@ -172,6 +218,25 @@ function AdminUsersInner() {
                   <Switch checked={!u.disabled} onChange={() => void toggleDisabled(u)} size="small" />
                 </TableCell>
                 <TableCell>
+                  {AUTH_BACKEND === "home" && u.kind !== "external" && (
+                    <>
+                      {u.familyId && (
+                        <Button size="small" onClick={() => void createInvite(u)}>
+                          Invite code
+                        </Button>
+                      )}
+                      <Button
+                        size="small"
+                        onClick={() => {
+                          setPwUser(u);
+                          setPwValue("");
+                          setNotice(null);
+                        }}
+                      >
+                        Set password
+                      </Button>
+                    </>
+                  )}
                   <IconButton size="small" onClick={() => void deleteUser(u)} aria-label="delete">
                     <DeleteIcon fontSize="small" />
                   </IconButton>
@@ -247,6 +312,50 @@ function AdminUsersInner() {
           <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
           <Button onClick={() => void createUser()} disabled={!formValid}>
             Create
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog fullScreen={fullScreen} open={invite !== null} onClose={() => setInvite(null)} fullWidth maxWidth="xs">
+        <DialogTitle>Invite code</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Typography variant="h4" sx={{ fontFamily: "monospace", textAlign: "center" }}>
+              {invite?.code}
+            </Typography>
+            <Typography variant="body2">
+              Valid until {invite ? new Date(invite.expiresAt).toLocaleString() : ""}
+            </Typography>
+            <Typography variant="body2">
+              Give this code to {invite?.name}. On the sign-in page they choose &quot;Have an invite code?&quot; and set
+              their own password or passkey. It works once.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setInvite(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog fullScreen={fullScreen} open={pwUser !== null} onClose={() => setPwUser(null)} fullWidth maxWidth="xs">
+        <DialogTitle>Set password{pwUser ? ` for @${pwUser.alias}` : ""}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              autoFocus
+              type="password"
+              label="Password"
+              value={pwValue}
+              onChange={(e) => setPwValue(e.target.value)}
+              helperText="At least 8 characters"
+              fullWidth
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPwUser(null)}>Cancel</Button>
+          <Button onClick={() => void savePassword()} disabled={pwValue.length < 8}>
+            Save
           </Button>
         </DialogActions>
       </Dialog>

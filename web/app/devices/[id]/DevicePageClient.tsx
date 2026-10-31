@@ -39,6 +39,8 @@ import { useAuth } from "@/lib/auth-context";
 import { deviceName } from "@/lib/devices";
 import { useNewestBuild } from "@/lib/firmware";
 import { useDirectory } from "@/lib/directory";
+import { useLive } from "@/lib/live";
+import { deviceQuery } from "@/lib/live/queries";
 import {
   type SmsContact,
   type SmsContactsResponse,
@@ -142,6 +144,16 @@ function DeviceInner() {
   const [logLoadingMore, setLogLoadingMore] = useState(false);
   const [logHasMore, setLogHasMore] = useState(true);
 
+  const deviceQ = id && id !== "_" ? deviceQuery(id) : null;
+  const { docs: deviceDocs, loading: deviceLoading, error: deviceListenError } = useLive<DeviceDoc>(deviceQ);
+  const device: (DeviceDoc & { id: string }) | null = deviceDocs[0]
+    ? { id: deviceDocs[0].id, ...deviceDocs[0].data }
+    : null;
+  const deviceError = deviceListenError
+    ? "You don't have access to this device."
+    : deviceQ && !deviceLoading && deviceDocs.length === 0
+      ? "No such device."
+      : null;
 
   // Both fetchers set state only after their `await`, so the mount effect may call them.
   const fetchContacts = useCallback(async () => {

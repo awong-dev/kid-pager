@@ -3,6 +3,7 @@
 /** `/family/contacts`: the family's SMS contacts with add/rename/delete via `/api/family/contacts`,
  * plus a read-only "Linked families" list. A duplicate name is a 409 shown in the dialog. */
 
+import { useEffect, useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Chip from "@mui/material/Chip";
@@ -27,6 +28,8 @@ import { ApiError, api } from "@/lib/api";
 import type { BookResponse } from "@/lib/book";
 import { useDirectory } from "@/lib/directory";
 import { familyQuery, useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { allowEdgesOfFamilyQuery } from "@/lib/live/queries";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 import { responsiveTableSx } from "@/lib/tableSx";
 
@@ -106,6 +109,17 @@ function FamilyContactsInner() {
   }, [familyId, people, byUid, contacts]);
 
   // Linked families: cross-family `allow` edges, i.e. `familyIds` with two distinct entries.
+  const { docs: edgeDocs } = useLive<AllowEdgeDoc>(familyId ? allowEdgesOfFamilyQuery(familyId) : null);
+  const linkedEdges = useMemo(() => {
+    const rows: LinkedEdge[] = [];
+    for (const d of edgeDocs) {
+      const ids = d.data.familyIds ?? [];
+      if (new Set(ids).size === 2) {
+        rows.push({ key: d.id, fromUid: d.data.fromUid, toUid: d.data.toUid });
+      }
+    }
+    return rows;
+  }, [edgeDocs]);
 
   function labelFor(uid: string): string {
     const entry = byUid(uid);

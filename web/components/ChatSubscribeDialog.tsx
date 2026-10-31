@@ -3,6 +3,7 @@
 /** Subscribe dialog for a seen Google Chat / Voice conversation (`/family/chat` and the
  * `chat_unknown` alert card). If the member's people rule is `none` it sends `canReply: false`. */
 
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Dialog from "@mui/material/Dialog";
@@ -19,6 +20,8 @@ import ChatRosterEditor, { rosterErrors } from "@/components/ChatRosterEditor";
 import { ApiError } from "@/lib/api";
 import { NICK_MAX_CODEPOINTS, nickError, useBook } from "@/lib/book";
 import { defaultRoster, outboundBlocksPeople, subscribeChat } from "@/lib/bridges";
+import { useLive } from "@/lib/live";
+import { userQuery } from "@/lib/live/queries";
 import type { RosterEntry, SubscribeResult } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
@@ -48,6 +51,9 @@ function Body({
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
 
+  const { docs: ownerDocs } = useLive<{ alias?: string; policy?: { out?: string } }>(userQuery(ownerUid));
+  const policyOut = ownerDocs[0]?.data.policy?.out ?? null;
+  const alias = ownerDocs[0]?.data.alias ?? "";
 
   const { data: book } = useBook(ownerUid);
   const pastCap = book !== null && book.entries.length >= book.pagerCap;

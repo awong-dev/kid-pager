@@ -3,6 +3,7 @@
 /** `/admin/devices`: add, rotate credentials, revoke, lock controls, last status. The one-time
  * `setupCode` lives only in React state; the auto-lock select shows the last requested value. */
 
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Dialog from "@mui/material/Dialog";
@@ -25,6 +26,8 @@ import SoracomSimsSection from "@/components/SoracomSimsSection";
 import { ApiError, api } from "@/lib/api";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { allDevicesQuery, allUsersQuery } from "@/lib/live/queries";
 import { useNewestBuild } from "@/lib/firmware";
 import type { DeviceDoc, UserDoc } from "@/lib/types";
 
@@ -58,6 +61,15 @@ function DevicesInner() {
   const fullScreen = useFullScreenDialog();
   const { uidToAlias } = useDirectory();
   const { familyId: scopeFamilyId, families } = useFamily();
+  const { docs: deviceDocs } = useLive<
+    DeviceDoc & { provisionState?: ProvisionState; pendingCfg?: PendingCfgDoc }
+  >(allDevicesQuery());
+  const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
+  const { docs: userDocs } = useLive<UserDoc>(allUsersQuery());
+  const users = useMemo<{ uid: string; alias: string; familyId: string | null }[]>(
+    () => userDocs.map((d) => ({ uid: d.id, alias: d.data.alias, familyId: d.data.familyId ?? null })),
+    [userDocs]
+  );
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState(emptyForm);

@@ -31,6 +31,8 @@ import {
   toMs,
   unpairBridge,
 } from "@/lib/bridges";
+import { useLive } from "@/lib/live";
+import { familyMembersQuery } from "@/lib/live/queries";
 import { formatRelativeAge } from "@/lib/time";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
@@ -172,6 +174,14 @@ export default function BridgePhonesSection({
   const [bridges, setBridges] = useState<BridgeRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   // each member's relay-derived SMS number
+  const { docs: userDocs } = useLive<{ smsNumber?: string | null }>(
+    familyId ? familyMembersQuery(familyId) : null
+  );
+  const smsByUid = useMemo(() => {
+    const next: Record<string, string | null> = {};
+    for (const d of userDocs) next[d.id] = d.data.smsNumber ?? null;
+    return next;
+  }, [userDocs]);
 
   const [addOpen, setAddOpen] = useState(false);
   const [addOwner, setAddOwner] = useState("");

@@ -2,6 +2,7 @@
 
 /** Auth state: calls `GET /api/me` on every sign-in; a 403 means signed in but not registered. */
 
+import type { User as FirebaseUser } from "firebase/auth";
 import {
   type ReactNode,
   createContext,
@@ -12,6 +13,8 @@ import {
 } from "react";
 
 import { ApiError, api } from "./api";
+import { AUTH_BACKEND, authProvider } from "./auth";
+import { getSetupStatus } from "./auth/home";
 import type { PolicyDoc, Role, UserKind } from "./types";
 
 export interface Me {
@@ -48,6 +51,8 @@ interface AuthContextValue {
   status: AuthStatus;
   firebaseUser: FirebaseUser | null;
   me: Me | null;
+  /** Home only: no account exists yet, so `/setup` should be shown. */
+  needsSetup: boolean;
   /** `role === 'super'` -- the one global admin. */
   isSuper: boolean;
   /** `role === 'admin' || isSuper`. */
@@ -67,13 +72,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("loading");
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [me, setMe] = useState<Me | null>(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
 
   useEffect(() => {
+    const unsubscribe = authProvider.onChange(async (user) => {
+      setFirebaseUser(AUTH_BACKEND === "firebase" ? (user as FirebaseUser | null) : null);
       if (!user) {
         setMe(null);
+        if (AUTH_BACKEND === "home") {
+          try {
+            setNeedsSetup((await getSetupStatus()).needsSetup);
+          } catch {
+            setNeedsSetup(false);
+          }
+        }
         setStatus("signed-out");
         return;
       }
+      setNeedsSetup(false);
       setStatus("loading");
       try {
         let resp = await api.get<{ user: MeResponse; role: Role; claimsStale?: boolean }>(
@@ -81,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         );
         if (resp.claimsStale) {
           // The server rewrote this account's claims: refresh the token, refetch once.
+          await authProvider.refresh(user);
           resp = await api.get<{ user: MeResponse; role: Role; claimsStale?: boolean }>("/me");
         }
         setMe(normalizeMe(resp.user));
@@ -89,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setMe(null);
         if (err instanceof ApiError && err.status === 403) {
           setStatus("not-registered");
+          await authProvider.signOut();
         } else {
           // A transient failure counts as signed out so the UI does not stay "loading".
           setStatus("signed-out");
@@ -99,6 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOutUser = useCallback(async () => {
+    await authProvider.signOut();
     setMe(null);
     setStatus("signed-out");
   }, []);
@@ -110,6 +129,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     status,
     firebaseUser,
     me,
+    needsSetup,
     isSuper,
     isFamilyAdmin,
     isAdmin: isFamilyAdmin,

@@ -3,6 +3,7 @@
 /** `/family/alerts`: inbox of `families/{fam}/alerts`, newest first; "Show handled" adds
  * `handled`/`dismissed` ones. Each row is an `AlertCard` with its own actions. */
 
+import { useMemo, useState } from "react";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
@@ -12,12 +13,16 @@ import AlertCard, { type AlertRow } from "@/components/AlertCard";
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { familyAlertsQuery } from "@/lib/live/queries";
 import type { AlertDoc } from "@/lib/types";
 
 function FamilyAlertsInner() {
   const { familyId } = useFamily();
   const [showHandled, setShowHandled] = useState(false);
 
+  const { docs } = useLive<AlertDoc>(familyId ? familyAlertsQuery(familyId, showHandled) : null);
+  const alerts = useMemo<AlertRow[]>(() => docs.map((d) => ({ id: d.id, ...d.data })), [docs]);
 
   return (
     <Stack spacing={2}>

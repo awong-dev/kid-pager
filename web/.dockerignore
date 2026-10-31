@@ -1,0 +1,5 @@
+# Host builds and dependencies stay out of the relay image's web build context.
+node_modules
+.next
+out
+tsconfig.tsbuildinfo

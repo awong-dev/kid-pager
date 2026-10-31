@@ -86,6 +86,29 @@ npm run lint       # eslint
 from `web/firebase.json` (Firebase Hosting), not `next.config.ts`; the
 config's `rewrites()` only matters to `next dev`.
 
+## Sign-in backends
+
+`lib/auth/` is the sign-in seam: one provider interface (`currentUser`,
+`getAuthHeaders`, `signOut`, `onChange`, `refresh`) with two implementations,
+picked at build time by `NEXT_PUBLIC_BACKEND`:
+
+- `firebase` (default, the cloud): Firebase Auth;
+  `lib/api.ts` sends `Authorization: Bearer <ID token>`.
+- `home` (`NEXT_PUBLIC_BACKEND=home npm run build`): relay sessions. The
+  relay (`AUTH_BACKEND=home`) sets an `HttpOnly` `pager_session` cookie;
+  `lib/api.ts` sends `credentials: "include"` and `X-Requested-With: pager`
+  on every call. `/login` renders `app/login/HomeLogin.tsx` (username +
+  password, "Sign in with a passkey", invite-code redeem); `/setup` is the
+  first-run page that creates the first super admin while the relay has no
+  users, and `RequireAuth` sends a signed-out visitor there. People and
+  Users gain "Invite code" (and, for super, "Set password"); email/phone are
+  optional for new people. Under `firebase`, `/setup` redirects to `/` and
+  none of this shows.
+
+Passkeys need a secure context: https with a certificate the device trusts
+(under the self-signed CA, only devices that imported it). Passwords always
+work.
+
 ## Known limitations
 
 - **The FCM token is refreshed automatically** once per page load by `NotificationWatcher`

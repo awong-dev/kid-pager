@@ -21,6 +21,7 @@ function AdminSettingsInner() {
   const [status, setStatus] = useState<string | null>(null);
 
   useEffect(() => {
+    return subscribeLive<RetentionSettingsDoc>(retentionSettingsQuery(), (docs) => {
     });
   }, []);
 

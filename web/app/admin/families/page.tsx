@@ -29,6 +29,8 @@ import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { useFamily } from "@/lib/family-context";
 import { ApiError, api } from "@/lib/api";
+import { useLive } from "@/lib/live";
+import { allDevicesQuery, allFamiliesQuery, allUsersQuery } from "@/lib/live/queries";
 import type { DeviceDoc, FamilyDoc, Role, UserDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 import { responsiveTableSx } from "@/lib/tableSx";
@@ -62,6 +64,16 @@ function AdminFamiliesInner() {
   const router = useRouter();
   const { setFamilyId } = useFamily();
 
+  const { docs: familyDocs } = useLive<FamilyDoc>(allFamiliesQuery());
+  const families = useMemo(() => {
+    const rows: FamilyRow[] = familyDocs.map((d) => ({ id: d.id, ...d.data }));
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    return rows;
+  }, [familyDocs]);
+  const { docs: userDocs } = useLive<UserDoc>(allUsersQuery());
+  const users = useMemo<UserRow[]>(() => userDocs.map((d) => ({ uid: d.id, ...d.data })), [userDocs]);
+  const { docs: deviceDocs } = useLive<DeviceDoc>(allDevicesQuery());
+  const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
 
   const [error, setError] = useState<string | null>(null);
 

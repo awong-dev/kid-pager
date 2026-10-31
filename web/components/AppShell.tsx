@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { type ReactNode, useState } from "react";
 import AppBar from "@mui/material/AppBar";
 import Badge from "@mui/material/Badge";
 import Box from "@mui/material/Box";
@@ -28,6 +29,8 @@ import SettingsIcon from "@mui/icons-material/Settings";
 
 import { useAuth } from "@/lib/auth-context";
 import { useFamily } from "@/lib/family-context";
+import { useLive } from "@/lib/live";
+import { openAlertsQuery } from "@/lib/live/queries";
 import { useLocatableDevices } from "@/lib/locatableDevices";
 
 import NotificationWatcher from "./NotificationWatcher";
@@ -247,6 +250,9 @@ function MobileNavList({
 
 /** Live count of open `families/{fam}/alerts` (rules: super or that family's admin). */
 function useOpenAlertCount(familyId: string | null, enabled: boolean): number {
+  // with no family in scope `useLive` keeps the last count; nothing renders it while `!enabled`
+  const { docs } = useLive(enabled && familyId ? openAlertsQuery(familyId) : null);
+  return docs.length;
 }
 
 /** Top nav shell for signed-in pages. Members get Chat/Location/Settings; a family admin adds the

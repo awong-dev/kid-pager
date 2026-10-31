@@ -16,11 +16,18 @@ import RequireAuth from "@/components/RequireAuth";
 import { useAuth } from "@/lib/auth-context";
 import { ApiError, api } from "@/lib/api";
 import {
+  type PushPath,
+  currentPushPath,
   notificationPermission,
   notificationsSupported,
   registerForPush,
   showLocalTestNotification,
 } from "@/lib/notifications";
+
+const PATH_LABELS: Record<PushPath, string> = {
+  webpush: "standard Web Push (VAPID, from this server)",
+  fcm: "Firebase Cloud Messaging",
+};
 
 function NotificationsInner() {
   const { me, isFamilyAdmin } = useAuth();
@@ -28,6 +35,9 @@ function NotificationsInner() {
     notificationPermission()
   );
   const [hasToken, setHasToken] = useState(false);
+  // `undefined` while loading; `null` path = no push available here.
+  const [pushPath, setPushPath] = useState<PushPath | null | undefined>(undefined);
+  const [tlsMode, setTlsMode] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +75,28 @@ function NotificationsInner() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    currentPushPath()
+      .then(({ path, subscribed }) => {
+        if (cancelled) return;
+        setPushPath(path);
+        if (subscribed) setHasToken(true);
+      })
+      .catch(() => {
+        if (!cancelled) setPushPath(null);
+      });
+    api
+      .get<{ tlsMode?: string }>("/me")
+      .then((r) => {
+        if (!cancelled) setTlsMode(r.tlsMode ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function handleTest() {
     setError(null);
     try {
@@ -98,7 +130,9 @@ function NotificationsInner() {
     setError(null);
     setStatus(null);
     try {
+      const path = await registerForPush();
       setPermission(notificationPermission());
+      if (!path) {
         setError(
           notificationPermission() === "denied"
             ? "Notifications are blocked for this site in the browser's site settings."
@@ -106,6 +140,7 @@ function NotificationsInner() {
         );
         return;
       }
+      setPushPath(path);
       setHasToken(true);
       setStatus("Notifications enabled for this browser.");
     } catch (err) {
@@ -127,6 +162,22 @@ function NotificationsInner() {
       <Typography variant="body2" color="text.secondary">
         Current permission: <strong>{permission}</strong>
       </Typography>
+
+      {pushPath !== undefined && (
+        <Typography variant="body2" color="text.secondary" data-testid="push-path">
+          Delivery:{" "}
+          <strong>{pushPath ? PATH_LABELS[pushPath] : "not available on this server"}</strong>
+          {pushPath && (hasToken ? " (this browser is registered)" : " (this browser is not registered yet)")}
+        </Typography>
+      )}
+
+      {tlsMode === "selfsigned" && (
+        <Alert severity="warning">
+          This server uses its own certificate, not a publicly trusted one. Browsers only deliver
+          push notifications to a site whose certificate they trust, so notifications need the
+          server switched to Let&apos;s Encrypt (TLS_MODE=letsencrypt in pager.env).
+        </Alert>
+      )}
 
       {isFamilyAdmin && (
         <>
@@ -168,6 +219,7 @@ function NotificationsInner() {
       <Alert severity="info">
         The test button shows a notification locally in this browser -- it does not round-trip
         through the relay (there is no &quot;send me a push&quot; API endpoint), so it only checks that
+        permission and display work, not the push delivery path end to end.
       </Alert>
 
       <Alert severity="info">

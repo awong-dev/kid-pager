@@ -1,7 +1,9 @@
 /**
  * `fetch` wrapper for every relay write: the base path is the relative `/api`, with auth
+ * headers (and credentials) from the auth provider.
  */
 
+import { authProvider } from "./auth";
 
 // A policy-gated 403 body is `{reason, message}` (nested under `detail` or bare); `reason` is
 // a machine code and `message` is shown verbatim.
@@ -31,8 +33,11 @@ export class ApiError extends Error {
 }
 
 async function authHeader(): Promise<Record<string, string>> {
+  const headers = await authProvider.getAuthHeaders();
+  if (!headers) {
     throw new ApiError(401, "not signed in");
   }
+  return headers;
 }
 
 async function request<T>(
@@ -46,6 +51,9 @@ async function request<T>(
     headers["Content-Type"] = "application/json";
     payload = JSON.stringify(body);
   }
+  const init: RequestInit = { method, headers, body: payload };
+  if (authProvider.fetchCredentials) init.credentials = authProvider.fetchCredentials;
+  const resp = await fetch(`/api${path}`, init);
   const text = await resp.text();
   const data = text ? JSON.parse(text) : undefined;
   if (!resp.ok) {

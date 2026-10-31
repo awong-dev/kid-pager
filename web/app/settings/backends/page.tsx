@@ -3,6 +3,7 @@
 /** `/settings/backends`: list, add (Google Chat link code) and enable backends. Reads
  * `users/{uid}/backends`; writes use `/api/me/backends*`. A `gchat` backend starts disabled. */
 
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -19,6 +20,8 @@ import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
+import { useLive } from "@/lib/live";
+import { userBackendsQuery } from "@/lib/live/queries";
 import type { BackendDoc } from "@/lib/types";
 
 interface BackendRow extends BackendDoc {
@@ -33,6 +36,8 @@ function configSummary(b: BackendRow): string {
 
 function BackendsInner() {
   const { me } = useAuth();
+  const { docs } = useLive<BackendDoc>(me ? userBackendsQuery(me.uid) : null);
+  const backends = useMemo<BackendRow[]>(() => docs.map((d) => ({ id: d.id, ...d.data })), [docs]);
   const [error, setError] = useState<string | null>(null);
 
   async function toggleEnabled(b: BackendRow) {

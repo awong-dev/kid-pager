@@ -4,6 +4,7 @@
  * (access is enforced server-side). A `?who=<alias>` deep link is read once. */
 
 import dynamic from "next/dynamic";
+import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -30,6 +31,7 @@ import { ApiError, api } from "@/lib/api";
 import { locBackoffLabel } from "@/lib/deviceTrust";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
+import { useLive } from "@/lib/live";
 import { useLocatableDevices, type LocatableDevice } from "@/lib/locatableDevices";
 import { formatRelativeAge, tsToMillis } from "@/lib/time";
 
@@ -87,6 +89,10 @@ function LocationDetail({
   const [locateBusy, setLocateBusy] = useState(false);
   const [snack, setSnack] = useState<string | null>(null);
 
+  const { docs: fixDocs } = useLive<LocationFixDoc>(
+    deviceLocationsQuery(device.id, LOCATIONS_QUERY_LIMIT)
+  );
+  const fixRows = useMemo<LocationFixRow[]>(() => fixDocs.map((d) => ({ id: d.id, ...d.data })), [fixDocs]);
 
   const entries = useMemo(
   );

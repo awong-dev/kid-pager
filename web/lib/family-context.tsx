@@ -15,6 +15,8 @@ import {
 } from "react";
 
 import { useAuth } from "./auth-context";
+import { useLive } from "./live";
+import { allFamiliesQuery } from "./live/queries";
 import type { FamilyDoc } from "./types";
 
 const STORAGE_KEY = "pager.family";
@@ -69,6 +71,14 @@ export function FamilyProvider({ children }: { children: ReactNode }) {
   );
 
   // Super only: live `families` for the switcher and family display names.
+  const { docs: familyDocs } = useLive<FamilyDoc>(isSuper ? allFamiliesQuery() : null);
+  const families = useMemo<FamilySummary[]>(
+    () =>
+      familyDocs
+        .map((d) => ({ id: d.id, name: d.data.name }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [familyDocs]
+  );
 
   const familyId = isSuper ? (selected ?? me?.familyId ?? null) : (me?.familyId ?? null);
 
