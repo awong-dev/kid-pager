@@ -381,6 +381,8 @@ The relay's *role* is what PROTOCOL.md describes, but its *transport* is the bro
 session. `sent` means "the broker's publish API accepted the QoS 1 message", which is the same fact
 PUBACK reported. The §5.3 "re-publish on online edge" is triggered by the `/status` webhook.
 Nothing the device sees changes.
+*Addendum:* on the home server only, `BROKER_MODE=mqtt` makes the relay a persistent MQTT client of
+Mosquitto instead (`HOMESERVER_DESIGN.md` §2.2); the cloud stays as described here.
 
 ### 4.9 `cell` on `/loc` — cell-tower location fallback
 `PROTOCOL.md` §13.2. GNSS and LTE cannot run at once on the pager's modem, and a school pager is

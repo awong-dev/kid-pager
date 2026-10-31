@@ -78,6 +78,10 @@ Open work, unverified items and decisions still needed. Items that are done are 
   (RI) line is wired. If it is, the fix is simpler and has no clipping risk
   (`docs/SLEEP_URC_DESIGN.md` §8.7).
 
+## Address book (`docs/BOOK_ADD_ANYONE_DESIGN.md`)
+
+- The bench acceptance run is not yet done.
+
 ## Bridge phones (`docs/BRIDGE_PHONE_DESIGN.md`)
 
 - The Android app has never run on a phone. Bench steps are in `bridge-android/README.md`. Until

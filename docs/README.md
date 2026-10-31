@@ -48,6 +48,7 @@
 ## Evaluations and root-cause analyses
 
 - [CORES_EVAL.md](CORES_EVAL.md): whether network work moves to a worker task and whether the UI runs on CPU1.
+- [ULP_KEYBOARD_EVAL.md](ULP_KEYBOARD_EVAL.md): whether a ULP-polled keyboard would let the CPU light-sleep through the typing window.
 - [MODEM_KEEPALIVE_EVAL.md](MODEM_KEEPALIVE_EVAL.md): whether the modem sends MQTT keepalive pings on its own, and at which keepalive values.
 - [SORACOM_EVAL.md](SORACOM_EVAL.md): Soracom as the LTE provider, with Beam or a direct bearer.
 - [TWILIO_EVAL.md](TWILIO_EVAL.md): relay-side SMS through Twilio: the evaluation.
