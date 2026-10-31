@@ -19,6 +19,8 @@ from starlette.concurrency import run_in_threadpool
 
 from app import alerts as alerts_module
 from app.bridgeauth import mint_token, require_bridge
+from app.db import sqlitestore
+from app.db.firestore import get_db
 from app.inbound_text import handle_text, placeholder_for
 from app.routers.webhooks import _check_webhook_ip_rate_limit
 from app.sms_text import redact_phone, voice_link
@@ -60,6 +62,7 @@ class PairRequest(BaseModel):
 class PairResponse(BaseModel):
     bridgeId: str
     token: str
+    outboxWaitS: int | None = None  # omitted when 0
 
 
 def normalize_optional_phone(raw: str | None, field: str) -> str | None:
@@ -71,6 +74,7 @@ def normalize_optional_phone(raw: str | None, field: str) -> str | None:
         raise HTTPException(status_code=422, detail=f"{field} is not a valid phone number") from None
 
 
+@router.post("/pair", response_model_exclude_none=True)
 def pair(req: PairRequest, request: Request) -> PairResponse:
     """Consume the code, mint the token, store the accepted numbers and set `smsNumber`."""
     _check_webhook_ip_rate_limit(request, "bridge")
@@ -115,6 +119,8 @@ def pair(req: PairRequest, request: Request) -> PairResponse:
     bridge_numbers.apply_numbers(fresh, request.app.state.broker)
     logger.info("bridge paired bridge=%s owner=%s sim=%s voice=%s", bridge.id, bridge.ownerUid,
                 bool(sim), bool(voice))
+    wait_s = request.app.state.settings.bridge_outbox_wait_s
+    return PairResponse(bridgeId=bridge.id, token=token, outboxWaitS=wait_s or None)
 
 
 class HeartbeatStatus(BaseModel):
@@ -146,6 +152,9 @@ SIM_CHANGED = "SIM changed"
 
 @router.post("/heartbeat")
 def heartbeat(
+    req: HeartbeatRequest,
+    request: Request,
+    bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)]
 ) -> dict:
     """Record the status; a reported SIM differing from the accepted one sets `status.error`."""
     status = req.status.model_dump(exclude_unset=True, exclude={"error"})
@@ -180,6 +189,11 @@ def heartbeat(
         bridges_store.set_error(bridge.id, SIM_CHANGED)
     elif bridge.status.error == SIM_CHANGED:
         bridges_store.set_error(bridge.id, None)
+    out: dict[str, int] = {"pending": bridge_outbox.count_pending(bridge.id)}
+    wait_s = request.app.state.settings.bridge_outbox_wait_s
+    if wait_s > 0:
+        out["outboxWaitS"] = wait_s
+    return out
 
 
 OUTBOX_WAIT_CAP_S = 25
@@ -193,6 +207,35 @@ async def get_outbox(
 ) -> dict:
     """Pending items, oldest first, at most 20; `wait` (cap 25 s) long-polls without a thread."""
     deadline = time.monotonic() + min(wait, OUTBOX_WAIT_CAP_S)
+    woke = asyncio.Event()
+    unsubscribe = None
+    db = get_db()
+    if wait > 0 and isinstance(db, sqlitestore.Client):
+        loop = asyncio.get_running_loop()
+        outbox_parent = f"bridges/{bridge.id}/outbox"
+
+        def _on_change(path: str, collection: str, parent: str, data: dict | None) -> None:
+            if parent == outbox_parent:
+                loop.call_soon_threadsafe(woke.set)
+
+        unsubscribe = db.subscribe(_on_change)
+    try:
+        while True:
+            woke.clear()
+            items = await run_in_threadpool(bridge_outbox.list_pending, bridge.id)
+            remaining = deadline - time.monotonic()
+            if items or remaining <= 0:
+                return {"items": [i.for_phone() for i in items]}
+            if unsubscribe is None:
+                await asyncio.sleep(min(OUTBOX_POLL_INTERVAL_S, remaining))
+            else:
+                try:
+                    await asyncio.wait_for(woke.wait(), remaining)
+                except TimeoutError:
+                    pass
+    finally:
+        if unsubscribe is not None:
+            unsubscribe()
 
 
 class AckRequest(BaseModel):

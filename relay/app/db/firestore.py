@@ -15,6 +15,9 @@ from google.api_core.exceptions import Aborted
 from google.auth.credentials import AnonymousCredentials
 from google.cloud.firestore import Client, DocumentReference, Transaction, transactional
 
+from app.config import Settings, auth_backend
+from app.db import sqlitestore
+
 T = TypeVar("T")
 
 # `run_transaction` retries on a fresh transaction with full-jitter exponential backoff;
@@ -25,6 +28,7 @@ EXTRA_RETRY_MAX_DELAY_S = 3.2
 
 _lock = threading.Lock()
 _app: firebase_admin.App | None = None
+_db: Client | sqlitestore.Client | None = None
 
 
 class EmulatorCredentials(credentials.Base):
@@ -56,12 +60,23 @@ def get_app() -> firebase_admin.App:
         return _app
 
 
+def get_db() -> Client | sqlitestore.Client:
+    """The process-wide document store (Firestore, or SQLite when `DB_BACKEND=sqlite`)."""
     global _db
     with _lock:
         if _db is not None:
             return _db
+    settings = Settings.from_env()
+    if settings.db_backend != "sqlite" or auth_backend() == "firebase":
+        get_app()  # ensure initialized (and fail fast if misconfigured)
     with _lock:
         if _db is None:
+            if settings.db_backend == "sqlite":
+                _db = sqlitestore.open_client(settings.sqlite_path)
+            else:
+                from firebase_admin import firestore as fa_firestore
+
+                _db = fa_firestore.client()
         return _db
 
 
@@ -69,6 +84,8 @@ def reset_for_tests() -> None:
     """Tears down the cached app/client so the next use creates a fresh one. Tests only."""
     global _app, _db
     with _lock:
+        if isinstance(_db, sqlitestore.Client):
+            _db.close()
         if _app is not None:
             try:
                 firebase_admin.delete_app(_app)

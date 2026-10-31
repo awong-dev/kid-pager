@@ -293,3 +293,92 @@ def test_preview_reports_cached_delta(ota_client, admin_headers, world):  # noqa
     new = next(b for b in builds if b["id16"] == N16)
     assert new["kind"] == "delta" and new["osz"] == len(world["cached"][0])
     assert world["storage"].uploads == []
+
+
+HOME_URL = "https://pager.example.test"
+
+
+def _local(tmp_path) -> Any:
+    return settings(fw_cache="local", fw_cache_dir=str(tmp_path / "fw-cache"), public_base_url=HOME_URL)
+
+
+def test_fw_cache_env_parsing(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("FW_CACHE", raising=False)
+    monkeypatch.delenv("FW_CACHE_DIR", raising=False)
+    s = Settings.from_env()
+    assert (s.fw_cache, s.fw_cache_dir) == ("gcs", "data/fw-cache")
+    monkeypatch.setenv("FW_CACHE", "local")
+    monkeypatch.setenv("FW_CACHE_DIR", "/data/fw-cache")
+    s = Settings.from_env()
+    assert (s.fw_cache, s.fw_cache_dir) == ("local", "/data/fw-cache")
+    monkeypatch.setenv("FW_CACHE", "s3")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_local_generates_into_the_directory_never_the_bucket(world, tmp_path):
+    s = _local(tmp_path)
+    d = firmware.delta_on_demand(_index(world), B16, N16, s)
+    assert d is not None and d.path == CACHE_PATH
+    assert world["storage"].uploads == [] and world["heads"] == 0
+    dz_file = tmp_path / "fw-cache" / N16 / f"from-{B16}.dz"
+    raw = zlib.decompress(dz_file.read_bytes())
+    out = io.BytesIO()
+    detools.apply_patch(io.BytesIO(BASE_IMG), io.BytesIO(raw), out)
+    assert out.getvalue() == NEW_IMG
+    meta = json.loads(dz_file.with_suffix(".json").read_text())
+    assert meta == {"psz": str(len(raw)), "osha": d.osha, "base": BASE_ID, "img": NEW_ID}
+    assert [p.name for p in dz_file.parent.iterdir() if ".tmp" in p.name] == []
+
+    # Found again from disk by a fresh process (no in-memory cache), no
+    # second generation.
+    firmware.reset_delta_cache()
+    gets = len(world["gets"])
+    assert firmware.cached_delta(_index(world), B16, N16, s) == d
+    assert firmware.delta_on_demand(_index(world), B16, N16, s) == d
+    assert len(world["gets"]) == gets
+
+
+def test_local_cfg_ota_url_is_the_relay(world, tmp_path):
+    s = _local(tmp_path)
+    d = firmware.delta_on_demand(_index(world), B16, N16, s)
+    build = _index(world).find(N16)
+    cfg = firmware.build_cfg_ota(firmware.Choice("delta", build, d, on_demand=True), s)
+    assert cfg["url"] == f"{HOME_URL}/{CACHE_PATH}"
+    # Published objects still come from the bucket.
+    full = firmware.build_cfg_ota(firmware.Choice("full", build, build.full), s)
+    assert full["url"] == BASE_URL + build.full.path
+    with pytest.raises(firmware.FirmwareNotConfigured):
+        firmware.build_cfg_ota(
+            firmware.Choice("delta", build, d, on_demand=True),
+            settings(fw_cache="local", fw_cache_dir=str(tmp_path)),
+        )
+
+
+def test_local_metadata_missing_is_absent(world, tmp_path):
+    s = _local(tmp_path)
+    firmware.delta_on_demand(_index(world), B16, N16, s)
+    (tmp_path / "fw-cache" / N16 / f"from-{B16}.json").unlink()
+    firmware.reset_delta_cache()
+    assert firmware.cached_delta(_index(world), B16, N16, s) is None
+
+
+def test_fw_cache_route_serves_local_deltas_only_when_local(world, tmp_path, broker):  # noqa: F811
+    from app.main import create_app
+
+    s = _local(tmp_path)
+    firmware.delta_on_demand(_index(world), B16, N16, s)
+    body = (tmp_path / "fw-cache" / N16 / f"from-{B16}.dz").read_bytes()
+    with TestClient(create_app(settings=s, broker_client=broker)) as c:
+        r = c.get(f"/{CACHE_PATH}")
+        assert r.status_code == 200 and r.content == body
+        assert r.headers["content-type"] == "application/octet-stream"
+        assert r.headers["cache-control"] == "no-store"
+        assert c.get(f"/fw-cache/{N16}/from-{'0' * 16}.dz").status_code == 404
+        assert c.get(f"/fw-cache/{N16}/from-{B16}.json").status_code == 404
+        assert c.get(f"/fw-cache/{N16}/..%2F..%2Fx").status_code == 404
+        assert c.get("/fw-cache/..%2F/from-0000000000000000.dz").status_code == 404
+    with TestClient(create_app(settings=settings(), broker_client=broker)) as c:
+        assert c.get(f"/{CACHE_PATH}").status_code == 404

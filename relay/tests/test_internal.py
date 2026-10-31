@@ -121,6 +121,9 @@ def test_sweep_runs_and_reports_zero_deletions_with_nothing_stale(client: TestCl
         "bridgePairCodesDeleted": 0,
         "bridgeOutboxDeleted": 0,
         "heldChatDeleted": 0,
+        "sessionsDeleted": 0,
+        "inviteCodesDeleted": 0,
+        "webauthnChallengesDeleted": 0,
     }
 
 
@@ -242,3 +245,31 @@ def test_dev_mode_bypass_still_works_locally(client: TestClient):
     """`client` (dev_mode=True) needs no Authorization header."""
     resp = client.post("/internal/tick")
     assert resp.status_code == 200
+    # Under SCHEDULER_MODE=internal the routes also accept `X-Relay-Webhook-Key`.
+
+
+def _home_client(**overrides: object) -> TestClient:
+    settings = make_settings(dev_mode=False, scheduler_mode="internal", **overrides)
+    return TestClient(create_app(settings=settings, broker_client=FakeBrokerClient()))
+
+
+def test_internal_accepts_the_webhook_key_under_the_internal_scheduler(monkeypatch):
+    monkeypatch.setattr("app.scheduler.FIRST_TICK_DELAY_S", 3600.0)
+    with _home_client() as c:
+        assert c.post("/internal/tick", headers={"X-Relay-Webhook-Key": "test-webhook-key"}).status_code == 200
+        assert c.post("/internal/sweep", headers={"X-Relay-Webhook-Key": "test-webhook-key"}).status_code == 200
+        assert c.post("/internal/tick", headers={"X-Relay-Webhook-Key": "wrong"}).status_code == 401
+        assert c.post("/internal/tick").status_code == 401
+
+
+def test_internal_ignores_the_webhook_key_in_the_cloud():
+    app = create_app(settings=make_settings(dev_mode=False), broker_client=FakeBrokerClient())
+    with TestClient(app) as c:
+        resp = c.post("/internal/tick", headers={"X-Relay-Webhook-Key": "test-webhook-key"})
+        assert resp.status_code == 401
+
+
+def test_internal_refuses_an_empty_webhook_key(monkeypatch):
+    monkeypatch.setattr("app.scheduler.FIRST_TICK_DELAY_S", 3600.0)
+    with _home_client(webhook_key="") as c:
+        assert c.post("/internal/tick", headers={"X-Relay-Webhook-Key": ""}).status_code == 401

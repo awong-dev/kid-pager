@@ -1,0 +1,11 @@
+# Test override: the relay with home sign-in on the SQLite store and the emulator hosts blanked,
+# so it provably needs no Firebase.
+
+services:
+  relay:
+    environment:
+      AUTH_BACKEND: home
+      DB_BACKEND: sqlite
+      SQLITE_PATH: /app/data/relay/pager.sqlite
+      FIRESTORE_EMULATOR_HOST: ""
+      FIREBASE_AUTH_EMULATOR_HOST: ""

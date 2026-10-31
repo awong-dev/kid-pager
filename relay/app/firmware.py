@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
+import os
 import re
 import threading
 import time
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -294,6 +297,18 @@ def choose(index: FirmwareIndex, target_id16: str, device_img16: str | None) -> 
     return Choice("full", build, build.full)
 
 
+def object_url(settings: Settings, path: str) -> str:
+    """The URL a device downloads `path` from: the bucket, except a `fw-cache/` object under
+    `FW_CACHE=local`, which the relay serves itself."""
+    if settings.fw_cache == "local" and path.startswith("fw-cache/"):
+        if not settings.public_base_url:
+            raise FirmwareNotConfigured("FW_CACHE=local needs PUBLIC_BASE_URL")
+        return f"{settings.public_base_url}/{path}"
+    if not settings.fw_bucket_base:
+        raise FirmwareNotConfigured("OTA not configured")
+    return settings.fw_bucket_base + path
+
+
 def build_cfg_ota(choice: Choice, settings: Settings) -> dict[str, Any]:
     """The `cfg.ota` JSON shape."""
     if not settings.fw_bucket_base:
@@ -302,6 +317,7 @@ def build_cfg_ota(choice: Choice, settings: Settings) -> dict[str, Any]:
     cfg: dict[str, Any] = {
         "img": choice.build.id,
         "isz": choice.build.size,
+        "url": object_url(settings, obj.path),
         "osz": obj.osz,
         "osha": obj.osha,
         "fmt": choice.kind,
@@ -367,6 +383,11 @@ def _lookup_cached(
         if hit and now - hit[0] < HEAD_TTL_S:
             return hit[1]
     delta: FwDelta | None = None
+    if settings.fw_cache == "local":
+        delta = _lookup_local(settings, path, base)
+        with _cache_lock:
+            _head_cache[path] = (now, delta)
+        return delta
     try:
         with httpx.Client(timeout=INDEX_TIMEOUT_S, transport=_transport) as client:
             resp = client.head(settings.fw_bucket_base + path)
@@ -383,6 +404,38 @@ def _lookup_cached(
     with _cache_lock:
         _head_cache[path] = (now, delta)
     return delta
+
+
+# `FW_CACHE=local`: `<FW_CACHE_DIR>/<target16>/from-<base16>.dz` plus a `.json` beside it holding
+# the object metadata (`psz`, `osha`, `base`, `img`); the `.dz` is renamed into place last.
+def local_file(settings: Settings, path: str) -> Path:
+    """`fw-cache/<t16>/from-<b16>.dz` -> its file under `FW_CACHE_DIR`."""
+    assert path.startswith("fw-cache/")
+    return Path(settings.fw_cache_dir) / path[len("fw-cache/") :]
+
+
+def _lookup_local(settings: Settings, path: str, base: FwBuild) -> FwDelta | None:
+    dz = local_file(settings, path)
+    try:
+        meta = json.loads(dz.with_suffix(".json").read_text())
+        return _delta_from_meta(path, dz.stat().st_size, meta, base)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _write_local(settings: Settings, base: FwBuild, target: FwBuild, dz: bytes, psz: int) -> FwDelta:
+    path = cache_path(target.id16, base.id16)
+    osha = hashlib.sha256(dz).hexdigest()
+    final = local_file(settings, path)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    tag = f".tmp{os.getpid()}.{threading.get_ident()}"
+    meta_tmp = final.with_suffix(".json" + tag)
+    meta_tmp.write_text(json.dumps({"psz": str(psz), "osha": osha, "base": base.id, "img": target.id}))
+    os.replace(meta_tmp, final.with_suffix(".json"))
+    dz_tmp = final.with_suffix(".dz" + tag)
+    dz_tmp.write_bytes(dz)
+    os.replace(dz_tmp, final)
+    return FwDelta(path=path, osz=len(dz), osha=osha, base=base.id, psz=psz)
 
 
 def cached_delta(index: FirmwareIndex, base16: str, target16: str, settings: Settings) -> FwDelta | None:
@@ -431,6 +484,8 @@ def _make_patch(base: bytes, new: bytes) -> bytes:
 
 
 def _upload(settings: Settings, base: FwBuild, target: FwBuild, dz: bytes, psz: int) -> FwDelta:
+    if settings.fw_cache == "local":
+        return _write_local(settings, base, target, dz, psz)
     from google.api_core.exceptions import PreconditionFailed
 
     assert settings.fw_bucket_base

@@ -81,6 +81,22 @@ def _is_boot_ack_topic(topic: str) -> bool:
     return len(parts) == 4 and parts[0] == "pager" and parts[1] == "boot" and parts[3] == "up"
 
 
+def _handler_for(topic: str) -> TopicHandler | None:
+    if _is_boot_ack_topic(topic):
+        return lambda ingest, topic, payload: ingest.handle_boot_ack(topic, payload)
+    suffix = _topic_suffix(topic)
+    return _TOPIC_SUFFIX_HANDLERS.get(suffix) if suffix else None
+
+
+def dispatch(ingest: Ingest, topic: str, payload: bytes) -> None:
+    """Route one inbound device message to its `Ingest` handler by topic; exceptions propagate."""
+    handler = _handler_for(topic)
+    if handler is None:
+        logger.warning("message on unrecognised topic %s dropped", topic)
+        return
+    handler(ingest, topic, payload)
+
+
 @router.post("/webhooks/mqtt")
 async def mqtt_webhook(request: Request) -> Response:
     broker: BrokerClient = request.app.state.broker
@@ -93,6 +109,7 @@ async def mqtt_webhook(request: Request) -> Response:
         return Response(status_code=200)
 
     topic, payload, _qos = parsed
+    handler = _handler_for(topic)
     if handler is None:
         logger.warning("webhook for unrecognised topic %s dropped", topic)
         return Response(status_code=200)
@@ -100,6 +117,7 @@ async def mqtt_webhook(request: Request) -> Response:
     ingest: Ingest = request.app.state.ingest
     try:
         # off the event loop: handlers block on Firestore and up to REPUBLISH_CAP broker publishes
+        await run_in_threadpool(dispatch, ingest, topic, payload)
     except GoogleAPICallError:
         # a storage failure is not a 200: the message would be lost; a 500 makes the broker retry
         logger.exception("store error handling webhook for topic %s", topic)

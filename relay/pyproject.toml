@@ -27,9 +27,21 @@ dependencies = [
     # `app/firmware.py` builds OTA deltas on demand and writes them to the firmware bucket.
     "detools",
     "google-cloud-storage",
+    # `app/authn_home.py`: argon2id password hashes and WebAuthn passkeys.
+    "argon2-cffi",
+    "webauthn",
+    # Web Push (VAPID) in `app/push_webpush.py`; bundles py_vapid, used by `app/homeinit.py`.
+    "pywebpush",
+    # Persistent MQTT client under BROKER_MODE=mqtt (`app/broker_mqtt.py`), tools/pager_client.py.
+    "paho-mqtt>=2",
 ]
 
+[project.scripts]
+# `docker compose run relay pager-admin reset-password <alias>`.
+pager-admin = "app.homeadmin:main"
+
 [project.optional-dependencies]
+dev = ["pytest", "httpx"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
@@ -43,3 +55,7 @@ testpaths = ["tests"]
 "tests/test_chat*.py" = ["F811"]
 "tests/test_family_bridges.py" = ["F811"]
 "tests/test_whatsapp.py" = ["F811"]
+"tests/test_webpush.py" = ["F811"]
+
+# Tests import the shared fixtures from tests/bridge_world.py; pytest needs them in the module
+# namespace.

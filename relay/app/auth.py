@@ -10,13 +10,22 @@ from typing import Annotated, Any
 import google.auth.jwt as google_jwt
 import google.auth.transport.requests as google_requests
 import google.oauth2.id_token as google_id_token
+from fastapi import Depends, Header, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from firebase_admin import auth as fb_auth
 
+from app.config import auth_backend
 from app.store import users as users_store
 from app.store.users import User
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+# The home session cookie, and the header every cookie-authenticated write must carry (a
+# cross-site form cannot set it).
+SESSION_COOKIE = "pager_session"
+CSRF_HEADER = "X-Requested-With"
+CSRF_VALUE = "pager"
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +42,11 @@ def verify_id_token(token: str) -> dict:
 
 
 def require_user(
+    request: Request,
     creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> AuthedUser:
+    if auth_backend() == "home":
+        return _require_home_user(request, creds)
     if creds is None:
         raise HTTPException(status_code=401, detail="missing bearer token")
     try:
@@ -52,6 +64,33 @@ def require_user(
     return AuthedUser(uid=uid, claims=claims, user=user)
 
 
+def _require_home_user(
+    request: Request, creds: HTTPAuthorizationCredentials | None
+) -> AuthedUser:
+    """A bearer wins over the cookie; a cookie write needs `X-Requested-With: pager` (CSRF)."""
+    from app import authn_home
+
+    if creds is not None:
+        token = creds.credentials
+    else:
+        token = request.cookies.get(SESSION_COOKIE, "")
+        if not token:
+            raise HTTPException(status_code=401, detail="not signed in")
+        if request.method not in _SAFE_METHODS and request.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            raise HTTPException(status_code=403, detail=f"missing {CSRF_HEADER} header")
+    uid = authn_home.session_uid(token)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="invalid or expired session")
+    user = users_store.get_user(uid)
+    if user is None:
+        raise HTTPException(status_code=403, detail="not registered")
+    if user.disabled:
+        raise HTTPException(status_code=403, detail="account disabled")
+    # No token claims at home; the same keys are reported so `/api/me`'s `claims` keeps its shape.
+    claims = {"uid": uid, "role": user.role, "fam": user.familyId or ""}
+    return AuthedUser(uid=uid, claims=claims, user=user)
+
+
 @dataclass(frozen=True, slots=True)
 class Principal:
     """The token's `role`/`fam` custom claims only; without them: `member`, no family."""
@@ -62,6 +101,9 @@ class Principal:
 
 
 def principal_for(authed: AuthedUser) -> Principal:
+    if auth_backend() == "home":
+        # At home the document `require_user` already loaded is the source of truth.
+        return Principal(uid=authed.uid, role=authed.user.role, family_id=authed.user.familyId)
     role = authed.claims.get("role") or "member"
     fam = authed.claims.get("fam") or None
     return Principal(uid=authed.uid, role=role, family_id=fam)
@@ -99,6 +141,8 @@ def require_family_admin(
 
 def set_claims(uid: str, role: str, family_id: str | None) -> None:
     """Writes the `role` and `fam` custom claims; a no-op under `AUTH_BACKEND=home`."""
+    if auth_backend() == "home":
+        return
     fb_auth.set_custom_user_claims(uid, {"role": role, "fam": family_id or ""})
 
 

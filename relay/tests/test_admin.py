@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -114,6 +115,11 @@ def test_create_user_creates_auth_and_firestore_and_alias(
     assert refreshed.custom_claims == {"role": "member", "fam": "default"}
 
 
+@pytest.mark.skipif(
+    (os.environ.get("AUTH_BACKEND", "").strip().lower() or "firebase") == "home",
+    reason="a home account signs in by alias; email/phone are optional, "
+    "covered by tests/test_authn_home.py",
+)
 def test_create_user_requires_email_or_phone(client: TestClient, admin_headers: dict[str, str]):
     resp = client.post(
         "/api/admin/users",

@@ -396,3 +396,31 @@ def test_sweep_marks_settings_meta_last_swept_at():
 
     after = settings_store.get_meta().lastSweepAt
     assert after is not None
+
+
+def test_sweep_deletes_idle_sessions_and_expired_invites_and_challenges():
+    now = datetime.now(UTC)
+    db = get_db()
+    db.collection("sessions").document("idle").set(
+        {"uid": "u", "createdAt": now - timedelta(days=40), "lastSeenAt": now - timedelta(days=31)}
+    )
+    db.collection("sessions").document("live").set(
+        {"uid": "u", "createdAt": now - timedelta(days=40), "lastSeenAt": now - timedelta(days=29)}
+    )
+    db.collection("inviteCodes").document("old").set({"uid": "u", "expiresAt": now - timedelta(minutes=1)})
+    db.collection("inviteCodes").document("new").set({"uid": "u", "expiresAt": now + timedelta(days=1)})
+    db.collection("webauthnChallenges").document("old").set(
+        {"kind": "login", "expiresAt": now - timedelta(seconds=1)}
+    )
+    db.collection("webauthnChallenges").document("new").set(
+        {"kind": "login", "expiresAt": now + timedelta(minutes=5)}
+    )
+
+    result = jobs.sweep()
+
+    assert (result.sessionsDeleted, result.inviteCodesDeleted, result.webauthnChallengesDeleted) == (1, 1, 1)
+    for collection in ("sessions", "inviteCodes", "webauthnChallenges"):
+        remaining = {s.id for s in db.collection(collection).stream()}
+        assert remaining == ({"live"} if collection == "sessions" else {"new"})
+    again = jobs.sweep()
+    assert (again.sessionsDeleted, again.inviteCodesDeleted, again.webauthnChallengesDeleted) == (0, 0, 0)

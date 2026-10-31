@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -33,6 +34,10 @@ def _require_internal_caller(request: Request) -> None:
     settings = request.app.state.settings
     if settings.dev_mode:
         return
+    if settings.scheduler_mode == "internal" and settings.webhook_key:
+        presented = request.headers.get("x-relay-webhook-key", "")
+        if presented and hmac.compare_digest(presented.encode(), settings.webhook_key.encode()):
+            return
     auth_header = request.headers.get("authorization", "")
     if not auth_header.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")

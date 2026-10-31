@@ -143,3 +143,11 @@ class BrokerClient:
         if not isinstance(qos, int) or isinstance(qos, bool):
             return None
         return topic, payload_bytes, qos
+
+
+def make_broker_client(settings: Settings) -> BrokerClient:
+    if settings.broker_mode == "mqtt":
+        from app.broker_mqtt import MqttBrokerClient
+
+        return MqttBrokerClient(settings)
+    return BrokerClient(settings)

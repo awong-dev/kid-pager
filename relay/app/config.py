@@ -5,6 +5,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
+
+DbBackend = Literal["firestore", "sqlite"]
+AuthBackend = Literal["firebase", "home"]
+SchedulerMode = Literal["none", "internal"]
+BrokerMode = Literal["rest", "mqtt"]
+FwCache = Literal["gcs", "local"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,12 +48,42 @@ class Settings:
     # a trailing slash. Either unset = every OTA route answers 503.
     fw_index_url: str | None = None
     fw_bucket_base: str | None = None
+    # Where on-demand deltas are written. "gcs" (default) is `fw-cache/` in the bucket above;
+    # "local" is `fw_cache_dir`, served by the relay at `PUBLIC_BASE_URL/fw-cache/...`.
+    fw_cache: FwCache = "gcs"
+    fw_cache_dir: str = "data/fw-cache"
     # A Soracom SAM user's auth key for enrolling SIMs into the Beam group from the admin UI.
     # Unset = the enroll routes answer 503 and the list route reports `configured: false`.
     soracom_auth_key_id: str | None = None
     soracom_auth_key: str | None = None
     soracom_beam_group: str = "pager-beam"
     soracom_beam_destination: str = "mqtts://broker.example.com:8883"
+    # The document store: "firestore" (default) or "sqlite", the same client API over one
+    # SQLite file at `sqlite_path`.
+    db_backend: DbBackend = "firestore"
+    sqlite_path: str = "data/relay/pager.sqlite"
+    # The long-poll `wait` (s, 0..25) the relay asks the bridge phone to use on
+    # `GET /bridge/outbox`, sent as `outboxWaitS`. 0 sends no hint.
+    bridge_outbox_wait_s: int = 0
+    # "none" (default: Cloud Scheduler calls `/internal/tick` and `/internal/sweep`) or
+    # "internal" (the relay runs both itself, `app/scheduler.py`).
+    scheduler_mode: SchedulerMode = "none"
+    # VAPID pair, base64url (private: raw 32-byte P-256 scalar; public: 65-byte point). Unset =
+    # no Web Push. `webpush_subject` is the VAPID `sub` (`mailto:`/`https:`).
+    webpush_vapid_private_key: str | None = None
+    webpush_vapid_public_key: str | None = None
+    webpush_subject: str | None = None
+    # "rest" keeps the relay off MQTT (REST publish + `/webhooks/mqtt`); "mqtt" makes it one
+    # persistent client (`app/broker_mqtt.py`) logged in as `broker_mqtt_username`.
+    broker_mode: BrokerMode = "rest"
+    broker_mqtt_host: str = "localhost"
+    broker_mqtt_port: int = 1883
+    broker_mqtt_username: str = "relay"
+    broker_mqtt_password: str | None = None
+
+    @property
+    def webpush_configured(self) -> bool:
+        return bool(self.webpush_vapid_private_key and self.webpush_vapid_public_key)
 
     @property
     def soracom_configured(self) -> bool:
@@ -77,13 +114,97 @@ class Settings:
             firestore_emulator_host=os.environ.get("FIRESTORE_EMULATOR_HOST") or None,
             firebase_auth_emulator_host=os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or None,
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
+            broker_ca_pem=os.environ.get("BROKER_CA_PEM") or _read_pem_file(os.environ.get("BROKER_CA_PEM_FILE")),
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
             push_backend=os.environ.get("PUSH_BACKEND", "null").strip().lower(),
             fw_index_url=(os.environ.get("FW_INDEX_URL") or "").strip() or None,
             fw_bucket_base=(os.environ.get("FW_BUCKET_BASE") or "").strip() or None,
+            fw_cache=_fw_cache(os.environ.get("FW_CACHE", "")),
+            fw_cache_dir=(os.environ.get("FW_CACHE_DIR") or "").strip() or "data/fw-cache",
             soracom_auth_key_id=(os.environ.get("SORACOM_AUTH_KEY_ID") or "").strip() or None,
             soracom_auth_key=(os.environ.get("SORACOM_AUTH_KEY") or "").strip() or None,
             soracom_beam_group=(os.environ.get("SORACOM_BEAM_GROUP") or "").strip() or "pager-beam",
             soracom_beam_destination=(os.environ.get("SORACOM_BEAM_DESTINATION") or "").strip()
             or "mqtts://broker.example.com:8883",
+            db_backend=_db_backend(os.environ.get("DB_BACKEND", "")),
+            sqlite_path=(os.environ.get("SQLITE_PATH") or "").strip() or "data/relay/pager.sqlite",
+            bridge_outbox_wait_s=_bridge_outbox_wait_s(os.environ.get("BRIDGE_OUTBOX_WAIT_S", "")),
+            scheduler_mode=_scheduler_mode(os.environ.get("SCHEDULER_MODE", "")),
+            webpush_vapid_private_key=(os.environ.get("WEBPUSH_VAPID_PRIVATE_KEY") or "").strip()
+            or None,
+            webpush_vapid_public_key=(os.environ.get("WEBPUSH_VAPID_PUBLIC_KEY") or "").strip()
+            or None,
+            webpush_subject=(os.environ.get("WEBPUSH_SUBJECT") or "").strip()
+            or _https_or_none(os.environ.get("PUBLIC_BASE_URL")),
+            broker_mode=_broker_mode(os.environ.get("BROKER_MODE", "")),
+            broker_mqtt_host=(os.environ.get("BROKER_MQTT_HOST") or "").strip() or "localhost",
+            broker_mqtt_port=int((os.environ.get("BROKER_MQTT_PORT") or "").strip() or "1883"),
+            broker_mqtt_username=(os.environ.get("BROKER_MQTT_USERNAME") or "").strip() or "relay",
+            broker_mqtt_password=(os.environ.get("BROKER_MQTT_PASSWORD") or "").strip() or None,
         )
+
+
+def auth_backend() -> AuthBackend:
+    """`AUTH_BACKEND=firebase|home`, read from the environment on every call."""
+    raw = os.environ.get("AUTH_BACKEND", "")
+    value = raw.strip().lower() or "firebase"
+    if value not in ("firebase", "home"):
+        raise ValueError(f"AUTH_BACKEND must be 'firebase' or 'home', not {raw!r}")
+    return value  # type: ignore[return-value]
+
+
+def tls_mode() -> str:
+    """`TLS_MODE` (`public`, `selfsigned` or `letsencrypt`), exposed on `GET /api/me`."""
+    return (os.environ.get("TLS_MODE") or "").strip().lower() or "public"
+
+
+def _bridge_outbox_wait_s(raw: str) -> int:
+    raw = raw.strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"BRIDGE_OUTBOX_WAIT_S must be an integer, not {raw!r}") from None
+    return max(0, min(25, value))
+
+
+def _db_backend(raw: str) -> DbBackend:
+    value = raw.strip().lower() or "firestore"
+    if value not in ("firestore", "sqlite"):
+        raise ValueError(f"DB_BACKEND must be 'firestore' or 'sqlite', not {raw!r}")
+    return value  # type: ignore[return-value]
+
+
+def _scheduler_mode(raw: str) -> SchedulerMode:
+    value = raw.strip().lower() or "none"
+    if value not in ("none", "internal"):
+        raise ValueError(f"SCHEDULER_MODE must be 'none' or 'internal', not {raw!r}")
+    return value  # type: ignore[return-value]
+
+
+def _fw_cache(raw: str) -> FwCache:
+    value = raw.strip().lower() or "gcs"
+    if value not in ("gcs", "local"):
+        raise ValueError(f"FW_CACHE must be 'gcs' or 'local', not {raw!r}")
+    return value  # type: ignore[return-value]
+
+
+def _broker_mode(raw: str) -> BrokerMode:
+    value = raw.strip().lower() or "rest"
+    if value not in ("rest", "mqtt"):
+        raise ValueError(f"BROKER_MODE must be 'rest' or 'mqtt', not {raw!r}")
+    return value  # type: ignore[return-value]
+
+
+def _https_or_none(raw: str | None) -> str | None:
+    value = (raw or "").strip().rstrip("/")
+    return value if value.startswith("https://") else None
+
+
+def _read_pem_file(path: str | None) -> str | None:
+    """`BROKER_CA_PEM_FILE` names a CA file instead of carrying the PEM; `BROKER_CA_PEM` wins."""
+    if not (path or "").strip():
+        return None
+    with open(path.strip(), encoding="ascii") as f:  # type: ignore[union-attr]
+        return f.read() or None

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import tempfile
 import time
 from collections.abc import Iterator
 
@@ -13,6 +15,20 @@ os.environ.setdefault("FIRESTORE_EMULATOR_HOST", "localhost:8080")
 os.environ.setdefault("FIREBASE_AUTH_EMULATOR_HOST", "localhost:9099")
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "demo-pager")
 
+# DB_BACKEND=sqlite runs the suite against the SQLite store; AUTH_BACKEND=home signs in with relay
+# sessions. With both set no emulator is needed.
+DB_BACKEND = os.environ.get("DB_BACKEND", "firestore").strip().lower() or "firestore"
+HOME_AUTH = (os.environ.get("AUTH_BACKEND", "").strip().lower() or "firebase") == "home"
+FIREBASE_AUTH_SKIP_REASON = (
+    "mints or reads Firebase Auth accounts or tokens; there is no Firebase Auth under "
+    "AUTH_BACKEND=home"
+)
+if DB_BACKEND == "sqlite":
+    os.environ["SQLITE_PATH"] = os.path.join(
+        tempfile.mkdtemp(prefix="pager-sqlite-"), "pager.sqlite"
+    )
+
+from app.db.firestore import get_app, get_db
 from app.ingest import Ingest
 from tests.fake_transport import FakeBrokerClient
 
@@ -28,6 +44,10 @@ AUTH_WIPE_URL = f"http://{AUTH_HOST}/emulator/v1/projects/{PROJECT_ID}/accounts"
 
 def _emulators_reachable() -> bool:
     try:
+        if DB_BACKEND != "sqlite":
+            httpx.get(f"http://{FIRESTORE_HOST}/", timeout=2.0)
+        if not HOME_AUTH:
+            httpx.get(f"http://{AUTH_HOST}/", timeout=2.0)
         return True
     except httpx.HTTPError:
         return False
@@ -51,11 +71,64 @@ def _require_emulators() -> None:
 @pytest.fixture(scope="session", autouse=True)
 def _init_firebase_app() -> None:
     """Creates the process-wide `firebase_admin.App` (and the sqlite schema) once."""
+    if not HOME_AUTH:
+        get_app()
+    if DB_BACKEND == "sqlite":
+        get_db()
+
+
+# uid -> custom claims a test requested, under AUTH_BACKEND=home; compared with the user document.
+HOME_CLAIMS: dict[str, dict] = {}
+
+
+@pytest.fixture(autouse=True)
+def _skip_firebase_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under `AUTH_BACKEND=home`: relay-session sign-in; other `firebase_admin.auth` calls skip."""
+    if not HOME_AUTH:
+        return
+    from types import SimpleNamespace
+
+    from firebase_admin import auth as fb_auth
+
+    from app import authn_home
+
+    HOME_CLAIMS.clear()
+
+    def _skip(*_args, **_kwargs):
+        pytest.skip(FIREBASE_AUTH_SKIP_REASON)
+
+    def _create_user(**kwargs):
+        return SimpleNamespace(uid=kwargs.get("uid") or authn_home.new_uid())
+
+    def _set_claims(uid, claims):
+        HOME_CLAIMS[uid] = dict(claims or {})
+
+    for name in (
+        "get_user",
+        "get_user_by_email",
+        "get_user_by_phone_number",
+        "update_user",
+        "delete_user",
+        "create_custom_token",
+        "verify_id_token",
+    ):
+        monkeypatch.setattr(fb_auth, name, _skip)
+    monkeypatch.setattr(fb_auth, "create_user", _create_user)
+    monkeypatch.setattr(fb_auth, "set_custom_user_claims", _set_claims)
 
 
 @pytest.fixture(autouse=True)
 def _clean_emulators() -> Iterator[None]:
     """Wipes both emulators (or the sqlite `docs` table) before every test."""
+    if DB_BACKEND == "sqlite":
+        conn = sqlite3.connect(os.environ["SQLITE_PATH"])
+        with conn:
+            conn.execute("DELETE FROM docs")
+        conn.close()
+    else:
+        httpx.delete(FIRESTORE_WIPE_URL, timeout=10.0)
+    if not HOME_AUTH:
+        httpx.delete(AUTH_WIPE_URL, timeout=10.0)
     yield
 
 
@@ -81,6 +154,18 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "real_device_ids: do not honour a `deviceId` in create-device request bodies"
     )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if DB_BACKEND != "sqlite":
+        return
+    skip = pytest.mark.skip(
+        reason="firestore.rules has no meaning under DB_BACKEND=sqlite; the browser read "
+        "rules are ported to Python and tested there"
+    )
+    for item in items:
+        if item.path.name == "test_rules.py":
+            item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)

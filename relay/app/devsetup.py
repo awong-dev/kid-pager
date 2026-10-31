@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app import ca_resolve, wirecbor
 from app.broker import BrokerClient
+from app.broker_admin import BrokerAdmin, make_broker_admin
 from app.config import Settings
 from app.store import setup_codes as setup_codes_store
 
@@ -238,6 +239,7 @@ def issue(
     apn: str | None = None,
     settings: Settings | None = None,
     broker: BrokerClient | None = None,
+    emqx: BrokerAdmin | None = None,
     now: datetime | None = None,
 ) -> str:
     """Pushes the bootstrap credential, publishes the encrypted bundle retained to
@@ -247,6 +249,7 @@ def issue(
     `PublicBaseUrlRequired` rather than sending an unpinned bundle."""
     settings = settings if settings is not None else Settings.from_env()
     broker = broker if broker is not None else BrokerClient(settings)
+    emqx = emqx if emqx is not None else make_broker_admin(settings, broker)
 
     raw, token_str = token()
     bid, bpw, bkey = derive(raw)
@@ -279,6 +282,7 @@ def issue(
     return format_code(token_str, host=host, port=port, apn=apn)
 
 
+def _clear_and_revoke(bid: str, broker: BrokerClient, emqx: BrokerAdmin) -> None:
     # Bundle first, then credential: a retry between the two never leaves a readable bundle
     # behind a live credential.
     broker.publish(boot_topic_down(bid), b"", qos=1, retain=True)
@@ -290,10 +294,12 @@ def complete(
     *,
     settings: Settings | None = None,
     broker: BrokerClient | None = None,
+    emqx: BrokerAdmin | None = None,
 ) -> None:
     """Clear the retained bundle, delete the bootstrap credential and `setupCodes/{bid}`."""
     settings = settings if settings is not None else Settings.from_env()
     broker = broker if broker is not None else BrokerClient(settings)
+    emqx = emqx if emqx is not None else make_broker_admin(settings, broker)
     _clear_and_revoke(bid, broker, emqx)
     setup_codes_store.delete(bid)
 
@@ -303,11 +309,13 @@ def expire(
     now: datetime | None = None,
     settings: Settings | None = None,
     broker: BrokerClient | None = None,
+    emqx: BrokerAdmin | None = None,
 ) -> int:
     """Delete every expired setup code's retained bundle and bootstrap credential; returns the count."""
     now = now if now is not None else datetime.now(UTC)
     settings = settings if settings is not None else Settings.from_env()
     broker = broker if broker is not None else BrokerClient(settings)
+    emqx = emqx if emqx is not None else make_broker_admin(settings, broker)
     expired = setup_codes_store.list_expired(now)
     for code in expired:
         _clear_and_revoke(code.bid, broker, emqx)

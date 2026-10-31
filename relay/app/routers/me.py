@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from app.auth import AuthedUser, principal_for, require_user, set_claims
 from app.backends.base import Backend as BackendImpl
+from app.config import auth_backend, tls_mode
 from app.db.firestore import get_db
 from app.store import backends as backends_store
 from app.store import push_tokens as push_tokens_store
@@ -67,6 +68,9 @@ class MeResponse(BaseModel):
     claims: dict
     # true when the token's `role`/`fam` claims disagree with the user doc; re-issued server-side
     claimsStale: bool = False
+    # which sign-in this deployment uses ("firebase" | "home") and its `TLS_MODE`
+    authBackend: str = "firebase"
+    tlsMode: str = "public"
 
 
 @router.get("/api/me")
@@ -78,6 +82,12 @@ def get_me(authed: Annotated[AuthedUser, Depends(require_user)]) -> MeResponse:
     if stale:
         set_claims(authed.uid, authed.user.role, authed.user.familyId)
     return MeResponse(
+        user=authed.user,
+        role=authed.user.role,
+        claims=authed.claims,
+        claimsStale=stale,
+        authBackend=auth_backend(),
+        tlsMode=tls_mode(),
     )
 
 

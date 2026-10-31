@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from firebase_admin import auth as fb_auth
 from pydantic import BaseModel, model_validator
 
+from app.config import auth_backend
 from app.store import users as users_store
 
 router = APIRouter()
@@ -26,8 +27,11 @@ class DevTokenRequest(BaseModel):
 class DevTokenResponse(BaseModel):
     token: str
     uid: str
+    # Home only (absent in the cloud response): "session".
+    kind: str | None = None
 
 
+@router.post("/api/dev/token", response_model_exclude_none=True)
 def mint_dev_token(req: DevTokenRequest, request: Request) -> DevTokenResponse:
     settings = request.app.state.settings
     if not settings.dev_mode:
@@ -38,5 +42,10 @@ def mint_dev_token(req: DevTokenRequest, request: Request) -> DevTokenResponse:
         uid = users_store.get_uid_for_alias(req.alias)
         if uid is None:
             raise HTTPException(status_code=404, detail=f"unknown alias: {req.alias!r}")
+    if auth_backend() == "home":
+        from app import authn_home
+
+        session = authn_home.create_session(uid, "dev-token")
+        return DevTokenResponse(token=session, uid=uid, kind="session")
     token = fb_auth.create_custom_token(uid)
     return DevTokenResponse(token=token.decode("utf-8"), uid=uid)

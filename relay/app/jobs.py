@@ -16,6 +16,7 @@ from google.cloud.firestore import (
     WriteBatch,
 )
 
+from app.authn_home import SESSION_IDLE
 from app.db.firestore import get_db
 from app.routing import Routing
 from app.store import bridge_outbox
@@ -219,6 +220,9 @@ class SweepResult:
     bridgePairCodesDeleted: int = 0
     bridgeOutboxDeleted: int = 0
     heldChatDeleted: int = 0
+    sessionsDeleted: int = 0
+    inviteCodesDeleted: int = 0
+    webauthnChallengesDeleted: int = 0
 
 
 def sweep() -> SweepResult:
@@ -276,6 +280,16 @@ def sweep() -> SweepResult:
 
     outbox_deleted = bridge_outbox.delete_acked_before(datetime.now(UTC) - BRIDGE_ACKED_RETENTION)
 
+    now = datetime.now(UTC)
+    sessions_deleted = _sweep_by_created_at(
+        lambda: db.collection("sessions"), now - SESSION_IDLE, batch_size, created_at_field="lastSeenAt"
+    )
+    invite_codes_deleted = _sweep_by_created_at(
+        lambda: db.collection("inviteCodes"), now, batch_size, created_at_field="expiresAt"
+    )
+    challenges_deleted = _sweep_by_created_at(
+        lambda: db.collection("webauthnChallenges"), now, batch_size, created_at_field="expiresAt"
+    )
     )
         messagesDeleted=messages_deleted,
         wireIdsDeleted=wire_ids_deleted,
@@ -288,4 +302,7 @@ def sweep() -> SweepResult:
         bridgePairCodesDeleted=bridge_codes_deleted,
         bridgeOutboxDeleted=outbox_deleted,
         heldChatDeleted=held_chat_deleted,
+        sessionsDeleted=sessions_deleted,
+        inviteCodesDeleted=invite_codes_deleted,
+        webauthnChallengesDeleted=challenges_deleted,
     )

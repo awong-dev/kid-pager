@@ -13,10 +13,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import AlreadyExists
 
+from app import (
+    apn_presets,
+    authn_home,
+    book,
+    chat_subscribe,
+    devcfg,
+    inbound_text,
+    sms_text,
+)
 from app import policy as policy_module
 from app.auth import Principal, require_family_admin, set_claims
 from app.book import rederive_family_sms_contacts, rederive_sms_contacts
 from app.broker import BrokerClient
+from app.broker_admin import BrokerAdmin, make_broker_admin
+from app.config import Settings, auth_backend
 from app.db.firestore import get_db
 from app.ingest import Ingest
 from app.routers import admin as admin_router
@@ -63,10 +74,12 @@ def get_ingest(request: Request) -> Ingest:
     return request.app.state.ingest
 
 
+def get_emqx(request: Request) -> BrokerAdmin:
     """Fallback-to-a-fresh-instance, like the admin router's `get_emqx`."""
     existing = getattr(request.app.state, "emqx_admin", None)
     if existing is not None:
         return existing
+    return make_broker_admin(request.app.state.settings, request.app.state.broker)
 
 
 def get_app_settings(request: Request) -> Settings:
@@ -131,6 +144,9 @@ def create_member(
 ) -> User:
     """Same flow as the admin `create_user`, with the scope family fixed."""
     _, family_id = scope
+    home = auth_backend() == "home"
+    # at home the alias is the login name; email/phone are optional
+    if not home and not req.email and not req.phone:
         raise HTTPException(status_code=400, detail="email or phone is required")
 
     # sign-in number only, never an SMS route
@@ -143,9 +159,24 @@ def create_member(
                 status_code=400, detail="phone must be a number like +12065550100"
             ) from exc
 
+    if home:
+        uid = authn_home.new_uid()
+    else:
+        kwargs: dict[str, object] = {}
+        if req.email:
+            kwargs["email"] = req.email
+        if phone:
+            kwargs["phone_number"] = phone
+        try:
+            uid = fb_auth.create_user(**kwargs).uid
+        except fb_auth.EmailAlreadyExistsError as exc:
+            raise HTTPException(status_code=409, detail="email already registered") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         user = users_store.create_user(
+            uid=uid,
             alias=req.alias,
             display_name=req.displayName,
             email=req.email,
@@ -154,6 +185,8 @@ def create_member(
             family_id=family_id,
         )
     except (users_store.AliasTaken, users_store.InvalidAlias) as exc:
+        if not home:
+            fb_auth.delete_user(uid)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     set_claims(user.uid, user.role, user.familyId)
@@ -211,6 +244,29 @@ def patch_member(
     return result
 
 
+class InviteResponse(BaseModel):
+    code: str
+    expiresAt: datetime
+
+
+@router.post("/people/{uid}/invite", dependencies=[Depends(require_family_write_rate_limit)])
+def invite_member(uid: str, scope: FamilyScope) -> InviteResponse:
+    """One-time, seven-day code for the member to set a password or passkey (home only).
+
+    A family admin cannot mint one for a `super`: redeeming it signs in as that account.
+    """
+    principal, family_id = scope
+    if auth_backend() != "home":
+        raise HTTPException(status_code=404, detail="not found")
+    user = users_store.get_user(uid)
+    if user is None or user.familyId != family_id or user.kind != "person":
+        raise HTTPException(status_code=404, detail="no such person in this family")
+    if user.role == "super" and principal.role != "super":
+        raise HTTPException(status_code=403, detail="only a super admin can invite a super admin")
+    code, expires = authn_home.mint_invite(uid, principal.uid)
+    return InviteResponse(code=code, expiresAt=expires)
+
+
 
 
 def _require_family_owner(owner_alias: str, family_id: str) -> str:
@@ -243,6 +299,7 @@ def create_device(
     req: admin_router.CreateDeviceRequest,
     scope: FamilyScope,
     broker: Annotated[BrokerClient, Depends(get_broker)],
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> admin_router.DeviceSetupCodeResponse:
     _, family_id = scope
@@ -268,6 +325,7 @@ def rotate_credentials(
     device_id: str,
     scope: FamilyScope,
     broker: Annotated[BrokerClient, Depends(get_broker)],
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
     settings: Annotated[Settings, Depends(get_app_settings)],
     ingest: Annotated[Ingest, Depends(get_ingest)],
 ) -> admin_router.DeviceSetupCodeResponse:
@@ -282,6 +340,7 @@ def rotate_credentials(
 def revoke_device(
     device_id: str,
     scope: FamilyScope,
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
 ) -> Device:
     _, family_id = scope
     _require_family_device(device_id, family_id)

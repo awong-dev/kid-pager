@@ -25,6 +25,26 @@ def mint_id_token(uid: str) -> str:
 
 
 def auth_header(uid: str) -> dict[str, str]:
+    """A bearer for `uid`: a Firebase ID token, or a relay session token under
+    `AUTH_BACKEND=home`."""
+    if (os.environ.get("AUTH_BACKEND", "").strip().lower() or "firebase") == "home":
+        import pytest
+
+        from app import authn_home
+        from app.store import users as users_store
+        from tests.conftest import HOME_CLAIMS
+
+        claims = HOME_CLAIMS.get(uid)
+        user = users_store.get_user(uid)
+        if claims is not None and user is not None and (
+            (claims.get("role") or "member") != user.role
+            or (claims.get("fam") or None) != user.familyId
+        ):
+            pytest.skip(
+                "signs in with Firebase custom claims that differ from users/{uid}; at home "
+                "role and family come from the document only"
+            )
+        return {"Authorization": f"Bearer {authn_home.create_session(uid, 'pytest')}"}
     return {"Authorization": f"Bearer {mint_id_token(uid)}"}
 
 

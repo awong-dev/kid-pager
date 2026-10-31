@@ -15,8 +15,20 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from firebase_admin import auth as fb_auth
 
+from app import (
+    apn_presets,
+    authn_home,
+    book,
+    ca_resolve,
+    devcfg,
+    devsetup,
+    firmware,
+    soracom,
+)
 from app.auth import AuthedUser, principal_for, require_super, set_claims
 from app.broker import BrokerClient
+from app.broker_admin import BrokerAdmin, EmqxResult, make_broker_admin
+from app.config import Settings, auth_backend
 from app.db.firestore import get_db
 from app.device_ids import DEVICE_ID_ATTEMPTS, new_device_id
 from app.ingest import Ingest
@@ -66,10 +78,12 @@ def get_ingest(request: Request) -> Ingest:
     return request.app.state.ingest
 
 
+def get_emqx(request: Request) -> BrokerAdmin:
     """`app.state.emqx_admin` if set (tests inject one), else a fresh `make_broker_admin`."""
     existing = getattr(request.app.state, "emqx_admin", None)
     if existing is not None:
         return existing
+    return make_broker_admin(request.app.state.settings, request.app.state.broker)
 
 
 def get_app_settings(request: Request) -> Settings:
@@ -113,6 +127,9 @@ class PatchUserRequest(BaseModel):
 def create_user(
     req: CreateUserRequest, authed: Annotated[AuthedUser, Depends(require_super)]
 ) -> User:
+    home = auth_backend() == "home"
+    # at home the alias is the login name; email/phone are optional
+    if not home and not req.email and not req.phone:
         raise HTTPException(status_code=400, detail="email or phone is required")
 
     # an omitted `familyId` defaults to the calling super's own family
@@ -130,9 +147,26 @@ def create_user(
                 status_code=400, detail="phone must be a number like +12065550100"
             ) from exc
 
+    if home:
+        uid = req.uid or authn_home.new_uid()
+    else:
+        kwargs: dict[str, object] = {}
+        if req.uid:
+            kwargs["uid"] = req.uid
+        if req.email:
+            kwargs["email"] = req.email
+        if phone:
+            kwargs["phone_number"] = phone
+        try:
+            uid = fb_auth.create_user(**kwargs).uid
+        except fb_auth.EmailAlreadyExistsError as exc:
+            raise HTTPException(status_code=409, detail="email already registered") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         user = users_store.create_user(
+            uid=uid,
             alias=req.alias,
             display_name=req.displayName,
             email=req.email,
@@ -142,6 +176,8 @@ def create_user(
         )
     except (users_store.AliasTaken, users_store.InvalidAlias) as exc:
         # roll back the Auth account so a rejected alias leaves no orphaned Auth user
+        if not home:
+            fb_auth.delete_user(uid)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # claims are the only source of truth for `role`/`fam`
@@ -226,6 +262,9 @@ def patch_user(
 @router.delete("/users/{uid}", dependencies=[Depends(require_admin_write_rate_limit)])
     if users_store.get_user(uid) is None:
         raise HTTPException(status_code=404, detail="no such user")
+    if auth_backend() == "home":
+        authn_home.delete_account(uid)
+        return {"ok": True}
     try:
         fb_auth.delete_user(uid)
     except fb_auth.UserNotFoundError:
@@ -233,6 +272,19 @@ def patch_user(
     return {"ok": True}
 
 
+class SetPasswordRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
+
+
+@router.post("/users/{uid}/password", dependencies=[Depends(require_admin_write_rate_limit)])
+def set_user_password(uid: str, req: SetPasswordRequest) -> dict[str, bool]:
+    """Set or reset a member's password (home only)."""
+    if auth_backend() != "home":
+        raise HTTPException(status_code=404, detail="not found")
+    if users_store.get_user(uid) is None:
+        raise HTTPException(status_code=404, detail="no such user")
+    authn_home.set_password(uid, req.password)
+    return {"ok": True}
 
 
 class AllowlistEntry(BaseModel):
@@ -385,6 +437,7 @@ def _issue_device_id() -> str:
 def _create_device_impl(
     req: CreateDeviceRequest,
     broker: BrokerClient,
+    emqx: BrokerAdmin,
     settings: Settings,
 ) -> DeviceSetupCodeResponse:
     """The setup-code flow shared with `POST /api/family/devices`, after its own scope check."""
@@ -472,6 +525,7 @@ def _create_device_impl(
 def create_device(
     req: CreateDeviceRequest,
     broker: Annotated[BrokerClient, Depends(get_broker)],
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
     settings: Annotated[Settings, Depends(get_app_settings)],
 ) -> DeviceSetupCodeResponse:
     return _create_device_impl(req, broker, emqx, settings)
@@ -525,6 +579,7 @@ def list_devices(family: Annotated[str | None, Query()] = None) -> list[Device]:
 def _rotate_credentials_impl(
     device_id: str,
     broker: BrokerClient,
+    emqx: BrokerAdmin,
     settings: Settings,
     ingest: Ingest,
 ) -> DeviceSetupCodeResponse:
@@ -586,12 +641,14 @@ def _rotate_credentials_impl(
 def rotate_credentials(
     device_id: str,
     broker: Annotated[BrokerClient, Depends(get_broker)],
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
     settings: Annotated[Settings, Depends(get_app_settings)],
     ingest: Annotated[Ingest, Depends(get_ingest)],
 ) -> DeviceSetupCodeResponse:
     return _rotate_credentials_impl(device_id, broker, emqx, settings, ingest)
 
 
+def _revoke_device_impl(device_id: str, emqx: BrokerAdmin) -> Device:
     """Revoke the device and delete its broker credential."""
     device = devices_store.get_device(device_id)
     if device is None:
@@ -605,6 +662,7 @@ def rotate_credentials(
 )
 def revoke_device(
     device_id: str,
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
 ) -> Device:
     return _revoke_device_impl(device_id, emqx)
 

@@ -31,6 +31,8 @@ class MetaSettings(BaseModel):
 
     schemaVersion: int = 2
     lastSweepAt: datetime | None = None
+    # The in-process scheduler's last tick; never written in the cloud.
+    lastTickAt: datetime | None = None
     seqCounter: int = 0
 
 
@@ -54,6 +56,11 @@ def get_meta() -> MetaSettings:
     return MetaSettings.model_validate(snap.to_dict() or {})
 
 
+
+
+def mark_ticked() -> None:
+    """`settings/meta.lastTickAt = now`, after each in-process scheduler tick."""
+    _settings().document("meta").set({"lastTickAt": SERVER_TIMESTAMP}, merge=True)
 
 
 def ensure_meta_initialized() -> MetaSettings:

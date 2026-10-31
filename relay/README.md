@@ -79,6 +79,33 @@ run inside the `relay` container or against the emulators from the host)
 creates a Firebase Auth user + `users/{uid}` doc with `role: 'super'` + the
 `{role, fam}` custom claims — idempotent, safe to re-run.
 
+## SQLite store
+
+`DB_BACKEND=sqlite` swaps Firestore for `app/db/sqlitestore.py`: the subset
+of the `google.cloud.firestore` client API the relay uses, over one SQLite
+file at `SQLITE_PATH` (default `data/relay/pager.sqlite`; WAL, so `-wal` and
+`-shm` files sit beside it). `app/store/*` is unchanged. Writes go through
+google's own batch/transaction classes, so sentinels and field paths behave
+as in the cloud; anything outside the inventory in the module docstring
+raises `NotImplementedError`. The relay must be the only process with the
+file open: a second one refuses to start. The default, `DB_BACKEND=firestore`,
+is the cloud deployment. Firebase Auth is still used for sign-in in both
+modes, so the Auth emulator is still needed in development.
+
+The whole test suite is the shim's conformance test:
+
+```bash
+cd relay
+docker compose up -d firebase        # Auth is still needed
+DB_BACKEND=sqlite .venv/bin/python -m pytest
+```
+
+Each session gets a fresh temp database; `tests/test_rules.py` is skipped
+(`firestore.rules` has no meaning without Firestore).
+`tests/test_sqlitestore.py` covers what is specific to the shim (sentinels,
+`$ts` timestamps, cursors, collection groups, the change feed, the
+single-writer refusal).
+
 ## OTA firmware
 
 `FW_INDEX_URL` and `FW_BUCKET_BASE` point at the public firmware bucket
@@ -90,6 +117,21 @@ writes it to `fw-cache/<target16>/from-<base16>.dz` (7-day bucket lifecycle,
 owned by Terraform). The Cloud Run service account needs object create/read on
 the bucket; any failure falls back to the full image. The Docker image builds
 `detools` in a builder stage because it has no manylinux wheel.
+
+`FW_CACHE=local` (the home stack) writes those
+deltas to `FW_CACHE_DIR` (`<target16>/from-<base16>.dz` plus a `.json` with
+the metadata GCS would hold) and serves them at `/fw-cache/...`; the
+`cfg.ota` URL is then `PUBLIC_BASE_URL/fw-cache/...`. Published objects still
+come from the bucket. The local cache has no 7-day expiry.
+
+## Moving data: `python -m app.dbexport`
+
+`export <file>` writes the configured store (`DB_BACKEND`) as NDJSON, one
+`{path, data}` record per document, timestamps as `{"$ts": <µs>}` and bytes
+as `{"$b64": ...}`; `import <file>` writes such a file into an empty store
+(`--merge` to write over one); `convert <dir> <file>` turns a
+`gcloud firestore export` directory into the same records. Under SQLite,
+`import` needs the relay stopped. `tests/test_dbexport.py`.
 
 ## Soracom SIM enrollment
 
