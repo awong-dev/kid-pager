@@ -14,6 +14,7 @@ terraform {
 
   # Replace the bucket with the one infra/bootstrap created (its state_bucket_name output).
   backend "gcs" {
+    bucket = "kid-pager-tfstate"
     prefix = "envs/prod"
   }
 }

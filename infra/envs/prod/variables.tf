@@ -45,12 +45,61 @@ variable "relay_service_name" {
 }
 
 variable "relay_image" {
+  description = "Full Artifact Registry image URI. CI (.github/workflows/deploy.yml) passes `-var relay_image=<repo>:<sha>` per deploy. Empty (the default) = keep whatever the existing Cloud Run service is serving (read via data source in main.tf), so a local apply never changes the image. The very first apply (service does not exist yet) MUST pass this explicitly -- infra/README.md step 8."
   type        = string
+  default     = ""
 }
 
 variable "broker_api_url" {
   description = "docs/SERVER_PLAN.md §9.4: EMQX Cloud Serverless REST API base URL for this deployment (from the EMQX Cloud console, infra/README.md), or the broker-gce module's own REST endpoint if use_broker_gce=true."
   type        = string
+}
+
+variable "broker_host" {
+  description = "The broker's MQTT(S) hostname (not the REST API URL) -- baked into every device's setup-code bootstrap bundle. For EMQX Cloud Serverless this is normally the same base hostname as broker_api_url, just used for MQTT(S) instead of the REST management API."
+  type        = string
+}
+
+variable "broker_ca_pem_file" {
+  description = "Path, relative to infra/envs/prod, of the PEM root CA devices should pin for the broker -- e.g. \"certs/digicert-global-root-g2.pem\" for EMQX Cloud Serverless. Empty (the default) pins nothing: devices run with certificate validation off (docs/DEVICE_PLAN.md section 3.3). A file path rather than the PEM text so the same value works from terraform.tfvars and from a one-line CI `-var`."
+  type        = string
+  default     = ""
+}
+
+variable "public_base_url" {
+  description = "docs/V02_DESIGN.md §4.4 / infra/modules/relay-service/variables.tf's public_base_url: this deployment's own public HTTPS origin (used by app/tasks.py; keep it the Cloud Run run.app origin, infra/README.md; also the base of the CA-pointer URL a bootstrap bundle hands a device). Cloud Run v2's own computed URL cannot be referenced from inside the same apply that creates the service (a genuine cyclic reference), so this has no default derived from module.relay_service.service_url -- set it by hand after the service exists. Empty (the default) leaves it unset; e.g. `https://relay.example.com`."
+  type        = string
+  default     = ""
+}
+
+variable "cell_geo_provider" {
+  description = "relay/app/cellgeo.py's CELL_GEO_PROVIDER -- \"none\" (default), \"google\" or \"opencellid\". Not secret; safe to leave at the default until a real API key exists (see enable_cell_geo_secret below)."
+  type        = string
+  default     = "none"
+}
+
+variable "enable_cell_geo_secret" {
+  description = "Wire CELL_GEO_API_KEY into the relay service. Leave false (and cell_geo_provider at \"none\") until a real Google Geolocation API (or OpenCelliD) key exists in Secret Manager -- see infra/README.md's runbook step. Cloud Run refuses to create a revision that references a secret with zero versions."
+  type        = bool
+  default     = false
+}
+
+variable "enable_soracom_secrets" {
+  description = "Wire SORACOM_AUTH_KEY_ID and SORACOM_AUTH_KEY into the relay service (Beam enrolment from the admin UI). Leave false until both secrets hold a version -- see infra/README.md \"Soracom enrolment key\". Cloud Run refuses to create a revision that references a secret with zero versions."
+  type        = bool
+  default     = false
+}
+
+variable "fw_bucket_name" {
+  description = "Public firmware bucket name. Empty = \"<project_id>-pager-fw\"."
+  type        = string
+  default     = ""
+}
+
+variable "fw_publishers" {
+  description = "IAM members allowed to upload firmware with tools/fwpub.py, e.g. [\"user:you@example.com\"]. Gets roles/storage.objectAdmin on the firmware bucket."
+  type        = list(string)
+  default     = []
 }
 
 variable "tick_schedule" {

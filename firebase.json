@@ -1,6 +1,12 @@
 {
+  "$comment": "Root deploy config for `firebase deploy --only hosting,firestore`. Local dev uses relay/firebase.json and web/firebase.json instead.",
   "hosting": {
     "public": "web/out",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
     "cleanUrls": true,
     "trailingSlash": false,
     "rewrites": [
@@ -8,22 +14,45 @@
         "source": "/api/**",
         "run": {
           "serviceId": "pager-relay",
+          "region": "us-west1"
         }
       },
       {
         "source": "/webhooks/**",
         "run": {
           "serviceId": "pager-relay",
+          "region": "us-west1"
         }
+      },
+      {
+        "source": "/bridge/**",
+        "run": {
+          "serviceId": "pager-relay",
+          "region": "us-west1"
+        }
+      },
+      {
+        "source": "/chat/view/**",
+        "destination": "/chat/view/_.html"
       },
       {
         "source": "/chat/**",
         "destination": "/chat/_.html"
+      },
+      {
+        "source": "/devices/**",
+        "destination": "/devices/_.html"
       }
     ],
     "headers": [
       {
         "source": "/firebase-messaging-sw.js",
+        "headers": [
+          {
+            "key": "Service-Worker-Allowed",
+            "value": "/"
+          }
+        ]
       }
     ]
   },

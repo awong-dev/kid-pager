@@ -34,6 +34,35 @@ variable "broker_api_url" {
   type        = string
 }
 
+variable "broker_host" {
+  description = "app/routers/admin.py's _bootstrap_host_and_ca() BROKER_HOST -- the broker's MQTT(S) hostname baked into every device's setup-code bootstrap bundle. Distinct from broker_api_url (that's the REST management API base URL, a different port/purpose on the same EMQX Cloud Serverless deployment). Falls back to \"localhost\" if unset, which is only correct for the local docker-compose stack -- found live trying to provision a real device against a real deployment with this unset."
+  type        = string
+}
+
+variable "broker_ca_pem" {
+  description = "app/routers/admin.py's _bootstrap_host_and_ca() BROKER_CA_PEM -- the broker's root CA as PEM text, baked into every setup-code bootstrap bundle so the device pins it (docs/DEVICE_PLAN.md section 3.3). Empty (the default) means pin nothing: the env var is not set at all, the relay sends an empty CA, and the device runs with certificate validation off. A public root CA is not a secret. Only setup codes issued after a change carry the new value."
+  type        = string
+  default     = ""
+}
+
+variable "public_base_url" {
+  description = "app/config.py's PUBLIC_BASE_URL -- this deployment's own public HTTPS origin. Used by app/tasks.py; docs/V02_DESIGN.md §4.4 adds a use: the base of the content-addressed `GET /ca/{sha256hex}.pem` pointer a bootstrap bundle or a `cfg.ca` push hands a device. Cloud Run v2 cannot reference a service's own computed .uri from inside the same apply (a genuine cyclic reference -- see this module's `oidc_audience` variable for the same problem solved with a fixed string), so this is a plain variable rather than `google_cloud_run_v2_service.relay.uri`: set it by hand once the service exists (infra/README.md), e.g. `https://relay.example.com`. Empty (the default) means unset: a bootstrap/push for a deployment with a CA configured then fails closed with a clear error instead of silently sending an unpinned bundle (app/devsetup.py)."
+  type        = string
+  default     = ""
+}
+
+variable "fw_bucket_base" {
+  description = "app/config.py's FW_BUCKET_BASE: public base URL of the OTA firmware bucket (docs/OTA_DESIGN.md D3), trailing slash. Empty = unset."
+  type        = string
+  default     = ""
+}
+
+variable "fw_index_url" {
+  description = "app/config.py's FW_INDEX_URL: URL of fw/index.json in the firmware bucket. Empty = unset."
+  type        = string
+  default     = ""
+}
+
 variable "broker_api_key_secret_id" {
   type = string
 }
@@ -44,6 +73,62 @@ variable "broker_api_secret_secret_id" {
 
 variable "webhook_key_secret_id" {
   type = string
+}
+
+variable "cell_geo_provider" {
+  description = "relay/app/cellgeo.py's CELL_GEO_PROVIDER -- \"none\" (default: no third-party lookup, nothing stored beyond devices/{d}.status.lastCell), \"google\" or \"opencellid\". Not secret -- a plain env var, unlike the API key below."
+  type        = string
+  default     = "none"
+}
+
+variable "cell_geo_api_key_secret_id" {
+  description = "Optional: only wired into the service's env if non-null. A deployment with cell_geo_provider left at \"none\" never needs this -- relay/app/cellgeo.py treats an unset key as \"skip the lookup\", not a crash."
+  type        = string
+  default     = null
+}
+
+variable "soracom_auth_key_id_secret_id" {
+  description = "Optional: only wired into the service's env (as SORACOM_AUTH_KEY_ID) if non-null. Unset means the admin UI shows Soracom enrolment as not configured. The secret must hold a version before this is set."
+  type        = string
+  default     = null
+}
+
+variable "soracom_auth_key_secret_id" {
+  description = "Optional: only wired into the service's env (as SORACOM_AUTH_KEY) if non-null. Same gating as soracom_auth_key_id_secret_id."
+  type        = string
+  default     = null
+}
+
+variable "soracom_beam_group" {
+  description = "SORACOM_BEAM_GROUP: name of the Soracom group the relay creates/uses for Beam enrolment. Not secret."
+  type        = string
+  default     = "pager-beam"
+}
+
+variable "soracom_beam_destination" {
+  description = "SORACOM_BEAM_DESTINATION: Beam destination override. Empty (default) leaves the env var unset so the relay's own default applies."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_audience" {
+  description = "app/routers/internal.py's OIDC_AUDIENCE -- must match infra/modules/schedule's oidc_token.audience exactly (both fed the same value from envs/prod, per that file's module docstring 'Known gap' section). Also set as this service's custom_audiences so a fixed, non-self-referential string (e.g. \"https://pager-relay\") can be used instead of the service's own computed .uri."
+  type        = string
+}
+
+variable "oidc_allowed_emails" {
+  description = "app/routers/internal.py's OIDC_ALLOWED_EMAILS -- comma-separated caller service-account emails allowed to call /internal/*. Today just infra/modules/schedule's pager-scheduler SA; computed deterministically in envs/prod (account_id is the literal \"pager-scheduler\") to avoid a module cycle."
+  type        = string
+}
+
+variable "push_backend" {
+  description = "relay/app/config.py's PUSH_BACKEND -- \"fcm\" wires firebase_admin.messaging as the FirebaseFCMClient send_data() implementation; \"null\" (the default here, matching relay/app/config.py's own default) keeps the no-op null client dev and tests run against. Left at \"null\" by default so this module stays usable for a hypothetical non-prod environment without FCM configured; infra/envs/prod sets this to \"fcm\" once the web app's VAPID key exists."
+  type        = string
+  default     = "null"
+  validation {
+    condition     = contains(["fcm", "null"], var.push_backend)
+    error_message = "relay/app/config.py's PUSH_BACKEND only supports \"fcm\" or \"null\"."
+  }
 }
 
 variable "tasks_mode" {

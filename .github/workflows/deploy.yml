@@ -8,6 +8,12 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# Serialize runs: a second apply would fail on the state lock, and cancelling an apply
+# mid-run can leave the lock held.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -43,12 +49,15 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
+      - uses: actions/checkout@v7
 
       - id: auth
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v3
 
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
@@ -70,11 +79,14 @@ jobs:
     if: needs.gate.outputs.ready == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
 
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
@@ -91,22 +103,46 @@ jobs:
             -var "relay_image=${{ needs.build-and-push.outputs.image }}" \
             -var "github_org=${{ github.repository_owner }}" \
             -var "github_repo=${{ github.event.repository.name }}" \
+            -var "broker_api_url=${{ vars.BROKER_API_URL }}" \
+            -var "broker_host=${{ vars.BROKER_HOST }}" \
+            -var "broker_ca_pem_file=${{ vars.BROKER_CA_PEM_FILE }}" \
+            -var "public_base_url=${{ vars.PUBLIC_BASE_URL }}" \
+            -var "cell_geo_provider=${{ vars.CELL_GEO_PROVIDER != '' && vars.CELL_GEO_PROVIDER || 'none' }}" \
+            -var "enable_cell_geo_secret=${{ vars.ENABLE_CELL_GEO_SECRET == 'true' }}" \
+            -var "enable_soracom_secrets=${{ vars.ENABLE_SORACOM_SECRETS == 'true' }}"
+        # CELL_GEO_API_KEY (docs/PROTOCOL.md §13.2) and the SORACOM_* secrets must already hold a
+        # version before their enable_* flag is set: Cloud Run rejects a revision referencing an empty secret.
 
   firebase-deploy:
     needs: [gate, terraform-apply]
     if: needs.gate.outputs.ready == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
 
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
+      - uses: actions/setup-node@v7
         with:
+          node-version: "24"
 
       # NEXT_PUBLIC_FIREBASE_* are inlined at build time; unset, the build ships demo config
+      # and sign-in fails. They are public web-app identifiers, so repo variables.
+      # The VAPID key is a secret, read client-side by getToken() only.
       - name: Build web app
         working-directory: web
+        env:
+          NEXT_PUBLIC_USE_EMULATORS: "0"
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          NEXT_PUBLIC_FIREBASE_API_KEY: ${{ vars.FIREBASE_API_KEY }}
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${{ vars.FIREBASE_AUTH_DOMAIN }}
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: ${{ vars.FIREBASE_STORAGE_BUCKET }}
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: ${{ vars.FIREBASE_MESSAGING_SENDER_ID }}
+          NEXT_PUBLIC_FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+          NEXT_PUBLIC_FIREBASE_VAPID_KEY: ${{ secrets.NEXT_PUBLIC_FIREBASE_VAPID_KEY }}
         run: |
           npm ci
           npm run build

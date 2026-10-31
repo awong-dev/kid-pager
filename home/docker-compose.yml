@@ -1,0 +1,159 @@
+# The home server stack.
+#   docker compose up -d
+# Mosquitto with dynamic-security; the relay is its one MQTT client (BROKER_MODE=mqtt).
+# Everything worth backing up lives in ./data. PAGER_DATA_DIR and PAGER_ENV_FILE move it and pager.env.
+
+name: pager-home
+
+x-relay-image: &relay-image
+  image: pager-relay-home:local
+  build:
+    context: ../relay
+    additional_contexts:
+      web: ../web
+    args:
+      WEB: ${PAGER_WEB:-home}
+
+# Sourced at container start: on the first `up` these files do not exist until `init` has run.
+x-with-data-env: &with-data-env
+  entrypoint:
+    - /bin/sh
+    - -c
+    - set -a && . /data/secrets.env && . /data/relay.env && set +a && exec "$$@"
+    - --
+
+services:
+  # Generates missing secrets and certificates in ./data, then exits; leaves existing files alone.
+  init:
+    <<: *relay-image
+    command: ["python", "-m", "app.homeinit"]
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    volumes:
+      - ${PAGER_DATA_DIR:-./data}:/data
+    restart: "no"
+
+  relay:
+    <<: [*relay-image, *with-data-env]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    environment:
+      DB_BACKEND: sqlite
+      AUTH_BACKEND: home
+      SQLITE_PATH: /data/relay/pager.sqlite
+      BRIDGE_OUTBOX_WAIT_S: "25"
+      SCHEDULER_MODE: ${SCHEDULER_MODE:-internal}
+      # BROKER_MQTT_PASSWORD comes from data/relay.env.
+      BROKER_MODE: mqtt
+      BROKER_MQTT_HOST: mosquitto
+      BROKER_MQTT_PORT: "1883"
+      BROKER_MQTT_USERNAME: relay
+      # Firmware index and bucket; deltas are cached in data/fw-cache/ and served at /fw-cache/.
+      FW_INDEX_URL: ${FW_INDEX_URL:-https://storage.googleapis.com/kid-pager-pager-fw/fw/index.json}
+      FW_BUCKET_BASE: ${FW_BUCKET_BASE:-https://storage.googleapis.com/kid-pager-pager-fw/}
+      FW_CACHE: local
+      FW_CACHE_DIR: /data/fw-cache
+    volumes:
+      - ${PAGER_DATA_DIR:-./data}:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # TLS edge: 443 -> relay, 8883 -> broker, 80 -> redirect + ACME. Reloads every 6 h for renewed certificates.
+  nginx:
+    image: nginx:1.27-alpine
+    command:
+      - /bin/sh
+      - -c
+      - mkdir -p /etc/nginx/http.d && { (while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'; }
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      relay:
+        condition: service_started
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    environment:
+      MQTT_UPSTREAM: mosquitto:1883
+      # Only these two are substituted; nginx's own $vars are left alone.
+      NGINX_ENVSUBST_FILTER: ^(TLS_MODE|MQTT_UPSTREAM)$$
+      # Not conf.d/: the image's default server there would answer port 80.
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/http.d
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8883:8883"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ${PAGER_DATA_DIR:-./data}/certs:/data/certs:ro
+      - ${PAGER_DATA_DIR:-./data}/certbot/www:/var/www/certbot:ro
+    restart: unless-stopped
+
+  # Logins and ACLs live in the dynamic-security file in data/mosquitto/.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${PAGER_DATA_DIR:-./data}/mosquitto:/mosquitto/data
+    restart: unless-stopped
+
+  # TLS_MODE=letsencrypt only. certbot/certbot publishes no stable major tag.
+  certbot:
+    image: certbot/certbot:latest
+    profiles: [letsencrypt]
+    depends_on:
+      nginx:
+        condition: service_started
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        trap exit TERM
+        if [ ! -e /etc/letsencrypt/live/pager/fullchain.pem ]; then
+          certbot certonly --webroot -w /var/www/certbot --cert-name pager \
+            -d "$$PAGER_HOST" --email "$$LETSENCRYPT_EMAIL" \
+            --agree-tos --no-eff-email --non-interactive || exit 1
+        fi
+        while :; do
+          certbot renew --webroot -w /var/www/certbot --non-interactive
+          sleep 12h & wait $$!
+        done
+    volumes:
+      - ${PAGER_DATA_DIR:-./data}/certs/letsencrypt:/etc/letsencrypt
+      - ${PAGER_DATA_DIR:-./data}/certbot/www:/var/www/certbot
+    restart: unless-stopped
+
+  # `--profile backup run --rm backup` writes data/backups/<UTC stamp>.sqlite and <stamp>.tar.gz
+  # (secrets.env, certs/, mosquitto/, emqx/).
+  backup:
+    <<: *relay-image
+    profiles: [backup]
+    # `run --rm backup restore <stamp>` restores one; stop the stack first.
+    entrypoint: ["python", "-m", "app.homebackup", "--data", "/data"]
+    command: []
+    volumes:
+      - ${PAGER_DATA_DIR:-./data}:/data
+    restart: "no"
+
+  # Bridge phone test double; `--profile test` only.
+  bridge-sim:
+    profiles: [test]
+    build:
+      context: ../tools
+      dockerfile: mocks/bridge_sim.Dockerfile
+    environment:
+      RELAY_URL: http://relay:8000
+      BRIDGE_SIM_SIM_NUMBER: "+15550007777"
+      BRIDGE_SIM_HEARTBEAT_S: "30"
+    ports:
+      - "8020:8020"

@@ -15,6 +15,8 @@ pubsub-debug.log
 database-debug.log
 firestore-export-metadata.json
 
+.firebase/
+
 # Environment files
 .env
 
@@ -35,3 +37,30 @@ firmware/dependencies.lock
 .claude/scheduled_tasks.lock
 
 build-v2.log
+
+# host test build output
+firmware/host/build/
+
+# Android bridge app
+bridge-android/.gradle/
+bridge-android/build/
+bridge-android/app/build/
+bridge-android/local.properties
+bridge-android/app/google-services.json
+bridge-android/.kotlin/
+
+build/
+build_assets.bin
+
+# KiCad runtime files
+*.lck
+*-backups/
+*-unsaved-export-*.kicad_prl
+hardware/carrier/gnd_tmp.*
+hardware/carrier/gnd_cand.json
+
+# Home server stack: generated secrets, certificates, database and local settings
+home/data/
+home/pager.env
+home/.e2e-data/
+home/.e2e.env

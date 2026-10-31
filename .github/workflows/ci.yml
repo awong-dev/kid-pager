@@ -11,7 +11,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
 
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -39,9 +41,22 @@ jobs:
         working-directory: relay
         run: pytest -v
 
+      # firestore.rules tests are skipped; the Auth emulator is still needed for sign-in.
+      - name: Run relay unit tests against the SQLite store
+        working-directory: relay
+        env:
+          DB_BACKEND: sqlite
+        run: pytest -v
+
       - name: Stop the unit-test-only emulators (e2e_v2.py brings up its own full stack)
         working-directory: relay
         run: docker compose down -v
 
       - name: Run end-to-end test against the real docker-compose stack
         run: python3 tools/e2e_v2.py
+
+      - name: Run end-to-end test against the home stack (Mosquitto)
+        run: python3 tools/e2e_v2.py --stack home
+
+      - name: Run end-to-end test against the home stack (EMQX override)
+        run: python3 tools/e2e_v2.py --stack home-emqx

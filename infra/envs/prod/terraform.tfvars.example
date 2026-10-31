@@ -6,16 +6,36 @@ region      = "us-central1"
 github_org  = "my-github-org"
 github_repo = "pager"
 
+# relay_image is deliberately not set here: CI passes it per deploy, and an empty value keeps the
+# running image. Only the first apply passes it on the command line (infra/README.md step 8).
 
 # EMQX Cloud Serverless REST API base URL, from its console.
 broker_api_url = "https://<your-deployment>.emqxsl.com:8443/api/v5"
+
+# The broker's MQTT(S) hostname, baked into every setup code.
+broker_host = "<your-deployment>.emqxsl.com"
+
+# Root CA devices pin for the broker; unset pins nothing (validation off). For EMQX Cloud Serverless:
+# broker_ca_pem_file = "certs/digicert-global-root-g2.pem"
+
+# This deployment's public HTTPS origin; needed once a CA is pinned so the bootstrap bundle's CA
+# pointer (`GET /ca/{sha256hex}.pem`) resolves. Set by hand after the first apply, e.g.:
+# public_base_url = "https://relay.example.com"
 
 # Optional overrides (defaults shown):
 # firestore_location     = "nam5"
 # custom_domain          = ""
 # enable_phone_auth      = true
 # enable_email_link_auth = true
+# cell_geo_provider      = "none"  # "google" | "opencellid" | "none"
+# enable_cell_geo_secret = false   # flip once CELL_GEO_API_KEY has a real value set
+# enable_soracom_secrets = false   # flip once SORACOM_AUTH_KEY_ID and SORACOM_AUTH_KEY have values set
 # time_zone              = "America/Los_Angeles"
 # use_broker_gce         = false  
 # broker_domain          = ""      # required if use_broker_gce = true
 # letsencrypt_email      = ""      # required if use_broker_gce = true
+
+# Firmware OTA bucket. fw_publishers may upload with tools/fwpub.py; fw_bucket_name defaults to
+# "<project_id>-pager-fw".
+# fw_bucket_name = ""
+fw_publishers = ["user:you@example.com"]

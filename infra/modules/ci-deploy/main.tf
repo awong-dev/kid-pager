@@ -54,6 +54,8 @@ locals {
     "roles/cloudtasks.admin",           # infra/modules/schedule
     "roles/iam.securityAdmin",          # grant the runtime and scheduler SAs their project roles
     "roles/serviceusage.serviceUsageConsumer",
+    # This SA's own apply manages its workload identity pool; securityAdmin does not cover it.
+    "roles/iam.workloadIdentityPoolAdmin",
   ]
 }
 

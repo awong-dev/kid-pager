@@ -28,6 +28,35 @@ resource "google_secret_manager_secret" "webhook_key" {
   }
 }
 
+# Optional: only the third-party API key is a secret; CELL_GEO_PROVIDER is a plain env var.
+resource "google_secret_manager_secret" "cell_geo_api_key" {
+  project   = var.project_id
+  secret_id = "CELL_GEO_API_KEY" # relay/app/cellgeo.py api_key()
+  labels    = var.labels
+  replication {
+    auto {}
+  }
+}
+
+# Optional Soracom SAM auth key, used to enrol SIMs into the Beam group.
+resource "google_secret_manager_secret" "soracom_auth_key_id" {
+  project   = var.project_id
+  secret_id = "SORACOM_AUTH_KEY_ID" # relay/app/config.py Settings.soracom_auth_key_id
+  labels    = var.labels
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "soracom_auth_key" {
+  project   = var.project_id
+  secret_id = "SORACOM_AUTH_KEY" # relay/app/config.py Settings.soracom_auth_key
+  labels    = var.labels
+  replication {
+    auto {}
+  }
+}
+
 resource "google_secret_manager_secret" "additional" {
   for_each = toset(var.additional_secret_ids)
 

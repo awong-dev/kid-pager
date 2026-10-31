@@ -1,0 +1,16 @@
+# TLS for the pager on 8883 with the stack's own CA certificate, proxied as plain MQTT to the broker.
+resolver 127.0.0.11 valid=10s ipv6=off;
+ssl_session_cache shared:MQTT_SSL:10m;
+
+server {
+    listen 8883 ssl;
+    listen [::]:8883 ssl;
+    ssl_certificate /data/certs/mqtt/server.crt;
+    ssl_certificate_key /data/certs/mqtt/server.key;
+    include /etc/nginx/snippets/tls.conf;
+
+    # A pager idles up to its keepalive (840 s on Soracom); the default 10 min would cut it.
+    proxy_timeout 1h;
+    set $mqtt_upstream ${MQTT_UPSTREAM};
+    proxy_pass $mqtt_upstream;
+}

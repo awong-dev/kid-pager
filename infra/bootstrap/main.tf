@@ -5,7 +5,16 @@ provider "google" {
 
 locals {
   base_apis = [
+    "run.googleapis.com",             # Cloud Run v2 (relay service + jobs)
+    "cloudscheduler.googleapis.com",  # tick + sweep
+    "cloudtasks.googleapis.com",      # delivery retry queue
+    "firestore.googleapis.com",       # the data store
+    "firebase.googleapis.com",        # Firebase project/web-app/hosting resources
+    "identitytoolkit.googleapis.com", # Identity Platform / Firebase Auth config
+    # The Identity Platform settings page returns 400 without this API enabled.
+    "cloudfunctions.googleapis.com",
     "firebaseextensions.googleapis.com", # required by some google_firebase_* resources
+    "fcm.googleapis.com",                # Firebase Cloud Messaging (relay push sends)
     "secretmanager.googleapis.com",      # secret containers
     "artifactregistry.googleapis.com",   # relay container images
     "iam.googleapis.com",

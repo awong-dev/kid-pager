@@ -51,6 +51,9 @@ resource "google_project_iam_member" "relay" {
 locals {
   optional_secret_envs = {
     for k, v in {
+      CELL_GEO_API_KEY    = var.cell_geo_api_key_secret_id
+      SORACOM_AUTH_KEY_ID = var.soracom_auth_key_id_secret_id
+      SORACOM_AUTH_KEY    = var.soracom_auth_key_secret_id
     } : k => v if v != null
   }
 }
@@ -63,6 +66,9 @@ resource "google_cloud_run_v2_service" "relay" {
   # Public: Hosting rewrites and the broker webhook reach it unauthenticated at the Cloud Run
   # layer. /webhooks/mqtt checks WEBHOOK_KEY in the app; /internal/* checks the OIDC token.
   ingress = "INGRESS_TRAFFIC_ALL"
+
+  # Must equal the relay's OIDC_AUDIENCE; a fixed string avoids a two-apply bootstrap.
+  custom_audiences = [var.oidc_audience]
 
   template {
     service_account = google_service_account.relay.email
@@ -101,8 +107,70 @@ resource "google_cloud_run_v2_service" "relay" {
         value = var.broker_api_url
       }
       env {
+        name  = "BROKER_HOST"
+        value = var.broker_host
+      }
+      # Unset and empty BROKER_CA_PEM both mean "pin nothing".
+      dynamic "env" {
+        for_each = var.broker_ca_pem == "" ? [] : [var.broker_ca_pem]
+        content {
+          name  = "BROKER_CA_PEM"
+          value = env.value
+        }
+      }
+      dynamic "env" {
+        for_each = var.public_base_url == "" ? [] : [var.public_base_url]
+        content {
+          name  = "PUBLIC_BASE_URL"
+          value = env.value
+        }
+      }
+      # Unset makes the relay's OTA routes return 503.
+      dynamic "env" {
+        for_each = var.fw_bucket_base == "" ? [] : [var.fw_bucket_base]
+        content {
+          name  = "FW_BUCKET_BASE"
+          value = env.value
+        }
+      }
+      dynamic "env" {
+        for_each = var.fw_index_url == "" ? [] : [var.fw_index_url]
+        content {
+          name  = "FW_INDEX_URL"
+          value = env.value
+        }
+      }
+      env {
         name  = "TASKS_MODE"
         value = var.tasks_mode
+      }
+      env {
+        name  = "CELL_GEO_PROVIDER"
+        value = var.cell_geo_provider
+      }
+      env {
+        name  = "SORACOM_BEAM_GROUP"
+        value = var.soracom_beam_group
+      }
+      # Empty = unset: the relay's own default destination applies.
+      dynamic "env" {
+        for_each = var.soracom_beam_destination == "" ? [] : [var.soracom_beam_destination]
+        content {
+          name  = "SORACOM_BEAM_DESTINATION"
+          value = env.value
+        }
+      }
+      env {
+        name  = "OIDC_AUDIENCE"
+        value = var.oidc_audience
+      }
+      env {
+        name  = "PUSH_BACKEND"
+        value = var.push_backend
+      }
+      env {
+        name  = "OIDC_ALLOWED_EMAILS"
+        value = var.oidc_allowed_emails
       }
 
       dynamic "env" {
