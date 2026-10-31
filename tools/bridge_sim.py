@@ -140,6 +140,7 @@ class BridgeSim:
         self.voice_number = voice_number
         self.heartbeat_s = heartbeat_s
         self.poll_wait_s = poll_wait_s
+        self.hinted_wait_s: int | None = None  # outboxWaitS from pair/heartbeat
         self.token: str | None = None
         self.bridge_id: str | None = None
         self.outbox: list[dict[str, Any]] = []
@@ -150,6 +151,10 @@ class BridgeSim:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._counter = 0
+        # Bumped by `pair` and `reset`: a long-poll in flight with the previous token drops its
+        # result and exits, so it cannot hold up the new pairing.
+        self._gen = 0
+        self._started = False
 
 
     def status_body(self) -> dict[str, Any]:
@@ -196,7 +201,19 @@ class BridgeSim:
             self.token = out["token"]
             self.bridge_id = out["bridgeId"]
             self.last_error = None
+            self._gen += 1
+            gen = self._gen
+        self._take_hint(out)
+        if self._started:
+            self._spawn_poll(gen)
         return out
+
+    def _take_hint(self, out: Any) -> None:
+        """Like the phone: cache `outboxWaitS` (clamped 0..25); a response
+        without it resets the hint."""
+        hint = out.get("outboxWaitS") if isinstance(out, dict) else None
+        with self._lock:
+            self.hinted_wait_s = max(0, min(25, hint)) if isinstance(hint, int) else None
 
     def heartbeat(self) -> dict[str, Any] | None:
         if not self.token:
@@ -209,6 +226,7 @@ class BridgeSim:
         )
         if status == 200:
             self.heartbeats += 1
+            self._take_hint(out)
             return out
         if status == 401:
             self.token = None
@@ -253,7 +271,12 @@ class BridgeSim:
         if status != 204:
             raise RelayError(status, out)
 
+    def handle_outbox_once(self, wait: int = 0, gen: int | None = None) -> int:
+        """Polls once, records and acks every item. Returns how many. With
+        `gen`, a poll that returns after a re-pair is dropped."""
         items = self.poll_outbox(wait)
+        if gen is not None and gen != self._gen:
+            return 0
         for item in items:
             with self._lock:
                 fail = self.fail_next > 0
@@ -268,13 +291,27 @@ class BridgeSim:
 
     def start(self) -> None:
         self._stop.clear()
+        self._started = True
+        thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+        self._spawn_poll(self._gen)
+
+    def _spawn_poll(self, gen: int) -> None:
+        thread = threading.Thread(target=self._poll_loop, args=(gen,), daemon=True)
+        thread.start()
+        self._threads.append(thread)
 
     def stop(self) -> None:
         self._stop.set()
 
+    def _poll_loop(self, gen: int) -> None:
+        while not self._stop.is_set() and gen == self._gen:
                 self._stop.wait(0.5)
                 continue
             try:
+                hinted = self.hinted_wait_s
+                self.handle_outbox_once(self.poll_wait_s if hinted is None else hinted, gen)
             except Exception as exc:  # noqa: BLE001 -- a sim keeps going
                 self.last_error = str(exc)
                 self._stop.wait(1.0)
@@ -295,6 +332,7 @@ class BridgeSim:
             self.bridge_id = None
             self.heartbeats = 0
             self.last_error = None
+            self._gen += 1
 
 
 class BridgeSimClient:

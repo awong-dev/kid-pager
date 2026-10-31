@@ -11,6 +11,8 @@ Usage (needs the relay virtualenv -- imports `httpx`/`firebase-admin`):
     relay/.venv/bin/python tools/e2e_v2.py                 # all scenarios
     relay/.venv/bin/python tools/e2e_v2.py bootstrap allowlist
     relay/.venv/bin/python tools/e2e_v2.py location_periodic location_on_demand
+    relay/.venv/bin/python tools/e2e_v2.py --stack home     # the home stack (Mosquitto), through nginx/TLS
+    relay/.venv/bin/python tools/e2e_v2.py --stack home-emqx  # the same with the EMQX override
 
 Exit code 0 if every requested scenario passes, 1 otherwise. Always tears
 down the compose stack it started.
@@ -39,9 +41,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RELAY_DIR = REPO_ROOT / "relay"
 TOOLS_DIR = REPO_ROOT / "tools"
 COMPOSE_FILE = RELAY_DIR / "docker-compose.yml"
+# `--override FILE` appends compose files.
+COMPOSE_FILES: list[Path] = [COMPOSE_FILE]
 ENV_PATH = RELAY_DIR / ".env"
 EMQX_SETUP_SCRIPT = TOOLS_DIR / "emqx_setup.py"
 RELAY_VENV_PYTHON = RELAY_DIR / ".venv" / "bin" / "python3"
+
+# `--stack home` uses home/docker-compose.yml (the relay as an MQTT client of Mosquitto,
+# BROKER_MODE=mqtt) plus the `test` profile (bridge-sim), reached only through its nginx edge
+# with the stack's own CA. `--stack home-emqx` adds the EMQX override (BROKER_MODE=rest).
+STACK = "cloud"
+HOME_STACK = False  # STACK is "home" or "home-emqx"
+BROKER = "emqx"  # the broker's compose service: "emqx" or "mosquitto"
+BROKER_ADMIN_PASSWORD = ""  # home stack: the dynsec `relay` client's password
+HOME_DIR = REPO_ROOT / "home"
+# The home stacks run as their own compose project with their own gitignored data directory and
+# env file, so a test run never touches a live deployment's files.
+HOME_PROJECT = "pager-e2e"
+HOME_DATA = HOME_DIR / ".e2e-data"
+HOME_ENV = HOME_DIR / ".e2e.env"
+HOME_CA = HOME_DATA / "certs" / "ca" / "ca.crt"
 
 RELAY_URL = "http://localhost:8000"
 AUTH_URL = "http://localhost:9099"
@@ -62,6 +81,10 @@ import httpx
 import pager_client
 
 _env_backup: str | None = None
+
+# True when the relay under test answers `GET /api/setup/status`, i.e. runs `AUTH_BACKEND=home`.
+# The admin is then created through the first-run API and `store()` goes through `/api/dev/db`.
+HOME_AUTH = False
 
 # Wire encoding every `make_device()` plays; set once in `main()` from `--wire`.
 WIRE_MODE: str = "json"
@@ -122,8 +145,28 @@ def make_device(device_id: str) -> pager_client.DeviceClient:
 
 
 def compose(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    files = [arg for path in COMPOSE_FILES for arg in ("-f", str(path))]
+    profiles = ["-p", HOME_PROJECT, "--profile", "test"] if HOME_STACK else []
+    cmd = ["docker", "compose", *files, *profiles, *args]
     print(f"$ {' '.join(cmd)}")
+    env = dict(os.environ)
+    if HOME_STACK:
+        # A relay image without the web export, and no background scheduler racing scenarios that
+        # call /internal/tick themselves.
+        env.update(
+            PAGER_WEB="none",
+            SCHEDULER_MODE="none",
+            PAGER_DATA_DIR=str(HOME_DATA),
+            PAGER_ENV_FILE=str(HOME_ENV),
+        )
     return subprocess.run(
+        cmd,
+        cwd=str(COMPOSE_FILES[0].parent),
+        check=check,
+        capture_output=capture,
+        text=True,
+        timeout=600,
+        env=env,
     )
 
 
@@ -143,16 +186,58 @@ def wait_until(
     raise AssertionError(f"timed out after {timeout}s waiting for: {description}{extra}")
 
 
+def _env_path() -> Path:
+    return HOME_ENV if HOME_STACK else ENV_PATH
+
+
 def write_env_file() -> None:
     global _env_backup
+    path = _env_path()
+    if path.exists() and not HOME_STACK:  # home/.e2e.env is the suite's own file
+        _env_backup = path.read_text()
+    if HOME_STACK:
+        # The suite's own env file: pager.env's two values plus test-only switches (DEV_MODE gates
+        # /api/dev/token and /api/dev/db, and the rate limits are raised).
+        lines = [
+            "PAGER_HOST=localhost",
+            "TLS_MODE=selfsigned",
+            "DEV_MODE=1",
+            "RATE_LIMIT_BACKEND_CREATE_LIMIT=1000",
+            "RATE_LIMIT_ADMIN_WRITE_LIMIT=1000",
+            "RATE_LIMIT_WEBHOOK_IP_LIMIT=1000",
+            "RATE_LIMIT_AUTH_IP_LIMIT=1000",
+        ]
+    else:
+        lines = [
+            "BROKER_API_URL=http://emqx:18083/api/v5",
+            f"BROKER_API_KEY={BROKER_API_KEY}",
+            f"BROKER_API_SECRET={BROKER_API_SECRET}",
+            f"WEBHOOK_KEY={WEBHOOK_KEY}",
+        ]
 
 
 def restore_env_file() -> None:
+    path = _env_path()
     if _env_backup is not None:
+        path.write_text(_env_backup)
     else:
+        path.unlink(missing_ok=True)
+
+
+def _home_secrets() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in (HOME_DATA / "secrets.env").read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip()
+    return values
 
 
 def configure_emqx() -> None:
+    if HOME_STACK:
+        # A one-shot compose service runs the same script inside the compose network.
+        compose("run", "--rm", "emqx-setup")
+        return
     result = subprocess.run(
         [
             sys.executable,
@@ -176,9 +261,20 @@ def configure_emqx() -> None:
         raise AssertionError(f"tools/emqx_setup.py failed (exit {result.returncode})")
 
 
+def _verify() -> Any:
+    """httpx `verify` for RELAY_URL: the home stack's own CA (nginx on 443)."""
+    if HOME_STACK:
+        import ssl
+
+        return ssl.create_default_context(cafile=str(HOME_CA))
+    return True
+
+
 def _relay_reachable() -> bool:
     try:
+        resp = httpx.get(f"{RELAY_URL}/healthz", timeout=3.0, verify=_verify())
         return resp.status_code == 200
+    except (httpx.HTTPError, OSError):
         return False
 
 
@@ -205,26 +301,95 @@ def _auth_emulator_reachable() -> bool:
 
 
 def start_stack(*, build: bool) -> None:
+    global HOME_AUTH, BROKER_API_KEY, BROKER_API_SECRET, WEBHOOK_KEY, BROKER_ADMIN_PASSWORD
     write_env_file()
+    if HOME_STACK and HOME_DATA.exists() and any(HOME_DATA.iterdir()):
+        print(f"{HOME_DATA} is left over from an earlier run; clearing it and its stack")
+        _clear_home_data()
+        compose("down", "-v", check=False)
     compose(*(["up", "-d", "--build"] if build else ["up", "-d"]))
     wait_until(_relay_reachable, timeout=120, interval=1, description="relay to become healthy")
+    if HOME_STACK:
+        secrets = _home_secrets()
+        BROKER_API_KEY = secrets["BROKER_API_KEY"]
+        BROKER_API_SECRET = secrets["BROKER_API_SECRET"]
+        WEBHOOK_KEY = secrets["WEBHOOK_KEY"]
+        BROKER_ADMIN_PASSWORD = secrets["BROKER_ADMIN_PASSWORD"]
+    else:
+        wait_until(
+            _auth_emulator_reachable, timeout=60, interval=1, description="Auth emulator to become reachable"
+        )
+    HOME_AUTH = httpx.get(f"{RELAY_URL}/api/setup/status", timeout=5.0, verify=_verify()).status_code == 200
+    if HOME_AUTH:
+        print("relay runs AUTH_BACKEND=home: first-run admin, store oracle over /api/dev/db")
+    if STACK == "cloud":
+        configure_emqx()  # the home stack's emqx-setup service already ran on `up`
 
 
 def stop_stack() -> None:
     print("\n=== tearing down the compose stack ===")
+    if _HOST_MQTT is not None:
+        _HOST_MQTT.stop()
+    if HOME_STACK and HOME_DATA.exists():
+        _clear_home_data()
     compose("down", "-v", check=False)
+    if HOME_STACK and HOME_DATA.exists():
+        HOME_DATA.rmdir()
     restore_env_file()
 
 
+def _clear_home_data() -> None:
+    # The containers wrote the data directory as root; clear it from inside one.
+    compose(
+        "run", "--rm", "--no-deps", "--entrypoint", "sh", "init", "-c",
+        "rm -rf /data/* /data/.[!.]*", check=False,
+    )
+
+
 def dump_logs() -> None:
+    services = ("relay", BROKER, "nginx") if HOME_STACK else ("relay", "emqx", "firebase")
+    for service, tail in zip(services, ("120", "60", "40"), strict=True):
         print(f"\n--- docker compose logs {service} --tail {tail} ---")
         result = compose("logs", service, "--tail", tail, check=False, capture=True)
         print(result.stdout)
 
 
+def internal(path: str) -> dict[str, Any]:
+    """`POST /internal/{tick,sweep}`. The home stack's nginx refuses `/internal/` from outside, so
+    there the call is made from inside the compose network with `X-Relay-Webhook-Key`."""
+    if not HOME_STACK:
+        resp = httpx.post(f"{RELAY_URL}{path}", timeout=60.0, verify=_verify())
+        resp.raise_for_status()
+        return resp.json()
+    script = (
+        "import httpx,sys;"
+        f"r=httpx.post('http://localhost:8000{path}',headers={{'X-Relay-Webhook-Key':sys.argv[1]}},timeout=60);"
+        "r.raise_for_status();print(r.text)"
+    )
+    import json
+
+    result = compose("exec", "-T", "relay", "python", "-c", script, WEBHOOK_KEY, capture=True)
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
 def bootstrap_admin(alias: str = "admin", email: str = "admin@example.com") -> None:
     """Runs `python -m app.bootstrap` from the host against the published emulator ports; a
     home-auth relay uses the first-run API instead."""
+    if HOME_AUTH:
+        # Idempotent like app.bootstrap: later scenarios call this again.
+        status = httpx.get(f"{RELAY_URL}/api/setup/status", timeout=10.0, verify=_verify())
+        if not status.json()["needsSetup"]:
+            return
+        resp = httpx.post(
+            f"{RELAY_URL}/api/setup/first-admin",
+            json={"username": alias, "password": os.urandom(12).hex()},
+            headers={"X-Requested-With": "pager"},
+            timeout=10.0,
+            verify=_verify(),
+        )
+        assert resp.status_code == 200, resp.text
+        print(f"admin created through /api/setup/first-admin: uid={resp.json()['uid']}")
+        return
     python = str(RELAY_VENV_PYTHON) if RELAY_VENV_PYTHON.exists() else sys.executable
     env = dict(os.environ)
     env.update(
@@ -250,28 +415,169 @@ def bootstrap_admin(alias: str = "admin", email: str = "admin@example.com") -> N
 def _use_relay_store() -> None:
     """Sets the emulator env vars `app.db.firestore` reads (before its first use in this process)
     and makes `import app.*` resolve against `relay/`. Cloud stack only."""
+    assert not HOME_AUTH, "the Firestore emulator is not part of a home-auth stack"
     os.environ["FIRESTORE_EMULATOR_HOST"] = "localhost:8080"
     os.environ["FIREBASE_AUTH_EMULATOR_HOST"] = "localhost:9099"
     os.environ["GOOGLE_CLOUD_PROJECT"] = FIREBASE_PROJECT_ID
+
+
+class StoreTransport:
+    def get(self, path: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def set(self, path: str, data: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def merge(self, path: str, data: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def delete(self, path: str) -> None:
+        raise NotImplementedError
+
+    def list(self, *, parent: str | None = None, group: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        """`(document id, data)` for every document in collection `parent` or group `group`."""
+        raise NotImplementedError
+
+
+class FirestoreTransport(StoreTransport):
+    def __init__(self) -> None:
+        _use_relay_store()
+        from app.db.firestore import get_db
+
+        self._db = get_db()
+
+    def _ref(self, path: str):
+        parts = path.split("/")
+        return self._db.collection(*parts[:-1]).document(parts[-1])
+
+    def get(self, path: str) -> dict[str, Any] | None:
+        snap = self._ref(path).get()
+        return (snap.to_dict() or {}) if snap.exists else None
+
+    def set(self, path: str, data: dict[str, Any]) -> None:
+        self._ref(path).set(data)
+
+    def merge(self, path: str, data: dict[str, Any]) -> None:
+        self._ref(path).set(data, merge=True)
+
+    def delete(self, path: str) -> None:
+        self._ref(path).delete()
+
+    def list(self, *, parent: str | None = None, group: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        query = self._db.collection(*parent.split("/")) if parent else self._db.collection_group(group)
+        return [(snap.id, snap.to_dict() or {}) for snap in query.stream()]
+
+
+class HttpTransport(StoreTransport):
+    def __init__(self) -> None:
+        from app.db import sqlitestore
+
+        self._wire = sqlitestore
+        self._http = httpx.Client(base_url=f"{RELAY_URL}/api/dev/db", timeout=10.0, verify=_verify())
+
+    def _ok(self, resp: httpx.Response) -> dict[str, Any]:
+        if resp.status_code != 200:
+            raise AssertionError(f"/api/dev/db: {resp.status_code} {resp.text}")
+        return resp.json()
+
+    def get(self, path: str) -> dict[str, Any] | None:
+        body = self._ok(self._http.get("/doc", params={"path": path}))
+        return self._wire.from_wire(body["data"]) if body["exists"] else None
+
+    def set(self, path: str, data: dict[str, Any]) -> None:
+        self._ok(self._http.put("/doc", json={"path": path, "data": self._wire.to_wire(data)}))
+
+    def merge(self, path: str, data: dict[str, Any]) -> None:
+        self._ok(self._http.patch("/doc", json={"path": path, "data": self._wire.to_wire(data)}))
+
+    def delete(self, path: str) -> None:
+        self._ok(self._http.delete("/doc", params={"path": path}))
+
+    def list(self, *, parent: str | None = None, group: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        params = {"parent": parent} if parent else {"group": group}
+        rows = self._ok(self._http.get("/list", params=params))["docs"]
+        return [(row["id"], self._wire.from_wire(row["data"])) for row in rows]
+
+
+_store: StoreTransport | None = None
+
+
+def store() -> StoreTransport:
+    global _store
+    if _store is None:
+        _store = HttpTransport() if HOME_AUTH else FirestoreTransport()
+    return _store
+
+
 class Oracle:
+    """Whitebox store reads through `store()`, used only to verify what blackbox actions produced.
+    Bypasses `firestore.rules`; documents are decoded with the relay's own models."""
 
     def __init__(self) -> None:
+        from app.store import contacts, locations, messages, users
+
+        self.messages_store = messages
+        self._locations = locations
+        self._users = users
+        self._contacts = contacts
 
     def uid_for_alias(self, alias: str) -> str:
+        data = store().get(f"aliases/{alias}")
+        assert data is not None and data.get("uid"), f"no such alias: {alias!r}"
+        return data["uid"]
 
     def loc_req_exists(self, device_id: str) -> bool:
+        return store().get(f"locReqs/{device_id}") is not None
 
     def message(self, msg_id: str):
+        data = store().get(f"messages/{msg_id}")
+        return None if data is None else self.messages_store.Message.model_validate({"id": msg_id, **data})
+
+    def all_messages(self) -> list:
+        return [
+            self.messages_store.Message.model_validate({"id": doc_id, **data})
+            for doc_id, data in store().list(parent="messages")
+        ]
 
     def thread(self, alias_a: str, alias_b: str):
+        """`messages_store.list_thread`: the conversation's messages by `seq`."""
         key = self.messages_store.conv_key(self.uid_for_alias(alias_a), self.uid_for_alias(alias_b))
+        return sorted((m for m in self.all_messages() if m.convKey == key), key=lambda m: m.seq)
+
+    def conversation_exists(self, alias_a: str, alias_b: str) -> bool:
+        key = self.messages_store.conv_key(self.uid_for_alias(alias_a), self.uid_for_alias(alias_b))
+        return store().get(f"conversations/{key}") is not None
+
+    def locations(self, device_id: str) -> list:
+        fixes = [
+            self._locations.LocationFix.model_validate({"id": doc_id, **data})
+            for doc_id, data in store().list(parent=f"devices/{device_id}/locations")
+        ]
+        return sorted(fixes, key=lambda f: f.createdAt, reverse=True)
+
+    def user(self, uid: str):
+        data = store().get(f"users/{uid}")
+        return None if data is None else self._users.User.model_validate({"uid": uid, **data})
+
+    def device(self, device_id: str) -> dict[str, Any] | None:
+        return store().get(f"devices/{device_id}")
+
+    def setup_code_exists(self, bid: str) -> bool:
+        return store().get(f"setupCodes/{bid}") is not None
+
+    def contact_request(self, device_id: str, req_id: str):
+        key = self._contacts.key(device_id, req_id)
+        data = store().get(f"contactRequests/{key}")
+        return None if data is None else self._contacts.ContactRequest.model_validate({"key": key, **data})
 
 
 def _backdate_location(device_id: str, *, days_ago: float) -> str:
     from datetime import UTC, datetime, timedelta
 
+    from app.ids import new_id
 
     ts = int(time.time())
+    loc_id = new_id("l_")
     doc = {
         "ts": ts,
         "fixTs": ts,
@@ -283,6 +589,8 @@ def _backdate_location(device_id: str, *, days_ago: float) -> str:
         "reqId": None,
         "createdAt": datetime.now(UTC) - timedelta(days=days_ago),
     }
+    store().set(f"devices/{device_id}/locations/{loc_id}", doc)
+    return loc_id
 
 
 def _backdate_message(sender_uid: str, recipient_uid: str, *, days_ago: float) -> str:
@@ -310,6 +618,7 @@ def _backdate_message(sender_uid: str, recipient_uid: str, *, days_ago: float) -
         "deliveries": {},
         "pendingDeviceIds": [],
     }
+    store().set(f"messages/{msg_id}", doc)
     return msg_id
 
 
@@ -418,6 +727,19 @@ def scenario_allowlist() -> None:
         assert "403" in str(exc), f"expected a 403, got: {exc}"
     print("allowlist: admin deny -> send returns 403")
 
+    if HOME_AUTH:
+        _allowlist_unregistered_home()
+    else:
+        _allowlist_unregistered_cloud()
+    device.disconnect()
+
+    # Restore parent<->student so later scenarios see the allow-list state `bootstrap` set up.
+    admin.admin_set_allow("parent", "student", message=True, locate=True, one_way=False)
+
+
+def _allowlist_unregistered_cloud() -> None:
+    """An unregistered signed-in UID (a real Auth account with no users/{uid} doc) is rejected by
+    the API and by a direct Firestore read."""
     from firebase_admin import auth as fb_auth
 
     _use_relay_store()
@@ -452,6 +774,22 @@ def scenario_allowlist() -> None:
     print("allowlist: unregistered signed-in uid -> 403 from both the API and Firestore")
 
 
+def _allowlist_unregistered_home() -> None:
+    """The same check against home sign-in: a relay session for a uid with no users/{uid} doc is
+    refused by the API. The browser's rules-bounded reads at home are the SSE stream."""
+    minted = httpx.post(
+        f"{RELAY_URL}/api/dev/token", json={"uid": "e2e-stranger"}, timeout=10.0, verify=_verify()
+    )
+    minted.raise_for_status()
+    assert minted.json()["kind"] == "session", minted.json()
+    api_resp = httpx.get(
+        f"{RELAY_URL}/api/me",
+        headers={"Authorization": f"Bearer {minted.json()['token']}"},
+        timeout=10.0,
+        verify=_verify(),
+    )
+    assert api_resp.status_code == 403, api_resp.text
+    print("allowlist: unregistered signed-in uid -> 403 from the API (home session)")
 
 def scenario_republish() -> None:
     """A device that has never connected still gets its queued message once it comes online
@@ -488,6 +826,9 @@ def scenario_republish() -> None:
     print("republish: message queued before the device ever connected arrived exactly once")
 
     # --- broker REST API down -> tick recovers it ---
+    print(f"republish: stopping {BROKER} to simulate the broker being down...")
+    connects_before = _relay_mqtt_connects()
+    compose("stop", BROKER)
 
     sent2 = parent.say("student", "broker is down for this one")
     msg_id_2 = sent2["id"]
@@ -506,8 +847,22 @@ def scenario_republish() -> None:
         timeout=15,
         description="delivery to stay 'queued' while the broker is unreachable",
     )
+    print(f"republish: delivery stayed 'queued' while {BROKER} was down")
 
+    compose("start", BROKER)
+    if BROKER == "mosquitto":
+        # The relay reconnects by itself (backoff up to 30 s); only its log line shows it.
+        wait_until(
+            lambda: _relay_mqtt_connects() > connects_before,
+            timeout=90,
+            interval=2,
+            description="the relay to reconnect to mosquitto",
+        )
+    else:
+        wait_until(_emqx_reachable, timeout=90, interval=2, description="emqx's REST API to come back")
+        configure_emqx()  # restarting the container loses its dynamic rule-engine config
 
+    print(f"republish: /internal/tick -> {internal('/internal/tick')}")
 
     wait_until(
         lambda: _delivery_state(msg_id_2) == "sent",
@@ -515,6 +870,12 @@ def scenario_republish() -> None:
         description="delivery to reach 'sent' after tick retried it",
     )
     print("republish: /internal/tick delivered the previously-queued message")
+
+
+def _relay_mqtt_connects() -> int:
+    """How many times the relay has logged an MQTT (re)connect; always 0 under BROKER_MODE=rest."""
+    out = compose("logs", "relay", check=False, capture=True).stdout
+    return out.count("mqtt connected to")
 
 
 def scenario_location_periodic() -> None:
@@ -538,14 +899,24 @@ def scenario_location_periodic() -> None:
 
     device.loc_auto(5)
     wait_until(
+        lambda: len(oracle.locations(issued_id("pgr-e2e-locp"))) >= 2,
         timeout=25,
         description="at least 2 periodic fixes to land in devices/{d}/locations",
     )
     device.loc_stop_auto()
+    fixes = oracle.locations(issued_id("pgr-e2e-locp"))
     print(f"location_periodic: {len(fixes)} periodic fixes landed in devices/{{d}}/locations")
 
+    assert not oracle.conversation_exists("parent", "locperiodic"), (
+        "periodic fixes must never create a thread message (PROTOCOL.md §3.2)"
     )
 
+    if HOME_AUTH:
+        # The parent's read is a Firestore REST query bounded by firestore.rules; at home it is the
+        # SSE stream with the rules ported to Python.
+        print("location_periodic: rules-bounded location reads not checked (home)")
+        device.disconnect()
+        return
     parent = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     parent.login("parent")
     via_api = parent.locations("locperiodic")
@@ -683,6 +1054,7 @@ def scenario_location_on_demand() -> None:
 
     print(f"location_on_demand: waiting {LOC_REQ_TTL_S + 3}s for the loc_req to go stale...")
     time.sleep(LOC_REQ_TTL_S + 3)
+    tick_json = internal("/internal/tick")
     assert tick_json.get("locReqsCleared", 0) >= 1, tick_json
     assert not oracle.loc_req_exists(issued_id("pgr-e2e-locd4"))
     print(f"location_on_demand: tick() cleared the stale locReqs row -- {tick_json}")
@@ -711,7 +1083,9 @@ def scenario_retention() -> None:
     stale_loc_id = _backdate_location(issued_id("pgr-e2e-retloc"), days_ago=3)  # well past 1 day
     fresh_msg_id = parent.say("student", "retention: still here after a locations-only sweep")["id"]
 
+    print(f"retention: sweep (locations=1d) -> {internal('/internal/sweep')}")
 
+    remaining_ids = {f.id for f in oracle.locations(issued_id("pgr-e2e-retloc"))}
     assert stale_loc_id not in remaining_ids, remaining_ids
     assert fresh_loc_id in remaining_ids, remaining_ids
     assert oracle.message(fresh_msg_id) is not None, "messages must be untouched by a locations-only sweep"
@@ -724,6 +1098,7 @@ def scenario_retention() -> None:
     )
     fresh_msg_id_2 = parent.say("student", "retention: fresh message survives a 2-week sweep")["id"]
 
+    print(f"retention: sweep (messages=2w) -> {internal('/internal/sweep')}")
 
     assert oracle.message(stale_msg_id) is None, "message older than the 2-week retention must be swept"
     assert oracle.message(fresh_msg_id_2) is not None
@@ -734,6 +1109,8 @@ def scenario_retention() -> None:
         _backdate_message(oracle.uid_for_alias("parent"), oracle.uid_for_alias("student"), days_ago=20 + i)
         for i in range(3)
     ]
+    result3 = internal("/internal/sweep")
+    result4 = internal("/internal/sweep")
     print(f"retention: two sweep() calls in a row -> first {result3}, second {result4}")
 
     for mid in stale_ids:
@@ -792,12 +1169,16 @@ def scenario_bytes() -> None:
 def _pending_book_or_cfg_acked(device_id: str, field: str) -> bool:
     """Whitebox check that `devcfg.ack()` recorded the device's latest `book`/`cfg` `shown` ack
     (`devices/{d}.pendingBook`/`pendingCfg`); no client-facing read exists (§3.2)."""
+    data = store().get(f"devices/{device_id}")
+    if data is None:
         return False
+    pending = data.get(field)
     return isinstance(pending, dict) and pending.get("acked") is True
 
 
 def _relay_settings():
     """A `Settings` this host process can use against the compose stack's published ports
+    (`Settings.from_env()` would read this process's own environment, not `relay/.env`). The home
     stack's EMQX API is on 127.0.0.1:18083; its Mosquitto is reached over TLS on 8883 as `relay`."""
     from app.config import Settings
 
@@ -808,10 +1189,64 @@ def _relay_settings():
         webhook_key=WEBHOOK_KEY,
         dev_mode=True,
         google_cloud_project=FIREBASE_PROJECT_ID,
+        firestore_emulator_host=None if HOME_AUTH else "localhost:8080",
+        firebase_auth_emulator_host=None if HOME_AUTH else "localhost:9099",
+        broker_mode="mqtt" if BROKER == "mosquitto" else "rest",
+        broker_mqtt_host=MQTT_HOST,
+        broker_mqtt_port=MQTT_PORT,
+        broker_mqtt_username="relay",
+        broker_mqtt_password=BROKER_ADMIN_PASSWORD or None,
     )
 
 
+_HOST_MQTT = None
+
+
+def _host_mqtt():
+    """Mosquitto stack: one `app.broker_mqtt.MqttBrokerClient` from this host,
+    over nginx's TLS 8883 with the stack's CA, logged in as `relay` under its
+    own client id (never the relay's), with no device subscriptions."""
+    global _HOST_MQTT
+    if _HOST_MQTT is None:
+        from app.broker_mqtt import MqttBrokerClient
+
+        client = MqttBrokerClient(_relay_settings(), client_id="e2e-host")
+        client._client.tls_set(ca_certs=str(HOME_CA))  # the relay itself speaks plain 1883
+        client.start()
+        assert client.wait_until_ready(15), "could not log in to mosquitto as relay over 8883"
+        _HOST_MQTT = client
+    return _HOST_MQTT
+
+
+def _expire_setup_codes() -> int:
+    """`devsetup.expire()`, which no scheduler calls. A home relay's store is reachable only through
+    `store()`, so there the same steps run through it and `devsetup._clear_and_revoke`."""
+    from datetime import UTC, datetime
+
+    from app import devsetup
+    from app.broker import BrokerClient
+    from app.broker_admin import make_broker_admin
+
+    settings = _relay_settings()
+    broker = _host_mqtt() if BROKER == "mosquitto" else BrokerClient(settings)
+    emqx = make_broker_admin(settings, broker)
+    if not HOME_AUTH:
+        return devsetup.expire(settings=settings, broker=broker, emqx=emqx)
+    now = datetime.now(UTC)
+    expired = [bid for bid, data in store().list(parent="setupCodes") if data["expiresAt"] < now]
+    for bid in expired:
+        devsetup._clear_and_revoke(bid, broker, emqx)
+        store().delete(f"setupCodes/{bid}")
+    return len(expired)
+
+
+def _broker_user_exists(username: str) -> bool:
+    """EMQX: raw `GET .../authentication/{mechanism}/users/{username}` (`EmqxAdmin` has no exists
     method). Mosquitto: the dynsec `getClient` command."""
+    if BROKER == "mosquitto":
+        responses = _host_mqtt().control([{"command": "getClient", "username": username}])
+        assert responses is not None, "dynsec getClient timed out"
+        return "error" not in responses[0]
     resp = httpx.get(
         f"{EMQX_API_URL}/api/v5/authentication/password_based:built_in_database/users/{username}",
         auth=(BROKER_API_KEY, BROKER_API_SECRET),
@@ -820,8 +1255,12 @@ def _relay_settings():
     return resp.status_code == 200
 
 
+def _broker_retained_message_exists(topic: str) -> bool:
     """EMQX 5 retainer HTTP API (`GET /api/v5/mqtt/retainer/message/{topic}`: 200 or 404). Used
     because the cleanup revokes the bootstrap credential. Mosquitto: subscribe as `relay` and see
+    whether a retained message arrives."""
+    if BROKER == "mosquitto":
+        return _mosquitto_retained(topic)
     import urllib.parse
 
     encoded = urllib.parse.quote(topic, safe="")
@@ -831,6 +1270,31 @@ def _relay_settings():
         timeout=5.0,
     )
     return resp.status_code == 200
+
+
+def _mosquitto_retained(topic: str, wait_s: float = 2.0) -> bool:
+    import threading
+
+    import paho.mqtt.client as mqtt
+
+    got = threading.Event()
+    subscribed = threading.Event()
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id=f"e2e-retained-{os.getpid()}"
+    )
+    client.username_pw_set("relay", BROKER_ADMIN_PASSWORD)
+    client.tls_set(ca_certs=str(HOME_CA))
+    client.on_connect = lambda c, u, f, rc, p: c.subscribe(topic, 1)
+    client.on_subscribe = lambda c, u, mid, rcs, p: subscribed.set()
+    client.on_message = lambda c, u, m: got.set() if m.retain and m.payload else None
+    client.connect(MQTT_HOST, MQTT_PORT)
+    client.loop_start()
+    try:
+        assert subscribed.wait(10), f"could not subscribe to {topic} as relay"
+        return got.wait(wait_s)
+    finally:
+        client.disconnect()
+        client.loop_stop()
 
 
 def scenario_setup_code() -> None:
@@ -843,6 +1307,8 @@ def scenario_setup_code() -> None:
     from datetime import UTC, datetime, timedelta
 
     from app import devsetup
+
+    oracle = Oracle()
 
     admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
     admin.login("admin")
@@ -858,6 +1324,8 @@ def scenario_setup_code() -> None:
     token_bytes, _host, _port, _apn = devsetup.parse(code)
     bid, _bpw, _bkey = devsetup.derive(token_bytes)
     boot_username = devsetup.boot_username(bid)
+    assert _broker_user_exists(boot_username), f"{boot_username} should exist right after issue()"
+    print(f"setup_code: bootstrap credential {boot_username} is live on {BROKER} before the device fetches it")
 
     device = pager_client.bootstrap_device(code, port=MQTT_PORT, wire=WIRE_MODE)
     assert device.device_id == setup_id, (device.device_id, setup_id)
@@ -868,6 +1336,8 @@ def scenario_setup_code() -> None:
     device.publish_status(batt_mv=3800, mode="active", rssi=-70)
 
     def _provisioned() -> bool:
+        d = oracle.device(setup_id)
+        return d is not None and d.get("provisionState") == "provisioned"
 
     wait_until(
         _provisioned,
@@ -876,6 +1346,8 @@ def scenario_setup_code() -> None:
     )
     print("setup_code: provisionState == 'provisioned' after the device's first signed /status")
 
+    assert not _broker_user_exists(boot_username), f"{boot_username} should be gone after bootstrap completes"
+    assert not oracle.setup_code_exists(bid), "setupCodes/{bid} should be deleted by complete()"
     print(f"setup_code: boot user {boot_username} and setupCodes/{bid} are both gone -- the boot user is gone")
     device.disconnect()
 
@@ -888,14 +1360,21 @@ def scenario_setup_code() -> None:
     boot_username2 = devsetup.boot_username(bid2)
     down_topic2 = devsetup.boot_topic_down(bid2)
 
+    assert _broker_user_exists(boot_username2), "boot user should exist before expiry"
+    assert _broker_retained_message_exists(down_topic2), "retained bundle should exist before expiry"
     print(f"setup_code: pgr-e2e-setup-exp ({setup_exp_id})'s bootstrap credential and retained bundle both exist before expiry")
 
+    store().merge(f"setupCodes/{bid2}", {"expiresAt": datetime.now(UTC) - timedelta(minutes=1)})
+    expired_count = _expire_setup_codes()
     assert expired_count == 1, expired_count
     print(
         "setup_code: devsetup.expire() (standalone) "
         f"cleaned up {expired_count} expired code"
     )
 
+    assert not _broker_retained_message_exists(down_topic2), "retained bundle must be cleared after expiry"
+    assert not _broker_user_exists(boot_username2), "boot credential must be revoked after expiry"
+    assert not oracle.setup_code_exists(bid2)
     print("setup_code: expired code left no retained message on pager/boot/{bid}/down and no live bootstrap credential")
 
     try:
@@ -947,6 +1426,7 @@ def scenario_address_book() -> None:
         timeout=10,
         description="the 'Grandma: added; needs a parent's OK to text' system reply",
     )
+    row = oracle.contact_request(issued_id("pgr-e2e-book"), req_id)
     assert row is not None and row.status == "added", row
     contact_uid, contact_alias = externals_store.contact_ids(family_id, "+15550001111")
     expected_alert_id = f"cr_{abstudent['uid']}_{contact_uid}"
@@ -1167,6 +1647,7 @@ def scenario_bridge() -> None:
     assert bridge["simNumber"] == BRIDGE_SIM_SIM_NUMBER and bridge["voiceNumber"] == voice_number, bridge
     assert bridge["caps"]["sms"] and bridge["caps"]["gvoice"] and "tokenHash" not in bridge, bridge
     wait_until(
+        lambda: oracle.user(kid["uid"]).smsNumber == BRIDGE_SIM_SIM_NUMBER,
         timeout=10,
         description="the bridge SIM to become the member's smsNumber",
     )
@@ -1204,17 +1685,21 @@ def scenario_bridge() -> None:
         c for c in admin.family_list_contacts(family_id) if c["phone"] == neighbor
     )
     # Pager reply -> outbox (sms) -> acked sent.
+    t_publish = time.monotonic()
     device.publish_msg("on my way", to=contact["alias"])
     wait_until(
         lambda: any(i["text"] == "on my way" for i in _sim_sent(sim)),
         timeout=15,
+        interval=0.05,
         description="the pager reply to reach the bridge outbox",
     )
+    print(f"bridge: pager -> bridge ack latency {time.monotonic() - t_publish:.2f} s")
     item = next(i for i in _sim_sent(sim) if i["text"] == "on my way")
     assert item["source"] == "sms" and item["to"]["phone"] == neighbor, item
     assert item["ackState"] == "sent", item
 
     def _delivery_state(text: str) -> str | None:
+        for _doc_id, data in store().list(parent="messages"):
             if data.get("body") == text and data.get("senderUid") == kid["uid"]:
                 return (data.get("deliveries") or {}).get("sms", {}).get("state")
         return None
@@ -1366,6 +1851,7 @@ def scenario_bridge_voice() -> None:
     assert bridge["simNumber"] is None and bridge["voiceNumber"] == voice_number, bridge
     assert bridge["caps"]["gvoice"] and not bridge["caps"]["sms"], bridge
     wait_until(
+        lambda: oracle.user(kid["uid"]).smsNumber == voice_number,
         timeout=10,
         description="the Voice number to become the member's smsNumber",
     )
@@ -1374,6 +1860,7 @@ def scenario_bridge_voice() -> None:
     admin.family_put_approved(family_id, kid["uid"], contacts=[{"uid": gran["uid"]}])
 
     # Cold outbound: no thread has ever been seen for this number.
+    alias = oracle.user(gran["uid"]).alias
     device.publish_msg("hello grandma", to=alias)
     wait_until(
         lambda: any(i["text"] == "hello grandma" for i in _sim_sent(sim)),
@@ -1440,6 +1927,7 @@ def scenario_bridge_whatsapp() -> None:
     assert bridge["caps"]["whatsapp"] is True, bridge
     bridge_id = bridge["id"]
     wait_until(
+        lambda: oracle.user(kid["uid"]).smsNumber == wa_sim_number,
         timeout=10,
         description="the bridge SIM to become the member's smsNumber",
     )
@@ -1580,13 +2068,52 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-build", action="store_true", help="skip `docker compose build`")
     parser.add_argument(
+        "--keep-stack",
+        action="store_true",
+        help="leave the stack (and, for home stacks, home/.e2e-data and home/.e2e.env) up "
+        "after the run, for inspection; the next run clears it",
+    )
+    parser.add_argument(
         "--wire",
         choices=["json", "cbor"],
         default="json",
         help="wire encoding every simulated device in this run speaks "
         "-- run the whole suite once per value to cover both (default: json)",
     )
+    parser.add_argument(
+        "--stack",
+        choices=["cloud", "home", "home-emqx"],
+        default="cloud",
+        help="cloud: relay/docker-compose.yml (emulators, EMQX, plain ports). home: "
+        "home/docker-compose.yml (Mosquitto, the relay as its MQTT client) + the test profile, "
+        "through nginx's TLS edge with the stack's own CA. "
+        "home-emqx: the same plus home/docker-compose.emqx.yml (EMQX, BROKER_MODE=rest). Both "
+        "home stacks run as compose project pager-e2e with home/.e2e-data and home/.e2e.env "
+        "(never home/data or home/pager.env), removed afterwards",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="FILE",
+        help="extra compose file layered over relay/docker-compose.yml, e.g. "
+        "relay/docker-compose.home-auth.yml (AUTH_BACKEND=home DB_BACKEND=sqlite); repeatable",
+    )
     args = parser.parse_args(argv)
+    global STACK, HOME_STACK, BROKER, RELAY_URL, MQTT_PORT
+    STACK = args.stack
+    HOME_STACK = STACK in ("home", "home-emqx")
+    if STACK == "home":
+        BROKER = "mosquitto"
+        COMPOSE_FILES[:] = [HOME_DIR / "docker-compose.yml"]
+    elif STACK == "home-emqx":
+        COMPOSE_FILES[:] = [HOME_DIR / "docker-compose.yml", HOME_DIR / "docker-compose.emqx.yml"]
+    if HOME_STACK:
+        RELAY_URL = "https://localhost"
+        MQTT_PORT = 8883
+        pager_client.TLS_CA_CERTS = str(HOME_CA)
+    COMPOSE_FILES.extend(p.resolve() for p in args.override)
 
     unknown = [s for s in args.scenarios if s not in SCENARIOS]
     if unknown:
@@ -1609,6 +2136,10 @@ def main(argv: list[str] | None = None) -> int:
         dump_logs()
         return 1
     finally:
+        if args.keep_stack:
+            print("\n=== --keep-stack: leaving the compose stack up ===")
+        else:
+            stop_stack()
 
 
 if __name__ == "__main__":

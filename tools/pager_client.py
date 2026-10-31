@@ -64,6 +64,7 @@ import os
 import queue
 import re
 import shlex
+import ssl
 import sys
 import threading
 import time
@@ -89,6 +90,18 @@ DEFAULT_AUTH_URL = os.environ.get("PAGER_AUTH_URL", "http://localhost:9099")
 # The Auth emulator accepts any non-empty key.
 FAKE_API_KEY = "fake-api-key"
 SIM_KEEPALIVE_S = 60
+# CA file trusted for both MQTT (`tls_set`) and the relay API (`httpx` `verify`). Unset: plain
+# MQTT and the system trust store.
+TLS_CA_CERTS: str | None = os.environ.get("PAGER_CA_CERTS") or None
+
+
+def _tls(client: mqtt.Client) -> None:
+    if TLS_CA_CERTS:
+        client.tls_set(ca_certs=TLS_CA_CERTS)
+
+
+def _http_verify() -> ssl.SSLContext | bool:
+    return ssl.create_default_context(cafile=TLS_CA_CERTS) if TLS_CA_CERTS else True
 
 
 def new_id(prefix: str) -> str:
@@ -269,6 +282,7 @@ class DeviceClient:
         )
         if self.username:
             client.username_pw_set(self.username, self.password)
+        _tls(client)
         # §14.6: the broker-generated LWT carries no signature or `n`, so it bypasses `_publish`.
         lwt_obj = {"v": 1, "state": "offline", "session": self.session_id}
         lwt_payload = self._encode(lwt_obj)
@@ -778,6 +792,7 @@ def bootstrap_device(
         protocol=mqtt.MQTTv311,
     )
     boot_client.username_pw_set(username, bpw)
+    _tls(boot_client)
     boot_client.on_connect = _on_connect
     boot_client.on_message = _on_message
     boot_client.connect(host, conn_port, keepalive=30)
@@ -850,6 +865,7 @@ class ServerClient:
         self._id_token: str | None = None
         # Filled lazily via `GET /api/me` for `_device_id_for_owner`'s family-scoping filter.
         self._family_id: str | None | Literal["unset"] = "unset"
+        self._http = httpx.Client(timeout=10.0, verify=_http_verify())
 
     @property
     def firestore_base(self) -> str:
@@ -870,6 +886,17 @@ class ServerClient:
         resp.raise_for_status()
         data = resp.json()
         self.uid = data["uid"]
+        if data.get("kind") == "session":
+            # AUTH_BACKEND=home returns a session token, used as the bearer as-is.
+            self._id_token = data["token"]
+        else:
+            exchange = self._http.post(
+                f"{self.auth_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken",
+                params={"key": FAKE_API_KEY},
+                json={"token": data["token"], "returnSecureToken": True},
+            )
+            exchange.raise_for_status()
+            self._id_token = exchange.json()["idToken"]
         self.alias = alias
         self._family_id = "unset"
         print(f"logged in as {alias} (uid={self.uid})")
