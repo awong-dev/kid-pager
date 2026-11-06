@@ -13,6 +13,23 @@ void devinfo_fmt_batt(bool known, int mv, char *out, size_t cap)
     snprintf(out, cap, "%d.%02d V%s", c / 100, c % 100, mv >= DEVINFO_USB_MV ? " (USB)" : "");
 }
 
+void devinfo_fmt_batt_ex(bool known, int mv, bool have_pct, int pct, const char *charge, char *out, size_t cap)
+{
+    bool has_charge = charge != NULL && charge[0] != '\0';
+    if (!known || mv <= 0 || (!have_pct && !has_charge)) {
+        devinfo_fmt_batt(known, mv, out, cap);
+        return;
+    }
+    int c = (mv + 5) / 10;
+    int n = snprintf(out, cap, "%d.%02d V", c / 100, c % 100);
+    if (have_pct && n > 0 && (size_t) n < cap) {
+        n += snprintf(out + n, cap - (size_t) n, " %d%%", pct);
+    }
+    if (has_charge && n > 0 && (size_t) n < cap) {
+        snprintf(out + n, cap - (size_t) n, " %s", charge);
+    }
+}
+
 void devinfo_fmt_temp(bool known, int dc, char *out, size_t cap)
 {
     if (!known) {
@@ -87,6 +104,7 @@ int devinfo_rows(const devinfo_view_t *v, char rows[][DEVINFO_ROW_LEN], int max_
         }                                                                                          \
     } while (0)
 
+    devinfo_fmt_batt_ex(v->batt_known, v->batt_mv, v->have_pct, v->batt_pct, v->charge, a, sizeof(a));
     ROW("battery %s", a);
     devinfo_fmt_temp(v->temp_known, v->temp_dc, a, sizeof(a));
     ROW("temperature %s", a);
@@ -123,6 +141,7 @@ int devinfo_rows(const devinfo_view_t *v, char rows[][DEVINFO_ROW_LEN], int max_
     ROW("rsrp %s  rsrq %s", rp, rq);
     ROW("carrier %.24s  %s", or_dash(v->carrier), !v->bearer_known ? "--" : (v->beam ? "beam" : "direct"));
     ROW("apn %s", (v->apn != NULL && v->apn[0] != '\0') ? v->apn : "(network's choice)");
+    ROW("board %s", or_dash(v->board));
 #undef ROW
     return n;
 }

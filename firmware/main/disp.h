@@ -23,6 +23,9 @@ bool disp_is_dead(void);
 /* Sends the whole framebuffer and marks the shadow plane clean (about 2-4 s of panel current). */
 void disp_full_refresh(void);
 
+/* SSD1680 deep-sleep (0x10, 0x01); only a hardware reset wakes it. Low-battery shutdown only. */
+void disp_panel_deep_sleep(void);
+
 /* Sends only the changed row band; no-op if nothing changed; full every 20th partial. */
 void disp_partial_refresh(void);
 

@@ -381,3 +381,22 @@ $(BUILD)/test_devinfo.o: test_devinfo.c $(MAIN_SRC)/devinfo_fmt.h | $(BUILD)
 
 $(BUILD)/test_devinfo: $(BUILD)/devinfo_fmt.o $(BUILD)/test_devinfo.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/devinfo_fmt.o $(BUILD)/test_devinfo.o
+
+$(BUILD)/tunes.o: $(MAIN_SRC)/tunes.c $(MAIN_SRC)/tunes.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/tunes.c
+
+$(BUILD)/test_tunes.o: test_tunes.c $(MAIN_SRC)/tunes.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_tunes.c
+
+$(BUILD)/test_tunes: $(BUILD)/tunes.o $(BUILD)/test_tunes.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/tunes.o $(BUILD)/test_tunes.o
+
+# fuel_fmt.c is also compiled strict (-std=c11 -Wall -Wextra -Werror) as a gate.
+$(BUILD)/fuel_fmt.o: $(MAIN_SRC)/fuel_fmt.c $(MAIN_SRC)/fuel_fmt.h | $(BUILD)
+	$(CC) -std=c11 -Wall -Wextra -Werror $(INCLUDES) -c -o $@ $(MAIN_SRC)/fuel_fmt.c
+
+$(BUILD)/test_fuel.o: test_fuel.c $(MAIN_SRC)/fuel_fmt.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_fuel.c
+
+$(BUILD)/test_fuel: $(BUILD)/fuel_fmt.o $(BUILD)/test_fuel.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/fuel_fmt.o $(BUILD)/test_fuel.o

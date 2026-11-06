@@ -8,11 +8,16 @@
 #include "ui.h"
 #include "disp.h"
 #include "flightrec.h"
+#include "board.h"
 #include "pins.h"
 #include "battstat.h"
 #include "refreshpol.h"
 #include "gfx.h"
 #include <time.h>
+#include "buzzer.h"
+#include "haptic.h"
+#include "frontlight.h"
+#include "extled.h"
 #include "rail.h"
 
 #include "input.h"
@@ -62,6 +67,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "fuel.h"
+#include "driver/rtc_io.h"
 
 static const char *TAG = "modes";
 
@@ -391,6 +398,10 @@ static void on_auth_epoch_wrap(void)
 // Last good battery/RSSI readings, so one failed AT command does not block a /status publish.
 // RAM only; reset on reboot.
 static int s_last_batt_mv = 0;              // 0 = no good reading yet this boot (raw mV, unclamped: ~5200 on USB)
+static int s_last_pct = -1;                 // carrier gauge percent, -1 = no reading (breadboard: always -1)
+static int s_last_charge_state = 0;         // fuel_state_t (carrier); FUEL_ON_BATTERY on the breadboard
+static bool s_gauge_fresh = false;          // set by refresh_batt_mv() when it did a new gauge read (fuel_shutdown_check())
+static int64_t s_last_gauge_us = 0;         // esp_timer time of the last gauge I2C read, 0 = none yet
 static int s_last_temp_dc = 0;              // modem temperature, tenths of C; valid only if s_have_temp
 static bool s_have_temp = false;
 static int s_last_rssi_dbm = PAGER_RSSI_UNSET; // unset = no good reading yet this boot
@@ -405,6 +416,26 @@ static bool cbor_w_int(cbor_w_t *w, uint32_t key, int64_t v)
 // Shared fetch-with-fallback for /status and the UI-wake status refresh.
 static void refresh_batt_mv(void)
 {
+    if (board_has_fuel_gauge()) {
+        // Carrier: the MAX17048 replaces AT+SQNVMON; at most one ~1 ms I2C read per 10 s, charger pins
+        // always refreshed. A failed read invalidates the percent but keeps the last good mV.
+        s_last_charge_state = (int) fuel_state();
+        int64_t now = esp_timer_get_time();
+        if (s_last_gauge_us != 0 && now - s_last_gauge_us < 10 * 1000000LL) {
+            return;
+        }
+        s_last_gauge_us = now;
+        s_gauge_fresh = true;
+        fuel_t f;
+        if (fuel_read(&f) && f.mv > 0) {
+            s_last_batt_mv = f.mv;
+            s_last_pct = f.pct;
+            battstat_note_mv(f.mv);
+        } else {
+            s_last_pct = -1;
+        }
+        return;
+    }
     // Raw AT+SQNVMON millivolts; a failed or zero read never overwrites the last good value.
     int batt_mv;
     if (net_get_battery_mv(&batt_mv) && batt_mv > 0) {
@@ -466,6 +497,8 @@ int modes_get_rssi_dbm(void) { return (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_
 int modes_get_batt_mv(void) { return s_last_batt_mv; } // raw mV; 0 = no reading yet
 // s_last_batt_mv stays 0 until AT+SQNVMON returns a non-zero reading; 0 means unknown.
 bool modes_batt_mv_known(void) { return s_last_batt_mv != 0; }
+int modes_get_batt_pct(void) { return s_last_pct; }          // -1 = unknown (always on the breadboard)
+int modes_get_charge_state(void) { return s_last_charge_state; } // fuel_state_t
 bool modes_get_temp_dc(int *temp_dc)
 {
     if (temp_dc && s_have_temp) {
@@ -777,12 +810,96 @@ void modes_accel_halt(const accel_halt_info_t *h)
     net_radio_off();
     rail_off();
     gpio_hold_en((gpio_num_t) PAGER_PIN_3V3_EN); // keep both rails off through deep sleep; rail_init() releases
+    if (board_disp_vcc_en_pin() >= 0) { // carrier: IO12 is FL_PWM, not a display gate
+        gpio_hold_en((gpio_num_t) PAGER_PIN_DISP_VCC_EN);
+    }
     gpio_deep_sleep_hold_en();
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_deep_sleep_start();
     for (;;) {
         vTaskDelay(portMAX_DELAY); // unreachable
     }
+}
+
+// Plain "title / line2" shutdown screen. Power effect: none.
+static void power_off_screen_paint(const char *title, const char *line2)
+{
+    gfx_clear();
+    gfx_text(4, 30, GFX_FONT_LARGE, title);
+    if (line2 && line2[0]) {
+        gfx_text(4, 62, GFX_FONT_NORMAL, line2);
+    }
+}
+
+// Carrier low-battery shutdown: no publish or MQTT teardown; modem to MINIMUM, then held in reset.
+// Power effect: one full refresh (~2-4 s), <= 2 s modem wait, then deep sleep (~uA); IO15 high wakes.
+void modes_power_off_lowbatt(void)
+{
+    ESP_LOGI(TAG, "shutdown: start");
+    // a. light / ext LED / buzzer / haptic off
+    frontlight_off();
+    extled_pause();
+    buzzer_stop();
+    /* haptic: the DRV2605L sits on 3V3_AWK, which rail_off() drops in step d. */
+    // b. modem to MINIMUM (best effort, <= 2 s), then held in reset through deep sleep
+    net_modem_minimum(2000);
+    net_airplane_hold_modem();
+    watchdog_feed();
+    // c. screen, full refresh (returns after BUSY clears), then SSD1680 deep sleep
+    ui_ensure_powered();
+    power_off_screen_paint("Shutdown", "Charge me");
+    disp_full_refresh();
+    disp_panel_deep_sleep();
+    watchdog_feed();
+    // d. rails off, keep them off through deep sleep (rail_init() releases)
+    rail_off();
+    gpio_hold_en((gpio_num_t) PAGER_PIN_3V3_EN);
+    // e. USB arrived during the draw: the ext1 level wake would fire at once anyway, restart cleanly
+    if (gpio_get_level((gpio_num_t) PAGER_PIN_VBUS_DET) == 1) {
+        ESP_LOGI(TAG, "shutdown: USB present at the end, restarting instead of sleeping");
+        net_modem_uart_unblock();
+        esp_restart();
+    }
+    // f. deep sleep, only VBUS_DET wakes it
+    ESP_LOGI(TAG, "shutdown: entering deep sleep, wake on IO%d high", PAGER_PIN_VBUS_DET);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+    esp_sleep_enable_ext1_wakeup(1ULL << PAGER_PIN_VBUS_DET, ESP_EXT1_WAKEUP_ANY_HIGH);
+    gpio_deep_sleep_hold_en();
+    esp_deep_sleep_start();
+    for (;;) {
+        vTaskDelay(portMAX_DELAY); // unreachable
+    }
+}
+
+// Carrier low-battery decision, voltage based: one fresh read at boot, else FUEL_SHUTDOWN_READS low
+// reads in a row (<= one per 10 s). Never when plugged in or on a failed read. Power effect: ~1 ms I2C.
+static void fuel_shutdown_check(bool booting)
+{
+    if (!board_has_fuel_gauge()) {
+        return;
+    }
+    static int low_count = 0;
+    s_gauge_fresh = false;
+    refresh_batt_mv();
+    if (!booting) {
+        if (!s_gauge_fresh) {
+            return; // rate-limited: nothing new to count
+        }
+        low_count = (s_last_pct >= 0 && s_last_batt_mv <= FUEL_SHUTDOWN_MV) ? low_count + 1 : 0;
+    }
+    const bool plugged = s_last_charge_state != (int) FUEL_ON_BATTERY;
+    const int mv = (s_last_pct >= 0) ? s_last_batt_mv : 0; // pct < 0 marks a failed read: no decision on stale mV
+    if (fuel_should_shutdown(mv, plugged, low_count, booting)) {
+        ESP_LOGI(TAG, "low battery %d mV (%d%%), unplugged%s: shutting down", mv, s_last_pct, booting ? ", at boot" : "");
+        modes_power_off_lowbatt();
+    }
+}
+
+// Setup boot: the same low-battery check before the Setup console starts. Power effect: ~1 ms I2C.
+void modes_fuel_boot_check(void)
+{
+    fuel_shutdown_check(true);
 }
 
 bool modes_publish_status_now(void)
@@ -1264,8 +1381,35 @@ void modes_debug_sleeptest_report(void)
 }
 #endif // PAGER_DEBUG_NO_LIGHT_SLEEP
 
+// Carrier new-message alert (buzzer + haptic): set on the modem event task, serviced on the modes
+// loop task next to service_render_pending(). Fires whether or not the device is locked.
+static bool s_alert_pending = false;
+
+// Modes loop task. Power effect: powers the rail (CardKB/haptic/panel) if it was off, a ~150 ms piezo
+// chirp and two haptic clicks; nothing on the breadboard.
+static bool s_haptic_pending = false; // modes loop task only: haptic waits for the kbd/rail boot guard
+
+static void service_alert_pending(void)
+{
+    if (__atomic_exchange_n(&s_alert_pending, false, __ATOMIC_ACQ_REL) &&
+        (board_has_piezo() || board_has_haptic())) {
+        ui_ensure_powered();
+        buzzer_play(BUZZ_NEW_MSG); // buzzer plays at once
+        s_haptic_pending = board_has_haptic();
+    }
+    if (s_haptic_pending) {
+        if (!rail_is_on()) {
+            s_haptic_pending = false; // rail went off first: drop it
+        } else if (esp_timer_get_time() >= ui_kb_ready_us()) {
+            s_haptic_pending = false;
+            haptic_play(HAPTIC_NEW_MSG);
+        }
+    }
+}
+
 void modes_alert_incoming(const char *id, const char *from)
 {
+    __atomic_store_n(&s_alert_pending, true, __ATOMIC_RELEASE);
     // Captured before set_mode() flips it; unlocked read of g_rtc.mode.
     bool was_asleep = (g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP);
     set_mode(PAGER_MODE_ACTIVE, MODE_REASON_INCOMING_MSG);
@@ -1643,6 +1787,8 @@ void modes_boot(void)
     net_airplane_init(); // power effect: one NVS read; net_airplane() is a RAM read from here on
 
     input_init(); // power effect: GPIO config + static queue alloc only
+    buzzer_init(); // carrier only: piezo pins idle low; no-op on the breadboard
+    extled_start(); // carrier only: 6 s breath timer; no-op on the breadboard
 
     refreshpol_load_nvs(); // NVS "disp" floor/ceil/idle/gap overrides; no power effect
     if (!ui_init()) {
@@ -1666,6 +1812,7 @@ void modes_boot(void)
     loc_bind(&g_rtc.loc, &g_rtc.auth, rtc_lock, rtc_unlock, rtc_save, on_auth_epoch_wrap);
     loc_init();
 
+    fuel_shutdown_check(true); // carrier: a boot at VCELL <= 3550 mV and unplugged goes back to Shutdown BEFORE the radio starts
     watchdog_kick(WD_NET_INIT);
     if (net_airplane()) {
         // Power effect: IO45 (modem reset) held low; modem in reset for the whole boot.
@@ -1967,6 +2114,23 @@ void modes_run(void)
                 esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
                 // The button and the LIS3DH motion interrupt share one ext1 mask;
                 // esp_sleep_get_ext1_wakeup_status() tells them apart (button IO8, motion IO16).
+                // IDF ranks TIMER > GPIO > EXT1, so causes can hide each other; the pin level catches
+                // a button press that a timer wake reported first.
+                const bool wake_is_light_btn =
+                    board_has_frontlight() &&
+                    (wake_cause == ESP_SLEEP_WAKEUP_GPIO ||
+                     (gpio_get_level((gpio_num_t) PAGER_PIN_FL_BTN) == 0 && !input_light_held()));
+                wake_is_ext1 = (wake_cause == ESP_SLEEP_WAKEUP_EXT1) || (wake_cause == ESP_SLEEP_WAKEUP_GPIO) ||
+                               wake_is_light_btn;
+                if (wake_is_light_btn) {
+                    // Like a shake wake (rail on, hot window), and the press itself opens the attentive
+                    // window and turns the light on via one INPUT_EVT_LIGHT (toggle from off).
+                    int64_t lw_us = esp_timer_get_time();
+                    s_last_input_us = lw_us;
+                    ui_ensure_powered();
+                    input_note_shake_wake(lw_us);
+                    input_note_light_wake(lw_us);
+                }
 #if PAGER_WAKE_BUTTON_ENABLED
                 bool wake_is_button =
                     wake_is_ext1 &&
@@ -2066,6 +2230,7 @@ void modes_run(void)
             // On a lengthened cadence, hold the window open until the probe is answered; after the yield so
             // the time is charged to the post-wake bucket. Skipped on input wakes (UI-awake holds RTS).
             if (!wake_is_ext1) {
+                fuel_shutdown_check(false); // carrier: timer wakes only, never ahead of a first render
                 wait_for_probe_answer(interval_ms);
             }
         } else if (btn_busy || accel_shake_pending()) {
@@ -2117,6 +2282,11 @@ void modes_run(void)
                 ui_on_button_long();
                 s_last_input_us = esp_timer_get_time(); // arms the attentive cadence
                 break;
+            case INPUT_EVT_LIGHT:
+                // Carrier front-light button: toggles the light and counts as input; nothing else.
+                frontlight_toggle();
+                s_last_input_us = esp_timer_get_time();
+                break;
             case INPUT_EVT_KEY:
                 // Stamp the key before dispatch so a transition it causes sees "a key just arrived";
                 // every key is a partial.
@@ -2143,6 +2313,7 @@ void modes_run(void)
         // Renders an incoming message on this task, then marks `shown`.
         watchdog_kick(WD_RENDER);
         service_render_pending();
+        service_alert_pending();
 
         // Syncs the Locked screen and drains any toast lock.c queued from the MQTT event task, before
         // this iteration's render.

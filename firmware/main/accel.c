@@ -105,6 +105,12 @@ accel_rec_act_t accel_rec_step(accel_rec_t *r, bool read_ok, bool reboot_ok)
 static const char *TAG = "accel";
 
 #define LIS3DH_REG_WHO_AM_I 0x0F
+#define LIS3DH_WHO_AM_I_VALUE 0x33      // Adafruit LIS3DH
+#define LIS2DW12_CLONE_WHO_AM_I 0x11    // MSKSEMI LIS2DW12TR-MS clone
+#define LIS3DH_REG_SDO_PU 0x57          // clone only: bit 7 enables the SDO/SA0 pull-up
+#define LIS3DH_SDO_PU_ON 0x80
+
+static bool who_ok(uint8_t who) { return who == LIS3DH_WHO_AM_I_VALUE || who == LIS2DW12_CLONE_WHO_AM_I; }
 
 #define LIS3DH_REG_CTRL_REG1 0x20
 #define LIS3DH_REG_CTRL_REG2 0x21
@@ -205,8 +211,13 @@ static uint32_t s_shake_fired = 0;
 static uint8_t s_ctrl3 = 0;
 
 // Own bus; battery-powered breakout, so never torn down. Internal pull-ups on as backup.
+static bool s_bus_installed = false;
+
 static void accel_bus_init(void)
 {
+    if (s_bus_installed) {
+        return;
+    }
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = PAGER_PIN_ACCEL_SDA,
@@ -216,6 +227,7 @@ static void accel_bus_init(void)
         .master.clk_speed = 100000,
     };
     i2c_param_config(I2C_NUM_1, &conf);
+    s_bus_installed = i2c_driver_install(I2C_NUM_1, conf.mode, 0, 0, 0) == ESP_OK;
     // Keep the internal pull-up through light sleep.
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_ACCEL_SDA);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_ACCEL_SCL);
@@ -228,6 +240,7 @@ static bool accel_bus_reset(void)
         return false;
     }
     i2c_driver_delete(I2C_NUM_1);
+    s_bus_installed = false;
     const gpio_num_t sda = (gpio_num_t) PAGER_PIN_ACCEL_SDA, scl = (gpio_num_t) PAGER_PIN_ACCEL_SCL;
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << sda) | (1ULL << scl),
@@ -298,6 +311,15 @@ static bool configure_and_arm(uint8_t who)
 {
     bool ok = true;
     const uint8_t ctrl3 = LIS3DH_CTRL_REG3_I1_IA1 | LIS3DH_CTRL_REG3_I1_IA2;
+    if (who == LIS2DW12_CLONE_WHO_AM_I) {
+        uint8_t pu = 0;
+        if (reg_read(LIS3DH_REG_SDO_PU, &pu)) { // read-modify-write: set bit 7
+            ESP_LOGI(TAG, "SDO_PU (0x57) was 0x%02x", pu);
+            ok &= reg_write(LIS3DH_REG_SDO_PU, (uint8_t) (pu | LIS3DH_SDO_PU_ON));
+        } else {
+            ok = false;
+        }
+    }
     ok &= reg_write(LIS3DH_REG_CTRL_REG1, LIS3DH_CTRL_REG1_25HZ_LOWPOWER);
     ok &= reg_write(LIS3DH_REG_CTRL_REG4, LIS3DH_CTRL_REG4_4G);
     ok &= reg_write(LIS3DH_REG_CTRL_REG2, LIS3DH_CTRL_REG2_HPF_INT12);
@@ -325,7 +347,9 @@ static bool configure_and_arm(uint8_t who)
 
     s_present = true;
     net_enable_accel_wake(); // IO16 becomes a light-sleep wake source
+    ESP_LOGI(TAG, "%s found (WHO_AM_I=0x%02x), 25Hz LP +-4g, INT1 motion THS=256 mg, "
                   "INT2 shake THS=1152 mg, CTRL_REG3=0x60",
+             who == LIS2DW12_CLONE_WHO_AM_I ? "LIS2DW12 clone" : "LIS3DH", (unsigned) who);
     return true;
 }
 
@@ -335,13 +359,37 @@ static bool probe_and_configure(void)
     bool read_ok = reg_read(LIS3DH_REG_WHO_AM_I, &who);
     s_who_err = s_last_err;
     s_who = who;
+    if (!read_ok || !who_ok(who)) {
         return false;
     }
     return configure_and_arm(who);
 }
 
+static void accel_mtx_ensure(void)
+{
+    if (!s_bus_mtx) {
+        s_bus_mtx = xSemaphoreCreateMutexStatic(&s_bus_mtx_buf);
+    }
+}
+
+bool accel_probe_id(uint8_t *who)
+{
+    accel_mtx_ensure();
+    accel_bus_init();
+    uint8_t v = 0;
+    if (!reg_read(LIS3DH_REG_WHO_AM_I, &v)) {
+        return false;
+    }
+    *who = v;
+    return true;
+}
+
+void accel_bus_lock(void) { accel_mtx_ensure(); xSemaphoreTake(s_bus_mtx, portMAX_DELAY); }
+void accel_bus_unlock(void) { xSemaphoreGive(s_bus_mtx); }
+
 bool accel_init(void)
 {
+    accel_mtx_ensure();
     if (s_rtc.magic != ACCEL_RTC_MAGIC || s_rtc.crc != rtc_crc()) {
         rtc_set(0);
     } else if (s_rtc.n > 0) {
@@ -512,6 +560,7 @@ bool accel_debug_status(accel_debug_status_t *out, bool *out_newly_configured)
     }
 
     uint8_t who = 0;
+    bool answers = reg_read(LIS3DH_REG_WHO_AM_I, &who) && who_ok(who);
     if (answers && !s_present) {
         bool newly = configure_and_arm(who);
         if (out_newly_configured) {

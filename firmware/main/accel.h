@@ -68,6 +68,13 @@ uint32_t accel_shake_rejected_total(void);
 // Probes WHO_AM_I (expect 0x33), configures 25 Hz low-power sensing and arms the INT1 wake.
 bool accel_init(void);
 
+// Board detection: reads WHO_AM_I (0x33 LIS3DH, 0x11 carrier clone); configures nothing.
+bool accel_probe_id(uint8_t *who);
+
+// Hold/release the I2C_NUM_1 mutex for another driver; do not call accel functions in between.
+void accel_bus_lock(void);
+void accel_bus_unlock(void);
+
 // Drains INT1/INT2 once per loop. Returns true once per intentional shake.
 bool accel_poll(void);
 

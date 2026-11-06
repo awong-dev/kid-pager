@@ -36,6 +36,15 @@ int main(void)
     batt(true, 4299, "4.30 V");
     batt(true, 3925, "3.93 V");
     batt(false, 0, "--");
+    {
+        char b[40];
+        devinfo_fmt_batt_ex(true, 3870, true, 72, "charging", b, sizeof(b));
+        CHECK(strcmp(b, "3.87 V 72% charging") == 0, "batt_ex: %s", b);
+        devinfo_fmt_batt_ex(true, 3870, true, 72, "", b, sizeof(b));
+        CHECK(strcmp(b, "3.87 V 72%") == 0, "batt_ex nochg: %s", b);
+        devinfo_fmt_batt_ex(true, 5203, false, 0, NULL, b, sizeof(b));
+        CHECK(strcmp(b, "5.20 V (USB)") == 0, "batt_ex legacy: %s", b);
+    }
     batt(true, 0, "--");
     temp(true, 235, "23.5 C");
     temp(true, -4, "-0.4 C");
@@ -55,6 +64,8 @@ int main(void)
     static char rows[DEVINFO_MAX_ROWS][DEVINFO_ROW_LEN];
     devinfo_view_t u = {0};
     int n = devinfo_rows(&u, rows, DEVINFO_MAX_ROWS);
+    CHECK(n == 11, "unknown view rows %d want 11 (no number row)", n);
+    CHECK(!strcmp(rows[10], "board --"), "unknown board row: %s", rows[10]);
     CHECK(!strcmp(rows[0], "battery --") && !strcmp(rows[2], "IMEI --") && !strcmp(rows[6], "band --  cell --  tac --"),
           "unknown rows: %s | %s | %s", rows[0], rows[2], rows[6]);
 
@@ -63,10 +74,14 @@ int main(void)
     v.imei = "352656100123456"; v.imsi = "310280123456789"; v.iccid = "89148000001234567890";
     v.msisdn = "+15551234567"; v.opname = "Verizon Wireless"; v.have_cell = true; v.mcc = "311"; v.mnc = "480";
     v.tac = 12345; v.ci = 123456789; v.band = 13; v.have_rsrp = true; v.rsrp = -95; v.have_rsrq = true;
+    v.rsrq_dtenths = -95; v.carrier = "Soracom"; v.apn = "soracom.io"; v.bearer_known = true; v.beam = true; v.board = "carrier-v0.2";
     n = devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
+    CHECK(n == 12, "full rows %d want 12", n);
     const char *want[] = {"battery 5.20 V (USB)", "temperature 23.5 C", "IMEI 352656100123456",
         "IMSI 310280123456789", "ICCID 89148000001234567890", "number +15551234567",
         "Verizon Wireless  311-480", "band 13  cell 123456789  tac 12345", "rsrp -95 dBm  rsrq -9.5 dB",
+        "carrier Soracom  beam", "apn soracom.io", "board carrier-v0.2"};
+    for (int i = 0; i < 12 && i < n; i++) {
         CHECK(!strcmp(rows[i], want[i]), "row %d \"%s\" want \"%s\"", i, rows[i], want[i]);
         CHECK(strlen(rows[i]) < 40, "row %d too long for 296 px at 12 px (%zu chars)", i, strlen(rows[i]));
     }

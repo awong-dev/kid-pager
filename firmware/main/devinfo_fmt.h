@@ -32,6 +32,10 @@ typedef struct {
     const char *apn;     /* "" = network's choice */
     bool bearer_known;
     bool beam;
+    const char *board; /* "" = unknown */
+    bool have_pct;     /* carrier fuel gauge percent valid */
+    int batt_pct;
+    const char *charge; /* "charging" / "charged", NULL or "" = on battery */
 } devinfo_view_t;
 
 // Unknown values print "--".
@@ -39,6 +43,8 @@ int devinfo_rows(const devinfo_view_t *v, char rows[][DEVINFO_ROW_LEN], int max_
 
 // "5.20 V", "5.20 V (USB)" at >= DEVINFO_USB_MV, "--" when unknown.
 void devinfo_fmt_batt(bool known, int mv, char *out, size_t cap);
+// Adds percent and charge state when given.
+void devinfo_fmt_batt_ex(bool known, int mv, bool have_pct, int pct, const char *charge, char *out, size_t cap);
 // "23.5 C" or "--".
 void devinfo_fmt_temp(bool known, int dc, char *out, size_t cap);
 

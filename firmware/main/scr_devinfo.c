@@ -5,6 +5,8 @@
 #include "modes.h"
 #include "net.h"
 #include "devinfo_fmt.h"
+#include "board.h"
+#include "fuel_fmt.h"
 
 #include <stdio.h>
 
@@ -27,6 +29,9 @@ static int devinfo_build(char rows[][DEVINFO_ROW_LEN])
     devinfo_view_t v = {0};
     v.batt_known = modes_batt_mv_known();
     v.batt_mv = modes_get_batt_mv();
+    v.have_pct = modes_get_batt_pct() >= 0;
+    v.batt_pct = modes_get_batt_pct();
+    v.charge = modes_get_charge_state() != 0 ? fuel_state_name((fuel_state_t) modes_get_charge_state()) : "";
     v.temp_known = modes_get_temp_dc(&v.temp_dc);
     v.imei = d.imei;
     v.imsi = d.imsi;
@@ -47,6 +52,7 @@ static int devinfo_build(char rows[][DEVINFO_ROW_LEN])
     v.apn = d.apn;
     v.bearer_known = d.apn[0] != '\0' || net_carrier_label()[0] != '\0';
     v.beam = net_bearer_beam();
+    v.board = board_name();
     return devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
 }
 

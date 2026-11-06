@@ -39,6 +39,7 @@ typedef enum {
     INPUT_EVT_BTN_DOWN,  /* debounced press registered (not yet resolved short/long) */
     INPUT_EVT_BTN_SHORT, /* released before the long-press threshold */
     INPUT_EVT_BTN_LONG,  /* held past the long-press threshold (fires once, not on release) */
+    INPUT_EVT_LIGHT,     /* carrier front-light button (IO4) pressed */
 } input_evt_type_t;
 
 typedef struct {
@@ -82,6 +83,15 @@ bool input_button_stuck(void);
 
 /* Seeds BTN_DOWN for the ext1 wake press at now_us; no-op unless BTN_IDLE. Power effect: none. */
 void input_note_button_wake(int64_t now_us);
+
+/* Carrier only: IO4 was already low when the last sleep was armed; cleared when it reads high. */
+bool input_light_held(void);
+
+/* Carrier only: net_sleep() records that the arm was skipped because IO4 was low. */
+void input_light_set_held(bool held);
+
+/* Carrier only: front-light button light-sleep wake; queues one INPUT_EVT_LIGHT, no-op if counted. */
+void input_note_light_wake(int64_t now_us);
 
 /* Shake wake: re-arms the awake window, else opens the 15 s hot window with no event (~0.2 mAh). */
 void input_note_shake_wake(int64_t now_us);

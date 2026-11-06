@@ -114,6 +114,9 @@ void ui_draw_row_separator(int y);
  * render. Power effect: powers the display and CardKB iff they were off. */
 void ui_ensure_powered(void);
 
+/* esp_timer time (us) when the kbd boot guard after the last rail restore ends. */
+int64_t ui_kb_ready_us(void);
+
 /* Count of rail off->on edges that ui_ensure_powered() drove; never reset. */
 uint32_t ui_rail_lazy_on_count(void);
 
@@ -166,6 +169,11 @@ void ui_kb_rail_changed(void);
  * bound, then sleeps anyway) so sleep never starts mid-transaction; unpark releases it. */
 void ui_kb_sleep_park(void);
 void ui_kb_sleep_unpark(void);
+
+/* Takes/releases the CardKB I2C_NUM_0 bus mutex for other devices on that bus; non-recursive.
+ * lock returns false on timeout. */
+bool ui_kb_bus_lock(uint32_t timeout_ms);
+void ui_kb_bus_unlock(void);
 
 /* Pauses the kbd task so a console command can use I2C_NUM_0; returns once any read has finished. */
 void ui_debug_pause_kb_poll(bool paused);

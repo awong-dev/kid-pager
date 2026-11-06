@@ -23,6 +23,7 @@ typedef struct {
 
 void gpio_config(const gpio_config_t *cfg);
 int gpio_get_level(gpio_num_t pin);
+void gpio_sleep_sel_dis(gpio_num_t pin); /* input.c keeps the carrier pads live in light sleep */
 
 /* Test-only: sets the level gpio_get_level() returns (default 0 = released, active-high). */
 void idf_stub_set_button_level(int level);

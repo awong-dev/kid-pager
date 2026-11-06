@@ -1,12 +1,14 @@
 // rail.c — drives the display and CardKB supply gates.
 
 #include "rail.h"
+#include "frontlight.h"
 
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "board.h"
 #include "pins.h"
 #include "ui.h"
 
@@ -36,7 +38,10 @@ static void rail_delay_at_least_ms(uint32_t ms)
 static const gpio_num_t s_disp_bus_pins[] = {
     (gpio_num_t) PAGER_PIN_DISP_RST, (gpio_num_t) PAGER_PIN_DISP_DC,
     (gpio_num_t) PAGER_PIN_DISP_CS, (gpio_num_t) PAGER_PIN_DISP_MOSI,
+    (gpio_num_t) PAGER_PIN_DISP_SCK,
 };
+// Breadboard only: the Friend's SRAM CS. On the carrier this pad is CHG_STAT1 (an input the
+// charger drives) and is never touched here.
 
 static void rail_disp_bus_release(void)
 {
@@ -44,6 +49,11 @@ static void rail_disp_bus_release(void)
         gpio_sleep_set_direction(s_disp_bus_pins[i], GPIO_MODE_DISABLE);
         gpio_sleep_set_pull_mode(s_disp_bus_pins[i], GPIO_FLOATING);
         gpio_sleep_sel_en(s_disp_bus_pins[i]);
+    }
+    if (board_disp_srcs_pin() >= 0) {
+        gpio_sleep_set_direction((gpio_num_t) board_disp_srcs_pin(), GPIO_MODE_DISABLE);
+        gpio_sleep_set_pull_mode((gpio_num_t) board_disp_srcs_pin(), GPIO_FLOATING);
+        gpio_sleep_sel_en((gpio_num_t) board_disp_srcs_pin());
     }
     gpio_sleep_set_direction((gpio_num_t) PAGER_PIN_DISP_BUSY, GPIO_MODE_DISABLE);
     gpio_sleep_set_pull_mode((gpio_num_t) PAGER_PIN_DISP_BUSY, GPIO_FLOATING);
@@ -55,6 +65,9 @@ static void rail_disp_bus_restore(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_RST);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_DC);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_CS);
+    if (board_disp_srcs_pin() >= 0) {
+        gpio_sleep_sel_dis((gpio_num_t) board_disp_srcs_pin());
+    }
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_BUSY); // back to disp.c's isolation-exempt input
 }
 
@@ -64,8 +77,13 @@ void rail_init(void)
 {
     // ENA (active-high) gates the panel regulator, 3V3_EN (active-low) the CardKB. A modes_accel_halt()
     // deep sleep holds both pads and a RESET keeps it: release first. The carrier has no display gate.
+    const bool has_ena = board_disp_vcc_en_pin() >= 0;
     gpio_hold_dis((gpio_num_t) PAGER_PIN_3V3_EN);
+    if (has_ena) {
+        gpio_hold_dis((gpio_num_t) PAGER_PIN_DISP_VCC_EN);
+    }
     gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PAGER_PIN_3V3_EN) | (has_ena ? (1ULL << PAGER_PIN_DISP_VCC_EN) : 0ULL),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -73,9 +91,15 @@ void rail_init(void)
     };
     gpio_config(&cfg);
     gpio_set_level(PAGER_PIN_3V3_EN, 0); // active-low: CardKB supply on
+    if (has_ena) {
+        gpio_set_level(PAGER_PIN_DISP_VCC_EN, PAGER_DISP_VCC_EN_ON); // Friend regulator on: panel
+    }
     // Exclude both pads from sleep GPIO isolation (CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND); otherwise
     // they float in light sleep and the board pull-ups switch the rails.
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_3V3_EN);
+    if (has_ena) {
+        gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_VCC_EN);
+    }
     portENTER_CRITICAL(&s_on_mux);
     s_rail_on = true;
     s_on_since_us = esp_timer_get_time();
@@ -87,6 +111,9 @@ void rail_on(void)
 {
     if (s_rail_on) {
         return; // already on: no power edge, do not re-arm the CardKB boot guard
+    }
+    if (board_disp_vcc_en_pin() >= 0) {
+        gpio_set_level(PAGER_PIN_DISP_VCC_EN, PAGER_DISP_VCC_EN_ON); // ENA on: panel
     }
     gpio_set_level(PAGER_PIN_3V3_EN, 0); // active-low: CardKB supply on
     int64_t on_edge_us = esp_timer_get_time();
@@ -109,8 +136,12 @@ void rail_off(void)
         return;
     }
     // Stop driving the I2C idle-high level so the CardKB is not phantom-powered through its protection diodes.
+    frontlight_off(); // never light the panel while it is unpowered; power effect: LED off
     ui_kb_bus_release();
     rail_disp_bus_release();
+    if (board_disp_vcc_en_pin() >= 0) {
+        gpio_set_level(PAGER_PIN_DISP_VCC_EN, PAGER_DISP_VCC_EN_OFF); // ENA off: panel unpowered
+    }
     gpio_set_level(PAGER_PIN_3V3_EN, 1); // active-low: CardKB supply off
     portENTER_CRITICAL(&s_on_mux);
     s_on_acc_us += esp_timer_get_time() - s_on_since_us;

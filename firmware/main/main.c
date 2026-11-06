@@ -25,6 +25,12 @@
 
 #include "accel.h"
 #include "battstat.h"
+#include "board.h"
+#include "buzzer.h"
+#include "extled.h"
+#include "frontlight.h"
+#include "haptic.h"
+#include "tunes.h"
 #include "cafetch.h"
 #include "catrust.h"
 #include "mbedtls/sha256.h"
@@ -46,6 +52,7 @@
 #include "setup.h"
 #include "sms.h"
 #include "ui.h"
+#include "fuel.h"
 
 static const char *TAG = "school_pager";
 
@@ -801,8 +808,85 @@ static void register_input_cmds(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&key_cmd));
 }
 
+// `board` -- which PCB variant this is (board.h). `board auto|breadboard|carrier` persists the
+// choice (NVS board/kind); reboot to apply. Power effect: none (one NVS write when setting).
+static int cmd_board(int argc, char **argv)
+{
+    if (argc == 2) {
+        board_kind_t k = BOARD_AUTO;
+        if (strcmp(argv[1], "breadboard") == 0) {
+            k = BOARD_BREADBOARD;
+        } else if (strcmp(argv[1], "carrier") == 0) {
+            k = BOARD_CARRIER_V02;
+        } else if (strcmp(argv[1], "auto") != 0) {
+            printf("board [auto|breadboard|carrier]\n");
+            return 1;
+        }
+        printf("%s\n", board_set_kind(k) ? "saved; reboot to apply" : "save failed");
+        return 0;
+    }
+    uint8_t who = 0;
+    bool who_ok = board_who_am_i(&who);
+    printf("board: %s (%s), stored kind %d\n", board_name(), board_source_name(), (int) board_stored_kind());
+    if (who_ok) {
+        printf("WHO_AM_I: 0x%02x\n", (unsigned) who);
+    } else {
+        printf("WHO_AM_I: read failed\n");
+    }
+    if (board_is_carrier()) {
+        int vbus, s1, s2;
+        board_read_charger_pins(&vbus, &s1, &s2);
+        printf("IO%d VBUS_DET=%d  IO%d CHG_STAT1=%d  IO%d CHG_STAT2=%d\n", PAGER_PIN_VBUS_DET, vbus,
+               PAGER_PIN_CHG_STAT1, s1, PAGER_PIN_CHG_STAT2, s2);
+    }
+    return 0;
+}
+
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+// fuel [quick|shutdown] -- carrier battery gauge (fuel.h). Debug console only.
+static int cmd_fuel(int argc, char **argv)
+{
+    if (!board_has_fuel_gauge()) {
+        printf("fuel: no gauge on this board (%s)\n", board_name());
+        return 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "quick") == 0) {
+        printf("fuel: quick-start %s\n", fuel_quick_start() ? "sent" : "failed");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "shutdown") == 0) {
+        int vbus, s1, s2;
+        fuel_pins(&vbus, &s1, &s2);
+        printf("fuel: running the low-battery Shutdown now (IO15=%d: %s)\n", vbus,
+               vbus ? "USB present, so it will restart after the screen draws" : "unplugged, deep sleep until USB is plugged in");
+        modes_power_off_lowbatt();
+    }
+    fuel_t f;
+    bool ok = fuel_read(&f);
+    int vbus, s1, s2;
+    fuel_pins(&vbus, &s1, &s2);
+    if (ok) {
+        printf("fuel: %d mV  %d%%  crate %c%d.%03d %%/h  state %s\n", f.mv, f.pct, f.crate_milli < 0 ? '-' : '+',
+               (f.crate_milli < 0 ? -f.crate_milli : f.crate_milli) / 1000,
+               (f.crate_milli < 0 ? -f.crate_milli : f.crate_milli) % 1000, fuel_state_name(fuel_state()));
+    } else {
+        printf("fuel: gauge read failed\n");
+    }
+    printf("IO%d VBUS_DET=%d  IO%d CHG_STAT1=%d  IO%d CHG_STAT2=%d\n", PAGER_PIN_VBUS_DET, vbus,
+           PAGER_PIN_CHG_STAT1, s1, PAGER_PIN_CHG_STAT2, s2);
+    return ok ? 0 : 1;
+}
+#endif // PAGER_DEBUG_NO_LIGHT_SLEEP
+
 static void register_carrier_cmd(void)
 {
+    const esp_console_cmd_t board_cmd = {
+        .command = "board",
+        .help = "board [auto|breadboard|carrier] -- show the PCB variant, or set it (reboot to apply)",
+        .hint = NULL,
+        .func = &cmd_board,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&board_cmd));
     const esp_console_cmd_t carrier_cmd = {
         .command = "carrier",
         .help = "carrier [<n> | custom <apn>] -- choose the carrier APN (presets are built in)",
@@ -819,6 +903,111 @@ static void register_carrier_cmd(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&bearer_cmd));
 }
 
+
+// Carrier peripheral consoles: buzz / haptic / light / led.
+// `light <pct>` and `haptic cfg` persist to NVS.
+static int cmd_buzz(int argc, char **argv)
+{
+    if (!board_has_piezo()) {
+        printf("no piezo on this board\n");
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+        buzzer_stop();
+    } else if (argc >= 2 && strcmp(argv[1], "msg") == 0) {
+        buzzer_play(BUZZ_NEW_MSG);
+    } else if (argc >= 2 && strcmp(argv[1], "mario") == 0) {
+        size_t n = argc >= 3 ? (size_t) atoi(argv[2]) : TUNE_MARIO_DEFAULT_NOTES;
+        printf("mario: %u notes\n", (unsigned) (n > TUNE_MARIO_NOTES ? TUNE_MARIO_NOTES : n));
+        buzzer_play_mario(n);
+    } else if (argc >= 3 && atoi(argv[1]) > 0) {
+        buzzer_note_t one = {.hz = (uint16_t) atoi(argv[1]), .ms = (uint16_t) atoi(argv[2])};
+        buzzer_play(&one, 1);
+    } else {
+        printf("buzz <hz> <ms> | msg | mario [n] | off\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_haptic(int argc, char **argv)
+{
+    if (!board_has_haptic()) {
+        printf("no haptic driver on this board\n");
+        return 0;
+    }
+    char line[160];
+    if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+        haptic_status(line, sizeof(line));
+        printf("%s\n", line);
+    } else if (argc >= 2 && strcmp(argv[1], "calibrate") == 0) {
+        haptic_calibrate(line, sizeof(line));
+        printf("%s\n", line);
+    } else if (argc >= 5 && strcmp(argv[1], "cfg") == 0) {
+        printf("%s\n", haptic_set_cfg((uint32_t) atoi(argv[2]), (uint32_t) atoi(argv[3]), (uint32_t) atoi(argv[4]))
+                           ? "saved"
+                           : "bad values");
+    } else if (argc >= 2 && strcmp(argv[1], "msg") == 0) {
+        printf("%s\n", haptic_play(HAPTIC_NEW_MSG) ? "ok" : "failed (rail off or no chip)");
+    } else if (argc >= 2 && atoi(argv[1]) > 0) {
+        printf("%s\n", haptic_play(atoi(argv[1])) ? "ok" : "failed (rail off or no chip)");
+    } else {
+        printf("haptic <effect> | msg | calibrate | status | cfg <rated_mv> <clamp_mv> <f_hz>\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_light(int argc, char **argv)
+{
+    if (!board_has_frontlight()) {
+        printf("no front light on this board\n");
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "on") == 0) {
+        frontlight_set(true);
+    } else if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+        frontlight_off();
+        frontlight_set(true);
+    } else {
+        return argc >= 2 ? 1 : 0;
+    }
+    return 0;
+}
+
+static int cmd_led(int argc, char **argv)
+{
+    if (!board_has_ext_led()) {
+        printf("no external LED on this board\n");
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "on") == 0) {
+        extled_hold(true);
+    } else if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+        extled_hold(false);
+    } else if (argc >= 2 && strcmp(argv[1], "pulse") == 0) {
+        extled_pulse(true);
+    } else if (argc >= 2 && strcmp(argv[1], "breath") == 0) {
+        extled_pulse(false);
+    } else {
+        printf("led on|off|pulse|breath\n");
+        return 1;
+    }
+    return 0;
+}
+
+static void register_peripheral_cmds(void)
+{
+    static const esp_console_cmd_t cmds[] = {
+        {.command = "buzz", .help = "buzz <hz> <ms> | msg | mario [n] | off -- carrier piezo", .hint = NULL, .func = &cmd_buzz},
+        {.command = "haptic", .help = "haptic <effect> | msg | calibrate | status | cfg <rated_mv> <clamp_mv> <f_hz>", .hint = NULL, .func = &cmd_haptic},
+        {.command = "led", .help = "led on|off|pulse|breath -- carrier external LED", .hint = NULL, .func = &cmd_led},
+    };
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+    }
+}
+
 // Starts the USB-serial REPL task that waits for `setup <code>`.
 static void start_setup_console(void)
 {
@@ -830,9 +1019,14 @@ static void start_setup_console(void)
 
     // esp_console_new_repl_uart() binds to UART0's pins, not the native USB-Serial/JTAG port that
     // the board's single connector exposes.
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     esp_console_dev_usb_serial_jtag_config_t usb_config =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&usb_config, &repl_config, &repl));
+#else // carrier build (sdkconfig.carrier): UART0 -> CP2102N is the primary console
+    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
+#endif
 
     esp_console_register_help_command();
 
@@ -845,6 +1039,7 @@ static void start_setup_console(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&setup_cmd));
     register_carrier_cmd();
     register_input_cmds();
+    register_peripheral_cmds();
 
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
     // Debug build only.
@@ -1601,9 +1796,14 @@ static void start_normal_console(void)
     repl_config.prompt = "pager>";
     repl_config.task_stack_size = 16384;
 
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     esp_console_dev_usb_serial_jtag_config_t usb_config =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&usb_config, &repl_config, &repl));
+#else // carrier build (sdkconfig.carrier): UART0 -> CP2102N is the primary console
+    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
+#endif
 
     esp_console_register_help_command();
 
@@ -1783,6 +1983,7 @@ static void start_normal_console(void)
 
     register_carrier_cmd();
     register_input_cmds();
+    register_peripheral_cmds();
 
     const esp_console_cmd_t gnsstest_cmd = {
         .command = "gnsstest",
@@ -1909,6 +2110,14 @@ static void start_normal_console(void)
         .func = &cmd_battstat,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&battstat_cmd));
+    const esp_console_cmd_t fuel_cmd = {
+        .command = "fuel",
+        .help = "fuel [quick|shutdown] -- carrier gauge: mV, percent, crate, charger state, raw IO levels; "
+                "`quick` = MAX17048 quick-start; `shutdown` runs the low-battery Shutdown on purpose",
+        .hint = NULL,
+        .func = &cmd_fuel,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&fuel_cmd));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     ESP_LOGD(TAG, "debug console REPL started in normal mode (PAGER_DEBUG_NO_LIGHT_SLEEP)");
@@ -1949,6 +2158,13 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
+    // Decides breadboard vs carrier (board.h) before anything touches IO12/IO38/IO42.
+    // Power effect: one I2C read on the always-on bus, at most one NVS write.
+    board_init();
+    fuel_init(); // carrier only: release the IO15 ext1 hold, charger pins as inputs, log MAX17048 VERSION
+
+    rail_init(); // 3V3 peripheral rail on; must precede any display/I2C use
+
     if (!ident_load()) {
         // No identity: Setup mode. Shows a status splash and checks the SIM once per boot;
         // `setup <code>` is the only way out.
@@ -1961,6 +2177,7 @@ void app_main(void)
             ui_push(&g_scr_greeting);
             ui_render_boot();
         }
+        modes_fuel_boot_check(); // carrier: low unplugged battery goes to Shutdown; the modem is not started yet
 
         bool sim_ok = net_check_sim();
         ESP_LOGI(TAG, "SIM check: %s", sim_ok ? "found" : "missing");

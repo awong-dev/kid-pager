@@ -3,6 +3,7 @@
 #include "disp_flip.h"
 #include "gfx.h"
 #include "refreshpol.h"
+#include "board.h"
 #include "pins.h"
 #include "wf_partial_2in9.h"
 
@@ -351,6 +352,9 @@ static void disp_send_fb_rows(const uint8_t src[][GFX_FB_ROW_BYTES], int win_fir
 static void disp_power_on(void)
 {
     // Power effect: enables the panel regulator (ENA, active-high).
+    if (board_disp_vcc_en_pin() >= 0) { // carrier: panel 3V3 is always on, IO12 is FL_PWM
+        gpio_set_level(PAGER_PIN_DISP_VCC_EN, PAGER_DISP_VCC_EN_ON);
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
@@ -706,8 +710,11 @@ static bool restore_ram_planes_locked(void)
 
 static void disp_gpio_init(void)
 {
+    // On the carrier IO12 (ENA) and IO38 (SRCS) are FL_PWM / CHG_STAT1; leave them alone.
+    const bool breadboard_pins = !board_is_carrier();
     gpio_config_t out_cfg = {
         .pin_bit_mask = (1ULL << PAGER_PIN_DISP_RST) | (1ULL << PAGER_PIN_DISP_DC) |
+                        (breadboard_pins ? ((1ULL << PAGER_PIN_DISP_VCC_EN) | (1ULL << PAGER_PIN_DISP_SRCS)) : 0ULL),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -720,6 +727,9 @@ static void disp_gpio_init(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_RST);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_DC);
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_CS);
+    if (breadboard_pins) {
+        gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_VCC_EN);
+    }
 
     gpio_config_t busy_cfg = {
         .pin_bit_mask = (1ULL << PAGER_PIN_DISP_BUSY),
@@ -733,12 +743,17 @@ static void disp_gpio_init(void)
     gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_BUSY);
 
     // ENA is owned by rail.c. The eInk Friend SRAM shares SCK/MOSI; keep it deselected (CS high).
+    if (breadboard_pins) {
+        gpio_set_level(PAGER_PIN_DISP_SRCS, 1);
+        gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_SRCS);
+    }
 }
 
 static bool disp_spi_init(void)
 {
     spi_bus_config_t buscfg = {
         .mosi_io_num = PAGER_PIN_DISP_MOSI,
+        .miso_io_num = board_disp_miso_pin(), // -1 on the carrier (IO42 is CHG_STAT2)
         .sclk_io_num = PAGER_PIN_DISP_SCK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
@@ -826,6 +841,17 @@ void disp_note_power_loss(void)
         ESP_LOGI(TAG, "disp: RAM restore failed after rail power loss - forcing a full refresh");
         s_force_full = true;
     }
+    disp_unlock();
+}
+
+// SSD1680 deep-sleep mode 1 (0x10, 0x01): RAM kept, only a hardware reset wakes it.
+// Power effect: panel controller to ~uA.
+void disp_panel_deep_sleep(void)
+{
+    disp_lock();
+    (void) disp_wait_busy_max(PAGER_UI_BUSY_RESET_TIMEOUT_US);
+    disp_send_cmd(0x10);
+    disp_send_data1(0x01);
     disp_unlock();
 }
 

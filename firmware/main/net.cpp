@@ -13,6 +13,10 @@
 #include "net_probe_guard.h"
 #include "publish_quiet.h"
 #include "input.h"
+#include "board.h"
+#include "frontlight.h"
+#include "buzzer.h"
+#include "extled.h"
 #include "ui.h"
 extern "C" {
 #include "devinfo_fmt.h"
@@ -90,6 +94,7 @@ extern "C" void net_set_airplane(bool on)
 // modem's reset line low and holds it through light sleep.
 extern "C" void net_airplane_hold_modem(void)
 {
+    gpio_hold_dis((gpio_num_t) PAGER_PIN_MODEM_RESET); // reset() leaves a hold on IO45; a write under hold is ignored
     gpio_config_t io = {};
     io.pin_bit_mask = 1ULL << PAGER_PIN_MODEM_RESET;
     io.mode = GPIO_MODE_OUTPUT;
@@ -123,6 +128,13 @@ static const char *walter_state_name(int result)
 
 // The modem UART; must match the WalterModem::begin() argument and net_sleep().
 static constexpr uart_port_t PAGER_MODEM_UART = UART_NUM_1;
+
+// esp_restart() waits for every UART's TX FIFO to drain; with the modem in reset its CTS is dead and
+// the RTC watchdog forces an abnormal reset (rst 0x10). Dropping flow control lets it drain.
+extern "C" void net_modem_uart_unblock(void)
+{
+    uart_set_hw_flow_ctrl(PAGER_MODEM_UART, UART_HW_FLOWCTRL_DISABLE, 0);
+}
 
 static constexpr int PAGER_PDP_CTX_ID = 1;
 
@@ -1000,7 +1012,22 @@ extern "C" bool net_sleep(uint32_t ms)
     if (ext1_mask != 0) {
         esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ANY_HIGH);
     }
+    // Carrier front-light button (IO4, active-low): low-level wake armed only while the pin reads high;
+    // gpio_wakeup_enable() rewrites the interrupt type, so it is disabled again after the wake.
+    const bool fl_wake_armed = board_has_frontlight() && gpio_get_level((gpio_num_t) PAGER_PIN_FL_BTN) == 1;
+    if (board_has_frontlight()) {
+        input_light_set_held(!fl_wake_armed); // IO4 low at arm time: a later low read is the same press
+    }
+    if (fl_wake_armed) {
+        gpio_wakeup_enable((gpio_num_t) PAGER_PIN_FL_BTN, GPIO_INTR_LOW_LEVEL);
+        esp_sleep_enable_gpio_wakeup();
+    }
     esp_sleep_enable_timer_wakeup((uint64_t) ms * 1000ULL);
+
+    // Carrier: light, tune and LED off before sleeping; the LED timer restarts after the wake.
+    frontlight_off();
+    buzzer_stop();
+    extled_pause();
 
     // Drive RTS high so the modem is free to sleep, as WalterModem::sleep(_, true) does. Airplane mode
     // has no modem: no RTS/flow-control steps, ext1 + timer wake only.
@@ -1018,6 +1045,9 @@ extern "C" bool net_sleep(uint32_t ms)
 
     esp_light_sleep_start();
     ui_kb_sleep_unpark();
+    if (fl_wake_armed) {
+        gpio_wakeup_disable((gpio_num_t) PAGER_PIN_FL_BTN);
+    }
 
     // esp_light_sleep_start() latches an RTC pad HOLD on each ext1 pad that the S3 never releases
     // (gpio_get_level() freezes, reads 1 at 0 V); release it each wake. input_init() clears old holds.
@@ -1043,6 +1073,7 @@ extern "C" bool net_sleep(uint32_t ms)
                         (int32_t) net_uart_rx_buffered_bytes());
         flightrec_event('F', flightrec_cts_level(), 0);
     }
+    extled_resume(); // power effect: restarts the 6 s breath timer (carrier only)
     return true;
 }
 
@@ -1855,6 +1886,42 @@ extern "C" bool net_gnss_poll_event(net_gnss_event_t *out)
     }
     s_gnss_event_pending = false;
     return true;
+}
+
+// Best-effort OPSTATE_MINIMUM for the low-battery Shutdown, capped at `cap_ms`: setOpState() has no
+// timeout, so it runs on a task that is abandoned on timeout. Power effect: radio off.
+struct minimum_ctx_t {
+    SemaphoreHandle_t done;
+    volatile bool ok;
+};
+
+static void modem_minimum_task(void *arg)
+{
+    minimum_ctx_t *c = (minimum_ctx_t *) arg;
+    c->ok = WalterModem::setOpState(WALTER_MODEM_OPSTATE_MINIMUM);
+    xSemaphoreGive(c->done);
+    vTaskDelete(NULL);
+}
+
+extern "C" bool net_modem_minimum(uint32_t cap_ms)
+{
+    if (net_airplane()) {
+        return false; // already held in reset
+    }
+    if (!s_modem_begun) {
+        // setOpState() before begin() asserts on a NULL queue (WalterModem.cpp:5143)
+        ESP_LOGI(TAG, "modem not started, skipping MINIMUM");
+        return false;
+    }
+    static minimum_ctx_t ctx; // static: the abandoned task may outlive the caller's frame
+    ctx.ok = false;
+    ctx.done = xSemaphoreCreateBinary();
+    if (!ctx.done || xTaskCreate(modem_minimum_task, "modem_min", 4096, &ctx, 5, NULL) != pdPASS) {
+        return false;
+    }
+    bool finished = xSemaphoreTake(ctx.done, pdMS_TO_TICKS(cap_ms)) == pdTRUE;
+    ESP_LOGI(TAG, "modem to MINIMUM: %s", finished ? (ctx.ok ? "ok" : "failed") : "timed out");
+    return finished && ctx.ok;
 }
 
 extern "C" bool net_radio_off(void)

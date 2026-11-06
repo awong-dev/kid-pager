@@ -341,6 +341,12 @@ bool net_gnss_poll_event(net_gnss_event_t *out);
 /* OPSTATE_NO_RF for coverage.c's duty cycle; call net_session_down() first. Power: radio off. */
 bool net_radio_off(void);
 
+/* Best-effort OPSTATE_MINIMUM, waiting at most cap_ms; false on failure, timeout or airplane. */
+bool net_modem_minimum(uint32_t cap_ms);
+
+/* Drops modem-UART flow control before esp_restart() with the modem in reset (TX drain hang). */
+void net_modem_uart_unblock(void);
+
 /* OPSTATE_FULL; does not wait for re-attach (poll net_is_attached()). Power: re-attach begins. */
 bool net_radio_on(void);
 

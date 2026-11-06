@@ -49,6 +49,19 @@
 #define PAGER_PIN_ACCEL_SDA 17
 #define PAGER_PIN_ACCEL_SCL 18
 
+// Carrier v0.2 only.
+#define PAGER_PIN_FL_PWM 12      // front light, high = on (shares IO12 with the breadboard's Friend ENA)
+#define PAGER_PIN_FL_BTN 4       // front-light button, active-low, external pull-up, RTC pad
+#define PAGER_PIN_PIEZ_P 6       // piezo, differential with PIEZ_N
+#define PAGER_PIN_PIEZ_N 7
+#define PAGER_PIN_EXT_LED 8      // external LED, high = on
+#define PAGER_PIN_VBUS_DET 15    // high = USB present (divider from VBUS)
+#define PAGER_PIN_CHG_STAT1 38   // BQ25185 STAT1, open-drain (shares IO38 with the breadboard's Friend SRCS)
+#define PAGER_PIN_CHG_STAT2 42   // BQ25185 STAT2 (shares IO42 with the breadboard's Friend MISO)
+#define PAGER_PIN_UART0_TX 43    // carrier console TX (CP2102N RXD); kept driven through light sleep
+#define PAGER_I2C_ADDR_DRV2605 0x5A  // haptic driver on the CardKB bus (I2C_NUM_0), 3V3_AWK gated
+#define PAGER_I2C_ADDR_MAX17048 0x36 // fuel gauge on the always-on bus (I2C_NUM_1)
+
 // LTE_WAKE0: a modem input, unused except by debug-build `wake0` instrumentation. Left as an
 // input with no pull otherwise.
 #define PAGER_PIN_WAKE0 46

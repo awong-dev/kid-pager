@@ -2,6 +2,8 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_timer.h"
+#include "board.h"
+#include "frontlight.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -13,6 +15,10 @@ void gpio_config(const gpio_config_t *cfg)
 }
 
 void rtc_gpio_hold_dis(gpio_num_t pin) { (void) pin; }
+void gpio_sleep_sel_dis(gpio_num_t pin) { (void) pin; }
+
+bool board_has_frontlight(void) { return false; }
+void frontlight_activity(void) {}
 
 static int s_button_level = 0; /* idle (active-high, released) by default */
 

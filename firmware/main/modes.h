@@ -32,6 +32,16 @@ int64_t modes_debug_last_input_age_us(void);
 /* True once a non-zero AT+SQNVMON reading has been taken this boot; until then
  * modes_get_batt_mv() returns 0 (no reading). The reading is raw, ~5200 mV on USB. */
 bool modes_batt_mv_known(void);
+/* Battery percent 0..100, -1 = no reading; charge state is a fuel_state_t (0 battery, 1 charging,
+ * 2 charged). */
+int modes_get_batt_pct(void);
+int modes_get_charge_state(void);
+/* Low-battery shutdown: modem held in reset, panel and rails off, deep sleep waking only on
+ * VBUS_DET (IO15, ext1 ANY_HIGH). Restarts instead if USB is present. Does not return. */
+void modes_power_off_lowbatt(void) __attribute__((noreturn));
+
+// Boot-time low-battery check (carrier only).
+void modes_fuel_boot_check(void);
 // Last modem temperature in tenths of C; false until the first reading.
 bool modes_get_temp_dc(int *temp_dc);
 const char *modes_get_fw_version(void);
