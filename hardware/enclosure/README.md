@@ -95,8 +95,12 @@ pocket to knob 0.10 at the modelled knob position. Tin clearance 0.3 mm less the
 - Keyboard wires: J2 is at the far / battery-end corner; the wires cross under the plate over the
   battery to the hinge-edge channel at y 116-124.
 
+# Faceplate v2: cost-reduced carrier, no locating pin
 
 Source `faceplate_v2.py` -> `out/v2/` (same frame and print orientation as v1; `faceplate.py` and `out/`
+are v1). Built for the cost-reduced carrier layout: USB-C, SW1 and
+SW2 sit in one row on the hinge edge (board ky 61.09 = world x -40.18). The battery-end edge is at
+kx 110.55; no plate feature depends on it.
 
 | part | board (kx, ky) | world (x, y) | what the plate does |
 |---|---|---|---|
@@ -104,6 +108,41 @@ Source `faceplate_v2.py` -> `out/v2/` (same frame and print orientation as v1; `
 | J6 TYPE-C 16PLT-H6.5 (shell 8.94 x 3.16, 6.50 tall) | 92.71, 61.09 | -40.18, 90.68 | 3.46 x 9.74 slot; shell top 17.41 stands 0.41 proud of the plate |
 | SW2 MSS12C02LS (knob 1.63 x 0.68, 2.0 above a 1.9 body, +-0.75) | 105.28, 61.09 | -40.18, 103.25 | 2.9 x 5.4 slot; slide cap: 2.6 x 3.6 stem, 0.93 x 1.88 knob pocket, 4 x 7 head |
 
+## How the board is held (no pin)
+- **x/y and rotation:** the USB-C shell in its slot (0.15 per side across, 0.40 along). The board unit
+  is also taped to the tin floor, so the slot only has to keep the plate and board aligned.
+- **Height:** the corner foot (board 77.6, 59.6) and the two far-edge rail segments rest on bare mask;
+  the battery foot and the panel-board posts rest on the battery, as in v1.
+- **No locating pin.** The board's 1.10 NPTH H4 at (102.743, 72.009) is under the glass, where no plate
+  feature can reach. H4 is optional; nothing in the plate uses it.
+- **Why no pin is needed:** the board end past the Walter (world y 97 to 108.5) overhangs the battery, but
+  nothing presses it down in use: plugging the SH cables pushes along the board, SW2 slides sideways, and
+  SW1 (the only push button) sits over the Walter. The plate presses from above and the battery is
+  1.16 below. If the overhang feels loose, put a 1 mm foam pad on the battery under it.
+
+## Assembly rules
+- **Trim the Walter header pins to 1.5 mm or less above the carrier top.** Under the glass (back at
+  z 14.2) the seven SH headers stand 13.87, 0.33 below it, and are the backstop if the glass is pressed
+  or its tape lets go. Pin stubs must stay below the header tops (2.96 above the board); at 1.5 they keep
+  1.8 to the glass, so jagged cut ends never reach it. Both pin rows are under the taped glass border,
+  outside the window. Optional: a strip of Kapton over each pin row.
+- **Nothing may stick out under the carrier over the battery.** The carrier bottom is only 1.16 above the
+  cell (8.75 vs 9.91) from world y 97 onward. Nothing does: J6's shell legs are 0.95 long in a
+  1.0 board, SW2's two plastic pegs are shorter than the board, and there are no bottom-side parts.
+  The SYS_SW solder point at board (99.64, 60.60) = world (-40.7, 97.6) is over the battery edge: solder
+  its wire from the top and cut the underside flush.
+- **Kapton on the battery top under the carrier overhang.** A cut stub or solder spike pressed into a
+  pouch cell is the one real hazard in the stack.
+
+## Clearances
+Boolean intersection of the plate, slider cap and FL cap against a STEP export of the board
+(J6 and SW2 as datasheet-sized proxies) shows no overlaps. Shell to slot 0.15, knob pocket 0.125 per side
+at mid travel (the knob proxies at the travel ends touch the pocket, as intended), FL cap 0.20 to the plate,
+slider cap clear of the plate at both travel ends, foot and rails on the board.
+
 ## Assumptions still open
+- **CARRIER_TOP 10.91 is the socketed v1 number; measure the soldered unit (tin floor to carrier
+  top).** The SH headers clear the glass by only 0.33: if the board sits more than 0.33 higher, raise
+  GLASS_TOP. The FL cap tolerates the board up to 0.6 higher before its flange holds the button down.
 - SW2 knob centred across the body (vendor drawing shows it so; not measured on a part).
 - Fusion: the script imports from `out/`; point `OUT` at `out/v2` (or copy the v2 STEPs over) to load v2.
