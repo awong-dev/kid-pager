@@ -94,3 +94,16 @@ pocket to knob 0.10 at the modelled knob position. Tin clearance 0.3 mm less the
 - CardKB clamp rails (ridges that meet the keyboard PCB margins when the lid closes) not included.
 - Keyboard wires: J2 is at the far / battery-end corner; the wires cross under the plate over the
   battery to the hinge-edge channel at y 116-124.
+
+
+Source `faceplate_v2.py` -> `out/v2/` (same frame and print orientation as v1; `faceplate.py` and `out/`
+
+| part | board (kx, ky) | world (x, y) | what the plate does |
+|---|---|---|---|
+| SW1 TS-1187A-S16 (5.15 sq, H 1.5, button dia 2.0, 0.2 travel) | 82.42, 61.09 | -40.18, 80.39 | 4.0 hole; captive cap (dia 3.6 shaft, 1.8 nub on the button, 5.6 flange 0.6 under the band), top 18.4 |
+| J6 TYPE-C 16PLT-H6.5 (shell 8.94 x 3.16, 6.50 tall) | 92.71, 61.09 | -40.18, 90.68 | 3.46 x 9.74 slot; shell top 17.41 stands 0.41 proud of the plate |
+| SW2 MSS12C02LS (knob 1.63 x 0.68, 2.0 above a 1.9 body, +-0.75) | 105.28, 61.09 | -40.18, 103.25 | 2.9 x 5.4 slot; slide cap: 2.6 x 3.6 stem, 0.93 x 1.88 knob pocket, 4 x 7 head |
+
+## Assumptions still open
+- SW2 knob centred across the body (vendor drawing shows it so; not measured on a part).
+- Fusion: the script imports from `out/`; point `OUT` at `out/v2` (or copy the v2 STEPs over) to load v2.
