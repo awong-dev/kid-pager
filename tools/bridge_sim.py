@@ -13,6 +13,11 @@ end to end without a phone. Two things live here:
 * A small control-plane HTTP server (FastAPI, imported lazily) on `:8020`:
   `POST /_pair {code, simNumber?, voiceNumber?}`, `POST /_inject {event}`
   (or `{events: [...]}`), `GET /_outbox`, `POST /_fail_next {times}`,
+  `POST /_reset`, `GET /_status`, `POST /_pause` / `POST /_resume` (stop / restart
+  heartbeating and outbox polling, to look like a dead phone),
+  `POST /_set {smsDefault?, listenerBound?, accessibility?, battery?, charging?}` (heartbeat
+  status overrides). The heartbeat also reports `charging`, `batteryExempt` and `carrier`
+  (`BRIDGE_SIM_CARRIER_NAME`, default `Sim Carrier`) and a `sent` SMS ack carries `parts: 1`.
   The compose service `bridge-sim` runs it (`tools/mocks/bridge_sim.Dockerfile`).
 
 Environment: `RELAY_URL` (default `http://relay:8000`), `BRIDGE_SIM_PAIR_CODE`
@@ -147,6 +152,9 @@ class BridgeSim:
         self.fail_next = 0
         self.heartbeats = 0
         self.last_error: str | None = None
+        self.paused = False
+        self.overrides: dict[str, Any] = {}
+        self.carrier_name = os.environ.get("BRIDGE_SIM_CARRIER_NAME", "Sim Carrier")
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -168,6 +176,10 @@ class BridgeSim:
             "simNumber": self.sim_number,
             "voiceNumber": self.voice_number,
             "version": "sim-1",
+            "charging": True,
+            "batteryExempt": True,
+            "carrier": {"simOperator": "310260", "simName": self.carrier_name, "netName": "Sim Net"},
+            **self.overrides,
         }
 
     def pair(
@@ -252,6 +264,7 @@ class BridgeSim:
         return self.events([event])
 
     def poll_outbox(self, wait: int = 0) -> list[dict[str, Any]]:
+        if not self.token or self.paused:
             return []
         status, out = _request(
             "GET",
@@ -263,9 +276,21 @@ class BridgeSim:
             raise RelayError(status, out)
         return out["items"]
 
+    def ack(
+        self,
+        ob_id: str,
+        state: str,
+        reason: str | None = None,
+        tier: int = 1,
+        parts: int | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"state": state, "reason": reason, "tier": tier}
+        if parts is not None and state == "sent":
+            body["parts"] = parts
         status, out = _request(
             "POST",
             f"{self.relay_url}/bridge/outbox/{ob_id}/ack",
+            body=body,
             token=self.token,
         )
         if status != 204:
@@ -286,6 +311,8 @@ class BridgeSim:
             record = {**item, "ackState": state, "reason": reason, "tier": 1, "at": time.time()}
             with self._lock:
                 self.outbox.append(record)
+            sms_send = item.get("kind") == "send" and item.get("source") == "sms"
+            self.ack(item["id"], state, reason, 1, parts=1 if sms_send else None)
         return len(items)
 
 
@@ -307,6 +334,7 @@ class BridgeSim:
 
     def _poll_loop(self, gen: int) -> None:
         while not self._stop.is_set() and gen == self._gen:
+            if not self.token or self.paused:
                 self._stop.wait(0.5)
                 continue
             try:
@@ -318,6 +346,7 @@ class BridgeSim:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
+            if self.token and not self.paused:
                 try:
                     self.heartbeat()
                 except Exception as exc:  # noqa: BLE001
@@ -332,6 +361,8 @@ class BridgeSim:
             self.bridge_id = None
             self.heartbeats = 0
             self.last_error = None
+            self.paused = False
+            self.overrides.clear()
             self._gen += 1
 
 
@@ -373,6 +404,17 @@ class BridgeSimClient:
 
     def reset(self) -> None:
         self._call("POST", "/_reset", {})
+
+    def pause(self) -> None:
+        """Stop heartbeating and polling (a dead phone)."""
+        self._call("POST", "/_pause", {})
+
+    def resume(self) -> None:
+        self._call("POST", "/_resume", {})
+
+    def set_status(self, **overrides: Any) -> None:
+        """Override heartbeat status keys (`smsDefault=False`, `battery=10`, ...)."""
+        self._call("POST", "/_set", overrides)
 
 
 def create_app(sim: BridgeSim):
@@ -431,6 +473,35 @@ def create_app(sim: BridgeSim):
             sim.fail_next = int(body.get("times", 1))
         return {"failNext": sim.fail_next}
 
+    @app.post("/_pause")
+    def pause() -> dict[str, bool]:
+        sim.paused = True
+        return {"paused": True}
+
+    @app.post("/_resume")
+    def resume() -> dict[str, bool]:
+        sim.paused = False
+        try:
+            sim.heartbeat()  # the phone says so at once, like a real wake-up
+        except RelayError:
+            pass
+        return {"paused": False}
+
+    @app.post("/_set")
+    async def set_status(request: Request) -> dict[str, Any]:
+        body = await _json(request)
+        allowed = {"smsDefault", "listenerBound", "accessibility", "battery", "charging"}
+        with sim._lock:
+            for key, value in body.items():
+                if key in allowed:
+                    sim.overrides[key] = value
+            current = dict(sim.overrides)
+        try:
+            sim.heartbeat()  # report the change now rather than in 30 s
+        except RelayError:
+            pass
+        return current
+
     @app.post("/_reset")
     def reset() -> dict[str, bool]:
         sim.reset()
@@ -445,6 +516,7 @@ def create_app(sim: BridgeSim):
             "voiceNumber": sim.voice_number,
             "whatsapp": sim.whatsapp,
             "heartbeats": sim.heartbeats,
+            "paused": sim.paused,
             "lastError": sim.last_error,
         }
 

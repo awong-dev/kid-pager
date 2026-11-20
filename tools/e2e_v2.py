@@ -74,6 +74,9 @@ WEBHOOK_KEY = "dev-webhook-key"
 # docs/PROTOCOL.md §13.4: 900 s in production. Shortened so the derived-expiry sub-case does not
 # wait 15 minutes, yet longer than every other sub-case (incl. the 3 s answer delay).
 LOC_REQ_TTL_S = 10
+# A bridge is offline after this many seconds of silence (production: 900); above the sim's
+# 60 s `lastSeenAt` touch. The `bridge_health` scenario backdates `lastSeenAt` instead.
+BRIDGE_OFFLINE_AFTER_S = 120
 
 sys.path.insert(0, str(TOOLS_DIR))
 sys.path.insert(0, str(RELAY_DIR))
@@ -214,6 +217,16 @@ def write_env_file() -> None:
             f"BROKER_API_SECRET={BROKER_API_SECRET}",
             f"WEBHOOK_KEY={WEBHOOK_KEY}",
         ]
+    path.write_text(
+        "\n".join(
+            [
+                *lines,
+                f"LOC_REQ_TTL_S={LOC_REQ_TTL_S}",
+                f"BRIDGE_OFFLINE_AFTER_S={BRIDGE_OFFLINE_AFTER_S}",
+                "",
+            ]
+        )
+    )
 
 
 def restore_env_file() -> None:
@@ -1089,6 +1102,15 @@ def scenario_retention() -> None:
     assert stale_loc_id not in remaining_ids, remaining_ids
     assert fresh_loc_id in remaining_ids, remaining_ids
     assert oracle.message(fresh_msg_id) is not None, "messages must be untouched by a locations-only sweep"
+    from datetime import UTC, datetime, timedelta
+
+    # The sweep reports the oldest survivor per class.
+    sweep_report = internal("/internal/sweep")
+    oldest_loc = (sweep_report.get("oldest") or {}).get("locations")
+    assert oldest_loc is not None, sweep_report
+    assert (
+        datetime.now(UTC) - datetime.fromisoformat(oldest_loc)
+    ) < timedelta(days=1, hours=1), f"oldest surviving location past the 1-day limit: {oldest_loc}"
     print("retention: stale location fix swept; fresh fix + messages untouched")
 
     # --- messages: retention.messages=2w ---
@@ -2042,6 +2064,155 @@ def scenario_bridge_whatsapp() -> None:
     device.disconnect()
 
 
+def scenario_receipts() -> None:
+    """A pager page to a bridged SMS contact; the simulator acks `failed sim_failed`
+    (`/_fail_next`). A device that never reported `mb` gets one `system` row; once
+    `devices.status.mb` is set (whitebox) it gets `kind:"rcpt"` for the failure, then a success."""
+    import bridge_sim
+
+    bootstrap_admin()
+    admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
+    admin.login("admin")
+    family_id = admin.me()["user"]["familyId"] or "default"
+    sim = bridge_sim.BridgeSimClient(BRIDGE_SIM_URL)
+
+    kid, device = _bridge_member(admin, family_id, "rkid", "pgr-e2e-rcp")
+    _pair_sim(admin, sim, family_id, kid["uid"], "Receipt phone")
+    gran = admin.family_create_contact(family_id, "+15550003333", "ReceiptGran")
+    admin.family_put_approved(family_id, kid["uid"], contacts=[{"uid": gran["uid"]}])
+    alias = Oracle().user(gran["uid"]).alias
+
+    # Phase 1: no `mb` -> one `system` row on failure, nothing on success.
+    device.inbox.clear()
+    sim.fail_next(1)
+    device.publish_msg("hello one", to=alias)
+
+    def _system_rows() -> list[Any]:
+        return [e for e in device.inbox if e.data.get("from") == "system"]
+
+    wait_until(lambda: bool(_system_rows()), timeout=15, description="the phase-1 system row")
+    time.sleep(1.0)
+    (row,) = _system_rows()
+    body = row.data["body"]
+    assert body.startswith("to ReceiptGran ") and body.endswith(": not delivered (sim_failed)"), body
+    assert not device.receipts, device.receipts
+    device.publish_msg("hello two", to=alias)
+    wait_until(
+        lambda: any(i["text"] == "hello two" for i in _sim_sent(sim)),
+        timeout=15,
+        description="the second page to reach the bridge outbox",
+    )
+    time.sleep(1.0)
+    assert len(_system_rows()) == 1 and not device.receipts, "a success must stay silent on phase 1"
+    print(f"receipts: phase 1 system row: {body!r}")
+
+    # Phase 2: `mb` reported -> rcpt for both outcomes.
+    store().merge(f"devices/{device.device_id}", {"status": {"mb": 1024}})
+    device.inbox.clear()
+    sim.fail_next(1)
+    failed_id = device.publish_msg("hello three", to=alias)
+    wait_until(lambda: len(device.receipts) >= 1, timeout=15, description="the failed rcpt")
+    assert device.receipts[0]["ref"] == failed_id, device.receipts
+    assert device.receipts[0]["st"] == "failed" and device.receipts[0]["rsn"] == "sim_failed"
+    ok_id = device.publish_msg("hello four", to=alias)
+    wait_until(lambda: len(device.receipts) >= 2, timeout=15, description="the sent rcpt")
+    assert device.receipts[1]["ref"] == ok_id and device.receipts[1]["st"] == "sent", device.receipts
+    assert not _system_rows(), "an mb device must not get the phase-1 row"
+    print("receipts: phase 2 rcpt failed(sim_failed) then sent")
+    device.disconnect()
+
+
+def scenario_bridge_health() -> None:
+    """A silent bridge is announced once (a `system` alert and one pager `system` text) however
+    many ticks follow; its next heartbeat closes the alert; losing the SMS role is a `degraded`
+    notice and regaining it a "fully working" one. Silence is `/_pause` + stale `lastSeenAt`."""
+    from datetime import UTC, datetime, timedelta
+
+    import bridge_sim
+
+    bootstrap_admin()
+    admin = pager_client.ServerClient(RELAY_URL, AUTH_URL)
+    admin.login("admin")
+    family_id = admin.me()["user"]["familyId"] or "default"
+    sim = bridge_sim.BridgeSimClient(BRIDGE_SIM_URL)
+
+    kid, device = _bridge_member(admin, family_id, "hkid", "pgr-e2e-hlt")
+    bridge = _pair_sim(admin, sim, family_id, kid["uid"], "Health phone")
+    bridge_id = bridge["id"]
+    gran = admin.family_create_contact(family_id, "+15550004444", "HealthGran")
+    admin.family_put_approved(family_id, kid["uid"], contacts=[{"uid": gran["uid"]}])
+
+    def _system_texts() -> list[str]:
+        return [e.data["body"] for e in device.inbox if e.data.get("from") == "system"]
+
+    def _alert(code: str) -> dict[str, Any] | None:
+        return next(
+            (
+                a
+                for a in admin.family_list_alerts(family_id, status="all")
+                if a["kind"] == "system" and a.get("code") == code and a.get("key") == bridge_id
+            ),
+            None,
+        )
+
+    def _health_state() -> str | None:
+        row = next(b for b in admin.family_list_bridges(family_id) if b["id"] == bridge_id)
+        return (row.get("health") or {}).get("state")
+
+    # Offline: silent phone + stale lastSeenAt -> one notice over three ticks.
+    sim.pause()
+    time.sleep(6)  # an outbox long-poll already in flight has returned
+    store().merge(
+        f"bridges/{bridge_id}", {"lastSeenAt": datetime.now(UTC) - timedelta(minutes=10)}
+    )
+    device.inbox.clear()
+    for _ in range(3):
+        internal("/internal/tick")
+    wait_until(
+        lambda: any(t.startswith("Bridge phone offline since") for t in _system_texts()),
+        timeout=15,
+        description="the offline system text",
+    )
+    time.sleep(1.0)
+    assert len([t for t in _system_texts() if t.startswith("Bridge phone offline")]) == 1, _system_texts()
+    assert _health_state() == "offline"
+    alert = _alert("bridge_offline")
+    assert alert is not None and alert["status"] == "open", alert
+    print(f"bridge_health: offline -> {_system_texts()[0]!r}")
+
+    # Back: the heartbeat closes it at once.
+    device.inbox.clear()
+    sim.resume()
+    wait_until(
+        lambda: "Bridge phone is back." in _system_texts(),
+        timeout=15,
+        description="the restored system text",
+    )
+    assert _health_state() == "ok"
+    alert = _alert("bridge_offline")
+    assert alert is not None and alert["status"] == "handled", alert
+    print("bridge_health: restored")
+
+    # Degraded: the SMS role is lost, then regained.
+    device.inbox.clear()
+    sim.set_status(smsDefault=False)
+    wait_until(
+        lambda: "Bridge phone lost SMS role." in _system_texts(),
+        timeout=15,
+        description="the degraded system text",
+    )
+    assert _health_state() == "degraded"
+    sim.set_status(smsDefault=True)
+    wait_until(
+        lambda: "Bridge phone is fully working again." in _system_texts(),
+        timeout=15,
+        description="the fully-working system text",
+    )
+    assert _health_state() == "ok"
+    print("bridge_health: degraded then fully working")
+    device.disconnect()
+
+
 SCENARIOS: dict[str, Callable[[], None]] = {
     "bootstrap": scenario_bootstrap,
     "text_roundtrip": scenario_text_roundtrip,
@@ -2057,6 +2228,8 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "bridge": scenario_bridge,
     "bridge_voice": scenario_bridge_voice,
     "bridge_whatsapp": scenario_bridge_whatsapp,
+    "receipts": scenario_receipts,
+    "bridge_health": scenario_bridge_health,
 }
 
 

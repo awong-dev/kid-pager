@@ -38,6 +38,7 @@ Commands:
   Server: login, contacts, chat, say, watch, tick, sweep, locate <alias>,
           locations <alias> [n],
           admin user-add / allow / deny / device-add <label> / ca push|unpin <device_id> /
+          settings retention messages=<n><d|w> locations=<n><d|w> alerts=.. battery=.. /
           alerts <family> [open|all] / approve <family> <alert_id> [link|create] [alias] /
           block <family> <alert_id> / dismiss <family> <alert_id> /
           cfg <device_id> [--auto <min>] [--clear],
@@ -210,6 +211,8 @@ class DeviceClient:
         self.session_id = new_id("s_")
         self.connected = False
         self.inbox: list[InboxEntry] = []
+        # `kind:"rcpt"` delivery receipts (§3.2), newest last; also appended to `inbox`.
+        self.receipts: list[dict[str, Any]] = []
         self.autoack: str = "off"  # off | on | shown-only
         self.bytes = ByteCounter()
         self._client: mqtt.Client | None = None
@@ -399,6 +402,13 @@ class DeviceClient:
             # /loc instead, subject to §13.3's device-side rate limit.
             self._handle_loc_req(data.get("id"))
             return
+        if kind == "rcpt":
+            # §3.2 `kind:"rcpt"`: never shown, never acked, never a thread entry;
+            # CBOR keys 74 `ref` / 75 `rsn` arrive here already named.
+            self.receipts.append(
+                {k: data.get(k) for k in ("id", "ref", "st", "rsn") if data.get(k) is not None}
+            )
+            return
         if kind == "book":
             # §3.2 `kind:"book"`: not a thread entry; applied, then acked `shown` unconditionally.
             self._handle_book(data)
@@ -430,6 +440,13 @@ class DeviceClient:
         self._client.publish(topic, payload, qos=qos, retain=retain)
 
     def publish_status(
+        self,
+        *,
+        batt_mv: int = 3280,
+        mode: str = "sleep",
+        rssi: int = -85,
+        fw: str = "sim-0.2.0",
+        mb: int | None = None,
     ) -> None:
         obj: dict[str, Any] = {
             "v": 1,
@@ -447,6 +464,8 @@ class DeviceClient:
             # MQTT-session generation within this boot; constant (sessions are never resumed).
             "link": 1,
         }
+        if mb is not None:
+            obj["mb"] = mb  # PROTOCOL.md §5.1 key 76: the `rcpt`/long-body capability switch
         if self.ca_fp is not None:
             obj["ca_fp"] = self.ca_fp
         # Reported only while `loc track` is on.
@@ -1040,7 +1059,25 @@ class ServerClient:
         ]
 
     def admin_set_retention(
+        self,
+        *,
+        messages: str | None = None,
+        locations: str | None = None,
+        alerts: str | None = None,
+        battery: str | None = None,
     ) -> dict[str, Any]:
+        """`admin settings retention messages=<n><d|w> locations=.. alerts=.. battery=..`: `PUT
+        /api/admin/settings` merges day counts, so only the classes given are sent."""
+        payload: dict[str, int] = {}
+        for name, value in (
+            ("messagesDays", messages),
+            ("locationsDays", locations),
+            ("alertsDays", alerts),
+            ("batteryDays", battery),
+        ):
+            if value is not None:
+                parsed = parse_retention_shorthand(value)
+                payload[name] = parsed["n"] * (7 if parsed["unit"] == "weeks" else 1)
         resp = self.api_put("/api/admin/settings", payload)
         if resp.status_code >= 400:
             raise RuntimeError(f"admin settings retention failed: {resp.status_code} {resp.text}")
@@ -1803,15 +1840,21 @@ class PagerShell(cmd.Cmd):
 
     def _admin_settings(self, args: list[str]) -> None:
         if not args or args[0] != "retention":
+            print("usage: admin settings retention messages=<n><d|w> locations=<n><d|w> alerts=.. battery=..")
             return
         kv: dict[str, str] = {}
         for item in args[1:]:
             key, sep, value = item.partition("=")
             if not sep:
+                print("usage: admin settings retention messages=<n><d|w> locations=<n><d|w> alerts=.. battery=..")
                 return
             kv[key] = value
         try:
             result = self.server.admin_set_retention(
+                messages=kv.get("messages"),
+                locations=kv.get("locations"),
+                alerts=kv.get("alerts"),
+                battery=kv.get("battery"),
             )
         except ValueError as exc:
             print(f"invalid retention value: {exc}")
