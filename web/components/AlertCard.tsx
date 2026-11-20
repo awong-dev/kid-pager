@@ -21,13 +21,18 @@ import Typography from "@mui/material/Typography";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
 import ForumIcon from "@mui/icons-material/Forum";
 import PersonAddIcon from "@mui/icons-material/PersonAdd";
+import ReportIcon from "@mui/icons-material/Report";
 import SmsIcon from "@mui/icons-material/Sms";
+import SettingsInputAntennaIcon from "@mui/icons-material/SettingsInputAntenna";
+import PublicIcon from "@mui/icons-material/Public";
 
+import BridgeTopups from "@/components/BridgeTopups";
 import ChatSubscribeDialog from "@/components/ChatSubscribeDialog";
 import { formatPhoneDigits } from "@/components/NewChatDialog";
 import { ApiError, api } from "@/lib/api";
 import { ignoreChat, sourceLabel } from "@/lib/bridges";
 import { isHashAlias } from "@/lib/names";
+import { fedMovedInfo, fedReauthInfo } from "@/lib/federation";
 import { familyQuery } from "@/lib/family-context";
 import type { AlertDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
@@ -38,6 +43,7 @@ interface HeldText {
   body: string;
   // epoch seconds, epoch ms or an ISO string
   receivedAt: number | string | null;
+  status: "held" | "delivered" | "too_long" | "blocked" | "dismissed" | "empty";
 }
 
 interface ApproveResult {
@@ -76,7 +82,42 @@ function kindIcon(kind: AlertDoc["kind"]) {
       return <PersonAddIcon fontSize="small" />;
     case "chat_unknown":
       return <ForumIcon fontSize="small" />;
+    case "hook_flag":
+    case "hook_down":
+      return <ReportIcon fontSize="small" />;
+    case "system":
+      return <SettingsInputAntennaIcon fontSize="small" />;
+    case "fed_contact":
+    case "fed_unknown":
+    case "fed_moved":
+    case "fed_reauth":
+      return <PublicIcon fontSize="small" />;
   }
+}
+
+const SYSTEM_TITLES: Record<string, string> = {
+  bridge_offline: "Bridge phone offline",
+  bridge_online: "Bridge phone restored",
+  bridge_degraded: "Bridge phone degraded",
+  bridge_battery: "Bridge phone battery low",
+  sms_low: "Texts running low",
+  sms_out: "Out of texts",
+  sms_topped_up: "Texts topped up",
+  peer_down: "Server unreachable",
+  peer_up: "Server restored",
+  link_unreachable: "Chat link unreachable",
+  family_frozen: "Family frozen",
+};
+
+// A notice that reports a problem going away: shown as resolved history.
+const RESTORED_CODES = new Set(["bridge_online", "peer_up", "sms_topped_up"]);
+
+function isRestored(alert: Pick<AlertDoc, "code">): boolean {
+  return RESTORED_CODES.has(alert.code ?? "");
+}
+
+function systemTitle(code: string | undefined): string {
+  return (code && SYSTEM_TITLES[code]) || "System notice";
 }
 
 function kindLabel(kind: AlertDoc["kind"], source?: AlertDoc["source"]): string {
@@ -92,6 +133,20 @@ function kindLabel(kind: AlertDoc["kind"], source?: AlertDoc["source"]): string 
       return source === "gchat" || source === "gvoice" || source === "whatsapp"
         ? sourceLabel(source)
         : "Unknown source";
+    case "hook_flag":
+      return "Flagged message";
+    case "hook_down":
+      return "Hook failing";
+    case "system":
+      return "System";
+    case "fed_contact":
+      return "Contact on another server";
+    case "fed_unknown":
+      return "Unknown person on another server";
+    case "fed_moved":
+      return "Linked family moved";
+    case "fed_reauth":
+      return "Linked family needs re-authorizing";
   }
 }
 
@@ -182,7 +237,15 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
     } catch (err) {
       const detail = err instanceof ApiError ? String(err.detail ?? err.message) : `Failed to ${action}`;
       if (err instanceof ApiError && err.status === 409 && action === "approve") {
+        if (alert.kind === "fed_contact" && detail.startsWith("not_shared")) {
+          setError(
+            `@${alert.subjectAlias} is not shared with ${alert.fedName ?? "that family"} yet. Share them under People > Other families, then approve.`
+          );
+        } else if (alert.kind === "fed_contact" && detail.startsWith("alias_taken")) {
+          setError("That alias is taken here. Add them from Contacts > Add from another family and choose another alias.");
+        } else if (alert.kind === "contact_request" || (alert.kind === "fed_contact" && detail.startsWith("name_taken"))) {
           setNameConflict(detail);
+          setNameValue((body as { name?: string }).name ?? alert.peerName ?? alert.preview);
           setNameOpen(true);
         } else if (alert.kind === "sms_unknown") {
           setNameConflict(detail);
@@ -219,6 +282,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
               size="small"
               variant="outlined"
               color={alert.status === "dismissed" ? "default" : "success"}
+              label={alert.kind === "system" ? (isRestored(alert) ? "restored" : "resolved") : alert.status}
             />
           )}
         </Stack>
@@ -255,6 +319,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
                             {formatReceived(h.receivedAt)}
                           </Typography>
                           {h.status !== "held" && (
+                            <Chip size="small" variant="outlined" label={h.status === "empty" ? "empty message" : h.status.replace("_", " ")} />
                           )}
                         </Stack>
                         <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
@@ -293,6 +358,54 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             )}
           </>
         )}
+
+        {(alert.kind === "hook_flag" || alert.kind === "hook_down") && (
+          <>
+            <Typography variant="body1">
+              {alert.title || (alert.kind === "hook_flag" ? "A message was flagged" : `Hook ${alert.hookName ?? ""} is failing`)}
+            </Typography>
+            {alert.preview && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                {alert.preview}
+              </Typography>
+            )}
+            {alert.hookName && (
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                Hook: {alert.hookName}
+              </Typography>
+            )}
+          </>
+        )}
+
+        {alert.kind === "system" && (
+          <>
+            <Typography variant="body1" sx={{ fontWeight: 600 }} color={isRestored(alert) || handled ? "text.secondary" : undefined}>
+              {systemTitle(alert.code)}
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+              {alert.preview}
+            </Typography>
+            {!handled && (alert.code === "sms_low" || alert.code === "sms_out") && alert.key && (
+              <Stack sx={{ mt: 1 }}>
+                <BridgeTopups bridgeId={alert.key} compact />
+              </Stack>
+            )}
+          </>
+        )}
+
+        {(alert.kind === "fed_contact" || alert.kind === "fed_unknown") && (
+          <>
+            <Typography variant="body1">{alert.preview}</Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+              {alert.kind === "fed_contact"
+                ? `Approve: ${alert.peerName ?? "they"} become a contact of @${alert.subjectAlias}, so they can write back.`
+                : "Their message was not delivered. Add them as a contact to let them through."}
+            </Typography>
+          </>
+        )}
+
+        {alert.kind === "fed_moved" && <Typography variant="body1">{fedMovedInfo(alert).text}</Typography>}
+        {alert.kind === "fed_reauth" && <Typography variant="body1">{fedReauthInfo(alert).text}</Typography>}
 
         {alert.kind === "contact_request" && (
           <>
@@ -389,8 +502,29 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
               </Button>
             </>
           )}
+          {alert.kind === "hook_flag" && alert.convKey && (
+            <Button size="small" component={Link} href={`/chat/view/${encodeURIComponent(alert.convKey)}`}>
+              View conversation
+            </Button>
+          )}
+          {(alert.kind === "contact_request" || alert.kind === "fed_contact") && (
             <Button size="small" variant="contained" onClick={() => void post("approve", {})} disabled={submitting}>
               Approve
+            </Button>
+          )}
+          {alert.kind === "fed_unknown" && (
+            <Button size="small" component={Link} href="/family/contacts">
+              Contacts
+            </Button>
+          )}
+          {(alert.kind === "fed_moved" || alert.kind === "fed_reauth") && (
+            <Button
+              size="small"
+              variant="contained"
+              component={Link}
+              href={`/family/people#federation${alert.fedLinkId ? `&link=${encodeURIComponent(alert.fedLinkId)}` : ""}`}
+            >
+              Review link
             </Button>
           )}
           {alert.kind === "chat_unknown" && (
@@ -403,6 +537,7 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
               </Button>
             </>
           )}
+          {alert.kind !== "chat_unknown" && alert.kind !== "hook_flag" && alert.kind !== "hook_down" && alert.kind !== "system" && alert.kind !== "fed_moved" && alert.kind !== "fed_reauth" && alert.kind !== "fed_contact" && alert.kind !== "fed_unknown" && (alert.kind !== "contact_request" || isSms) && (
             <Button size="small" color="warning" onClick={() => void post("block", {})} disabled={submitting}>
               Block
             </Button>

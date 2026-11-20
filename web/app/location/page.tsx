@@ -32,13 +32,17 @@ import { locBackoffLabel } from "@/lib/deviceTrust";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useLive } from "@/lib/live";
+import { deviceLocationsQuery, retentionSettingsQuery } from "@/lib/live/queries";
+import { buildLocationTimeline, locationsDaysOf, type LocationFixRow } from "@/lib/location";
 import { useLocatableDevices, type LocatableDevice } from "@/lib/locatableDevices";
 import { formatRelativeAge, tsToMillis } from "@/lib/time";
+import type { LocationFixDoc, RetentionSettingsDoc } from "@/lib/types";
 
 const MAP_HEIGHT_PX = 420;
 const MOBILE_TIMELINE_HEIGHT_PX = 280;
 // A limit instead of a `ts` range filter, which would need a composite index; the time window
 // is applied client-side by `buildLocationTimeline`.
+const LOCATIONS_QUERY_LIMIT = 4500; // 30 days (the retention ceiling) of 10-minute fixes
 
 const LocationMap = dynamic(() => import("@/components/LocationMap"), {
   ssr: false,
@@ -92,9 +96,13 @@ function LocationDetail({
   const { docs: fixDocs } = useLive<LocationFixDoc>(
     deviceLocationsQuery(device.id, LOCATIONS_QUERY_LIMIT)
   );
+  const { docs: retentionDocs } = useLive<RetentionSettingsDoc>(retentionSettingsQuery());
+  const windowDays = locationsDaysOf(retentionDocs[0]?.data);
   const fixRows = useMemo<LocationFixRow[]>(() => fixDocs.map((d) => ({ id: d.id, ...d.data })), [fixDocs]);
 
   const entries = useMemo(
+    () => buildLocationTimeline(fixRows, device.status.lastCell?.ts ?? null, undefined, windowDays),
+    [fixRows, device, windowDays]
   );
 
   // Focus is the clicked entry, else the newest one with a position (never the coordinate-less

@@ -44,6 +44,7 @@ import {
 import { sourceLabel } from "@/lib/bridges";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { fedRemoteName } from "@/lib/federation";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 interface Owner {
@@ -205,6 +206,11 @@ function BookInner() {
               const secondary = [
                 e.kind === "external" && e.phone
                   ? formatPhoneDigits(e.phone)
+                  : e.fed
+                    ? fedRemoteName(e.fed)
+                    : e.kind === "group" || e.chat
+                      ? ""
+                      : `@${e.alias}`,
                 e.nick ? `was ${e.displayName}` : "",
               ]
                 .filter(Boolean)

@@ -23,6 +23,7 @@ import {
   redeemInvite,
   registerPasskey,
 } from "@/lib/auth/home";
+import { takeReturnPath } from "@/lib/returnPath";
 
 type Mode = "sign-in" | "invite" | "offer-passkey";
 
@@ -56,6 +57,7 @@ export default function HomeLogin() {
     if (needsSetup) {
       router.replace("/setup");
     } else if (status === "signed-in" && mode !== "offer-passkey") {
+      router.replace(takeReturnPath());
     }
   }, [status, needsSetup, mode, router]);
 
@@ -86,11 +88,13 @@ export default function HomeLogin() {
         setMode("invite");
         throw err;
       }
+      if (!canPasskey) router.replace(takeReturnPath());
     }, "That invite code did not work.");
 
   const addPasskey = () =>
     run(async () => {
       await registerPasskey();
+      router.replace(takeReturnPath());
     }, "Adding a passkey failed.");
 
   const signInValid = username.trim() !== "" && password !== "";
@@ -186,6 +190,7 @@ export default function HomeLogin() {
             <Button variant="contained" disabled={busy} onClick={() => void addPasskey()}>
               Add a passkey
             </Button>
+            <Button disabled={busy} onClick={() => router.replace(takeReturnPath())}>
               Not now
             </Button>
           </Stack>

@@ -277,6 +277,10 @@ describe("admin/settings", () => {
     const handWritten = doc(db, "settings", "retention");
     expect(refEqual(asRef(Q.retentionSettingsQuery()), handWritten)).toBe(true);
   });
+  it("meta doc", () => {
+    const handWritten = doc(db, "settings", "meta");
+    expect(refEqual(asRef(Q.metaSettingsQuery()), handWritten)).toBe(true);
+  });
 });
 
 describe("admin/families", () => {

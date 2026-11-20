@@ -14,16 +14,31 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import BridgeTopups from "@/components/BridgeTopups";
+import { HealthChip } from "@/components/BridgePhonesSection";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
 import RequireAuth from "@/components/RequireAuth";
 import { deviceName } from "@/lib/devices";
 import { ApiError, api } from "@/lib/api";
+import { listMyBridges, type MyBridge } from "@/lib/bridges";
 import type { DeviceListItem } from "@/lib/smsContacts";
 
 function DevicesInner() {
   const [devices, setDevices] = useState<DeviceListItem[] | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // The caller's own bridge phones; any failure just hides the section.
+  const [myBridges, setMyBridges] = useState<MyBridge[]>([]);
+  useEffect(() => {
+    let live = true;
+    listMyBridges()
+      .then((b) => live && setMyBridges(b))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +98,30 @@ function DevicesInner() {
           </Card>
         ))}
       </Stack>
+
+      {myBridges.length > 0 && (
+        <Stack spacing={1.5}>
+          <Typography variant="h5">My bridge phone</Typography>
+          {myBridges.map((b) => (
+            <Card key={b.id} variant="outlined">
+              <CardContent>
+                <Stack spacing={1}>
+                  <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+                    <Typography variant="subtitle1">{b.label}</Typography>
+                    <HealthChip health={b.health} unpaired={!b.paired} />
+                  </Stack>
+                  {b.paired && b.carrier && (
+                    <Typography variant="body2">
+                      Texts left: {b.carrier.unlimited ? "unlimited" : (b.carrier.texts ?? "unknown")}
+                    </Typography>
+                  )}
+                  {b.paired && b.carrier && <BridgeTopups bridgeId={b.id} carrierName={b.carrier.name} />}
+                </Stack>
+              </CardContent>
+            </Card>
+          ))}
+        </Stack>
+      )}
     </Stack>
   );
 }

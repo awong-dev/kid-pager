@@ -4,6 +4,7 @@
  * Writes go through `/api/admin/families*`, `/api/admin/users/{uid}` and `/api/family/members`. */
 
 import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Autocomplete from "@mui/material/Autocomplete";
 import Button from "@mui/material/Button";
@@ -15,6 +16,7 @@ import DialogTitle from "@mui/material/DialogTitle";
 import Divider from "@mui/material/Divider";
 import IconButton from "@mui/material/IconButton";
 import Stack from "@mui/material/Stack";
+import Switch from "@mui/material/Switch";
 import Table from "@mui/material/Table";
 import TableBody from "@mui/material/TableBody";
 import TableCell from "@mui/material/TableCell";
@@ -25,8 +27,10 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import LaunchIcon from "@mui/icons-material/Launch";
 
+import { BackupDialog, ExportDialog, ImportDialog } from "@/components/FamilyMoveDialogs";
 import AppShell from "@/components/AppShell";
 import RequireAuth from "@/components/RequireAuth";
+import { getFedState, setFedFamily, type FedState } from "@/lib/federation";
 import { useFamily } from "@/lib/family-context";
 import { ApiError, api } from "@/lib/api";
 import { useLive } from "@/lib/live";
@@ -76,6 +80,38 @@ function AdminFamiliesInner() {
   const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
 
   const [error, setError] = useState<string | null>(null);
+
+  const [fed, setFed] = useState<FedState | null>(null);
+  const loadFed = useCallback(() => {
+    getFedState()
+      .then(setFed)
+      .catch(() => setFed(null));
+  }, []);
+  useEffect(() => {
+    const t = setTimeout(loadFed, 0);
+    return () => clearTimeout(t);
+  }, [loadFed]);
+  async function toggleFed(f: FamilyRow, on: boolean) {
+    setError(null);
+    try {
+      setFed(await setFedFamily(f.id, on));
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to change federation");
+    }
+  }
+
+  const [exportFor, setExportFor] = useState<FamilyRow | null>(null);
+  const [backupFor, setBackupFor] = useState<FamilyRow | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+
+  async function setFrozen(f: FamilyRow, frozen: boolean) {
+    setError(null);
+    try {
+      await api.post(`/admin/families/${encodeURIComponent(f.id)}/${frozen ? "freeze" : "unfreeze"}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to change freeze");
+    }
+  }
 
   const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState(emptyCreateForm);
@@ -191,9 +227,16 @@ function AdminFamiliesInner() {
     <Stack spacing={2}>
       <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">Families</Typography>
+        <Stack direction="row" spacing={1}>
+          <Button onClick={() => setImportOpen(true)}>Import</Button>
+          <Button variant="contained" onClick={() => setCreateOpen(true)}>
+            Create family
+          </Button>
+        </Stack>
       </Stack>
       {error && <Alert severity="error">{error}</Alert>}
 
+      <TableContainer sx={responsiveTableSx(fed ? [2, 6] : [2, 5])}>
         <Table size="small">
           <TableHead>
             <TableRow>
@@ -201,6 +244,7 @@ function AdminFamiliesInner() {
               <TableCell>Admins</TableCell>
               <TableCell>Members</TableCell>
               <TableCell>Devices</TableCell>
+              {fed && <TableCell>Federation</TableCell>}
               <TableCell>Created</TableCell>
               <TableCell />
             </TableRow>
@@ -208,6 +252,9 @@ function AdminFamiliesInner() {
           <TableBody>
             {families.map((f) => (
               <TableRow key={f.id} hover sx={{ cursor: "pointer" }} onClick={() => openDetail(f)}>
+                <TableCell>
+                  {f.name} {f.frozen && <Chip size="small" color="info" label="Frozen" sx={{ ml: 0.5 }} />}
+                </TableCell>
                 <TableCell>
                   <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
                     {(countsByFamily.admins.get(f.id) ?? []).map((a) => (
@@ -217,8 +264,45 @@ function AdminFamiliesInner() {
                 </TableCell>
                 <TableCell>{countsByFamily.members.get(f.id) ?? 0}</TableCell>
                 <TableCell>{countsByFamily.deviceCounts.get(f.id) ?? 0}</TableCell>
+                {fed && (
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Switch
+                      size="small"
+                      checked={fed.families.find((x) => x.id === f.id)?.enabled ?? false}
+                      onChange={(e) => void toggleFed(f, e.target.checked)}
+                      slotProps={{ input: { "aria-label": `Federation for ${f.name}` } }}
+                    />
+                  </TableCell>
+                )}
                 <TableCell>{formatCreatedAt(f)}</TableCell>
                 <TableCell>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void setFrozen(f, !f.frozen);
+                    }}
+                  >
+                    {f.frozen ? "Unfreeze" : "Freeze"}
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExportFor(f);
+                    }}
+                  >
+                    Export
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBackupFor(f);
+                    }}
+                  >
+                    Back up
+                  </Button>
                   <IconButton
                     size="small"
                     aria-label="open as family"
@@ -235,6 +319,13 @@ function AdminFamiliesInner() {
           </TableBody>
         </Table>
       </TableContainer>
+
+      <ExportDialog
+        family={exportFor ? { id: exportFor.id, name: exportFor.name, frozen: !!exportFor.frozen } : null}
+        onClose={() => setExportFor(null)}
+      />
+      <BackupDialog family={backupFor ? { id: backupFor.id, name: backupFor.name } : null} onClose={() => setBackupFor(null)} />
+      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
 
       <Dialog fullScreen={fullScreen} open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Create family</DialogTitle>

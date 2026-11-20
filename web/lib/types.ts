@@ -31,15 +31,41 @@ export interface UserDoc {
 }
 
 /** `families/{fid}.settings`. */
+export interface FamilySettingsDoc {
+  notices: { pager: boolean };
+  linkChecks: boolean;
+  topup: { mode: "off" | "limited" | "unlimited"; perMonth: number };
+}
+
 export interface FamilyDoc {
   name: string;
+  /** Absent when the relay defaults apply. */
+  settings?: FamilySettingsDoc;
   blockedNumbers: string[];
   createdAt: Timestamp | null;
   createdBy: string;
+  /** `GET /api/family` only: hooks that also receive this family's messages. */
+  hooks?: { id?: string; name: string; mode: string; host: string }[];
+  /** `GET /api/family` only: federation is effectively on (server and family switch). */
+  federation?: boolean;
+  /** Set by `POST /api/admin/families/{fid}/freeze` (family move). */
+  frozen?: boolean;
 }
 
 // A family admin's inbox of things needing a decision. `chat_unknown`: a bridged Google Chat
 // conversation nobody subscribed. `hook_down`: a hook failed three calls running (super only).
+export type AlertKind =
+  | "new_conversation"
+  | "sms_unknown"
+  | "contact_request"
+  | "chat_unknown"
+  | "hook_flag"
+  | "hook_down"
+  | "system"
+  | "fed_contact"
+  | "fed_unknown"
+  | "fed_moved"
+  | "fed_reauth";
 export type AlertStatus = "open" | "handled" | "dismissed";
 
 export interface AlertDoc {
@@ -65,6 +91,19 @@ export interface AlertDoc {
   isGroup?: boolean;
   people?: string[];
   source?: BridgeSource;
+  // `hook_flag` / `hook_down`: the hook's title (<= 60) and which hook.
+  title?: string | null;
+  hookId?: string;
+  hookName?: string;
+  // `system`: `code` is e.g. `bridge_offline`, `key` the bridge / peer / conversation.
+  code?: string;
+  key?: string;
+  // `fed_*`: the link and the other family's name and host (the NEW host for `fed_moved`).
+  fedLinkId?: string;
+  fedName?: string;
+  fedHost?: string;
+  fedRid?: string;
+  fedOldHost?: string;
   convKey: string | null;
   contactRequestKey: string | null;
   decidedAt: Timestamp | null;
@@ -192,6 +231,9 @@ export interface DeliveryDoc {
   state: DeliveryState;
   attempts: number;
   externalId: string | null;
+  // A `fed` delivery: `server` is the other family's name, `serverHost` its host.
+  server?: string | null;
+  serverHost?: string | null;
   error: string | null;
   sentTs: number | null;
   shownTs: number | null;
@@ -215,6 +257,8 @@ export interface MessageDoc {
   kind: MessageKind;
   body: string | null;
   loc: MessageLocDoc | null;
+  // The retention sweep scrubbed the coordinates.
+  locExpired?: boolean;
   wireId: string | null;
   originBackendKind: string | null;
   originBackendId: string | null;
@@ -229,6 +273,15 @@ export interface MessageDoc {
   // Every family with a uid in this message; lets the family-admin monitor thread query
   // `familyIds array-contains fam` without being in `uids`.
   familyIds?: string[];
+  // What each hook said about this message, keyed by hook id.
+  hooks?: Record<string, MessageHookDoc>;
+}
+
+export interface MessageHookDoc {
+  action: string;
+  labels?: string[];
+  reason?: string | null;
+  at?: number | string | null;
 }
 
 export interface ConversationDoc {
@@ -249,9 +302,26 @@ export interface ConversationDoc {
   familyIds?: string[];
 }
 
-
+// Plain day counts; a legacy doc may carry `messages`/`locations` `{n, unit}` instead.
+export interface RetentionSettingsDoc {
+  messagesDays?: number;
+  locationsDays?: number;
+  alertsDays?: number;
+  batteryDays?: number;
+  messages?: { n: number; unit: "days" | "weeks" };
+  locations?: { n: number; unit: "days" | "weeks" };
 }
 
+/** `settings/meta.lastSweep`. */
+export interface LastSweepDoc {
+  at: Timestamp | null;
+  counts: Record<string, number>;
+  oldest: Record<string, Timestamp | null>;
+}
+
+export interface MetaSettingsDoc {
+  lastSweepAt?: Timestamp | null;
+  lastSweep?: LastSweepDoc | null;
 }
 
 // A loc_req never `fulfilled` expires 15 minutes after creation (derived; docs/PROTOCOL.md §13.4).
@@ -272,6 +342,80 @@ export interface BridgeStatus {
   version?: string | null;
   error?: string | null;
   unpaired?: boolean;
+  charging?: boolean | null;
+  batteryExempt?: boolean | null;
+}
+
+// `since` is epoch seconds; `flags` names what is degraded (e.g. "sms", "listener").
+export interface BridgeHealth {
+  state: "ok" | "offline" | "degraded";
+  since: number;
+  flags: string[];
+  notifiedAt: number | null;
+}
+
+// Epoch-second times.
+export interface CarrierView {
+  id: string;
+  name: string;
+  manual: boolean;
+  autoId: string;
+  canCheck: boolean;
+  canTopup: boolean;
+  texts: number | null;
+  unlimited: boolean;
+  source: "carrier" | "manual" | "estimate" | null;
+  balanceAt: number | null;
+  sentSince: number;
+  level: "ok" | "low" | "out" | string;
+  lastCheckAt: number | null;
+  unknownReplies: number;
+  estimateOnly: boolean;
+}
+
+export interface CarrierChoice {
+  id: string;
+  name: string;
+  canCheck: boolean;
+  canTopup: boolean;
+}
+
+export interface CarrierLogRow {
+  id: string;
+  at: ApiTime;
+  dir: "in" | "out" | string;
+  party: string;
+  text: string;
+  kind: string;
+  detail: string | null;
+}
+
+export interface CarrierOut {
+  carrier: CarrierView;
+  carriers: CarrierChoice[];
+  log: CarrierLogRow[];
+}
+
+export interface TopupRow {
+  id: string;
+  pack: string;
+  packLabel: string;
+  texts: number;
+  by: string;
+  at: string;
+  // requested | confirmed | failed | unconfirmed (failed does not count)
+  state: "requested" | "confirmed" | "failed" | "unconfirmed" | string;
+  note: string | null;
+}
+
+export interface TopupsOut {
+  mode: "off" | "limited" | "unlimited" | string;
+  perMonth: number | null;
+  used: number;
+  allowed: boolean;
+  reason: string | null;
+  packs: { id: string; label: string; texts: number }[];
+  history: TopupRow[];
 }
 
 export interface BridgeRow {
@@ -289,6 +433,9 @@ export interface BridgeRow {
   status: BridgeStatus;
   caps: { sms: boolean; gchat: boolean; gvoice: boolean; whatsapp: boolean };
   createdAt: ApiTime;
+  // Null until the relay has evaluated the bridge / unpaired.
+  health?: BridgeHealth | null;
+  carrier?: CarrierView | null;
 }
 
 export type BridgeConversationStatus = "seen" | "subscribed" | "ignored" | "paused";
@@ -319,6 +466,8 @@ export interface BridgeConversationRow {
   pagerName: string | null;
   customName: boolean;
   alertId: string | null;
+  // Epoch seconds. Null until the link worked or failed.
+  health?: { state: "ok" | "failing" | "unreachable"; okAt: number | null; failAt: number | null; reason: string | null } | null;
   // Subscribed / paused rows only.
   alias?: string | null;
   canReply?: boolean | null;

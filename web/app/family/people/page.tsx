@@ -25,10 +25,14 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import FedLinksSection from "@/components/FedLinksSection";
+import FamilySettingsSection from "@/components/FamilySettingsSection";
 import MemberDrawer, { type MemberDrawerMember } from "@/components/MemberDrawer";
 import RequireAuth from "@/components/RequireAuth";
 import { deviceName } from "@/lib/devices";
+import { ApiError, api, createPersonAccount } from "@/lib/api";
 import { AUTH_BACKEND } from "@/lib/auth";
+import { looksLikeEmail } from "@/lib/emailList";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import { useLive } from "@/lib/live";
 import { familyDevicesQuery, familyMembersQuery } from "@/lib/live/queries";
@@ -55,15 +59,24 @@ function FamilyPeopleInner() {
   const [form, setForm] = useState(emptyForm);
   const [selected, setSelected] = useState<MemberDrawerMember | null>(null);
   const [familyName, setFamilyName] = useState<string | null>(null);
+  const [familySettings, setFamilySettings] = useState<FamilyDoc["settings"]>(undefined);
+  const [familyHooks, setFamilyHooks] = useState<NonNullable<FamilyDoc["hooks"]>>([]);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [familyFederation, setFamilyFederation] = useState<boolean | undefined>(undefined);
+  const [signInFor, setSignInFor] = useState<MemberRow | null>(null);
+  const [signInEmail, setSignInEmail] = useState("");
+  const [signInError, setSignInError] = useState<string | null>(null);
   const [invite, setInvite] = useState<{ name: string; code: string; expiresAt: string } | null>(null);
 
   const loadFamily = useCallback(async () => {
     try {
       const fam = await api.get<FamilyDoc>(`/family${familyQuery()}`);
       setFamilyName(fam.name);
+      setFamilyHooks(fam.hooks ?? []);
+      setFamilySettings(fam.settings);
+      setFamilyFederation(fam.federation);
     } catch {
       // Header just stays blank; the members table is unaffected.
     }
@@ -75,6 +88,11 @@ function FamilyPeopleInner() {
     api
       .get<FamilyDoc>(`/family${familyQuery()}`)
       .then((fam) => {
+        if (!live) return;
+        setFamilyName(fam.name);
+        setFamilyHooks(fam.hooks ?? []);
+        setFamilySettings(fam.settings);
+        setFamilyFederation(fam.federation);
       })
       .catch(() => {
         // Header stays blank; the members table is unaffected.
@@ -156,6 +174,18 @@ function FamilyPeopleInner() {
     }
   }
 
+  async function addSignIn() {
+    if (!signInFor) return;
+    setSignInError(null);
+    try {
+      await createPersonAccount(signInFor.uid, signInEmail.trim(), familyQuery());
+      setSignInFor(null);
+      setSignInEmail("");
+    } catch (err) {
+      setSignInError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to add sign-in email");
+    }
+  }
+
   const formValid =
     form.alias.trim() &&
     form.displayName.trim() &&
@@ -185,6 +215,19 @@ function FamilyPeopleInner() {
         </Button>
       </Stack>
 
+      <FamilySettingsSection
+        settings={familySettings}
+        onSaved={(fam) => {
+          setFamilySettings(fam.settings);
+        }}
+      />
+
+      {familyHooks.map((h) => (
+        <Typography key={`${h.name}@${h.host}`} variant="body2" color="text.secondary">
+          Messages in this family are also sent to: {h.name} ({h.host})
+        </Typography>
+      ))}
+
       <TableContainer sx={responsiveTableSx([4,5,6])}>
         <Table size="small">
           <TableHead>
@@ -210,6 +253,22 @@ function FamilyPeopleInner() {
                     label={m.role}
                     color={m.role === "admin" || m.role === "super" ? "primary" : "default"}
                   />
+                </TableCell>
+                <TableCell onClick={(e) => e.stopPropagation()}>
+                  {m.email ?? (m.phone ? `${m.phone} (sign-in)` : "--")}
+                  {AUTH_BACKEND !== "home" && !m.email && !m.phone && m.kind === "person" && (
+                    <Button
+                      size="small"
+                      sx={{ ml: 1 }}
+                      onClick={() => {
+                        setSignInFor(m);
+                        setSignInEmail("");
+                        setSignInError(null);
+                      }}
+                    >
+                      Add sign-in email
+                    </Button>
+                  )}
                 </TableCell>
                 <TableCell>
                   <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
@@ -249,6 +308,11 @@ function FamilyPeopleInner() {
           </TableBody>
         </Table>
       </TableContainer>
+
+      <FedLinksSection
+        federation={familyFederation}
+        members={members.filter((m) => m.kind === "person" && !m.disabled)}
+      />
 
       <Dialog fullScreen={fullScreen} open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add person</DialogTitle>
@@ -300,6 +364,28 @@ function FamilyPeopleInner() {
           <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
           <Button onClick={() => void createMember()} disabled={!formValid}>
             Create
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog fullScreen={fullScreen} open={signInFor !== null} onClose={() => setSignInFor(null)} fullWidth maxWidth="xs">
+        <DialogTitle>Add sign-in email for {signInFor?.displayName}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              autoFocus
+              label="Email"
+              value={signInEmail}
+              onChange={(e) => setSignInEmail(e.target.value)}
+              fullWidth
+            />
+            {signInError && <Alert severity="error">{signInError}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSignInFor(null)}>Cancel</Button>
+          <Button onClick={() => void addSignIn()} disabled={!looksLikeEmail(signInEmail)}>
+            Add
           </Button>
         </DialogActions>
       </Dialog>

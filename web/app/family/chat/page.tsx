@@ -274,6 +274,12 @@ function ChatInner() {
                           {r.onPager === false && <Chip size="small" color="warning" variant="outlined" label="Not on pager" />}
                           {r.status === "paused" && <Chip size="small" label="Paused" />}
                           {r.canReply === false && <Chip size="small" variant="outlined" label="Read only" />}
+                          {r.health?.state === "failing" && (
+                            <Chip size="small" color="warning" label={`Failing${r.health.reason ? `: ${r.health.reason}` : ""}`} />
+                          )}
+                          {r.health?.state === "unreachable" && (
+                            <Chip size="small" color="error" label={`Unreachable${r.health.reason ? `: ${r.health.reason}` : ""}`} />
+                          )}
                         </Stack>
                       </TableCell>
                       <TableCell>

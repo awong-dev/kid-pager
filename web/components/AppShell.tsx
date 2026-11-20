@@ -57,6 +57,8 @@ const adminLinks = [
   { href: "/admin/users", label: "All users" },
   { href: "/admin/devices", label: "All devices" },
   { href: "/admin/allowlist", label: "Allow-list" },
+  { href: "/admin/hooks", label: "Hooks" },
+  { href: "/admin/federation", label: "Federation" },
   { href: "/admin/settings", label: "Retention" },
 ];
 

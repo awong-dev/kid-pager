@@ -1,5 +1,6 @@
 /** Pure helpers for rendering a location fix: zoom, staleness, coarseness and the timeline. */
 
+import type { LocationFixDoc, RetentionSettingsDoc } from "./types";
 
 // A fix older than this reads as stale in `LocationCard`.
 export const STALE_FIX_MS = 30 * 60 * 1000;
@@ -66,6 +67,19 @@ export function whyLabel(
   return WHY_LABELS[why] ?? why;
 }
 
+// `settings/retention.locationsDays` (1-30) bounds the timeline; the sweep is hourly, so the
+// timeline also enforces the window on every read.
+export const DEFAULT_LOCATIONS_DAYS = 7;
+const DAY_MS = 24 * 60 * 60 * 1000;
+export const LOCATION_TIMELINE_WINDOW_MS = DEFAULT_LOCATIONS_DAYS * DAY_MS;
+
+/** The retention window in days from a `settings/retention` doc, clamped to 1-30. */
+export function locationsDaysOf(doc: RetentionSettingsDoc | null | undefined): number {
+  let d = doc?.locationsDays;
+  if (d === undefined && doc?.locations) d = doc.locations.n * (doc.locations.unit === "weeks" ? 7 : 1);
+  if (typeof d !== "number" || !Number.isFinite(d)) return DEFAULT_LOCATIONS_DAYS;
+  return Math.max(1, Math.min(30, Math.round(d)));
+}
 
 /** One timeline row: a stored fix, or the synthetic "position unknown" row (`positionUnknown`). */
 export interface LocationTimelineEntry {
@@ -95,7 +109,10 @@ export interface LocationFixRow extends LocationFixDoc {
 export function buildLocationTimeline(
   fixes: LocationFixRow[],
   lastCellTsS: number | null | undefined,
+  nowMs: number = Date.now(),
+  windowDays: number = DEFAULT_LOCATIONS_DAYS
 ): LocationTimelineEntry[] {
+  const cutoffMs = nowMs - windowDays * DAY_MS;
 
   const entries: LocationTimelineEntry[] = [];
   for (const f of fixes) {

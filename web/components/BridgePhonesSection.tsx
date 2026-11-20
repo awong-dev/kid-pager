@@ -20,7 +20,9 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import BridgeCarrierBlock from "@/components/BridgeCarrierBlock";
 import BridgePairPanel from "@/components/BridgePairPanel";
+import BridgeTopups from "@/components/BridgeTopups";
 import { ApiError } from "@/lib/api";
 import {
   acceptSim,
@@ -34,6 +36,7 @@ import {
 import { useLive } from "@/lib/live";
 import { familyMembersQuery } from "@/lib/live/queries";
 import { formatRelativeAge } from "@/lib/time";
+import type { ApiTime, BridgeHealth, BridgeRow } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
 export interface BridgeMember {
@@ -52,6 +55,26 @@ interface PairState {
 
 function errText(e: unknown, fallback: string): string {
   return e instanceof ApiError ? String(e.detail ?? e.message) : fallback;
+}
+
+// mirrors the relay's `bridge_health.FLAG_WORDS`
+const FLAG_WORDS: Record<string, string> = {
+  sms: "SMS role",
+  listener: "chat alerts",
+  accessibility: "screen access",
+};
+
+export function HealthChip({ health, unpaired }: { health: BridgeHealth | null | undefined; unpaired: boolean }) {
+  if (unpaired) return <Chip size="small" variant="outlined" label="unpaired" />;
+  if (!health) return <Chip size="small" variant="outlined" label="waiting for the relay" />;
+  if (health.state === "offline") {
+    return <Chip size="small" color="error" label={`offline since ${new Date(health.since * 1000).toLocaleString()}`} />;
+  }
+  if (health.state === "degraded") {
+    const what = health.flags.map((f) => FLAG_WORDS[f] ?? f).join(", ");
+    return <Chip size="small" color="warning" label={`degraded: lost ${what}`} />;
+  }
+  return <Chip size="small" color="success" label="ok" />;
 }
 
 function StatusChip({ label, ok }: { label: string; ok: boolean | undefined }) {
@@ -105,6 +128,8 @@ function BridgePhoneCard(p: BridgePhoneCardProps) {
             <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>
               {p.ownerLabel}
             </Typography>
+            <HealthChip health={b.health} unpaired={unpaired} />
+            <Chip size="small" label={`seen ${p.seenLabel}`} variant="outlined" />
             <StatusChip label="listener" ok={st.listenerBound} />
             {sim && <StatusChip label="SMS app" ok={st.smsDefault} />}
             <StatusChip label="accessibility" ok={st.accessibility} />
@@ -129,6 +154,20 @@ function BridgePhoneCard(p: BridgePhoneCardProps) {
           </Box>
 
           <Box sx={{ display: "grid", gridTemplateColumns: "auto 1fr", columnGap: 1.5, alignItems: "center", alignContent: "start", minWidth: 0 }}>
+            <Fact label="Battery">
+              {st.battery != null ? `${st.battery}%` : "--"}
+              {st.charging != null && <Chip size="small" variant="outlined" label={st.charging ? "charging" : "not charging"} />}
+            </Fact>
+            {st.batteryExempt != null && (
+              <Fact label="Battery exemption">
+                <Chip
+                  size="small"
+                  color={st.batteryExempt ? "success" : "warning"}
+                  variant={st.batteryExempt ? "filled" : "outlined"}
+                  label={st.batteryExempt ? "unrestricted" : "restricted (may be stopped)"}
+                />
+              </Fact>
+            )}
             <Fact label="Tier 2">{st.tier2Count ?? 0}</Fact>
             {st.error && (
               <Fact label="Error" color="error.main">
@@ -157,6 +196,17 @@ function BridgePhoneCard(p: BridgePhoneCardProps) {
               </Button>
             </Box>
           </Box>
+
+          {b.paired && b.carrier && (
+            <Box sx={{ minWidth: 0 }}>
+              <BridgeCarrierBlock bridgeId={b.id} carrier={b.carrier} />
+            </Box>
+          )}
+          {b.paired && b.carrier && (
+            <Box sx={{ minWidth: 0 }}>
+              <BridgeTopups bridgeId={b.id} carrierName={b.carrier.name} />
+            </Box>
+          )}
         </Box>
       </CardContent>
     </Card>

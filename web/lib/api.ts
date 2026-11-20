@@ -63,10 +63,48 @@ async function request<T>(
   return data as T;
 }
 
+/** A non-JSON request (file upload / download) with the same auth and error
+ * mapping as `request()`; returns the raw `Response` once it is `ok`. */
+async function requestRaw(
+  method: "GET" | "POST",
+  path: string,
+  extraHeaders: Record<string, string>,
+  body?: Blob
+): Promise<Response> {
+  const headers: Record<string, string> = { ...(await authHeader()), ...extraHeaders };
+  const init: RequestInit = { method, headers, body };
+  if (authProvider.fetchCredentials) init.credentials = authProvider.fetchCredentials;
+  const resp = await fetch(`/api${path}`, init);
+  if (!resp.ok) {
+    const text = await resp.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : undefined;
+    } catch {
+      data = text;
+    }
+    const detail = data && typeof data === "object" && "detail" in data ? (data as { detail: unknown }).detail : data;
+    throw new ApiError(resp.status, detail);
+  }
+  return resp;
+}
+
 export const api = {
+  /** GET a binary body (e.g. a `.kpfam` export) as a Blob. */
+  getBlob: async (path: string, headers: Record<string, string> = {}) =>
+    (await requestRaw("GET", path, headers)).blob(),
+  /** POST a raw file body (`application/octet-stream`) and parse the JSON answer. */
+  postFile: async <T>(path: string, file: Blob, headers: Record<string, string> = {}) =>
+    (await requestRaw("POST", path, { "Content-Type": "application/octet-stream", ...headers }, file)).json() as Promise<T>,
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? {}),
   patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body ?? {}),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body ?? {}),
   del: <T>(path: string) => request<T>("DELETE", path),
 };
+
+/** Give an existing person without an account a sign-in email (cloud build).
+ * POST /api/family/people/{uid}/account {email}. */
+export function createPersonAccount(uid: string, email: string, query = ""): Promise<unknown> {
+  return api.post(`/family/people/${encodeURIComponent(uid)}/account${query}`, { email });
+}

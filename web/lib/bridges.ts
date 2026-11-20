@@ -4,13 +4,18 @@ import { api } from "./api";
 import { familyQuery } from "./family-context";
 import type {
   ApiTime,
+  BridgeHealth,
+  CarrierView,
   BridgeConversationRow,
   BridgeRow,
   BridgeSource,
+  CarrierOut,
   ChatTabOut,
   RosterEntry,
   SubscribeRequest,
   SubscribeResult,
+  TopupRow,
+  TopupsOut,
 } from "./types";
 
 const seg = encodeURIComponent;
@@ -30,6 +35,17 @@ export interface BridgeCode {
 export interface CreatedBridge extends BridgeCode {
   bridge: BridgeRow;
 }
+
+/** `GET /api/me/bridges` (`MyBridgeOut`): the caller's own bridge phones, any member. */
+export interface MyBridge {
+  id: string;
+  label: string;
+  paired: boolean;
+  health: BridgeHealth | null;
+  carrier: CarrierView | null;
+}
+
+export const listMyBridges = () => api.get<MyBridge[]>("/me/bridges");
 
 export const listBridges = () => api.get<BridgeRow[]>(`/family/bridges${familyQuery()}`);
 
@@ -151,3 +167,21 @@ export const WHATSAPP_LINK_MESSAGE = "WhatsApp chats cannot be added by link; wa
 export function isWhatsAppLink(url: string): boolean {
   return /^\s*(whatsapp:\/\/|(https?:\/\/)?([a-z0-9-]+\.)*(wa\.me|whatsapp\.com)(\/|\?|#|$))/i.test(url);
 }
+
+// `carrier*` routes are family-admin only; `topups`/`topup` also accept the bridge's owner.
+export const getCarrier = (id: string) => api.get<CarrierOut>(`/family/bridges/${seg(id)}/carrier${familyQuery()}`);
+
+/** `null` goes back to auto-matching the SIM. */
+export const setCarrierId = (id: string, carrierId: string | null) =>
+  api.put<CarrierOut>(`/family/bridges/${seg(id)}/carrier${familyQuery()}`, { id: carrierId });
+
+export const setCarrierBalance = (id: string, body: { texts: number } | { unlimited: true }) =>
+  api.put<CarrierOut>(`/family/bridges/${seg(id)}/carrier/balance${familyQuery()}`, body);
+
+export const checkCarrierNow = (id: string) =>
+  api.post<{ outboxId: string }>(`/family/bridges/${seg(id)}/carrier/check${familyQuery()}`);
+
+export const getTopups = (id: string) => api.get<TopupsOut>(`/family/bridges/${seg(id)}/topups${familyQuery()}`);
+
+export const requestTopup = (id: string, pack: string) =>
+  api.post<TopupRow>(`/family/bridges/${seg(id)}/topup${familyQuery()}`, { pack });

@@ -34,8 +34,12 @@ import {
   messageQuery,
   threadMessagesQuery,
 } from "@/lib/live/queries";
+import type { DeviceDoc, FamilyDoc, MessageDoc } from "@/lib/types";
 import { threadHeightSx } from "@/lib/layout";
 
+// Body cap in UTF-8 bytes; the counter shows from BODY_COUNTER_FROM_BYTES.
+const BODY_MAX_UTF8_BYTES = 1024;
+const BODY_COUNTER_FROM_BYTES = 900;
 const PAGE_SIZE_STEP = 50;
 // within this distance of the bottom counts as at-bottom
 const AT_BOTTOM_THRESHOLD_PX = 80;
@@ -117,6 +121,7 @@ async function loadModemRows(peerDigits: string, isStaff: boolean): Promise<SmsL
 }
 
 function ThreadInner({ alias }: { alias: string }) {
+  const { me, isFamilyAdmin } = useAuth();
   const { familyId } = useFamily();
   const { aliasToUid, learn, groupByAlias, byUid } = useDirectory();
   const router = useRouter();
@@ -146,6 +151,26 @@ function ThreadInner({ alias }: { alias: string }) {
   // SMS-contact threads also show the pager modem's audit rows
   // (`GET /api/devices/{id}/sms-log`) for every device the viewer can see.
   const peerEntry = peerUid ? byUid(peerUid) : undefined;
+  // Family admins see hook notes; name each hook from the family's hooks list.
+  const [hookNames, setHookNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!isFamilyAdmin) return;
+    let live = true;
+    api
+      .get<FamilyDoc>(`/family${familyQuery()}`)
+      .then((fam) => {
+        if (!live) return;
+        const names: Record<string, string> = {};
+        for (const h of fam.hooks ?? []) if (h.id) names[h.id] = h.name;
+        setHookNames(names);
+      })
+      .catch(() => {
+        // Unknown ids keep the plain chip.
+      });
+    return () => {
+      live = false;
+    };
+  }, [isFamilyAdmin]);
   const isExternal = peerEntry?.kind === "external";
   const peerDigits = (peerEntry?.phone ?? "").replace(/\D/g, "");
   const isStaff = me ? me.role !== "member" : false;
@@ -386,6 +411,7 @@ function ThreadInner({ alias }: { alias: string }) {
         meUid={me?.uid ?? null}
         isGroup={Boolean(group)}
         locationAlias={alias}
+        hookNames={hookNames}
         canLoadOlder={Boolean(convKey) && messages.length >= pageSize}
         onLoadOlder={() => {
           // record the pre-prepend scrollHeight for the layout effect
@@ -415,6 +441,8 @@ function ThreadInner({ alias }: { alias: string }) {
               void handleSend();
             }
           }}
+          helperText={bodyBytes >= BODY_COUNTER_FROM_BYTES ? `${bodyBytes}/${BODY_MAX_UTF8_BYTES} bytes` : undefined}
+          error={bodyBytes > BODY_MAX_UTF8_BYTES}
         />
         <Button
           variant="contained"

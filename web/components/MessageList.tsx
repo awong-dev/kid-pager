@@ -12,6 +12,7 @@ import Typography from "@mui/material/Typography";
 import LocationOnIcon from "@mui/icons-material/LocationOn";
 
 import DeliveryChips from "@/components/DeliveryChips";
+import { useAuth } from "@/lib/auth-context";
 import SmsLogBubble from "@/components/SmsLogBubble";
 import type { SmsLogEntry } from "@/lib/smsContacts";
 import { formatClock, isLocReqExpired } from "@/lib/time";
@@ -73,6 +74,13 @@ function LocReqRow({ message, mine, alias }: { message: MessageRow; mine: boolea
 }
 
 function LocMessageRow({ message, mine, alias }: { message: MessageRow; mine: boolean; alias?: string }) {
+  if (message.locExpired || !message.loc) {
+    return (
+      <Typography variant="body2" color="text.secondary" sx={{ my: 0.75, textAlign: mine ? "right" : "left" }}>
+        location (expired)
+      </Typography>
+    );
+  }
   return <LocRequestLinkRow alias={alias} label={`${mine ? "Location you shared" : "Location received"} -- view`} />;
 }
 
@@ -81,13 +89,18 @@ function MessageBubble({
   mine,
   isGroup,
   meUid,
+  hookNames,
 }: {
   message: MessageRow;
   mine: boolean;
   isGroup: boolean;
   meUid: string | null;
+  hookNames?: Record<string, string>;
 }) {
   const atMs = (message.ts ?? 0) * 1000;
+  const { isFamilyAdmin } = useAuth();
+  // Hook labels/reason: family admins only.
+  const hookNotes = isFamilyAdmin ? Object.entries(message.hooks ?? {}) : [];
   return (
     <Stack sx={{ alignItems: mine ? "flex-end" : "flex-start", my: 0.75 }}>
       {isGroup && message.senderAlias && (
@@ -118,6 +131,29 @@ function MessageBubble({
           {formatClock(atMs)}
         </Typography>
       </Box>
+      {hookNotes.map(([hookId, h]) => {
+        const labels = h.labels ?? [];
+        if (labels.length === 0 && !h.reason && (h.action === "allow" || !h.action)) return null;
+        return (
+          <Stack key={hookId} direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center", mt: 0.25 }}>
+            {hookNames?.[hookId] && (
+              <Typography variant="caption" color="text.secondary">
+                {hookNames[hookId]}
+              </Typography>
+            )}
+            {h.action && h.action !== "allow" && <Chip size="small" color="warning" variant="outlined" label={h.action} />}
+            {labels.map((l) => (
+              <Chip key={l} size="small" variant="outlined" label={l} />
+            ))}
+            {h.reason && (
+              <Typography variant="caption" color="text.secondary">
+                {h.reason}
+              </Typography>
+            )}
+          </Stack>
+        );
+      })}
+      {message.senderUid === meUid && <DeliveryChips message={message} />}
     </Stack>
   );
 }
@@ -129,6 +165,8 @@ export interface MessageListProps {
   isGroup: boolean;
   /** Alias for the loc rows' `/location?who=` link; omit for plain text. */
   locationAlias?: string;
+  /** Hook id -> name (the family's hooks list), for the hook notes. */
+  hookNames?: Record<string, string>;
   /** Whether to show the "Load older" button. */
   canLoadOlder: boolean;
   onLoadOlder: () => void;
@@ -145,6 +183,7 @@ export default function MessageList({
   meUid,
   isGroup,
   locationAlias,
+  hookNames,
   canLoadOlder,
   onLoadOlder,
   listRef,
@@ -178,6 +217,7 @@ export default function MessageList({
           if (m.kind === "loc") {
             return <LocMessageRow key={m.id} message={m} mine={mine} alias={locationAlias} />;
           }
+          return <MessageBubble key={m.id} message={m} mine={mine} isGroup={isGroup} meUid={meUid} hookNames={hookNames} />;
         })}
       </Box>
       {showNewMessagesChip && (

@@ -18,6 +18,8 @@ export interface BookEntry {
   phone?: string | null;
   // Set on a bridged Google Chat / Voice / WhatsApp contact (`t:"chat"` on the pager).
   chat?: { source: "gchat" | "gvoice" | "whatsapp" } | null;
+  // Set on a person on a peer server; `reason` is `unpeered`, `fed_reauth` or `fed_off` if blocked.
+  fed?: import("./federation").FedRef | null;
   inFamily: boolean;
   sendable: boolean;
   reason?: string | null;
@@ -135,6 +137,14 @@ export function reasonText(reason?: string | null): string {
       return "Bridge phone not set up";
     case "not_allowed":
       return "Not approved";
+    case "unpeered":
+      return "unpeered";
+    case "no_peer":
+      return "That family is not linked";
+    case "fed_off":
+      return "Federation is off for this family";
+    case "fed_reauth":
+      return "This family link needs re-authorizing";
     default:
       return "Can't message";
   }

@@ -21,6 +21,7 @@ import {
   passkeysAvailable,
   registerPasskey,
 } from "@/lib/auth/home";
+import { takeReturnPath } from "@/lib/returnPath";
 
 export default function SetupPage() {
   return AUTH_BACKEND === "home" ? <HomeSetup /> : <RedirectHome />;
@@ -69,6 +70,7 @@ function HomeSetup() {
       if (passkeysAvailable()) {
         setStep("passkey");
       } else {
+        router.replace(takeReturnPath());
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Setup failed.");
@@ -82,6 +84,7 @@ function HomeSetup() {
     setBusy(true);
     try {
       await registerPasskey();
+      router.replace(takeReturnPath());
     } catch (err) {
       setError(
         err instanceof DOMException && err.name === "NotAllowedError"
@@ -162,6 +165,7 @@ function HomeSetup() {
             <Button variant="contained" disabled={busy} onClick={() => void addPasskey()}>
               Add a passkey
             </Button>
+            <Button disabled={busy} onClick={() => router.replace(takeReturnPath())}>
               Not now
             </Button>
           </Stack>

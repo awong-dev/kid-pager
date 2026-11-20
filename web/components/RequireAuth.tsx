@@ -6,6 +6,7 @@ import Box from "@mui/material/Box";
 import CircularProgress from "@mui/material/CircularProgress";
 
 import { useAuth } from "@/lib/auth-context";
+import { stashReturnPath } from "@/lib/returnPath";
 
 function LoadingScreen() {
   return (
@@ -36,6 +37,7 @@ export default function RequireAuth({
   useEffect(() => {
     if (status === "signed-out" || status === "not-registered") {
       // Home backend with no users yet: first run. Keep the page asked for (and its #fragment).
+      stashReturnPath(`${window.location.pathname}${window.location.search}${window.location.hash}`);
       router.replace(needsSetup ? "/setup" : "/login");
     } else if (status === "signed-in" && !allowed) {
       router.replace("/chat");

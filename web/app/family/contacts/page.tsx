@@ -23,13 +23,16 @@ import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 
 import AppShell from "@/components/AppShell";
+import FedAddContactDialog from "@/components/FedAddContactDialog";
 import RequireAuth from "@/components/RequireAuth";
 import { ApiError, api } from "@/lib/api";
 import type { BookResponse } from "@/lib/book";
 import { useDirectory } from "@/lib/directory";
+import { fedRemoteHost, fedRemoteName, getFamilyFed, type FedLink, type FedRef } from "@/lib/federation";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import { useLive } from "@/lib/live";
 import { allowEdgesOfFamilyQuery } from "@/lib/live/queries";
+import type { AllowEdgeDoc, FamilyDoc } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 import { responsiveTableSx } from "@/lib/tableSx";
 
@@ -40,6 +43,10 @@ interface ContactRow {
   displayName: string;
   approvedFor: string[];
   impliedFor?: string[];
+  // A person on a peer server; `sendable`/`reason` are the peer-state verdict (null otherwise).
+  fed?: FedRef | null;
+  sendable?: boolean | null;
+  reason?: string | null;
 }
 
 interface LinkedEdge {
@@ -58,6 +65,10 @@ function FamilyContactsInner() {
   const { byUid, contacts: people } = useDirectory();
   // contact uid -> member uids whose address book marks it "added from the pager".
   const [addedBy, setAddedBy] = useState<Record<string, string[]>>({});
+  // contact uid -> its server and whether that peering is gone, from the same books.
+  const [fedLinks, setFedLinks] = useState<FedLink[]>([]);
+  const [fedOn, setFedOn] = useState<boolean | undefined>(undefined);
+  const [fedOpen, setFedOpen] = useState(false);
   const [contacts, setContacts] = useState<ContactRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -87,6 +98,29 @@ function FamilyContactsInner() {
     })();
   }, [familyId]);
 
+  // `GET /api/family` says whether federation is on; when off, skip the links request (404).
+  useEffect(() => {
+    let live = true;
+    api
+      .get<FamilyDoc>(`/family${familyQuery()}`)
+      .catch(() => null)
+      .then((fam) => {
+        if (!live) return;
+        const flag = fam?.federation;
+        setFedOn(flag);
+        if (flag !== true) {
+          setFedLinks([]);
+          return;
+        }
+        getFamilyFed()
+          .then((f) => live && setFedLinks(f.links))
+          .catch(() => live && setFedLinks([]));
+      });
+    return () => {
+      live = false;
+    };
+  }, [familyId]);
+
   // The contacts API does not say who added a contact: read each member's book
   // (`GET /api/book?uid=`) and collect the `added` marks.
   useEffect(() => {
@@ -97,10 +131,15 @@ function FamilyContactsInner() {
       members.map((m) =>
         api
           .get<BookResponse>(`/book?uid=${encodeURIComponent(m.uid)}`)
+          .then((b) => ({
+            added: b.entries.filter((e) => e.added && e.uid).map((e) => [e.uid as string, m.uid] as const),
+          }))
+          .catch(() => ({ added: [] as (readonly [string, string])[] }))
       )
     ).then((rows) => {
       if (cancelled) return;
       const out: Record<string, string[]> = {};
+      for (const [peer, owner] of rows.flatMap((r) => r.added)) (out[peer] ??= []).push(owner);
       setAddedBy(out);
     });
     return () => {
@@ -191,6 +230,22 @@ function FamilyContactsInner() {
     <Stack spacing={3}>
       <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
         <Typography variant="h5">Contacts</Typography>
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+          {fedLinks.some((l) => l.state === "active") && (
+            <Button variant="outlined" onClick={() => setFedOpen(true)}>
+              Add from another family
+            </Button>
+          )}
+          <Button
+            variant="contained"
+            onClick={() => {
+              setDialogError(null);
+              setAddOpen(true);
+            }}
+          >
+            Add contact
+          </Button>
+        </Stack>
       </Stack>
       <Typography variant="body2" color="text.secondary">
         Contacts are texted by the pager&apos;s own SMS. Approve a contact for a member (People → Approved) to
@@ -212,7 +267,41 @@ function FamilyContactsInner() {
           </TableHead>
           <TableBody>
             {contacts.map((c) => (
+              <TableRow
+                key={c.uid}
+                hover
+                sx={c.fed && (fedOn === false || c.reason === "fed_off" || c.reason === "fed_reauth") ? { opacity: 0.55 } : undefined}
+              >
                 <TableCell>{c.displayName}</TableCell>
+                <TableCell>
+                  {c.phone ||
+                    (c.fed ? (
+                      <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+                        <Typography variant="body2">
+                          {fedRemoteName(c.fed)}
+                          {fedRemoteHost(c.fed) && (
+                            <Typography component="span" variant="caption" color="text.secondary">
+                              {" "}
+                              {fedRemoteHost(c.fed)}
+                            </Typography>
+                          )}
+                        </Typography>
+                        {(fedOn === false || c.reason === "fed_off") && (
+                          <Chip size="small" variant="outlined" label="Federation is off" />
+                        )}
+                        {fedOn !== false && c.reason === "fed_reauth" && (
+                          <Chip size="small" color="warning" variant="outlined" label="Needs re-authorizing" />
+                        )}
+                        {fedOn !== false && c.sendable === false && c.reason === "unpeered" && (
+                          <Tooltip title="This family is not linked or the link is suspended, so nothing can be sent to this person">
+                            <Chip size="small" color="warning" variant="outlined" label="unlinked" />
+                          </Tooltip>
+                        )}
+                      </Stack>
+                    ) : (
+                      ""
+                    ))}
+                </TableCell>
                 <TableCell>
                   <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
                     {(c.approvedFor ?? []).map((uid) => (
@@ -272,6 +361,16 @@ function FamilyContactsInner() {
           </TableContainer>
         )}
       </Stack>
+
+      {fedOpen && (
+        <FedAddContactDialog
+          open
+          links={fedLinks}
+          members={people.filter((p) => byUid(p.uid)?.familyId === familyId)}
+          onClose={() => setFedOpen(false)}
+          onAdded={() => void loadContacts()}
+        />
+      )}
 
       <Dialog fullScreen={fullScreen} open={addOpen} onClose={() => setAddOpen(false)} fullWidth maxWidth="xs">
         <DialogTitle>Add contact</DialogTitle>

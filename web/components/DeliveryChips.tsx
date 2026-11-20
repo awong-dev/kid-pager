@@ -1,6 +1,7 @@
 import Chip from "@mui/material/Chip";
 import Stack from "@mui/material/Stack";
 
+import { fedDeliveryLabel } from "@/lib/federation";
 import { formatClock, isLocReqExpired } from "@/lib/time";
 import type { DeliveryDoc, DeliveryState, MessageDoc } from "@/lib/types";
 
@@ -34,6 +35,17 @@ const WHERE: Record<string, string> = {
   gchat: "Google Chat",
   sms: "SMS",
   bridge: "Google Chat",
+  fed: "other family",
+};
+
+// Plainer words for stored `DeliveryDoc.error` reasons; others show as written.
+const ERROR_TEXT: Record<string, string> = {
+  unpeered: "no longer linked",
+  no_peer: "not linked",
+  fed_off: "Federation is off for this family",
+  fed_reauth: "This family link needs re-authorizing",
+  peer_offline: "family offline",
+  bridge_offline: "bridge phone offline",
 };
 
 const LABELS: Record<string, Partial<Record<DeliveryState, string>>> = {
@@ -50,14 +62,23 @@ const LABELS: Record<string, Partial<Record<DeliveryState, string>>> = {
 };
 
 /** Chip text saying where a delivery went; unknown kinds fall back to `kind: state`. */
+export function chipLabel(kind: string, state: DeliveryState, opts: { server?: string; error?: string | null } = {}): string {
   const where = WHERE[kind];
   if (!where) return `${kind}: ${state}`;
+  if (kind === "fed") {
+    const server = opts.server ?? "other family";
+    if (state === "queued") return `waiting for ${server}`;
+    if (state === "sent" || state === "shown" || state === "read") return `sent to ${server}`;
+    if (state === "failed") return opts.error ? `failed: ${ERROR_TEXT[opts.error] ?? opts.error}` : "failed";
+  }
+  if (state === "failed") return opts.error ? `${where} failed: ${ERROR_TEXT[opts.error] ?? opts.error}` : `${where} failed`;
   if (state === "expired") return "expired";
   if (state === "fulfilled") return "location received";
   return LABELS[kind]?.[state] ?? `${kind}: ${state}`;
 }
 
 /** Per-backend delivery-state chips read from the message's embedded `deliveries` map. */
+export default function DeliveryChips({ message }: { message: MessageDoc }) {
   const entries = Object.entries(message.deliveries);
   if (entries.length === 0) return null;
 
@@ -66,11 +87,14 @@ const LABELS: Record<string, Partial<Record<DeliveryState, string>>> = {
       {entries.map(([bid, delivery]) => {
         const state = effectiveState(message, delivery);
         const atMs = stateTimeMs(delivery, state);
+        const fed = delivery.kind === "fed" ? fedDeliveryLabel(delivery) : null;
+        const label = `${chipLabel(delivery.kind, state, { server: fed?.name, error: delivery.error })}${atMs ? " " + formatClock(atMs) : ""}`;
         return (
           <Chip
             key={bid}
             size="small"
             label={label}
+            title={fed?.host}
             color={STATE_COLOR[state]}
             variant={state === "queued" ? "outlined" : "filled"}
           />

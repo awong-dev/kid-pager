@@ -130,6 +130,11 @@ export function retentionSettingsQuery(): LiveQuery {
   return { doc: "settings/retention" };
 }
 
+/** The sweep's proof-of-run doc; readable by any registered user. */
+export function metaSettingsQuery(): LiveQuery {
+  return { doc: "settings/meta" };
+}
+
 /** Every device. */
 export function allDevicesQuery(): LiveQuery {
   return { collection: "devices" };

@@ -28,6 +28,7 @@ import { useAuth } from "@/lib/auth-context";
 import { getFirebaseAuth } from "@/lib/firebase";
 
 import HomeLogin from "./HomeLogin";
+import { takeReturnPath } from "@/lib/returnPath";
 
 const EMAIL_LINK_STORAGE_KEY = "pager.signInEmail";
 const E164_RE = /^\+[1-9]\d{1,14}$/;
@@ -54,6 +55,7 @@ function FirebaseLogin() {
 
   useEffect(() => {
     if (status === "signed-in") {
+      router.replace(takeReturnPath());
     }
   }, [status, router]);
 
