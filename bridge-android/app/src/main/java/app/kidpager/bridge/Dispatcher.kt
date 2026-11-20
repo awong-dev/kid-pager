@@ -11,6 +11,7 @@ import kotlin.coroutines.resume
 object Dispatcher {
     private const val TAG = "dispatch"
 
+    data class Outcome(val state: String, val reason: String?, val tier: Int, val parts: Int? = null)
 
     suspend fun dispatch(ctx: Context, item: RelayClient.OutboxItem): Outcome {
         val text = item.text.orEmpty()
@@ -32,7 +33,10 @@ object Dispatcher {
     private suspend fun sms(ctx: Context, id: String, phone: String, text: String, sim: Int?): Outcome {
         if (!Status.smsDefault(ctx)) return Outcome("failed", "sms_not_default", 1)
         if (text.isBlank()) return Outcome("failed", "sms_empty", 1)
+        val (ok, reason, parts) = suspendCancellableCoroutine<Triple<Boolean, String?, Int>> { cont ->
+            SmsSender.send(ctx, id, phone, text, sim) { ok, reason, n -> if (cont.isActive) cont.resume(Triple(ok, reason, n)) }
         }
+        return if (ok) Outcome("sent", null, 1, parts) else Outcome("failed", reason, 1)
     }
 
     private suspend fun chat(ctx: Context, conversationId: String?, link: String?, text: String): Outcome {

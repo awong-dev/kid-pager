@@ -58,6 +58,8 @@ class PhoneNumbersTest {
     fun voiceThreadLinkEncodesPlus() {
         assertEquals("https://voice.google.com/u/0/messages?itemId=t.%2B15551234567", Targets.voiceThreadLink("+15551234567"))
         assertEquals("t.+15551234567", Targets.conversationIdFromLink(Targets.voiceThreadLink("+15551234567")))
+        assertEquals("AAAAxyz", Targets.conversationIdFromLink("https://chat.google.com/room/AAAAxyz/abc"))
+        assertEquals("BBBB", Targets.conversationIdFromLink("https://mail.google.com/chat/u/0/#chat/dm/BBBB"))
         assertEquals(Targets.GCHAT_PKG, Targets.packageForLink("https://chat.google.com/room/AAAAxyz"))
         assertEquals(Targets.GVOICE_PKG, Targets.packageForLink("https://voice.google.com/u/0/messages"))
         assertNull(Targets.packageForLink("https://example.com/room/x"))

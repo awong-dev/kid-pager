@@ -20,6 +20,7 @@ object SmsSender {
     const val ACTION_DELIVERED = "app.kidpager.bridge.SMS_DELIVERED"
     private const val TIMEOUT_MS = 90_000L
 
+    private class Pending(var partsLeft: Int, val parts: Int, val onResult: (Boolean, String?, Int) -> Unit)
     private val pending = HashMap<String, Pending>()
     private val main = Handler(Looper.getMainLooper())
 
@@ -34,8 +35,11 @@ object SmsSender {
         }
     }
 
+    /** `onResult(ok, reason, parts)` fires exactly once. */
+    fun send(ctx: Context, sendId: String, to: String, text: String, subscriptionId: Int?, onResult: (Boolean, String?, Int) -> Unit) {
         val sm = manager(ctx, subscriptionId)
         val parts = sm.divideMessage(text)
+        if (parts.isEmpty()) { onResult(false, "sms_empty", 0); return }
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
         val sent = ArrayList<PendingIntent>()
         val delivered = ArrayList<PendingIntent>()
@@ -47,6 +51,7 @@ object SmsSender {
             sent += PendingIntent.getBroadcast(ctx, ("$sendId/s/$i").hashCode(), s, flags)
             delivered += PendingIntent.getBroadcast(ctx, ("$sendId/d/$i").hashCode(), d, flags)
         }
+        synchronized(pending) { pending[sendId] = Pending(parts.size, parts.size, onResult) }
         main.postDelayed({ finish(sendId, false, "sms_timeout") }, TIMEOUT_MS)
         try {
             sm.sendMultipartTextMessage(to, null, parts, sent, delivered)
@@ -73,6 +78,7 @@ object SmsSender {
     private fun finish(sendId: String, ok: Boolean, reason: String?) {
         val p = synchronized(pending) { pending.remove(sendId) } ?: return
         Log.i(TAG, "result id=$sendId ok=$ok reason=${reason ?: "-"}")
+        p.onResult(ok, reason, p.parts)
     }
 }
 

@@ -41,6 +41,18 @@ latency is at most the poll period. To get the push build:
    `{kind: "outbox"}` data push wakes the outbox worker at once. The FCM token travels in the
    heartbeat body (`fcmToken`).
 
+## Home server: CA and long-poll hint
+
+The app's network security config trusts system CAs **and user-installed CAs** (cleartext stays
+off). Against a home server on `TLS_MODE=selfsigned`, install the server's CA on the phone first:
+Settings -> Security -> Install a certificate -> CA certificate, pick the CA `.pem`, then use the
+`https://` home URL on the setup screen. Let's Encrypt needs none of this.
+
+The relay's pair and heartbeat responses may carry an integer `outboxWaitS` (home server only;
+the cloud relay never sends it). When it is above 0 the phone polls `GET /bridge/outbox?wait=<n>`
+(relay caps at 25 s) and loops at once instead of sleeping the poll interval; 0 or absent keeps
+the 60 s `wait=0` poll.
+
 ## Sideload and set up the phone
 
 ```sh
@@ -160,6 +172,18 @@ SMS event shape and JSON.
   `shortcutId` = the conversation id. Chat *also* posts a non-summary MessagingStyle roll-up of
   the recent messages with **no** `shortcutId` and id 0; spooling it under `pkg|id` would create
   a second conversation on the relay with the same messages, hence the drop.
+- **Chat deep links.** A Chat notification's `shortcutId` is the id in the Chat deep link
+  (`https://chat.google.com/dm/<id>` opens that DM in the Chat app; `mail.google.com/chat/…` has
+  no handler in the Chat app). `Targets.conversationIdFromLink` returns the bare `<id>` for `dm/`,
+  `room/` and `space/` links (Voice uses `itemId`), one id namespace with the notifications, and
+  the listener synthesizes `conversation.link` for every Chat conversation (`Targets.chatLink`:
+  `dm/` for a DM, `room/` for a group), so a Chat send works without a cached reply action. Not
+  verified: the `room/` form, beyond resolving to the same deep-link activity.
+- **Chat tier-2 selectors (Android 11).** Send button is an `ImageButton` id
+  `post_message_button`, content-desc "Post message" (`Targets.SEND_DESCRIPTION` and
+  `SEND_ID_HINTS`); composer `EditText` id `compose_rich_edit_text`; title `TextView` id
+  `action_bar_title`; sender names `TextView` id `user_name`. `inspect()` waits 3 s after the
+  window opens because the message stream is still empty at 1.5 s.
 - **Recent-message dedup.** Besides the Room table (keyed by conversation id, 7 days), the
   listener keeps a process-wide `RecentMessages` window of `(pkg, sender, text, ts)` tuples for
   5 minutes (256 entries) and skips a line already spooled under *any* key (DEBUG

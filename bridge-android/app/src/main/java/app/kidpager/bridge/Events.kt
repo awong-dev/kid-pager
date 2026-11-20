@@ -46,7 +46,9 @@ val WireJson = Json {
     encodeDefaults = true // isGroup:false must be on the wire
 }
 
+/** Field limits the relay enforces with a 422; `_CP` counts code points. */
 object Bounds {
+    const val TEXT_CP = 8192
     const val NAME_CP = 200
     const val CONV_ID_BYTES = 512
     const val BATCH = 50

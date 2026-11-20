@@ -33,6 +33,8 @@ object Targets {
     }
 
     val CHAT_LINK = Regex("^https://(chat\\.google\\.com|mail\\.google\\.com/chat)(/|$)")
+    /** Group 1 is `room`, `dm` or `space`; group 2 is the bare conversation id. */
+    val CHAT_LINK_ID = Regex("/(room|dm|space)/([A-Za-z0-9_-]+)")
     val VOICE_LINK = Regex("^https://voice\\.google\\.com(/|$)")
     val WA_LINK = Regex("^(https://wa\\.me/|https://api\\.whatsapp\\.com/send\\?|whatsapp://send\\?)", RegexOption.IGNORE_CASE)
 
@@ -48,6 +50,13 @@ object Targets {
         "https://voice.google.com/u/0/messages?itemId=t." + URLEncoder.encode(e164, "UTF-8")
 
     fun waLink(e164: String): String = "https://wa.me/" + e164.filter { it.isDigit() }
+
+    /**
+     * `convId` is the bare id that Chat puts in the notification `shortcutId`. The Chat app has
+     * no handler for the `mail.google.com/chat/...` link form.
+     */
+    fun chatLink(convId: String, isGroup: Boolean): String =
+        "https://chat.google.com/" + (if (isGroup) "room/" else "dm/") + convId
 
     /** WhatsApp notification `shortcutId`s: a DM by phone number, a group, a DM by privacy id. */
     val WA_DM_JID = Regex("^(\\d{6,15})@s\\.whatsapp\\.net$")
@@ -67,13 +76,27 @@ object Targets {
                 ?: return null
             return waDmJid(digits)
         }
+        CHAT_LINK_ID.find(link)?.let { return it.groupValues[2] }
         Regex("[?&]itemId=([^&#]+)").find(link)?.let { return java.net.URLDecoder.decode(it.groupValues[1], "UTF-8") }
         return null
     }
 
     /** Google Chat's composer is an `EditText` with id `compose_rich_edit_text`. */
     const val COMPOSER_CLASS_HINT = "EditText"
+    /** Google Chat's send button has contentDescription "Post message". */
+    val SEND_DESCRIPTION = Regex("^(send|post)( message)?$", RegexOption.IGNORE_CASE)
+    /** `post_message_button` is Google Chat's. */
+    val SEND_ID_HINTS = listOf("post_message_button", "send_button", "send")
+    /** `action_bar_title` is Google Chat's. */
+    val TITLE_ID_HINTS = listOf("action_bar_title", "toolbar_title", "title", "conversation_name", "room_name")
+    /** `user_name` is Google Chat's. */
     val SENDER_ID_HINTS = listOf("sender", "author", "user_name", "display_name", "contact_name")
+
+    /** True when the part of the resource id after `/`, lowercased, contains one of the hints. */
+    fun idMatches(viewIdResourceName: String?, hints: List<String>): Boolean {
+        val id = viewIdResourceName?.substringAfter('/')?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+        return hints.any { id.contains(it) }
+    }
 
     val WA_SEARCH_ID_HINTS = listOf("menuitem_search", "search")
     val WA_SEARCH_DESC = Regex("^search$", RegexOption.IGNORE_CASE)

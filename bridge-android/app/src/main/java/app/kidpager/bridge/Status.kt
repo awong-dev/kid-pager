@@ -19,6 +19,15 @@ import kotlinx.serialization.json.put
 
 /** The phone state reported in the heartbeat `status` block, and the `caps` derived from it. */
 object Status {
+    /** `simOperator` is MCC+MNC. */
+    data class Carrier(val simOperator: String?, val simName: String?, val netName: String?) {
+        fun toJson(): JsonObject = buildJsonObject {
+            simOperator?.let { put("simOperator", it) }
+            simName?.let { put("simName", it) }
+            netName?.let { put("netName", it) }
+        }
+    }
+
     data class Snapshot(
         val battery: Int,
         val listenerBound: Boolean,
@@ -31,6 +40,9 @@ object Status {
         val version: String,
         val fcm: Boolean,
         val pollSec: Int,
+        val charging: Boolean? = null,
+        val batteryExempt: Boolean? = null,
+        val carrier: Carrier? = null,
     ) {
         val caps get() = RelayClient.Caps(
             sms = simNumber != null && smsDefault,
@@ -54,6 +66,9 @@ object Status {
             put("fcm", fcm)
             put("pollSec", pollSec)
             put("replyActions", ReplyCache.size())
+            if (charging != null) put("charging", charging)
+            if (batteryExempt != null) put("batteryExempt", batteryExempt)
+            if (carrier != null) put("carrier", carrier.toJson())
         }
     }
 
@@ -69,10 +84,35 @@ object Status {
         version = BuildConfig.VERSION_NAME,
         fcm = BuildConfig.FCM,
         pollSec = Prefs.pollIntervalSec(ctx),
+        charging = charging(ctx),
+        batteryExempt = try { batteryExempt(ctx) } catch (e: Exception) { null },
+        carrier = carrier(ctx),
     )
 
     fun battery(ctx: Context): Int =
         (ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+    /** Null when unreadable. */
+    fun charging(ctx: Context): Boolean? = try {
+        val i = ctx.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+        i?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)?.let { it != 0 }
+    } catch (e: Exception) { null }
+
+    /** Carrier of the default SMS subscription; null when nothing is readable. */
+    @Suppress("MissingPermission")
+    fun carrier(ctx: Context): Carrier? = try {
+        var tm = ctx.getSystemService(TelephonyManager::class.java)
+        val subId = SubscriptionManager.getDefaultSmsSubscriptionId()
+        if (tm != null && subId >= 0) tm = tm.createForSubscriptionId(subId)
+        if (tm == null) null else {
+            val c = Carrier(
+                simOperator = tm.simOperator?.ifBlank { null },
+                simName = tm.simOperatorName?.toString()?.ifBlank { null },
+                netName = tm.networkOperatorName?.toString()?.ifBlank { null },
+            )
+            if (c.simOperator == null && c.simName == null && c.netName == null) null else c
+        }
+    } catch (e: Exception) { null }
 
     fun listenerBound(ctx: Context): Boolean =
         NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)

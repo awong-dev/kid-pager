@@ -61,6 +61,12 @@ object NotificationMapper {
         }
         val phoneFromTitle = if (phoneKeyed) PhoneNumbers.normalize(s.conversationTitle) else null
         // WhatsApp has a deep link only for a phone-JID DM. Google Chat's shortcutId is the id in
+        // its deep link.
+        val link = when {
+            source == Targets.SOURCE_WHATSAPP && !s.isGroup -> Targets.phoneFromWaJid(s.shortcutId)?.let { Targets.waLink(it) }
+            source == Targets.SOURCE_GCHAT -> Targets.chatLink(convId, s.isGroup)
+            else -> null
+        }
         val events = ArrayList<BridgeEvent>()
         val keys = ArrayList<String>()
         var peerPhone: String? = phoneFromIds ?: phoneFromTitle

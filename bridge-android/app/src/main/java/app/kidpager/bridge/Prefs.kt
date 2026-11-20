@@ -50,6 +50,10 @@ object Prefs {
     fun pollIntervalSec(ctx: Context): Int = get(ctx).getInt("pollSec", 60).coerceIn(30, 300)
     fun setPollIntervalSec(ctx: Context, v: Int) = get(ctx).edit().putInt("pollSec", v.coerceIn(30, 300)).apply()
 
+    /** Outbox long-poll seconds hinted by the relay; 0 = plain polling. */
+    fun outboxWaitS(ctx: Context): Int = get(ctx).getInt("outboxWaitS", 0).coerceIn(0, 25)
+    fun setOutboxWaitS(ctx: Context, v: Int) = get(ctx).edit().putInt("outboxWaitS", v.coerceIn(0, 25)).apply()
+
     fun fcmToken(ctx: Context): String? = get(ctx).getString("fcmToken", null)
     fun setFcmToken(ctx: Context, v: String?) = get(ctx).edit().putString("fcmToken", v).apply()
 }

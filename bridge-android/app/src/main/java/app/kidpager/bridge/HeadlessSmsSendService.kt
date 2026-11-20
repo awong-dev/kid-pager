@@ -14,6 +14,7 @@ class HeadlessSmsSendService : Service() {
             val to = intent.data?.schemeSpecificPart
             val text = intent.getStringExtra(Intent.EXTRA_TEXT)
             if (to != null && !text.isNullOrBlank()) {
+                SmsSender.send(this, "quick_${System.currentTimeMillis()}", to, text, null) { _, _, _ -> }
             }
         }
         stopSelf(startId)

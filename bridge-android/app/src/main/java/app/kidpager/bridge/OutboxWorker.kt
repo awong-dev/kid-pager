@@ -29,15 +29,26 @@ class OutboxWorker(private val ctx: Context, private val scope: CoroutineScope) 
 
     private suspend fun loop() {
         while (true) {
+            var failed = false
             if (Prefs.isPaired(ctx)) {
                 try {
                     pollOnce()
                 } catch (e: RelayClient.Unauthorized) {
                     Log.w(TAG, "unauthorized; waiting for re-pair")
+                    failed = true
                 } catch (e: Exception) {
                     Log.w(TAG, "poll failed: ${e.message}")
+                    failed = true
                 }
             }
+            // With a long-poll hint the request itself is the wait, so loop at once; after a
+            // failure back off 2 s so a down relay does not spin.
+            val period = when {
+                Prefs.outboxWaitS(ctx) <= 0 || !Prefs.isPaired(ctx) -> Prefs.pollIntervalSec(ctx) * 1000L
+                failed -> 2000L
+                else -> 0L
+            }
+            withTimeoutOrNull(period) { kicks.receive() }
         }
     }
 
@@ -45,7 +56,10 @@ class OutboxWorker(private val ctx: Context, private val scope: CoroutineScope) 
         flushAcks()
         for (id in tracker.purge()) Log.w(TAG, "ack $id given up after ${AckTracker.MAX_ACK_ATTEMPTS} attempts / 24 h; dropped")
         var more = true
+        var wait = Prefs.outboxWaitS(ctx) // only the first request of a pass may hold
         while (more) {
+            val items = client.outbox(wait).items
+            wait = 0
             more = false
             for (item in items) {
                 if (!tracker.begin(item.id)) continue
@@ -56,6 +70,7 @@ class OutboxWorker(private val ctx: Context, private val scope: CoroutineScope) 
                     Log.e(TAG, "dispatch ${item.id} threw", e)
                     Dispatcher.Outcome("failed", "exception", 1)
                 }
+                tracker.complete(item.id, out.state, out.reason, out.tier, out.parts)
                 Log.i(TAG, "ob=${item.id} kind=${item.kind} src=${item.source ?: "-"} state=${out.state} reason=${out.reason ?: "-"} tier=${out.tier} ms=${System.currentTimeMillis() - started}")
                 more = true
             }
@@ -66,6 +81,7 @@ class OutboxWorker(private val ctx: Context, private val scope: CoroutineScope) 
     private fun flushAcks() {
         for ((id, r) in tracker.pendingAcks()) {
             try {
+                client.ack(id, r.state, r.reason, r.tier, r.parts)
                 tracker.acked(id)
             } catch (e: RelayClient.Unauthorized) {
                 throw e

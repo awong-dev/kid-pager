@@ -15,6 +15,7 @@ class AckTracker(
 
     enum class Phase { IN_FLIGHT, DONE, ACKED }
 
+    data class Result(val state: String, val reason: String?, val tier: Int, val parts: Int? = null)
 
     private class Entry(var phase: Phase, var result: Result?, val startedAt: Long, var attempts: Int = 0)
 
@@ -31,9 +32,11 @@ class AckTracker(
 
     /** The first result for an id wins. */
     @Synchronized
+    fun complete(id: String, state: String, reason: String?, tier: Int, parts: Int? = null): Boolean {
         val e = entries[id] ?: return false
         if (e.phase != Phase.IN_FLIGHT) return false
         e.phase = Phase.DONE
+        e.result = Result(state, reason, tier, parts)
         return true
     }
 

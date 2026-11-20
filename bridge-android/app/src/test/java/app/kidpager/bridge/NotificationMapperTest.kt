@@ -43,6 +43,30 @@ class NotificationMapperTest {
         assertEquals(2, m.dedupKeys.size)
     }
 
+    @Test
+    fun chatDmGetsADmDeepLinkFromItsShortcutId() {
+        val m = NotificationMapper.map(
+            snap(shortcutId = "DMexample01", title = "Grandma", isGroup = false,
+                messages = listOf(SnapshotMessage("Grandma", "hi", 1_700_000_000_000L, false))),
+            noneSeen,
+        )
+        assertEquals(1, m.events.size)
+        assertEquals("DMexample01", m.events[0].conversation.id)
+        assertEquals("https://chat.google.com/dm/DMexample01", m.events[0].conversation.link)
+        assertEquals("DMexample01", Targets.conversationIdFromLink(m.events[0].conversation.link!!))
+    }
+
+    @Test
+    fun chatGroupGetsARoomDeepLinkFromItsShortcutId() {
+        val m = NotificationMapper.map(
+            snap(shortcutId = "ROOMexample", title = "Soccer carpool", isGroup = true,
+                messages = listOf(SnapshotMessage("Alice A", "hi", 1_700_000_000_000L, false))),
+            noneSeen,
+        )
+        assertEquals(1, m.events.size)
+        assertEquals("ROOMexample", m.events[0].conversation.id)
+        assertEquals("https://chat.google.com/room/ROOMexample", m.events[0].conversation.link)
+    }
 
     @Test
     fun conversationKeyUsesShortcutIdWhenPresent() {
@@ -197,10 +221,12 @@ class NotificationMapperTest {
 
     @Test
     fun boundsAreApplied() {
+        val long = "x".repeat(9000)
         val m = NotificationMapper.map(
             snap(title = "t".repeat(300), messages = listOf(SnapshotMessage("n".repeat(300), long, 1L, false))),
             noneSeen,
         )
+        assertEquals(Bounds.TEXT_CP, m.events[0].text.length)
         assertEquals(200, m.events[0].sender.name.length)
         assertEquals(200, m.events[0].conversation.title!!.length)
         assertFalse(Bounds.convId("c".repeat(600)).toByteArray().size > 512)

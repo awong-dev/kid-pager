@@ -37,6 +37,7 @@ class RelayClient(private val ctx: Context) {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS) // must exceed the relay's 25 s cap on outbox ?wait=
         .writeTimeout(20, TimeUnit.SECONDS)
         .callTimeout(60, TimeUnit.SECONDS)
         .build()
@@ -57,9 +58,13 @@ class RelayClient(private val ctx: Context) {
     )
 
     @Serializable
+    data class PairResponse(val bridgeId: String, val token: String, val outboxWaitS: Int = 0)
 
     fun pair(req: PairRequest): PairResponse {
         val body = post("/bridge/pair", WireJson.encodeToString(req), auth = false, retries = 0)
+        val r = WireJson.decodeFromString(PairResponse.serializer(), body)
+        Prefs.setOutboxWaitS(ctx, r.outboxWaitS)
+        return r
     }
 
     fun events(events: List<BridgeEvent>): EventsResponse {
@@ -88,16 +93,21 @@ class RelayClient(private val ctx: Context) {
     @Serializable
     data class OutboxResponse(val items: List<OutboxItem> = emptyList())
 
+    /** `wait` is the long-poll time in seconds; the relay caps it at 25. */
     fun outbox(wait: Int = 0): OutboxResponse {
         val body = get("/bridge/outbox?wait=$wait")
         return WireJson.decodeFromString(OutboxResponse.serializer(), body)
     }
 
     @Serializable
+    data class AckRequest(val state: String, val reason: String? = null, val tier: Int, val parts: Int? = null)
 
+    fun ack(obId: String, state: String, reason: String?, tier: Int, parts: Int? = null) {
+        post("/bridge/outbox/$obId/ack", WireJson.encodeToString(AckRequest(state, reason, tier, parts)))
     }
 
     @Serializable
+    data class HeartbeatResponse(val pending: Int = 0, val outboxWaitS: Int = 0)
 
     /** Returns the relay's count of pending outbox items. */
     fun heartbeat(status: JsonObject, fcmToken: String?): Int {
@@ -107,6 +117,9 @@ class RelayClient(private val ctx: Context) {
         }
         val text = post("/bridge/heartbeat", WireJson.encodeToString(JsonElement.serializer(), body))
         if (text.isBlank()) return 0
+        val r = try { WireJson.decodeFromString(HeartbeatResponse.serializer(), text) } catch (e: Exception) { return 0 }
+        Prefs.setOutboxWaitS(ctx, r.outboxWaitS)
+        return r.pending
     }
 
     private fun get(path: String): String = exec(Request.Builder().url(base() + path).get(), auth = true, retries = 2)

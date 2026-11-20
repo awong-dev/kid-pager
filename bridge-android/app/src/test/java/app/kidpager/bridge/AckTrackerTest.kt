@@ -116,4 +116,22 @@ class AckTrackerPurgeTest {
         t.purge(now = 100L)
         assertEquals(0, t.size())
     }
+
+    @Test
+    fun partsSurviveRoundTrip() {
+        val t = AckTracker()
+        t.begin("ob_1")
+        assertTrue(t.complete("ob_1", "sent", null, 1, 3))
+        assertEquals(listOf("ob_1" to AckTracker.Result("sent", null, 1, 3)), t.pendingAcks())
+        t.ackFailed("ob_1")
+        assertEquals(3, t.pendingAcks().single().second.parts)
+    }
+
+    @Test
+    fun ackBodyCarriesParts() {
+        val sent = WireJson.encodeToString(RelayClient.AckRequest.serializer(), RelayClient.AckRequest("sent", null, 1, 2))
+        assertTrue(sent, sent.contains("\"parts\":2"))
+        val failed = WireJson.encodeToString(RelayClient.AckRequest.serializer(), RelayClient.AckRequest("failed", "x", 1))
+        assertFalse(failed, failed.contains("parts"))
+    }
 }

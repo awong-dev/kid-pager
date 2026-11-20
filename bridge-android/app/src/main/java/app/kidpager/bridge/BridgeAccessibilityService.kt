@@ -41,9 +41,16 @@ class BridgeAccessibilityService : AccessibilityService() {
     /** Null on success, else the ack reason (`no_link`, `app_missing`, `ui_changed`, `unverified`, `timeout`). */
     suspend fun sendViaUi(link: String, text: String): String? = mutex.withLock {
         val pkg = Targets.packageForLink(link) ?: return "no_link"
+        val t0 = System.currentTimeMillis()
         val r: String = withTimeoutOrNull(Targets.TIER2_TIMEOUT_MS) {
             try {
                 if (!open(link, pkg)) return@withTimeoutOrNull "app_missing"
+                // On back-to-back sends the previous window is still leaving: wait for the target
+                // package to be active and accept only a composer that belongs to it.
+                waitFor(Targets.OPEN_TIMEOUT_MS) { root -> root.takeIf { it.packageName == pkg } }
+                    ?: run { Log.i(TAG, "window missing ms=${System.currentTimeMillis() - t0} ${windowInfo()}"); return@withTimeoutOrNull "ui_changed" }
+                delay(500)
+                composeAndSend(text, t0) { isComposer(it) && it.packageName == pkg }
             } finally {
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
@@ -93,12 +100,18 @@ class BridgeAccessibilityService : AccessibilityService() {
             try {
                 if (!open(link, pkg)) return@withTimeoutOrNull null
                 waitFor(Targets.OPEN_TIMEOUT_MS) { root -> root.takeIf { it.packageName == pkg } } ?: return@withTimeoutOrNull null
+                // Google Chat's message stream is still empty 1.5 s after the window opens.
+                delay(3_000)
                 val root = rootInActiveWindow ?: return@withTimeoutOrNull null
                 val title = findFirst(root) { n -> idHas(n, Targets.TITLE_ID_HINTS) && !n.text.isNullOrBlank() }?.text?.toString()
                     ?: root.window?.title?.toString()
                 val people = LinkedHashSet<String>()
                 collect(root) { n -> idHas(n, Targets.SENDER_ID_HINTS) && !n.text.isNullOrBlank() }
                     .forEach { people += it.text.toString().trim() }
+                // Chat ids are bare (no `dm/`/`room/` prefix), so the kind comes from the link itself.
+                val isGroup = when (Targets.CHAT_LINK_ID.find(link)?.groupValues?.get(1)) {
+                    "room", "space" -> true
+                    "dm" -> false
                     else -> people.size > 1
                 }
                 Inspected(convId, title, isGroup, people.take(64))
@@ -109,13 +122,50 @@ class BridgeAccessibilityService : AccessibilityService() {
     }
 
     /** Returns "ok" or an ack reason. */
+    private suspend fun composeAndSend(text: String, t0: Long = System.currentTimeMillis(), composer: (AccessibilityNodeInfo) -> Boolean): String {
+        fun ms() = System.currentTimeMillis() - t0
+        val node = waitFor(Targets.OPEN_TIMEOUT_MS) { root -> findFirst(root, composer) }
+            ?: run { Log.i(TAG, "composer missing ms=${ms()} ${windowInfo()}"); return "ui_changed" }
+        Log.i(TAG, "composer found id=${idSuffix(node)} pkg=${node.packageName} ms=${ms()}")
+        var set = setText(node, text)
+        node.refresh()
+        Log.i(TAG, "set text ok=$set now=\"${node.text?.toString()?.take(30) ?: ""}\" ms=${ms()}")
+        if (!set) {
+            // The node may belong to a window on its way out: settle, find the composer again, retry once.
+            delay(500)
+            val again = rootInActiveWindow?.let { findFirst(it, composer) }
+            if (again != null) {
+                set = setText(again, text)
+                again.refresh()
+                Log.i(TAG, "set text retry ok=$set id=${idSuffix(again)} now=\"${again.text?.toString()?.take(30) ?: ""}\" ms=${ms()}")
+            } else {
+                Log.i(TAG, "set text retry: composer missing ms=${ms()} ${windowInfo()}")
+            }
+            if (!set) return "ui_changed"
+        }
         delay(300)
+        val send = waitFor(3_000) { root -> findFirst(root) { isSendButton(it) } } ?: run {
+            Log.i(TAG, "send missing ms=${ms()} ${windowInfo()}")
+            val seen = rootInActiveWindow?.let { root ->
+                collect(root) { it.isVisibleToUser && it.isClickable }.take(20)
+                    .joinToString(" ") { "${idSuffix(it)}|${it.contentDescription?.toString()?.take(30) ?: "-"}" }
+            }
+            Log.i(TAG, "clickable: ${seen ?: "(no root)"}")
+            return "ui_changed"
+        }
+        if (!clickUp(send)) { Log.w(TAG, "send not clickable id=${idSuffix(send)} ms=${ms()}"); return "ui_changed" }
+        Log.i(TAG, "send clicked id=${idSuffix(send)} ms=${ms()}")
         val needle = text.take(60)
         val shown = waitFor(Targets.VERIFY_TIMEOUT_MS) { root ->
             findFirst(root) { !it.isEditable && it.text?.toString()?.contains(needle) == true }
         }
+        Log.i(TAG, "verify ${if (shown == null) "missed" else "shown"} ms=${ms()}")
         return if (shown == null) "unverified" else "ok"
     }
+
+    private fun windowInfo(): String = "root=${rootInActiveWindow?.packageName ?: "null"} windows=${windows.size}"
+
+    private fun idSuffix(n: AccessibilityNodeInfo): String = n.viewIdResourceName?.substringAfter('/') ?: "-"
 
     private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
         val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
@@ -156,6 +206,8 @@ class BridgeAccessibilityService : AccessibilityService() {
         if (!n.isVisibleToUser) return false
         val desc = n.contentDescription?.toString()?.trim()
         val txt = n.text?.toString()?.trim()
+        return idHas(n, Targets.SEND_ID_HINTS) ||
+            (desc != null && Targets.SEND_DESCRIPTION.matches(desc)) || (txt != null && Targets.SEND_DESCRIPTION.matches(txt))
     }
 
     private fun isWaSearch(n: AccessibilityNodeInfo): Boolean {
@@ -167,6 +219,7 @@ class BridgeAccessibilityService : AccessibilityService() {
     private fun isWaRow(n: AccessibilityNodeInfo, want: String): Boolean =
         n.isVisibleToUser && !n.isEditable && n.text?.toString()?.trim().equals(want, ignoreCase = true)
 
+    private fun idHas(n: AccessibilityNodeInfo, hints: List<String>): Boolean = Targets.idMatches(n.viewIdResourceName, hints)
 
     private fun clickUp(n: AccessibilityNodeInfo): Boolean {
         var cur: AccessibilityNodeInfo? = n
