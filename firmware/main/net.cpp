@@ -938,11 +938,16 @@ extern "C" bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t 
     return ok;
 }
 
+extern "C" bool net_publish_raw(const char *topic, uint8_t *buf, uint16_t len, uint8_t qos, uint16_t *mid)
 {
+    if (mid != NULL) {
+        *mid = 0;
+    }
     if (net_airplane()) {
         return false;
     }
     battstat_raise(BS_MODEM); // attribution only
+    bool ok = s_xport_ops->publish_raw(topic, buf, len, qos, mid);
     if (ok) {
         net_note_radio_event();
     }

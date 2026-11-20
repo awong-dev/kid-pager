@@ -710,6 +710,7 @@ bool book_request(const char *name, const char *ph_or_alias)
         if (w.err) {
             return false;
         }
+        bool ok = net_publish_raw(topic, buf, (uint16_t) w.len, 1, NULL);
         if (ok) {
             ESP_LOGI(TAG, "contact_req %s queued: name=%s ph=%s", id, name, has_ph ? ph_or_alias : "(none)");
         }
@@ -729,6 +730,7 @@ bool book_request(const char *name, const char *ph_or_alias)
     if (wrapped && s_on_wrap) {
         s_on_wrap();
     }
+    bool ok = net_publish_raw(topic, buf, (uint16_t) len, 1, NULL);
     if (ok) {
         ESP_LOGI(TAG, "contact_req %s queued: name=%s ph=%s", id, name, has_ph ? ph_or_alias : "(none)");
     }

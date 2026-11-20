@@ -3716,6 +3716,18 @@ void WalterModem::_processModemRSP(WalterModemCmd* cmd, WalterModemBuffer* buff)
     goto after_processing_logic;
   }
 
+  /*
+   * PAGER PATCH: 1.25 -- keep the mid of "+SQNSMQTTPUBLISH: <mid>" in the command response so
+   * callers can match the later PUBACK URC to the publish.
+   */
+  if(cmd && cmd->atCmd[0] && !strcmp(cmd->atCmd[0], "AT+SQNSMQTTPUBLISH=0,") &&
+     _buffStartsWith(buff, "+SQNSMQTTPUBLISH:")) {
+    const char* rspStr = _buffStr(buff) + _strLitLen("+SQNSMQTTPUBLISH:");
+    cmd->rsp->type = WALTER_MODEM_RSP_DATA_TYPE_MQTT_PUBLISH;
+    cmd->rsp->data.mqttPublishMid = (uint16_t) atoi(rspStr); // atoi() skips the leading space
+    goto after_processing_logic;
+  }
+
   /* MQTT publish event (URC) */
   if(_buffStartsWith(buff, "+SQNSMQTTONPUBLISH:0,")) {
     char* rsp = (char*) _buffStr(buff);

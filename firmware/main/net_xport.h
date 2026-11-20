@@ -18,6 +18,7 @@ typedef struct {
 
     /* net_publish()/net_publish_raw()/net_publish_quiet_wait_ms() */
     bool (*publish)(const char *topic, char *buf, uint16_t len, uint8_t qos);
+    bool (*publish_raw)(const char *topic, uint8_t *buf, uint16_t len, uint8_t qos, uint16_t *mid);
     uint32_t (*publish_quiet_wait_ms)(uint32_t max_wait_ms);
 
     /* net_service_session(); net.cpp applies LTE suppression before calling */

@@ -88,6 +88,7 @@ void net_session_down(void);
 bool net_publish(const char *topic, char *buf, uint16_t len, uint8_t qos);
 
 /* Binary publish; `mid` (nullable) gets the message id. True means accepted, not PUBACKed. */
+bool net_publish_raw(const char *topic, uint8_t *buf, uint16_t len, uint8_t qos, uint16_t *mid);
 
 /* Fires after a liveness SUBSCRIBE is sent and after any QoS 1 publish (open RRC window). */
 typedef void (*net_uplink_window_cb_t)(void);

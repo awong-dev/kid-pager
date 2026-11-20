@@ -1,3 +1,4 @@
+/* Front light PWM: LEDC timer 1, channel 2, 25 kHz, 11-bit on IO12; 10 levels, top = 50 % duty. */
 #include "frontlight.h"
 
 #include "board.h"
@@ -20,6 +21,10 @@ static SemaphoreHandle_t s_mtx;
 static StaticSemaphore_t s_mtx_buf;
 static esp_timer_handle_t s_idle_timer;
 static bool s_inited, s_on, s_configured;
+static uint8_t s_level = FRONTLIGHT_DEFAULT_LEVEL;
+
+/* Gamma-2 spacing; level 1 is floored to 16 counts (312 ns) for the Q2 gate RC through R9. */
+static const uint16_t k_level_duty[FRONTLIGHT_LEVELS] = {16, 41, 92, 164, 256, 369, 502, 655, 829, 1024};
 
 static void idle_cb(void *arg)
 {
@@ -38,6 +43,14 @@ static void init_once(void)
     nvs_handle_t h;
     if (nvs_open("board", NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = 0;
+        if (nvs_get_u8(h, "fl_lvl", &v) == ESP_OK) {
+            if (v >= 1 && v <= FRONTLIGHT_LEVELS) {
+                s_level = v;
+            }
+        } else if (nvs_get_u8(h, "fl_duty", &v) == ESP_OK && v >= 1 && v <= 100) {
+            /* legacy percent key: migrate in RAM only */
+            unsigned l = ((unsigned) v + 5) / 10;
+            s_level = (uint8_t) (l < 1 ? 1 : (l > FRONTLIGHT_LEVELS ? FRONTLIGHT_LEVELS : l));
         }
         nvs_close(h);
     }
@@ -50,10 +63,13 @@ static void init_once(void)
 
 static void apply_locked(void)
 {
+    uint32_t duty = k_level_duty[s_level - 1];
     if (!s_configured) {
         ledc_timer_config_t tc = {
             .speed_mode = FL_MODE,
+            .duty_resolution = LEDC_TIMER_11_BIT,
             .timer_num = FL_TIMER,
+            .freq_hz = 25000,
             .clk_cfg = LEDC_AUTO_CLK,
         };
         ledc_timer_config(&tc);
@@ -95,6 +111,11 @@ void frontlight_set(bool on)
     s_on = on;
     xSemaphoreGive(s_mtx);
     if (changed) {
+        if (on) {
+            ESP_LOGI(TAG, "front light on (level %u)", (unsigned) s_level);
+        } else {
+            ESP_LOGI(TAG, "front light off");
+        }
     }
 }
 
@@ -104,12 +125,16 @@ bool frontlight_is_on(void) { return s_inited && s_on; }
 
 void frontlight_toggle(void) { frontlight_set(!frontlight_is_on()); }
 
+void frontlight_set_level(uint8_t level)
 {
+    if (!board_has_frontlight() || level < 1 || level > FRONTLIGHT_LEVELS) {
         return;
     }
     init_once();
+    s_level = level;
     nvs_handle_t h;
     if (nvs_open("board", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "fl_lvl", level);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -118,6 +143,7 @@ void frontlight_toggle(void) { frontlight_set(!frontlight_is_on()); }
     }
 }
 
+uint8_t frontlight_get_level(void) { return s_level; }
 
 void frontlight_activity(void)
 {

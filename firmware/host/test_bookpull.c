@@ -79,6 +79,51 @@ static void test_book_with_c_is_not_a_nudge(void)
     CHECK(!p.is_nudge, "an empty c:[]/p:[] WITH the keys present must not be treated as a nudge");
 }
 
+/* A contact type of up to 4 bytes ("fed") is kept verbatim; 5 or more rejects the whole book. */
+static void test_book_contact_type_fed(void)
+{
+    uint8_t buf[256];
+    cbor_w_t w;
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 4);
+    cbor_w_tstr(&w, 1, "m_66666666", 10);
+    cbor_w_tstr(&w, 6, "book", 4);
+    cbor_w_uint(&w, 14, 7);
+    cbor_w_array(&w, 18, 3);
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 0, "ann", 3);
+    cbor_w_tstr(&w, 1, "Ann", 3);
+    cbor_w_tstr(&w, 2, "fed", 3);
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 0, "grp1", 4);
+    cbor_w_tstr(&w, 1, "Cousins", 7);
+    cbor_w_tstr(&w, 2, "grp", 3);
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 0, "zed", 3);
+    cbor_w_tstr(&w, 1, "Zed", 3);
+    cbor_w_tstr(&w, 2, "chat", 4);
+    CHECK(!w.err, "test setup: fed fixture must not overflow");
+    book_parsed_t p;
+    CHECK(book_parse(buf, (uint16_t) w.len, false, &p), "a book with a `fed` contact must parse");
+    CHECK(p.n_contacts == 3 && strcmp(p.contacts[0].type, "fed") == 0 &&
+              strcmp(p.contacts[1].type, "grp") == 0 && strcmp(p.contacts[2].type, "chat") == 0,
+          "contact types must be kept verbatim (fed/grp/chat)");
+
+    /* a 5-byte type does not fit the field: the whole envelope is malformed */
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 4);
+    cbor_w_tstr(&w, 1, "m_77777777", 10);
+    cbor_w_tstr(&w, 6, "book", 4);
+    cbor_w_uint(&w, 14, 7);
+    cbor_w_array(&w, 18, 1);
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 0, "ann", 3);
+    cbor_w_tstr(&w, 1, "Ann", 3);
+    cbor_w_tstr(&w, 2, "fedxx", 5);
+    CHECK(!book_parse(buf, (uint16_t) w.len, false, &p),
+          "a `t` of 5 bytes does not fit BOOK_TYPE_MAX and rejects the book");
+}
+
 static void test_nudge_missing_or_bad_url_is_malformed(void)
 {
     uint8_t buf[256];
@@ -353,6 +398,7 @@ int main(void)
 {
     test_nudge_parse_bv_url_no_c_p();
     test_book_with_c_is_not_a_nudge();
+    test_book_contact_type_fed();
     test_nudge_missing_or_bad_url_is_malformed();
     test_rule1();
     test_request_build();

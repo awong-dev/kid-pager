@@ -66,6 +66,7 @@ bool msg_composer_push_char(char c)
     uint8_t want = s_pending_want;
     s_pending_want = 0;
 
+    if ((size_t) s_composer_len + want > MSG_COMPOSER_MAX - 1) {
         return false; // refuse the whole code point atomically, never a partial write, §9.4
     }
 
@@ -243,7 +244,10 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     return true;
 }
 
+size_t msghist_record_encode(const msg_t *m, const char *body, uint32_t seq, uint8_t *out,
+                             size_t out_cap)
 {
+    if (!m || !out || m->body_len > MSG_BODY_MAX_BYTES || (m->body_len > 0 && !body)) {
         return 0;
     }
     size_t off = 0;
@@ -252,7 +256,9 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
         !w_u8(out, out_cap, &off, m->ack_state) || !w_u8(out, out_cap, &off, m->flags) ||
         !w_str_field(out, out_cap, &off, m->id) || !w_str_field(out, out_cap, &off, m->from) ||
         !w_str_field(out, out_cap, &off, m->to) || !w_str_field(out, out_cap, &off, m->sndr) ||
+        !w_str_field(out, out_cap, &off, m->rsn) || /* version 3 */
         !w_u16(out, out_cap, &off, m->body_len) ||
+        !w_bytes(out, out_cap, &off, body, m->body_len)) {
         return 0;
     }
     uint32_t crc = msghist_crc32(out, off);
@@ -262,6 +268,8 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     return off;
 }
 
+bool msghist_record_decode(const uint8_t *buf, size_t len, msg_t *out, uint32_t *out_seq,
+                           char *body_out, size_t body_cap)
 {
     if (!buf || !out) {
         return false;
@@ -271,6 +279,7 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     uint32_t seq;
     int64_t ts;
     uint8_t dir, ack_state, flags;
+    char id[MSG_ID_MAX], from[MSG_FROM_MAX], to[MSG_TO_MAX], sndr[MSG_FROM_MAX], rsn[sizeof(out->rsn)];
     uint16_t body_len;
 
     // Accepts versions 1 (pre-`sndr`) through MSGHIST_REC_VERSION so older persisted messages
@@ -289,6 +298,12 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     if (version >= 2 && !r_str_field(buf, len, &off, sndr, sizeof(sndr))) {
         return false;
     }
+    rsn[0] = '\0';
+    if (version >= 3 && !r_str_field(buf, len, &off, rsn, sizeof(rsn))) {
+        return false;
+    }
+    if (!r_u16(buf, len, &off, &body_len) || (size_t) body_len > MSG_BODY_MAX_BYTES ||
+        off + body_len > len || (body_out && body_cap < (size_t) body_len + 1)) {
         return false;
     }
     const uint8_t *body_ptr = buf + off;
@@ -308,6 +323,12 @@ static bool r_str_field(const uint8_t *buf, size_t len, size_t *off, char *dst, 
     memcpy(out->from, from, sizeof(from));
     memcpy(out->to, to, sizeof(to));
     memcpy(out->sndr, sndr, sizeof(sndr));
+    memcpy(out->rsn, rsn, sizeof(rsn));
+    if (body_out) {
+        memcpy(body_out, body_ptr, body_len);
+        body_out[body_len] = '\0';
+    }
+    out->body_slot = MSG_BODY_NONE;
     out->body_len = body_len;
     out->dir = dir;
     out->ack_state = ack_state;
@@ -384,6 +405,9 @@ void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, c
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_rom_crc.h"
@@ -395,6 +419,7 @@ void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, c
 #include "cbor.h"
 #include "ident.h"
 #include "net.h"
+#include "rcpt.h"
 #include "pubconfirm.h"
 #include "sms.h"
 
@@ -453,6 +478,95 @@ void msg_count_malformed(void)
 
 static msg_t s_thread[MSG_THREAD_DEPTH];
 
+// Body pool allocated once in msg_init(): 32 x 1025 B in PSRAM, else MSG_POOL_INTERNAL_SLOTS internal
+// slots (older rows then show MSG_BODY_PLACEHOLDER). `_locked` functions expect the msg.c lock held.
+#define MSG_POOL_INTERNAL_SLOTS 4
+
+static char *s_pool = NULL;
+static int s_pool_slots = 0;
+static bool s_slot_used[MSG_THREAD_DEPTH];
+
+static void pool_init(void)
+{
+    memset(s_slot_used, 0, sizeof(s_slot_used));
+    if (s_pool != NULL) {
+        return; // already allocated
+    }
+    s_pool = (char *) heap_caps_calloc(MSG_THREAD_DEPTH, MSG_BODY_BUF,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_pool != NULL) {
+        s_pool_slots = MSG_THREAD_DEPTH;
+        ESP_LOGI(TAG, "body pool: %d x %d B in PSRAM", s_pool_slots, MSG_BODY_BUF);
+        return;
+    }
+    s_pool = (char *) heap_caps_calloc(MSG_POOL_INTERNAL_SLOTS, MSG_BODY_BUF,
+                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_pool_slots = (s_pool != NULL) ? MSG_POOL_INTERNAL_SLOTS : 0;
+    ESP_LOGI(TAG, "body pool: no PSRAM, %d internal slot(s) - older rows show \"%s\"", s_pool_slots,
+             MSG_BODY_PLACEHOLDER);
+}
+
+static char *pool_ptr(uint8_t slot) { return s_pool + (size_t) slot * MSG_BODY_BUF; }
+
+static void pool_release_locked(msg_t *m)
+{
+    if (m->body_slot != MSG_BODY_NONE && m->body_slot < s_pool_slots) {
+        s_slot_used[m->body_slot] = false;
+    }
+    m->body_slot = MSG_BODY_NONE;
+}
+
+// Stores `body` for entry `m`, taking a free slot or, with none free, the OLDEST entry's slot.
+static void pool_store_locked(msg_t *m, const char *body)
+{
+    pool_release_locked(m);
+    if (s_pool == NULL || body == NULL || m->body_len > MSG_BODY_MAX_BYTES) {
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < s_pool_slots; i++) {
+        if (!s_slot_used[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = MSG_THREAD_DEPTH - 1; i >= 0; i--) {
+            if (&s_thread[i] != m && s_thread[i].in_use && s_thread[i].body_slot != MSG_BODY_NONE) {
+                slot = s_thread[i].body_slot;
+                s_thread[i].body_slot = MSG_BODY_NONE; // evicted: this row now reads "(text not kept)"
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        return;
+    }
+    s_slot_used[slot] = true;
+    memcpy(pool_ptr((uint8_t) slot), body, m->body_len);
+    pool_ptr((uint8_t) slot)[m->body_len] = '\0';
+    m->body_slot = (uint8_t) slot;
+}
+
+// Copies thread entry `m`'s stored text into out (cap >= body_len + 1 is
+// the caller's job). Returns false when the entry has no body in the pool.
+static bool pool_read_locked(const msg_t *m, char *out, size_t cap)
+{
+    if (s_pool == NULL || m->body_slot == MSG_BODY_NONE || (size_t) m->body_len + 1 > cap) {
+        return false;
+    }
+    memcpy(out, pool_ptr(m->body_slot), m->body_len);
+    out[m->body_len] = '\0';
+    return true;
+}
+
+// Static scratch, one per context: s_ingest_body (modem event task, 8 KB stack), s_tx_body and s_tx_buf
+// (main task). 1280 matches PAGER_MAX_PAYLOAD (docs/PROTOCOL.md §3.3).
+#define MSG_ENVELOPE_MAX 1280
+static char s_ingest_body[MSG_BODY_BUF];
+static char s_tx_body[MSG_BODY_BUF];
+static uint8_t s_tx_buf[MSG_ENVELOPE_MAX];
+
 static bool s_history_lost_pending = false;
 static char s_last_ingest_id[MSG_ID_MAX] = "";
 
@@ -502,10 +616,17 @@ static void seen_add_locked(uint32_t digest)
 }
 
 // Inserts at index 0 of the newest-first ring, evicting the oldest entry (and its pool slot) once full.
+// `body` (body_len bytes, NUL-terminated; NULL = no text) goes into the pool. Caller holds the lock.
+static void thread_insert_locked(const msg_t *entry, const char *body)
 {
+    if (s_thread[MSG_THREAD_DEPTH - 1].in_use) {
+        pool_release_locked(&s_thread[MSG_THREAD_DEPTH - 1]);
+    }
     memmove(&s_thread[1], &s_thread[0], sizeof(msg_t) * (MSG_THREAD_DEPTH - 1));
     s_thread[0] = *entry;
     s_thread[0].in_use = true;
+    s_thread[0].body_slot = MSG_BODY_NONE;
+    pool_store_locked(&s_thread[0], body);
 }
 
 static msg_t *thread_find_locked(const char *id, msg_dir_t dir)
@@ -526,6 +647,11 @@ static msg_t *thread_find_locked(const char *id, msg_dir_t dir)
 #define MSGHIST_NS "msghist"
 
 static bool s_hist_available = false;
+// One shared record scratch (1140 B), static so the 8 KB modem event task never carries it on its
+// stack; guarded by its own static mutex (created in msg_init()).
+static uint8_t s_hist_rec[MSGHIST_REC_MAX];
+static StaticSemaphore_t s_hist_mtx_buf;
+static SemaphoreHandle_t s_hist_mtx = NULL;
 // 0 = never persisted; history_restore() sets this to (max seq found) + 1.
 static uint32_t s_hist_next_seq = 1;
 
@@ -572,22 +698,41 @@ static uint32_t history_next_seq(void)
 // entry whose text is not in the pool is not persisted. Called with the lock released.
 static void history_write_entry(const msg_t *m)
 {
+    if (!s_hist_available || m->hist_seq == 0 || s_hist_mtx == NULL) {
         return;
     }
+    xSemaphoreTake(s_hist_mtx, portMAX_DELAY);
+    size_t len = 0;
+    s_lock();
+    const msg_t *t = thread_find_locked(m->id, (msg_dir_t) m->dir);
+    if (t != NULL && s_pool != NULL && t->body_slot != MSG_BODY_NONE) {
+        len = msghist_record_encode(m, pool_ptr(t->body_slot), m->hist_seq, s_hist_rec,
+                                    sizeof(s_hist_rec));
+    }
+    s_unlock();
     if (len == 0) {
+        ESP_LOGD(TAG, "msghist: nothing to persist for id=%s (text not in pool)", m->id);
+        xSemaphoreGive(s_hist_mtx);
         return; // fail open: this message just isn't persisted this time
     }
     char key[8];
     snprintf(key, sizeof(key), "m%u", (unsigned) (m->hist_seq % MSG_THREAD_DEPTH));
 
     nvs_handle_t h;
+    if (nvs_open_from_partition(MSGHIST_PART, MSGHIST_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_blob(h, key, s_hist_rec, len) == ESP_OK) {
+            nvs_commit(h);
+        }
+        nvs_close(h);
     }
+    xSemaphoreGive(s_hist_mtx);
 }
 
 // Called once from msg_init(), before the msgq recovery paths. Decodes each slot independently (a
 // corrupt or old-version slot is skipped) and restores newest-first by `seq`.
 static void history_restore(void)
 {
+    if (!s_hist_available || s_hist_mtx == NULL) {
         return;
     }
     nvs_handle_t h;
@@ -595,6 +740,8 @@ static void history_restore(void)
         return; // namespace not created yet: msghist mounted fine but nothing was ever written
     }
 
+    // Heap, not static: runs once at boot. If allocation fails the restore is skipped; a pager
+    // without scrollback still delivers pages.
     msg_t *decoded = heap_caps_malloc(sizeof(msg_t) * MSG_THREAD_DEPTH, MALLOC_CAP_8BIT);
     if (decoded == NULL) {
         nvs_close(h);
@@ -603,25 +750,58 @@ static void history_restore(void)
         return;
     }
     uint32_t seqs[MSG_THREAD_DEPTH];
+    int key_slot[MSG_THREAD_DEPTH]; // which "m<slot>" key each decoded header came from
     int n = 0;
     uint32_t max_seq = 0;
 
+    xSemaphoreTake(s_hist_mtx, portMAX_DELAY);
+    // Pass 1: headers only, to learn each record's `seq`.
     for (int slot = 0; slot < MSG_THREAD_DEPTH; slot++) {
         char key[8];
         snprintf(key, sizeof(key), "m%u", (unsigned) slot);
+        size_t len = sizeof(s_hist_rec);
+        if (nvs_get_blob(h, key, s_hist_rec, &len) != ESP_OK) {
             continue; // fewer than 32 messages ever persisted, or a gap: not an error
         }
         uint32_t seq;
+        if (!msghist_record_decode(s_hist_rec, len, &decoded[n], &seq, NULL, 0)) {
             ESP_LOGI(TAG, "msghist: slot %d failed to decode (corrupt or old version), skipped",
                      slot);
             continue;
         }
         seqs[n] = seq;
+        key_slot[n] = slot;
         if (seq > max_seq) {
             max_seq = seq;
         }
         n++;
     }
+
+    int order[MSG_THREAD_DEPTH];
+    int fill = (n > 0) ? msghist_restore_order(seqs, n, order, MSG_THREAD_DEPTH) : 0;
+
+    // Pass 2: newest first, re-read each record's blob and decode its body
+    // straight into a pool slot (as many rows as the pool has slots: all 32
+    // with PSRAM, the newest 4 without).
+    for (int i = 0; i < fill; i++) {
+        decoded[order[i]].body_slot = MSG_BODY_NONE;
+        if (s_pool == NULL || i >= s_pool_slots) {
+            continue;
+        }
+        char key[8];
+        snprintf(key, sizeof(key), "m%u", (unsigned) key_slot[order[i]]);
+        size_t len = sizeof(s_hist_rec);
+        msg_t tmp;
+        uint32_t seq;
+        if (nvs_get_blob(h, key, s_hist_rec, &len) == ESP_OK &&
+            msghist_record_decode(s_hist_rec, len, &tmp, &seq, pool_ptr((uint8_t) i),
+                                  MSG_BODY_BUF) &&
+            seq == seqs[order[i]]) {
+            s_slot_used[i] = true;
+            decoded[order[i]].body_slot = (uint8_t) i;
+        }
+    }
+    xSemaphoreGive(s_hist_mtx);
     nvs_close(h);
 
     if (n == 0) {
@@ -634,6 +814,8 @@ static void history_restore(void)
         s_thread[i] = decoded[order[i]];
         // Restored across a reset.
         s_thread[i].flags |= MSG_F_RECOVERED;
+        // A failure not yet seen is not marked unread again (RAM-only flag).
+        s_thread[i].flags &= (uint8_t) ~MSG_F_FAIL_UNSEEN;
     }
     s_hist_next_seq = max_seq + 1;
     s_unlock();
@@ -825,7 +1007,10 @@ static void warm_recover_replies(void)
             continue;
         }
 
+        char nid[MSG_ID_MAX] = "", nto[MSG_TO_MAX] = "";
+        char *body = s_tx_body; // static scratch, main task, boot time
         uint16_t body_len = 0;
+        if (!msgq_read_reply(i, nid, sizeof(nid), nto, sizeof(nto), body, MSG_BODY_BUF,
                               &body_len)) {
             continue; // NVS body missing/corrupt: msg_pump() still retries from RTC alone
         }
@@ -842,6 +1027,7 @@ static void warm_recover_replies(void)
         // No hist_seq: the row is already in msghist, or msghist is unavailable; a new seq would
         // orphan the original's ring slot.
         s_lock();
+        thread_insert_locked(&entry, body);
         s_unlock();
     }
 }
@@ -869,8 +1055,11 @@ static bool warm_recover_unread(void)
         return true; // msghist already restored this row; RTC metadata is already correct
     }
 
+    char nid[MSG_ID_MAX] = "", nfrom[MSG_FROM_MAX] = "";
+    char *body = s_tx_body; // static scratch, main task, boot time
     int64_t nts = 0;
     uint16_t body_len = 0;
+    if (!msgq_read_unread(nid, sizeof(nid), nfrom, sizeof(nfrom), &nts, body, MSG_BODY_BUF,
                           &body_len)) {
         return true; // RTC says there should be one; NVS body missing — still "had_unread"
     }
@@ -887,6 +1076,7 @@ static bool warm_recover_unread(void)
     // entry.sndr stays "": msg_unread_t has no sndr, so a warm-recovered group page loses its author
     // line (only runs when msghist is unavailable).
     s_lock();
+    thread_insert_locked(&entry, body);
     s_unlock();
     return true;
 }
@@ -896,7 +1086,10 @@ static bool warm_recover_unread(void)
 static void cold_recover_replies(void)
 {
     for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
+        char id[MSG_ID_MAX] = "", to[MSG_TO_MAX] = "";
+        char *body = s_tx_body; // static scratch, main task, boot time
         uint16_t body_len = 0;
+        if (!msgq_read_reply(i, id, sizeof(id), to, sizeof(to), body, MSG_BODY_BUF, &body_len)) {
             continue;
         }
 
@@ -920,6 +1113,7 @@ static void cold_recover_replies(void)
             entry.ack_state = MSG_ACK_UP_PENDING;
             entry.flags = MSG_F_RECOVERED;
             entry.in_use = true;
+            thread_insert_locked(&entry, body);
         }
         s_unlock();
 
@@ -931,8 +1125,11 @@ static void cold_recover_replies(void)
 // True if an orphaned unread message was found and recovered; same split as cold_recover_replies().
 static bool cold_recover_unread(void)
 {
+    char id[MSG_ID_MAX] = "", from[MSG_FROM_MAX] = "";
+    char *body = s_tx_body; // static scratch, main task, boot time
     int64_t ts = 0;
     uint16_t body_len = 0;
+    if (!msgq_read_unread(id, sizeof(id), from, sizeof(from), &ts, body, MSG_BODY_BUF,
                           &body_len)) {
         return false;
     }
@@ -957,6 +1154,7 @@ static bool cold_recover_unread(void)
         entry.flags = MSG_F_RECOVERED;
         entry.in_use = true;
         // entry.sndr stays "" (msg_unread_t has no sndr), as in warm_recover_unread().
+        thread_insert_locked(&entry, body);
     }
     s_unlock();
 
@@ -968,6 +1166,13 @@ static bool cold_recover_unread(void)
 void msg_init(bool rtc_was_valid)
 {
     memset(s_thread, 0, sizeof(s_thread));
+    for (int i = 0; i < MSG_THREAD_DEPTH; i++) {
+        s_thread[i].body_slot = MSG_BODY_NONE;
+    }
+    pool_init();
+    if (s_hist_mtx == NULL) {
+        s_hist_mtx = xSemaphoreCreateMutexStatic(&s_hist_mtx_buf);
+    }
     msg_composer_reset();
     s_history_lost_pending = false;
 
@@ -1024,6 +1229,8 @@ static bool id_shape_ok(const char *s)
 
 static bool body_rules_ok(const char *body, size_t body_len)
 {
+    // 1..1024 UTF-8 bytes, no code-point cap.
+    if (body_len == 0 || body_len > MSG_BODY_MAX_BYTES) {
         return false;
     }
     for (size_t i = 0; i < body_len; i++) {
@@ -1032,9 +1239,11 @@ static bool body_rules_ok(const char *body, size_t body_len)
             return false; // control char, §3.1
         }
     }
+    return true;
 }
 
 // Shared tail of msg_ingest_down_cbor(): dedup (docs/PROTOCOL.md §4.1 rule 7), thread insert, NVS/RTC
+// unread mirror (§9.2-§9.4). Callers have validated every field; `body_str` is read, never kept.
 static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *from_str,
                                    const char *sndr_str, const char *body_str, size_t body_len,
                                    const msg_t **out)
@@ -1095,8 +1304,10 @@ static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *fr
 
     // Full-fidelity NVS write before touching the RAM thread/RTC metadata, with the lock released
     // (flash I/O).
+    msgq_write_unread(id_copy, from_copy, ts, body_str);
 
     s_lock();
+    thread_insert_locked(&entry, body_str);
     if (out) {
         *out = &s_thread[0];
     }
@@ -1142,6 +1353,8 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
     char id_local[MSG_ID_MAX] = "";
     char from_local[MSG_FROM_MAX] = "";
     char sndr_local[MSG_FROM_MAX] = ""; // absent or bad: stays "" (author line falls back to `from`)
+    char *body_local = s_ingest_body; // static scratch: the event task's stack is 8 KB
+    body_local[0] = '\0';
     int64_t ts = 0;
     size_t body_len = 0;
     uint32_t n = 0;
@@ -1235,6 +1448,7 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
         case MK_BODY: {
             const char *s;
             size_t slen;
+            if (!cbor_r_tstr(&r, &s, &slen) || slen >= MSG_BODY_BUF) {
                 msg_count_malformed();
                 return MSG_INGEST_MALFORMED;
             }
@@ -1475,6 +1689,7 @@ bool msg_queue_reply(const char *to, const char *body, uint16_t len)
     entry.flags = 0;
     entry.in_use = true;
     entry.hist_seq = hist_seq; // insert-time msghist write
+    thread_insert_locked(&entry, body);
     s_unlock();
 
     history_write_entry(&entry); // unlocked flash I/O, same discipline as msgq_write_reply() above
@@ -1513,6 +1728,7 @@ bool msg_insert_sms_in(const char *from, const char *body, uint16_t body_len, in
     entry.hist_seq = history_next_seq();
 
     s_lock();
+    thread_insert_locked(&entry, body);
     s_unlock();
 
     history_write_entry(&entry); // unlocked flash I/O
@@ -1547,6 +1763,7 @@ bool msg_insert_sms_out_pending(const char *to, const char *body, uint16_t body_
     entry.hist_seq = history_next_seq(); // insert write; msg_finish_sms_out() below does the terminal one
 
     s_lock();
+    thread_insert_locked(&entry, body);
     s_unlock();
 
     history_write_entry(&entry); // unlocked flash I/O
@@ -1556,6 +1773,91 @@ bool msg_insert_sms_out_pending(const char *to, const char *body, uint16_t body_
         out_id[out_id_cap - 1] = '\0';
     }
     return true;
+}
+
+// The one reply awaiting its broker PUBACK (see msg_pump(); declared here for the rcpt path).
+static pubconfirm_t s_pc;
+static int s_pc_slot = -1; // pending_up slot being awaited, -1 = none
+static char s_pc_id[MSG_ID_MAX];
+
+// Runs on the modem event task: takes the msg lock only to flip the row, then writes msghist and
+// returns the alert request with the lock released.
+bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *alert)
+{
+    if (alert) {
+        alert->valid = false;
+    }
+    rcpt_t r;
+    bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
+    if (!rcpt_parse_cbor(buf, len, sig_present, &r)) {
+        return false;
+    }
+
+    s_lock();
+    msg_t *m = thread_find_locked(r.ref, MSG_DIR_UP);
+    bool found = (m != NULL);
+    rcpt_effect_t e = { false, false, false };
+    msg_t snapshot = { 0 };
+    int freed_slot = -1;
+    if (found) {
+        e = rcpt_apply(&m->ack_state, &m->flags, m->rsn, &r);
+        snapshot = *m;
+        if (e.confirm_pending) {
+            // The row was still awaiting its PUBACK: the receipt proves the relay has it, so release the
+            // pending_up slot as a PUBACK would and stop the wait.
+            for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
+                if (s_rtc->pending_up[i].in_use &&
+                    strncmp(s_rtc->pending_up[i].id, r.ref, MSG_ID_MAX) == 0) {
+                    s_rtc->pending_up[i].in_use = false;
+                    freed_slot = i;
+                    if (s_pc_slot == i) {
+                        pubconfirm_cancel(&s_pc, s_pc.mid);
+                        s_pc_slot = -1;
+                    }
+                    s_save();
+                    break;
+                }
+            }
+        }
+    }
+    s_unlock();
+    if (freed_slot >= 0) {
+        msgq_erase_reply(freed_slot); // unlocked flash I/O; the one write below covers the final state
+        ESP_LOGI(TAG, "rcpt %s: row was still pending, treated as confirmed", r.ref);
+    }
+
+    if (!found) {
+        // The thread is 32 deep: a receipt for an aged-out row is logged and dropped.
+        ESP_LOGI(TAG, "rcpt %s for %s: no matching row, dropped", r.st == RCPT_ST_SENT ? "sent" : "failed",
+                 r.ref);
+        return true;
+    }
+    if (!e.changed) {
+        ESP_LOGD(TAG, "rcpt %s for %s: no change (state %u)", r.st == RCPT_ST_SENT ? "sent" : "failed",
+                 r.ref, (unsigned) snapshot.ack_state);
+        return true;
+    }
+    ESP_LOGI(TAG, "rcpt %s: %s", r.ref,
+             r.st == RCPT_ST_SENT ? "delivered" : "FAILED");
+    history_write_entry(&snapshot); // the third msghist write of a bridged page
+    if (e.alert && alert) {
+        alert->valid = true;
+        strncpy(alert->id, snapshot.id, MSG_ID_MAX - 1);
+        alert->id[MSG_ID_MAX - 1] = '\0';
+        strncpy(alert->peer, snapshot.to, MSG_TO_MAX - 1);
+        alert->peer[MSG_TO_MAX - 1] = '\0';
+    }
+    return true;
+}
+
+void msg_clear_fail_unseen(const char *id)
+{
+    s_lock();
+    msg_t *m = thread_find_locked(id, MSG_DIR_UP);
+    if (m) {
+        m->flags &= (uint8_t) ~MSG_F_FAIL_UNSEEN;
+    }
+    s_unlock();
 }
 
 bool msg_finish_sms_out(const char *id, bool ok)
@@ -1635,6 +1937,7 @@ static bool publish_ack(const char *id, const char *ack_str)
         if (w.err) {
             return false;
         }
+        return net_publish_raw(topic, buf, (uint16_t) w.len, 1, NULL);
     }
 
     bool wrapped = false;
@@ -1650,8 +1953,11 @@ static bool publish_ack(const char *id, const char *ack_str)
     if (wrapped && s_on_epoch_wrap) {
         s_on_epoch_wrap();
     }
+    return net_publish_raw(topic, buf, (uint16_t) len, 1, NULL);
 }
 
+static bool publish_reply(const char *id, const char *to, const char *body, uint16_t body_len,
+                          uint16_t *mid)
 {
     int64_t ts = 0;
     net_get_clock(&ts);
@@ -1666,7 +1972,12 @@ static bool publish_ack(const char *id, const char *ack_str)
         nfields += 2; // n (written below) + sig (appended by auth_sign())
     }
 
+    // 1024-byte body + envelope overhead, <= 1280 (docs/PROTOCOL.md §3.3); static scratch, main task
+    // only
+    uint8_t *buf = s_tx_buf;
+    const size_t buf_cap = MSG_ENVELOPE_MAX;
     cbor_w_t w;
+    cbor_w_init(&w, buf, buf_cap);
     cbor_w_map(&w, nfields);
     cbor_w_uint(&w, MK_V, 1);
     cbor_w_tstr(&w, MK_ID, id, strlen(id));
@@ -1685,6 +1996,7 @@ static bool publish_ack(const char *id, const char *ack_str)
         if (w.err) {
             return false;
         }
+        return net_publish_raw(topic, buf, (uint16_t) w.len, 1, mid);
     }
 
     bool wrapped = false;
@@ -1694,12 +2006,20 @@ static bool publish_ack(const char *id, const char *ack_str)
         return false;
     }
     size_t len = w.len;
+    if (!auth_sign(topic, buf, &len, buf_cap)) {
         return false;
     }
     if (wrapped && s_on_epoch_wrap) {
         s_on_epoch_wrap();
     }
+    return net_publish_raw(topic, buf, (uint16_t) len, 1, mid);
 }
+
+// A reset forgets the awaited reply; its pending_up slot and NVS body remain, so it is published
+// again (same id; the relay dedups).
+
+void msg_on_publish_done(uint16_t mid, bool ok) { pubconfirm_note_urc(&s_pc, mid, ok); }
+void msg_on_mqtt_disconnect(void) { pubconfirm_note_disconnect(&s_pc); }
 
 void msg_pump(void)
 {
@@ -1708,9 +2028,18 @@ void msg_pump(void)
     // Replies go before acks so a typed reply is not stuck behind a pending-ack drain; with
     // MSG_PENDING_UP_MAX at 2, acks are delayed by at most 2 publishes.
     // A reply the modem accepted stays pending_up (body in NVS) until the broker's PUBACK URC for its
+    // mid arrives; one reply is in flight at a time, others fall through to the acks.
+    if (s_pc_slot >= 0 && (!s_rtc->pending_up[s_pc_slot].in_use ||
+                           strncmp(s_rtc->pending_up[s_pc_slot].id, s_pc_id, MSG_ID_MAX) != 0)) {
+        s_pc_slot = -1; // the awaited reply is gone (factory reset): forget it
+        pubconfirm_init(&s_pc);
+    }
     for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
         if (!s_rtc->pending_up[i].in_use) {
             continue;
+        }
+        if (s_pc_slot >= 0 && s_pc_slot != i) {
+            continue; // another reply is awaiting its PUBACK
         }
         msg_pending_up_t *p = &s_rtc->pending_up[i];
         bool too_old = (esp_timer_get_time() - p->created_us) > (int64_t) 2 * 3600 * 1000000;
@@ -1721,9 +2050,60 @@ void msg_pump(void)
         strncpy(to_copy, p->to, MSG_TO_MAX - 1);
         to_copy[MSG_TO_MAX - 1] = '\0';
 
+        // `ok` = this reply is now confirmed by the broker; otherwise one
+        // failed attempt (3 attempts or > 2 h, the existing rule).
+        bool ok = false;
+        if (s_pc_slot == i) {
+            pubconfirm_verdict_t v = pubconfirm_poll(&s_pc, esp_timer_get_time());
+            if (v == PUBCONFIRM_WAIT && !too_old) {
+                continue; // lock still held; no verdict yet
+            }
+            s_pc_slot = -1;
+            ok = (v == PUBCONFIRM_OK);
+            ESP_LOGI(TAG, "reply %s: %s", id_copy,
+                     ok ? "PUBACK received" : (v == PUBCONFIRM_FAIL ? "no PUBACK (failed attempt)" : "too old"));
+            s_unlock();
+        } else {
+            // Body from the RAM thread (full fidelity from the insert); NVS is the fallback when the
+            // pool slot was evicted or the entry scrolled out.
+            char *body_copy = s_tx_body; // static scratch, main task only
+            body_copy[0] = '\0';
+            uint16_t body_len = 0;
+            msg_t *tm = thread_find_locked(id_copy, MSG_DIR_UP);
+            bool have_pool_body = (tm != NULL) && pool_read_locked(tm, body_copy, MSG_BODY_BUF);
+            if (have_pool_body) {
+                body_len = tm->body_len;
+            }
+            s_unlock();
 
+            if (!have_pool_body) {
+                char nid[MSG_ID_MAX] = "", nto[MSG_TO_MAX] = "";
+                uint16_t nvs_len = 0;
+                if (msgq_read_reply(i, nid, sizeof(nid), nto, sizeof(nto), body_copy, MSG_BODY_BUF,
+                                     &nvs_len)) {
+                    body_len = nvs_len;
+                }
             }
 
+            uint16_t mid = 0;
+            bool accepted = (too_old || body_len == 0)
+                                ? false
+                                : publish_reply(id_copy, to_copy, body_copy, body_len, &mid);
+            if (accepted && mid != 0) {
+                // The modem accepted it; wait for the broker. Nothing else changes.
+                strncpy(s_pc_id, id_copy, MSG_ID_MAX - 1);
+                s_pc_id[MSG_ID_MAX - 1] = '\0';
+                s_pc_slot = i;
+                pubconfirm_arm(&s_pc, mid, esp_timer_get_time());
+                ESP_LOGI(TAG, "reply %s published, mid=%u, awaiting PUBACK", id_copy, (unsigned) mid);
+                return;
+            }
+            // mid 0: the modem gave no id, so the PUBACK cannot be matched: confirm on the modem's `OK`.
+            ok = accepted;
+            if (accepted) {
+                ESP_LOGI(TAG, "reply %s published without a mid: confirmed on OK", id_copy);
+            }
+        }
 
         bool freed = false;
         // Terminal-state msghist write: whichever branch flips ack_state makes this the row's last
@@ -1844,6 +2224,42 @@ const msg_t *msg_newest_unread(void)
     }
     s_unlock();
     return found ? &s_unread_snapshot : NULL;
+}
+
+size_t msg_body_copy(const msg_t *m, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (m == NULL) {
+        return 0;
+    }
+    size_t n = 0;
+    bool have = false;
+    s_lock();
+    const msg_t *t = thread_find_locked(m->id, (msg_dir_t) m->dir);
+    if (t != NULL && s_pool != NULL && t->body_slot != MSG_BODY_NONE) {
+        have = true;
+        n = t->body_len;
+        if (n > cap - 1) {
+            n = cap - 1;
+            while (n > 0 && is_utf8_cont((uint8_t) pool_ptr(t->body_slot)[n])) {
+                n--; // never cut a code point in half
+            }
+        }
+        memcpy(out, pool_ptr(t->body_slot), n);
+    }
+    s_unlock();
+    if (!have) {
+        n = strlen(MSG_BODY_PLACEHOLDER);
+        if (n > cap - 1) {
+            n = cap - 1;
+        }
+        memcpy(out, MSG_BODY_PLACEHOLDER, n);
+    }
+    out[n] = '\0';
+    return n;
 }
 
 // Uses msg_peer_of(), so an up message with an empty `to` is attributed to `default_alias` or

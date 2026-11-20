@@ -784,6 +784,12 @@ typedef enum {
   /**
    * @brief PAGER PATCH: 1.4 -- Result of AT+CPMS= (smsConfig()'s storage step).
    */
+  WALTER_MODEM_RSP_DATA_TYPE_SMS_STORAGE,
+  /**
+   * @brief PAGER PATCH: 1.25 -- Result of mqttPublish(): `data.mqttPublishMid` is the message id
+   * the modem reported in `+SQNSMQTTPUBLISH: <mid>`.
+   */
+  WALTER_MODEM_RSP_DATA_TYPE_MQTT_PUBLISH
 } WalterModemRspDataType;
 
 /**
@@ -2952,6 +2958,14 @@ union WalterModemRspData {
    * @brief PAGER PATCH: 1.4 -- AT+CPMS= storage usage/capacity (smsConfig()).
    */
   WalterModemSmsStorageInfo smsStorage;
+
+  /**
+   * @brief PAGER PATCH: 1.25 -- The MQTT message id the modem assigned to a publish
+   * (`+SQNSMQTTPUBLISH: <mid>`), valid when the response type is
+   * WALTER_MODEM_RSP_DATA_TYPE_MQTT_PUBLISH. It is the same id the broker's PUBACK URC
+   * (`+SQNSMQTTONPUBLISH:0,<mid>,<rc>`, WALTER_MODEM_MQTT_EVENT_PUBLISHED) carries.
+   */
+  uint16_t mqttPublishMid;
 };
 
 /**

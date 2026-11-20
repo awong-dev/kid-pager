@@ -23,12 +23,14 @@ extern "C" {
 
 #define BOOK_MAX_CONTACTS 32 /* §14.7 fetch response cap */
 #define BOOK_MAX_REQUESTS 4  /* §4.3 */
+#define BOOK_URL_MAX 201     /* 200 bytes + NUL, key 57 */
 
 // Applied-book entry; `nickname` is device-local and never on the wire.
 typedef struct {
     char alias[BOOK_ALIAS_MAX];
     char name[BOOK_NAME_MAX];
     char nickname[BOOK_NICK_MAX]; /* "" = unset */
+    char type[BOOK_TYPE_MAX];     /* web|sms|chat|grp|fed; sms/chat/fed are bridged */
 } book_contact_t;
 
 typedef struct {

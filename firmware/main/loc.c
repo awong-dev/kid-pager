@@ -954,6 +954,7 @@ static void publish_loc_answer(const char *req_id, bool success, double lat, dou
     }
 
     uint8_t qos = (req_id != NULL) ? 1 : 0; // docs/PROTOCOL.md §13.1
+    if (net_publish_raw(topic, buf, (uint16_t) len, qos, NULL)) {
         ESP_LOGI(TAG, "/loc %s published: req=%s why=%s %s cached=%d cell=%d", id,
                  req_id ? req_id : "(none)", why ? why : "(none)", success ? "fix" : "no_fix",
                  (int) cached, (int) (cell != NULL));

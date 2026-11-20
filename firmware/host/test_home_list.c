@@ -40,6 +40,20 @@ static int g_failures = 0;
         }                                                \
     } while (0)
 
+static char g_body_tab[64][128];
+static int g_body_n = 0;
+
+/* Test double for msg.c's ESP-only msg_body_copy(): body text from the side table. */
+size_t msg_body_copy(const msg_t *m, char *out, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    strncpy(out, g_body_tab[m->body_slot], cap - 1);
+    out[cap - 1] = '\0';
+    return strlen(out);
+}
+
 static msg_t mk_msg(int64_t ts, const char *from, const char *to, const char *body, uint8_t dir,
                      uint8_t ack)
 {
@@ -48,10 +62,33 @@ static msg_t mk_msg(int64_t ts, const char *from, const char *to, const char *bo
     m.ts = ts;
     strncpy(m.from, from ? from : "", sizeof(m.from) - 1);
     strncpy(m.to, to ? to : "", sizeof(m.to) - 1);
+    /* msg_t holds no body text: it goes into this test's side table, indexed by body_slot. */
+    CHECK(g_body_n < 64, "fixture table full");
+    strncpy(g_body_tab[g_body_n], body ? body : "", sizeof(g_body_tab[0]) - 1);
+    m.body_slot = (uint8_t) g_body_n++;
+    m.body_len = (uint16_t) strlen(g_body_tab[m.body_slot]);
     m.dir = dir;
     m.ack_state = ack;
     m.in_use = true;
     return m;
+}
+
+/* A failed receipt marks the peer unread until its tag is seen. */
+static void test_failed_receipt_marks_peer_unread(void)
+{
+    msg_t msgs[2];
+    msgs[0] = mk_msg(300, NULL, "carol", "hi carol", MSG_DIR_UP, MSG_ACK_UP_FAILED);
+    msgs[0].flags = MSG_F_SEND_FAILED | MSG_F_FAIL_UNSEEN;
+    msgs[1] = mk_msg(200, NULL, "mom", "hi mom", MSG_DIR_UP, MSG_ACK_UP_SENT);
+    home_peer_t out[16];
+    int n = home_peers_build(msgs, 2, true, "dad", out, 16);
+    CHECK(n == 2, "two peers expected, got %d", n);
+    CHECK(strcmp(out[0].alias, "carol") == 0 && out[0].unread,
+          "a FAIL_UNSEEN up row must mark its peer unread");
+    CHECK(strcmp(out[1].alias, "mom") == 0 && !out[1].unread, "a plain SENT up row must not");
+    msgs[0].flags = MSG_F_SEND_FAILED; /* seen in Chat: flag cleared */
+    n = home_peers_build(msgs, 2, true, "dad", out, 16);
+    CHECK(!out[0].unread, "once seen, the failed row no longer marks the peer unread");
 }
 
 /* 3 down messages from two peers + 1 up with empty `to`: 3 peers newest-first, unread flags right;
@@ -276,6 +313,7 @@ int main(void)
 {
     test_archive_filter();
     test_three_peers_newest_first_unread();
+    test_failed_receipt_marks_peer_unread();
     test_no_book_default_fallback();
     test_up_with_to();
     test_max_peers_cap();

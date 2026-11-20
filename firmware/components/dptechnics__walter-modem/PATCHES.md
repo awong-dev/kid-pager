@@ -359,3 +359,14 @@ Same shape as 1.8: `_processModemRSP()` stores the last `+COPS: ...` line and th
 `lastCNUM()` and reset with `clearCOPSCNUM()`. The library parses neither command. The application
 sends `AT+COPS?` and `AT+CNUM` through `sendCmd()` (1.20 budget) to show the operator name and the
 SIM's own number.
+
+## 1.25 Keep the message id of `AT+SQNSMQTTPUBLISH` (`src/WalterModem.h`, `src/WalterModem.cpp`)
+
+The modem answers `AT+SQNSMQTTPUBLISH=0,<topic>,<qos>,<len>` with a `+SQNSMQTTPUBLISH: <mid>` line
+and then `OK`; the broker's PUBACK arrives later as the `+SQNSMQTTONPUBLISH:0,<mid>,<rc>` URC. The
+stock parser dropped the first line, so a caller could not tie a PUBACK to its publish.
+
+**Fix**: `_processModemRSP()` parses that line while the command in flight is a publish and stores
+the id in the command's response: a new response type `WALTER_MODEM_RSP_DATA_TYPE_MQTT_PUBLISH`
+and a new `WalterModemRspData` member `mqttPublishMid`, readable after `mqttPublish()` returns
+true. The existing `WALTER_MODEM_MQTT_EVENT_PUBLISHED` event carries the same `mid`.

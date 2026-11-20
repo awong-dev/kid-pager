@@ -15,6 +15,7 @@ int chat_layout(const int *msg_rows, int count, int rows, int scroll, chat_layou
 bool chat_layout_is_last_row_visible(const int *msg_rows, int count, int rows, int scroll,
                                      int msg_index);
 int chat_composer_viewport(const uint8_t *adv, int n, int avail_px, int marker_px, bool *marker);
+int chat_page_step(int rows);
 
 static int g_failures = 0;
 
@@ -138,6 +139,49 @@ static void test_last_row_visible(void)
 }
 
 /* CHAT_MAX_ROWS_PER_MSG is 96 and left/right pages by (visible rows - 1): every row of a 96-row
+ * message shows at some scroll and paging reaches max scroll, at 5 and 3 visible rows. */
+static void test_96_row_message_fully_reachable_by_paging(void)
+{
+    const int rows_per_msg = 96; /* scr_chat.c CHAT_MAX_ROWS_PER_MSG */
+    const int msg_rows[1] = { rows_per_msg };
+    const int visible[2] = { 5, 3 };
+    for (int v = 0; v < 2; v++) {
+        int rows = visible[v];
+        CHECK(chat_page_step(rows) == rows - 1, "page step for %d rows == %d, want %d", rows,
+              chat_page_step(rows), rows - 1);
+        int max_scroll = chat_layout_max_scroll(msg_rows, 1, rows);
+        CHECK(max_scroll == rows_per_msg - rows, "max_scroll == %d, want %d", max_scroll,
+              rows_per_msg - rows);
+
+        bool seen[96] = { false };
+        int scroll = 0;
+        int pages = 0;
+        for (;;) {
+            chat_layout_cell_t cells[6];
+            chat_layout(msg_rows, 1, rows, scroll, cells);
+            for (int r = 0; r < rows; r++) {
+                if (cells[r].msg_index == 0 && cells[r].row_in_msg >= 0 &&
+                    cells[r].row_in_msg < rows_per_msg) {
+                    seen[cells[r].row_in_msg] = true;
+                }
+            }
+            if (scroll >= max_scroll) {
+                break;
+            }
+            scroll += chat_page_step(rows);
+            if (scroll > max_scroll) {
+                scroll = max_scroll; /* clamp_scroll() */
+            }
+            pages++;
+            CHECK(pages < 200, "paging did not terminate");
+        }
+        for (int i = 0; i < rows_per_msg; i++) {
+            CHECK(seen[i], "rows=%d: row %d of the 96-row message never on screen when paging", rows, i);
+        }
+    }
+    CHECK(chat_page_step(1) == 1 && chat_page_step(0) == 1, "page step floor is 1");
+}
+
 static void test_viewport_empty(void)
 {
     bool marker = true; /* deliberately wrong, to check it gets cleared */
@@ -206,6 +250,7 @@ int main(void)
     test_wrapped_message_row_order();
     test_every_row_of_a_tall_message_reachable();
     test_last_row_visible();
+    test_96_row_message_fully_reachable_by_paging();
 
     test_viewport_empty();
     test_viewport_fits_exactly();

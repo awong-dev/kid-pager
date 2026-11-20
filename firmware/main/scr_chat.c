@@ -74,6 +74,12 @@ bool chat_layout_is_last_row_visible(const int *msg_rows, int count, int rows, i
     return cum >= scroll && cum <= scroll + rows - 1;
 }
 
+// One screen minus one line, so the last line of the previous page stays visible.
+int chat_page_step(int rows)
+{
+    return (rows > 1) ? (rows - 1) : 1;
+}
+
 // Index of the first codepoint to draw (the longest suffix that fits) and whether the "…" marker
 // is needed. Returns n with marker true if the marker alone does not fit.
 int chat_composer_viewport(const uint8_t *adv, int n, int avail_px, int marker_px, bool *marker)
@@ -124,6 +130,7 @@ int chat_composer_viewport(const uint8_t *adv, int n, int avail_px, int marker_p
 #include "book.h"
 #include "ime.h"
 #include "sms.h"
+#include "rcpt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -136,6 +143,7 @@ int chat_composer_viewport(const uint8_t *adv, int n, int avail_px, int marker_p
 
 // Row cap per message: a 1024-byte body needs about 35 rows (Latin, large font). Rows beyond the
 // cap cannot be scrolled to.
+#define CHAT_MAX_ROWS_PER_MSG 96
 
 #define CHAT_MAX_VISIBLE_ROWS 6
 
@@ -172,6 +180,7 @@ static int visible_rows(void)
 typedef struct {
     char who[BOOK_NICK_MAX]; // fits a book name/nickname, not just an alias
     char ts[6];
+    char tag[RCPT_TAG_MAX]; // "" = no tag; up rows: rcpt_tag(), down rows: "sms"/"NEW"
     char id[MSG_ID_MAX];
 } chat_row_src_t;
 
@@ -180,10 +189,28 @@ static int s_rows[MSG_THREAD_DEPTH];
 // Copies of the open peer's messages, parallel to s_src[]/s_rows[].
 static msg_t s_entries[MSG_THREAD_DEPTH];
 
+// UI task only.
+static char s_body_scratch[MSG_BODY_BUF];
+
 // Wrapped lines of one message at a time.
 static char s_wrap_scratch[CHAT_MAX_ROWS_PER_MSG][64];
 static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch currently holds lines for
 
+// True when the peer is a book contact whose delivery a bridge reports (type sms/chat/fed).
+static bool peer_is_bridged(const char *peer)
+{
+    size_t nbook = book_contact_count();
+    for (size_t i = 0; i < nbook; i++) {
+        book_contact_t c;
+        if (book_contact_at(i, &c) && strcmp(c.alias, peer) == 0) {
+            return rcpt_peer_is_bridged(c.type);
+        }
+    }
+    return false;
+}
+
+static void load_row_src(const msg_t *m, const char *newest_unread_id, bool peer_bridged,
+                         chat_row_src_t *out)
 {
     strncpy(out->id, m->id, sizeof(out->id) - 1);
     out->id[sizeof(out->id) - 1] = '\0';
@@ -202,10 +229,16 @@ static int s_wrap_cached_msg = -1; // which s_src[] index s_wrap_scratch current
     }
     out->who[sizeof(out->who) - 1] = '\0';
 
+    out->tag[0] = '\0';
     if (dir == (uint8_t) MSG_DIR_UP) {
+        // a device-direct SMS row (x_ id) never gets a bridge receipt
+        rcpt_tag(peer_bridged && strncmp(out->id, "x_", 2) != 0, m->ack_state, m->flags, m->rsn,
+                 out->tag, sizeof(out->tag));
     } else if (strncmp(out->id, "x_", 2) == 0) {
         // "x_" ids are msg_insert_sms_in()'s synthetic namespace: the row arrived by SMS
+        snprintf(out->tag, sizeof(out->tag), "sms");
     } else if (newest_unread_id[0] != '\0' && strcmp(out->id, newest_unread_id) == 0) {
+        snprintf(out->tag, sizeof(out->tag), "NEW");
     }
 }
 
@@ -215,6 +248,7 @@ static int wrap_width_row0(gfx_font_t sz, const chat_row_src_t *src)
     char prefix[BOOK_NICK_MAX + 16];
     snprintf(prefix, sizeof(prefix), "%s %s ", src->who, src->ts);
     int avail = GFX_SCREEN_W - gfx_text_width(sz, prefix);
+    if (src->tag[0] != '\0') {
         avail -= gfx_text_width(sz, src->tag) + 4;
     }
     return avail;
@@ -229,8 +263,11 @@ static int wrap_width_conservative(gfx_font_t sz, const chat_row_src_t *src)
     return (w < CHAT_MIN_WRAP_WIDTH_PX) ? CHAT_MIN_WRAP_WIDTH_PX : w;
 }
 
+static int compute_row_count(gfx_font_t sz, const chat_row_src_t *src, const msg_t *m)
 {
     int width = wrap_width_conservative(sz, src);
+    msg_body_copy(m, s_body_scratch, sizeof(s_body_scratch));
+    int n = gfx_text_wrap(sz, s_body_scratch, width, s_wrap_scratch, CHAT_MAX_ROWS_PER_MSG);
     s_wrap_cached_msg = -1; // the scratch no longer holds any s_src[] message
     if (n < 0) {
         return CHAT_MAX_ROWS_PER_MSG;
@@ -239,9 +276,13 @@ static int wrap_width_conservative(gfx_font_t sz, const chat_row_src_t *src)
 }
 
 // msg_iter_peer() callback; the iteration holds msg.c's lock, so excess entries are dropped.
+static size_t s_collect_count;
 
 static void collect_peer_entry(const msg_t *m, void *ctx)
 {
+    (void) ctx;
+    if (s_collect_count < MSG_THREAD_DEPTH) {
+        s_entries[s_collect_count++] = *m;
     }
 }
 
@@ -253,6 +294,9 @@ static size_t chat_build_rows(gfx_font_t sz)
     char default_alias[BOOK_ALIAS_MAX] = "";
     bool have_default = book_get_default_alias(default_alias, sizeof(default_alias));
 
+    s_collect_count = 0;
+    msg_iter_peer(peer, have_default, default_alias, /*from_newest=*/true, collect_peer_entry, NULL);
+    size_t count = s_collect_count;
 
     const msg_t *nu = msg_newest_unread();
     char newest_unread_id[MSG_ID_MAX] = "";
@@ -261,7 +305,10 @@ static size_t chat_build_rows(gfx_font_t sz)
         newest_unread_id[sizeof(newest_unread_id) - 1] = '\0';
     }
 
+    bool bridged = peer_is_bridged(peer);
     for (size_t i = 0; i < count; i++) {
+        load_row_src(&s_entries[i], newest_unread_id, bridged, &s_src[i]);
+        s_rows[i] = compute_row_count(sz, &s_src[i], &s_entries[i]);
     }
     return count;
 }
@@ -275,6 +322,8 @@ static const char *get_wrapped_line(gfx_font_t sz, int msg_index, int row_in_msg
     }
     if (s_wrap_cached_msg != msg_index) {
         int width = wrap_width_conservative(sz, &s_src[msg_index]);
+        msg_body_copy(&s_entries[msg_index], s_body_scratch, sizeof(s_body_scratch));
+        gfx_text_wrap(sz, s_body_scratch, width, s_wrap_scratch, CHAT_MAX_ROWS_PER_MSG);
         s_wrap_cached_msg = msg_index;
     }
     return s_wrap_scratch[row_in_msg];
@@ -304,6 +353,9 @@ static void mark_visible_read(void)
             id[sizeof(id) - 1] = '\0';
             // PROTOCOL.md §4.1 rule 2: `read` without `shown` back-fills shown_ts
             msg_mark_read(id);
+        } else if (m->dir == (uint8_t) MSG_DIR_UP && (m->flags & MSG_F_FAIL_UNSEEN) != 0 &&
+                   chat_layout_is_last_row_visible(s_rows, (int) count, rows, scroll, (int) i)) {
+            msg_clear_fail_unseen(m->id);
         }
     }
 }
@@ -538,6 +590,7 @@ static void try_send(void)
         s_scroll = 0;
         ui_mark_transition();
     } else {
+        ui_show_toast("send queue full");
     }
 }
 
@@ -552,6 +605,7 @@ static void chat_on_key(input_key_t key)
         if (r.consumed) {
             for (const char *p = r.commit_utf8; *p != '\0'; p++) {
                 if (!msg_composer_push_char(*p)) {
+                    ui_show_toast("message full");
                     break;
                 }
             }
@@ -580,9 +634,11 @@ static void chat_on_key(input_key_t key)
         clamp_scroll();
         break;
     case INPUT_KEY_LEFT:
+        s_scroll += chat_page_step(visible_rows());
         clamp_scroll();
         break;
     case INPUT_KEY_RIGHT:
+        s_scroll -= chat_page_step(visible_rows());
         clamp_scroll();
         break;
     default:
@@ -675,6 +731,7 @@ static void chat_render(void)
                 gfx_text(x, y, sz, get_wrapped_line(sz, cell.msg_index, 0));
 
                 // the tag is always on row 0; wrap_width_row0() reserves room for it
+                if (src->tag[0] != '\0') {
                     int tw = gfx_text_width(sz, src->tag);
                     gfx_text(GFX_SCREEN_W - tw, y, sz, src->tag);
                 }
@@ -694,6 +751,8 @@ static void chat_render(void)
     char counter[24];
     sms_contact_t sms_peek;
     size_t sms_skip = 0;
+    bool sms_counter = composer_targets_sms(msg_composer_text(), &sms_skip, &sms_peek);
+    if (sms_counter) {
         const char *counted = msg_composer_text();
         size_t counted_len = msg_composer_len();
         if (sms_skip <= counted_len) {
@@ -707,14 +766,21 @@ static void chat_render(void)
         size_t used = (enc == SMS_ENC_UCS2) ? m.ucs2_units : m.gsm7_septets;
         snprintf(counter, sizeof(counter), "%u/%u sms", (unsigned) used, (unsigned) limit);
     } else {
+        snprintf(counter, sizeof(counter), "%u/%u", (unsigned) msg_composer_len(),
+                 (unsigned) MSG_BODY_MAX_BYTES);
     }
+    bool show_counter = sms_counter ? (msg_composer_codepoint_count() >= 120)
+                                    : (msg_composer_len() >= MSG_COMPOSER_COUNTER_FROM);
     int cw = show_counter ? gfx_text_width(GFX_FONT_NORMAL, counter) : 0;
 
     int pen = gfx_text(0, y, GFX_FONT_NORMAL, "> ");
 
     // per-codepoint advance and start offset; static: too big for the stack
+    static uint8_t adv[MSG_BODY_MAX_BYTES];
+    static const char *cp_start[MSG_BODY_MAX_BYTES];
     int n = 0;
     const char *cur = msg_composer_text();
+    while (*cur && n < MSG_BODY_MAX_BYTES) {
         cp_start[n] = cur;
         uint32_t cp;
         cur = composer_utf8_next(cur, &cp);

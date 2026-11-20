@@ -2,6 +2,7 @@
 // handler. PROTOCOL.md §6, §8. C++ because the walter-modem library is a C++ class.
 
 #include "net.h"
+#include "msg.h"
 #include "carrier.h"
 #include "net_xport.h"
 #include "net_internal.h"
@@ -44,6 +45,8 @@ static constexpr uint32_t PAGER_MQTT_RECEIVE_TIMEOUT_MS = 15000u;
 static constexpr uint32_t PAGER_RESUB_HOLD_MS = 3000u;
 
 // PROTOCOL.md §3.3: envelope limit for pager/{device_id}/...; must stay under the modem library's
+// 1540-byte receive buffer.
+static constexpr uint16_t PAGER_MAX_PAYLOAD = 1280;
 
 // PROTOCOL.md §2: pager/boot/{bid}/... has a larger 4 kB limit for the bootstrap bundle. One RX
 // buffer is sized to the larger cap; the MESSAGE handler picks the cap by topic.
@@ -286,6 +289,9 @@ void pager_mqtt_event_handler(WMMQTTEventType event, const WMMQTTEventData *data
             ESP_LOGD(TAG, "PUBACK mid=%d", data->mid);
             s_last_uplink_us = esp_timer_get_time(); // uplink activity resets the idle clock
         }
+        // msg.c keeps a reply until this URC (rc 0) arrives for the mid the modem reported at
+        // publish time; this call only sets flags and takes no lock
+        msg_on_publish_done((uint16_t) data->mid, data->rc == WALTER_MODEM_MQTT_SUCCESS);
         // the publish's uplink is over whatever the rc: leave the in-flight count and arm the quiet
         // window that disp.c's pre-refresh gate waits on
         publish_quiet_gate_done(&s_publish_quiet, esp_timer_get_time());
@@ -347,6 +353,7 @@ void pager_mqtt_event_handler(WMMQTTEventType event, const WMMQTTEventData *data
         s_last_rc = data->rc;
         s_last_class = classify_mqtt_rc(data->rc);
         s_disconnect_edge = true;
+        msg_on_mqtt_disconnect(); // a reply awaiting its PUBACK fails as one attempt (flags only)
         // a liveness ping or resume repair in flight is void; the next connect subscribes afresh
         s_resub_wait = false;
         s_resub_pending = false;
@@ -445,6 +452,7 @@ static bool lte_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
     return ok;
 }
 
+static bool lte_publish_raw(const char *topic, uint8_t *buf, uint16_t len, uint8_t qos, uint16_t *mid)
 {
     if (len > PAGER_MAX_PAYLOAD) {
         ESP_LOGI(TAG, "refusing to publish %u bytes > %u cap (PROTOCOL.md §3.3)",
@@ -457,6 +465,10 @@ static bool lte_publish(const char *topic, char *buf, uint16_t len, uint8_t qos)
     publish_quiet_gate_issued(&s_publish_quiet, issued_us);
     WalterModemRsp rsp = {};
     bool ok = WalterModem::mqttPublish(topic, buf, len, qos, &rsp);
+    if (ok && mid != nullptr && rsp.type == WALTER_MODEM_RSP_DATA_TYPE_MQTT_PUBLISH) {
+        // the id from `+SQNSMQTTPUBLISH: <mid>`, which the broker's PUBACK URC also carries
+        *mid = rsp.data.mqttPublishMid;
+    }
     if (ok) {
         // as in lte_publish(): only QoS 1 resets the idle clock
         if (qos != 0) {

@@ -17,15 +17,29 @@ extern "C" {
 #define MSG_FROM_MAX 17  /* 16 chars + NUL */
 #define MSG_TO_MAX 17    /* 16 chars + NUL — peer alias for up messages, §5.6 */
 
+/* One body is at most 1024 UTF-8 bytes in both directions, PROTOCOL.md §3.1/§3.3. */
+#define MSG_BODY_MAX_BYTES 1024
+#define MSG_BODY_BUF (MSG_BODY_MAX_BYTES + 1) /* + NUL */
+#define MSG_RAM_BODY_MAX MSG_BODY_BUF         /* one body slot, §9.5 */
+/* msg_t.body_slot value for "no body kept". */
+#define MSG_BODY_NONE 0xFF
+/* Row shown for an entry whose body is not in the pool. */
+#define MSG_BODY_PLACEHOLDER "(text not kept)"
 
 #define MSG_SEEN_IDS_MAX 16     /* §4.1 rule 7 — do not shrink, PROTOCOL.md §9.7 */
 #define MSG_PENDING_ACKS_MAX 8  /* §4.1 rule 6 */
 #define MSG_PENDING_UP_MAX 2    /* §4.2 */
 #define MSG_THREAD_DEPTH 32     /* §9.5 */
 
+#define MSG_COMPOSER_MAX MSG_BODY_BUF /* 1024 UTF-8 bytes + NUL */
+/* The composer's counter appears once this many bytes are typed. */
+#define MSG_COMPOSER_COUNTER_FROM 900
 
 /* msg_t.flags */
 #define MSG_F_RECOVERED (1u << 1)   /* restored after a reset/cold boot, §9.6 */
+#define MSG_F_SEND_FAILED (1u << 2) /* up message: 3 attempts or >2h old, §4.2; or a `rcpt` failed receipt */
+/* Up message: a `rcpt` failure not yet seen in Chat. Not persisted. */
+#define MSG_F_FAIL_UNSEEN (1u << 3)
 
 /* msg_t.dir */
 typedef enum {
@@ -34,12 +48,14 @@ typedef enum {
 } msg_dir_t;
 
 /* msg_t.ack_state. DOWN: UNSHOWN -> SHOWN -> READ (PROTOCOL.md §4). UP: PENDING -> SENT or FAILED;
+ * SENT -> DELIVERED -> FAILED only via a `rcpt` (SENT = broker PUBACK, DELIVERED = bridge success). */
 #define MSG_ACK_UNSHOWN 0
 #define MSG_ACK_SHOWN 1
 #define MSG_ACK_READ 2
 #define MSG_ACK_UP_PENDING 0
 #define MSG_ACK_UP_SENT 1
 #define MSG_ACK_UP_FAILED 2
+#define MSG_ACK_UP_DELIVERED 3 /* only from SENT, by a `rcpt st:"sent"` */
 
 /* RAM-resident thread entry, PROTOCOL.md §9.5. */
 typedef struct {
@@ -49,6 +65,11 @@ typedef struct {
     char to[MSG_TO_MAX]; /* peer alias for up messages; empty = default, §5.6 */
     /* Author alias of a group message (CBOR key 51); "" otherwise. Never sent on `/up`. */
     char sndr[MSG_FROM_MAX];
+    /* Reason of a `rcpt` failed receipt ("sms_timeout", ...), "" otherwise. */
+    char rsn[17];
+    /* The body text lives in msg.c's PSRAM pool; body_slot is the pool index and is only
+     * meaningful inside msg.c. Read the text with msg_body_copy(). */
+    uint8_t body_slot;
     uint16_t body_len; /* UTF-8 bytes */
     uint8_t dir;       /* msg_dir_t */
     uint8_t ack_state; /* depends on dir */
@@ -63,11 +84,19 @@ typedef struct {
 
 /* Record format version: 2 added `sndr`, 3 added `rsn`. The decoder accepts 1 to 3; an older
  * firmware skips a version-3 record. */
+#define MSGHIST_REC_VERSION 3
+/* header + 4 full-length names + 1024-byte body + crc = 1114 (version 2), with headroom. */
+#define MSGHIST_REC_MAX 1140
 
 /* `body` is the UTF-8 text (m->body_len bytes; may be NULL only when body_len == 0). Returns the
+ * encoded length, or 0 if body_len exceeds MSG_BODY_MAX_BYTES or the record does not fit out_cap. */
+size_t msghist_record_encode(const msg_t *m, const char *body, uint32_t seq, uint8_t *out,
+                             size_t out_cap);
 
 /* False, leaving `out` untouched, for an unknown version, truncation, bad CRC or oversize body. `body_out`
  * (>= body_len + 1) gets the NUL-terminated text; NULL decodes the header only. */
+bool msghist_record_decode(const uint8_t *buf, size_t len, msg_t *out, uint32_t *out_seq,
+                           char *body_out, size_t body_cap);
 
 /* True once `ack_state` is the last state this direction reaches. */
 bool msghist_is_terminal_ack(uint8_t dir, uint8_t ack_state);
@@ -172,9 +201,26 @@ bool msg_insert_sms_out_pending(const char *to, const char *body, uint16_t body_
  * scrolled out of the thread. */
 bool msg_finish_sms_out(const char *id, bool ok);
 
+/* Handles a `kind:"rcpt"` envelope; true iff well-formed (consumed even if nothing changes). `buf` must
+ * already have passed auth_verify() when IDENT_FLAG_REQ_SIG is set. A failure sets `alert` (nullable). */
+typedef struct {
+    bool valid;
+    char id[MSG_ID_MAX];
+    char peer[MSG_TO_MAX];
+} msg_rcpt_alert_t;
+bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *alert);
+
+/* Clears MSG_F_FAIL_UNSEEN on up row `id`. RAM only. */
+void msg_clear_fail_unseen(const char *id);
+
 /* Publishes at most one message per call: pending acks first, then replies; 3 attempts or 2h
  * (created_us) marks a reply MSG_F_SEND_FAILED (§4.2). */
 void msg_pump(void);
+
+/* A reply is SENT only on the broker's PUBACK URC for the modem-reported mid, not the modem's `OK`;
+ * rc != 0, a disconnect or 30 s of silence is one failed attempt. Both hooks run on the event task. */
+void msg_on_publish_done(uint16_t mid, bool ok); /* `ok` is rc == 0 */
+void msg_on_mqtt_disconnect(void);
 
 size_t msg_thread_count(void);
 
@@ -182,6 +228,10 @@ size_t msg_thread_count(void);
  * the same function overwrites its snapshot. */
 const msg_t *msg_thread_at(size_t index); /* 0 = newest; NULL if index >= msg_thread_count() */
 const msg_t *msg_newest_unread(void);     /* NULL if none */
+
+/* Copies the body of the entry `m` names into `out`, truncated to `cap - 1` bytes on a UTF-8 boundary;
+ * MSG_BODY_PLACEHOLDER if evicted. Not callable from a msg_iter_peer() callback (lock held). */
+size_t msg_body_copy(const msg_t *m, char *out, size_t cap);
 
 /* Writes the peer alias for message `m` into `out` (always NUL-terminated). */
 void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, char *out,

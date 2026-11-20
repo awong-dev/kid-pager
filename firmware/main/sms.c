@@ -1290,6 +1290,7 @@ void sms_try_publish_one(void)
     }
 
     // success means accepted by the modem, not confirmed delivered
+    if (net_publish_raw(topic, buf, (uint16_t) len, 1, NULL)) {
         ESP_LOGI(TAG, "sms_log %s published (peer=%s dir=%s st=%s)", id, e.peer, e.dir, e.st);
         uint8_t head, count;
         uint32_t lost;

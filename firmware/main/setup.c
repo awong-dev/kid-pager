@@ -724,6 +724,7 @@ bool setup_run(const char *code)
     cbor_w_uint(&w, 29, 1); /* ok=1 */
     if (!w.err) {
         // Power effect: the RRC time for one small publish if the modem was idle.
+        net_publish_raw(up_topic, ack, (uint16_t) w.len, 1, NULL);
     }
     /* one bounded delay for the PUBACK; this path does not wait for it */
     vTaskDelay(pdMS_TO_TICKS(SETUP_ACK_SETTLE_MS));

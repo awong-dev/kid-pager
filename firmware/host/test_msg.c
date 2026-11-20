@@ -51,10 +51,24 @@ static void test_ascii_byte_cap(void)
     CHECK(strlen(msg_composer_text()) == 50, "text length mismatch");
 }
 
+static void test_ascii_fills_to_exactly_1024_bytes(void)
 {
     msg_composer_reset();
+    for (int i = 0; i < MSG_BODY_MAX_BYTES; i++) {
         CHECK(msg_composer_push_char('x'), "push #%d refused before the cap", i);
     }
+    CHECK(msg_composer_len() == 1024, "len == %u, want 1024", (unsigned) msg_composer_len());
+    CHECK(msg_composer_codepoint_count() == 1024, "codepoints == %u, want 1024",
+          (unsigned) msg_composer_codepoint_count());
+    CHECK(strlen(msg_composer_text()) == 1024, "text length != 1024");
+
+    CHECK(!msg_composer_push_char('x'), "1025th byte was accepted, cap not enforced");
+    CHECK(msg_composer_len() == 1024, "byte len changed after a refused push");
+    CHECK(msg_composer_codepoint_count() == 1024, "codepoint count changed after a refused push");
+
+    CHECK(msg_composer_backspace(), "backspace refused");
+    CHECK(msg_composer_push_char('y'), "push after backspace refused");
+    CHECK(msg_composer_len() == 1024, "len != 1024 after backspace+push");
 }
 
 static void test_three_byte_codepoint_accepted(void)
@@ -81,9 +95,12 @@ static void test_three_byte_codepoint_accepted(void)
           "euro sign bytes not found intact at the end of the buffer");
 }
 
+/* 255 emoji (1020 bytes) plus 2 ASCII leave 2 bytes of headroom; a 3-byte code point must be
+ * refused whole: bytes 1 and 2 buffer, byte 3 returns false, and the text is unchanged. */
 static void test_three_byte_codepoint_refused_at_byte_cap(void)
 {
     msg_composer_reset();
+    for (int i = 0; i < 255; i++) {
         CHECK(push_bytes(k_emoji, sizeof(k_emoji)), "emoji fill #%d refused", i);
     }
     CHECK(msg_composer_push_char('a'), "ascii fill byte 0 refused");
@@ -91,14 +108,18 @@ static void test_three_byte_codepoint_refused_at_byte_cap(void)
 
     uint16_t len_before = msg_composer_len();
     uint16_t cp_before = msg_composer_codepoint_count();
+    CHECK(len_before == 1022, "did not fill to exactly 2 bytes of headroom (len=%u)",
           (unsigned) len_before);
+    CHECK(cp_before == 257, "code point count == %u, want 257 (255 emoji + 2 ascii)",
           (unsigned) cp_before);
+    static char snapshot[MSG_COMPOSER_MAX];
     strcpy(snapshot, msg_composer_text());
 
     bool r0 = msg_composer_push_char((char) k_euro[0]);
     bool r1 = msg_composer_push_char((char) k_euro[1]);
     bool r2 = msg_composer_push_char((char) k_euro[2]);
     CHECK(r0 && r1, "the two buffering bytes of an incomplete sequence must return true");
+    CHECK(!r2, "3-byte code point was accepted 2 bytes over the 1024-byte cap");
 
     CHECK(msg_composer_len() == len_before, "byte length changed after a refused code point: %u != %u",
           (unsigned) msg_composer_len(), (unsigned) len_before);
@@ -158,6 +179,8 @@ static msg_t make_msg(const char *id, const char *from, const char *to, const ch
     strncpy(m.id, id, sizeof(m.id) - 1);
     strncpy(m.from, from, sizeof(m.from) - 1);
     strncpy(m.to, to, sizeof(m.to) - 1);
+    m.body_len = (uint16_t) strlen(body);
+    m.body_slot = MSG_BODY_NONE;
     m.dir = dir;
     m.ack_state = ack_state;
     m.flags = flags;
@@ -165,18 +188,30 @@ static msg_t make_msg(const char *id, const char *from, const char *to, const ch
     return m;
 }
 
+/* Decoded body text of the most recent DEC() call. */
+static char g_dec_body[MSG_BODY_BUF];
+
+static bool DEC(const uint8_t *buf, size_t len, msg_t *out, uint32_t *seq)
+{
+    return msghist_record_decode(buf, len, out, seq, g_dec_body, sizeof(g_dec_body));
+}
+
 static void test_msghist_roundtrip_basic(void)
 {
     msg_t m = make_msg("m_7f3a", "mom", "", "Pickup at 3:15 by the gym", MSG_DIR_DOWN,
                        MSG_ACK_SHOWN, MSG_F_RECOVERED, 1757700000);
     uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = msghist_record_encode(&m, "Pickup at 3:15 by the gym", 42, buf, sizeof(buf));
     CHECK(len > 0, "encode of a normal record returned 0");
 
     msg_t out;
     uint32_t seq = 0;
+    CHECK(DEC(buf, len, &out, &seq), "decode of a just-encoded record failed");
     CHECK(seq == 42, "seq == %u, want 42", (unsigned) seq);
     CHECK(strcmp(out.id, m.id) == 0, "id mismatch after round trip: '%s' != '%s'", out.id, m.id);
     CHECK(strcmp(out.from, m.from) == 0, "from mismatch after round trip");
+    CHECK(strcmp(g_dec_body, "Pickup at 3:15 by the gym") == 0,
+          "body mismatch after round trip: '%s'", g_dec_body);
     CHECK(out.body_len == m.body_len, "body_len == %u, want %u", (unsigned) out.body_len,
           (unsigned) m.body_len);
     CHECK(out.ts == m.ts, "ts mismatch after round trip");
@@ -191,20 +226,71 @@ static void test_msghist_roundtrip_edges(void)
 {
     msg_t empty = make_msg("u_00000001", "student", "mom", "", MSG_DIR_UP, MSG_ACK_UP_PENDING, 0, 0);
     uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = msghist_record_encode(&empty, "", 1, buf, sizeof(buf));
     CHECK(len > 0, "encode of an empty-body record returned 0");
     msg_t out;
     uint32_t seq;
+    CHECK(DEC(buf, len, &out, &seq), "decode of an empty-body record failed");
     CHECK(out.body_len == 0, "decoded body_len == %u, want 0", (unsigned) out.body_len);
+    CHECK(g_dec_body[0] == '\0', "decoded body not empty");
 
+    /* 1024 bytes round-trips, 1025 is rejected. */
+    static char full_body[MSG_BODY_BUF + 1];
+    memset(full_body, 'x', MSG_BODY_MAX_BYTES);
+    full_body[MSG_BODY_MAX_BYTES] = '\0';
     msg_t full = make_msg("m_deadbeef", "mom", "", full_body, MSG_DIR_DOWN, MSG_ACK_UNSHOWN, 0,
                           1700000000);
+    len = msghist_record_encode(&full, full_body, 7, buf, sizeof(buf));
+    CHECK(len > 0 && len <= MSGHIST_REC_MAX, "encode of a full 1024-byte body out of range: %u",
           (unsigned) len);
+    memset(g_dec_body, 0, sizeof(g_dec_body));
+    CHECK(DEC(buf, len, &out, &seq), "decode of a full 1024-byte body failed");
+    CHECK(out.body_len == 1024, "decoded body_len == %u, want 1024", (unsigned) out.body_len);
+    CHECK(memcmp(g_dec_body, full_body, 1024) == 0 && g_dec_body[1024] == '\0',
+          "decoded 1024-byte body content mismatch");
+    /* header-only decode needs no body buffer */
+    CHECK(msghist_record_decode(buf, len, &out, &seq, NULL, 0) && out.body_len == 1024 &&
+              out.body_slot == MSG_BODY_NONE,
+          "header-only decode failed");
+    /* a body buffer one byte too small for body_len + NUL is refused, not truncated */
+    CHECK(!msghist_record_decode(buf, len, &out, &seq, g_dec_body, 1024),
+          "decode into a 1024-byte buffer (needs 1025) was accepted");
+
+    /* 1025 bytes: the encoder refuses ... */
+    full_body[1024] = 'x';
+    full_body[1025] = '\0';
+    msg_t over = make_msg("m_deadbeef", "mom", "", full_body, MSG_DIR_DOWN, MSG_ACK_UNSHOWN, 0,
+                          1700000000);
+    CHECK(over.body_len == 1025, "fixture is not 1025 bytes");
+    CHECK(msghist_record_encode(&over, full_body, 8, buf, sizeof(buf)) == 0,
+          "encode of a 1025-byte body was accepted");
+    /* ... and so does the decoder, for a hand-built record (valid CRC) claiming 1025 */
+    {
+        uint8_t raw[MSGHIST_REC_MAX + 64];
+        size_t off = 0;
+        raw[off++] = 2;                                /* version */
+        raw[off++] = 8; raw[off++] = 0; raw[off++] = 0; raw[off++] = 0; /* seq */
+        for (int i = 0; i < 8; i++) raw[off++] = 0;     /* ts */
+        raw[off++] = 0; raw[off++] = 0; raw[off++] = 0; /* dir, ack, flags */
+        raw[off++] = 1; raw[off++] = 'a';               /* id */
+        raw[off++] = 1; raw[off++] = 'b';               /* from */
+        raw[off++] = 0;                                 /* to */
+        raw[off++] = 0;                                 /* sndr */
+        raw[off++] = (uint8_t) (1025 & 0xFF); raw[off++] = (uint8_t) (1025 >> 8);
+        memset(raw + off, 'x', 1025);
+        off += 1025;
+        /* crc is checked after the length gate, so the length gate is what fires */
+        raw[off++] = 0; raw[off++] = 0; raw[off++] = 0; raw[off++] = 0;
+        CHECK(!msghist_record_decode(raw, off, &out, &seq, NULL, 0),
+              "decode of a record claiming a 1025-byte body was accepted");
+    }
 }
 
 static void test_msghist_decode_rejects_corruption(void)
 {
     msg_t m = make_msg("m_7f3a", "mom", "", "ok", MSG_DIR_DOWN, MSG_ACK_READ, 0, 1700000000);
     uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = msghist_record_encode(&m, "ok", 5, buf, sizeof(buf));
     CHECK(len > 0, "encode failed");
 
     for (size_t i = 0; i < len; i++) {
@@ -212,6 +298,7 @@ static void test_msghist_decode_rejects_corruption(void)
         buf[i] ^= 0xFF;
         msg_t out;
         uint32_t seq;
+        bool ok = DEC(buf, len, &out, &seq);
         buf[i] = saved;
         CHECK(!ok, "corrupting byte %u of a valid record was NOT detected", (unsigned) i);
     }
@@ -219,6 +306,7 @@ static void test_msghist_decode_rejects_corruption(void)
     for (size_t trunc = 0; trunc < len; trunc++) {
         msg_t out;
         uint32_t seq;
+        CHECK(!DEC(buf, trunc, &out, &seq),
               "a %u-byte truncation of a %u-byte record was NOT detected", (unsigned) trunc,
               (unsigned) len);
     }
@@ -228,6 +316,7 @@ static void test_msghist_decode_rejects_corruption(void)
     bad_version[0] = (uint8_t) (MSGHIST_REC_VERSION + 1);
     msg_t out;
     uint32_t seq;
+    CHECK(!DEC(bad_version, len, &out, &seq),
           "a record with an unknown version was accepted");
 }
 
@@ -236,16 +325,20 @@ static void test_msghist_roundtrip_sms_ts(void)
     msg_t with_ts = make_msg("x_deadbeef", "mom", "", "call me back", MSG_DIR_DOWN, MSG_ACK_READ, 0,
                              1757700000);
     uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = msghist_record_encode(&with_ts, "call me back", 21, buf, sizeof(buf));
     CHECK(len > 0, "encode of an SMS-shaped record with a real ts returned 0");
     msg_t out;
     uint32_t seq = 0;
+    CHECK(DEC(buf, len, &out, &seq), "decode of an SMS-shaped record failed");
     CHECK(out.ts == 1757700000, "ts mismatch after round trip: %lld != 1757700000",
           (long long) out.ts);
     CHECK(out.dir == MSG_DIR_DOWN, "dir mismatch");
     CHECK(out.ack_state == MSG_ACK_READ, "ack_state mismatch");
 
     msg_t no_ts = make_msg("x_cafef00d", "mom", "", "call me back", MSG_DIR_DOWN, MSG_ACK_READ, 0, 0);
+    len = msghist_record_encode(&no_ts, "call me back", 22, buf, sizeof(buf));
     CHECK(len > 0, "encode of an SMS-shaped record with ts 0 returned 0");
+    CHECK(DEC(buf, len, &out, &seq), "decode of the ts-0 record failed");
     CHECK(out.ts == 0, "ts-0 record decoded with ts == %lld, want 0", (long long) out.ts);
 }
 
@@ -256,21 +349,30 @@ static void test_msghist_roundtrip_sndr(void)
     strncpy(m.sndr, "alice", sizeof(m.sndr) - 1);
 
     uint8_t buf[MSGHIST_REC_MAX];
+    size_t len = msghist_record_encode(&m, "Pickup at 3:15 by the gym", 9, buf, sizeof(buf));
     CHECK(len > 0, "encode of a record with sndr returned 0");
 
     msg_t out;
     uint32_t seq = 0;
+    CHECK(DEC(buf, len, &out, &seq), "decode of a record with sndr failed");
     CHECK(strcmp(out.sndr, "alice") == 0, "sndr mismatch after round trip: '%s' != 'alice'",
           out.sndr);
     CHECK(strcmp(out.from, m.from) == 0, "from mismatch after round trip (should stay the group alias)");
 
+    /* Worst case: 16-char sndr, full body and full-length id/from/to fit MSGHIST_REC_MAX. */
     msg_t big = make_msg("m_deadbeefdeadbe", "0123456789abcdef", "0123456789abcdef", "", MSG_DIR_DOWN,
                          MSG_ACK_UNSHOWN, 0, 1700000000);
+    static char full_body[MSG_BODY_BUF];
+    memset(full_body, 'x', MSG_BODY_MAX_BYTES);
+    full_body[MSG_BODY_MAX_BYTES] = '\0';
+    big.body_len = MSG_BODY_MAX_BYTES;
     strncpy(big.sndr, "0123456789abcdef", sizeof(big.sndr) - 1);
 
+    len = msghist_record_encode(&big, full_body, 11, buf, sizeof(buf));
     CHECK(len > 0 && len <= MSGHIST_REC_MAX,
           "worst-case sndr+body record out of range: %u (cap %u)", (unsigned) len,
           (unsigned) MSGHIST_REC_MAX);
+    CHECK(DEC(buf, len, &out, &seq), "decode of the worst-case record failed");
     CHECK(strcmp(out.sndr, "0123456789abcdef") == 0, "worst-case sndr mismatch: '%s'", out.sndr);
 }
 
@@ -350,9 +452,11 @@ static void test_msghist_v1_record_decodes_with_empty_sndr(void)
 
     msg_t out;
     uint32_t seq = 0;
+    CHECK(DEC(buf, len, &out, &seq), "v2 decoder rejected a valid v1 record");
     CHECK(seq == 3, "v1 decode: seq == %u, want 3", (unsigned) seq);
     CHECK(strcmp(out.id, "m_old") == 0, "v1 decode: id mismatch");
     CHECK(strcmp(out.from, "mom") == 0, "v1 decode: from mismatch");
+    CHECK(strcmp(g_dec_body, "hi there") == 0, "v1 decode: body mismatch");
     CHECK(out.sndr[0] == '\0', "v1 decode: sndr should be empty, got '%s'", out.sndr);
 }
 
@@ -459,6 +563,7 @@ static void test_msg_peer_subsets_newest_first(void)
 int main(void)
 {
     test_ascii_byte_cap();
+    test_ascii_fills_to_exactly_1024_bytes();
     test_three_byte_codepoint_accepted();
     test_three_byte_codepoint_refused_at_byte_cap();
     test_backspace_removes_whole_codepoint();
@@ -477,6 +582,7 @@ int main(void)
     test_msg_peer_subsets_newest_first();
 
     if (g_failures == 0) {
+        printf("PASS: msg.c composer (1024-byte cap, no code-point cap, 3-byte code point atomicity), "
                "msghist record codec/terminal-ack/restore-order (v1+v2, sndr), and msg_peer_of() "
                "(shared peer rule), 0 failures\n");
         return 0;

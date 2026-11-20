@@ -30,6 +30,7 @@ endif
 MAIN_SRC := ../main
 BUILD := build
 
+TESTS := test_cbor test_auth test_setup test_input test_msg test_lock test_loc test_cafetch test_catrust test_cfg test_sms test_carrier test_chat_layout test_home_list test_archive test_coverage test_net_connect_guard test_net_probe_guard test_resub_verdict test_publish_quiet test_accel_rate test_bookpull test_clock test_disp_flip test_otapipe test_ota test_astpart test_gfx_assets test_battstat test_refreshpol test_temp test_devinfo test_tunes test_fuel test_pubconfirm test_rcpt
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 # Asset image for render_png (built by tools/mkassets.py).
@@ -297,6 +298,24 @@ $(BUILD)/test_resub_verdict.o: test_resub_verdict.c $(MAIN_SRC)/resub_verdict.h 
 
 $(BUILD)/test_resub_verdict: $(BUILD)/resub_verdict.o $(BUILD)/test_resub_verdict.o
 	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD)/rcpt.o: $(MAIN_SRC)/rcpt.c $(MAIN_SRC)/rcpt.h $(MAIN_SRC)/msg.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/rcpt.c
+
+$(BUILD)/test_rcpt.o: test_rcpt.c $(MAIN_SRC)/rcpt.h $(MAIN_SRC)/msg.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_rcpt.c
+
+$(BUILD)/test_rcpt: $(BUILD)/rcpt.o $(BUILD)/test_rcpt.o $(BUILD)/cbor.o $(BUILD)/msg.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/rcpt.o $(BUILD)/test_rcpt.o $(BUILD)/cbor.o $(BUILD)/msg.o
+
+$(BUILD)/pubconfirm.o: $(MAIN_SRC)/pubconfirm.c $(MAIN_SRC)/pubconfirm.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/pubconfirm.c
+
+$(BUILD)/test_pubconfirm.o: test_pubconfirm.c $(MAIN_SRC)/pubconfirm.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ test_pubconfirm.c
+
+$(BUILD)/test_pubconfirm: $(BUILD)/pubconfirm.o $(BUILD)/test_pubconfirm.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/pubconfirm.o $(BUILD)/test_pubconfirm.o
 
 $(BUILD)/publish_quiet.o: $(MAIN_SRC)/publish_quiet.c $(MAIN_SRC)/publish_quiet.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/publish_quiet.c

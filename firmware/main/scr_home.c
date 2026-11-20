@@ -44,10 +44,16 @@ int home_peers_build(const msg_t *msgs, size_t n, bool have_default, const char 
             idx = count++;
             strncpy(out[idx].alias, alias, HOME_PEER_ALIAS_MAX - 1);
             out[idx].alias[HOME_PEER_ALIAS_MAX - 1] = '\0';
+            // msg_t is header-only; the preview is cut on a code point boundary
+            msg_body_copy(m, out[idx].body, HOME_PEER_BODY_MAX);
             out[idx].ts = m->ts;
             out[idx].unread = false;
         }
         if (m->dir == (uint8_t) MSG_DIR_DOWN && m->ack_state != MSG_ACK_READ) {
+            out[idx].unread = true;
+        }
+        // a failed bridged page whose tag is not yet seen marks the peer unread
+        if (m->dir == (uint8_t) MSG_DIR_UP && (m->flags & MSG_F_FAIL_UNSEEN) != 0) {
             out[idx].unread = true;
         }
     }

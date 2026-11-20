@@ -13,6 +13,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -747,6 +748,54 @@ static void disp_gpio_init(void)
         gpio_set_level(PAGER_PIN_DISP_SRCS, 1);
         gpio_sleep_sel_dis((gpio_num_t) PAGER_PIN_DISP_SRCS);
     }
+}
+
+// `disptest pins`: leaves SCK/MOSI/CS off the SPI matrix; the caller must reboot afterwards.
+static void probe_busy(const char *what)
+{
+    printf("disptest pins:   %s: BUSY=%d\n", what, gpio_get_level(PAGER_PIN_DISP_BUSY));
+}
+
+void disp_pin_probe(uint32_t ms)
+{
+    static const struct { const char *name; int io; int j1; bool end_high; } pads[] = {
+        { "RST", PAGER_PIN_DISP_RST, 10, true },  { "DC", PAGER_PIN_DISP_DC, 11, true },
+        { "CS", PAGER_PIN_DISP_CS, 12, true },    { "SCK", PAGER_PIN_DISP_SCK, 13, false },
+        { "MOSI", PAGER_PIN_DISP_MOSI, 14, false },
+    };
+    disp_lock(); // never unlocked; caller reboots
+    gpio_num_t busy = (gpio_num_t) PAGER_PIN_DISP_BUSY;
+    gpio_set_direction(busy, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(busy, GPIO_PULLUP_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int up = gpio_get_level(busy);
+    gpio_set_pull_mode(busy, GPIO_PULLDOWN_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int down = gpio_get_level(busy);
+    gpio_set_pull_mode(busy, GPIO_FLOATING);
+    const char *verdict = (up == 1 && down == 0) ? "FLOATING (not driven / not connected)"
+                          : (up == 0 && down == 0) ? "driven low"
+                          : (up == 1 && down == 1) ? "driven high"
+                                                   : "inconsistent";
+    printf("BUSY (J1 pin 9): pullup->%d pulldown->%d => %s\n", up, down, verdict);
+
+    for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]); i++) {
+        gpio_num_t pin = (gpio_num_t) pads[i].io;
+        gpio_reset_pin(pin); // detaches the SPI/GPIO-matrix route
+        gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+        for (int lvl = 1; lvl >= 0; lvl--) {
+            printf("disptest pins: %s %s now (panel J1 pin %d, ESP IO %d) for %u ms\n", pads[i].name,
+                   lvl ? "HIGH" : "LOW", pads[i].j1, pads[i].io, (unsigned) ms);
+            gpio_set_level(pin, lvl);
+            vTaskDelay(pdMS_TO_TICKS(ms));
+            probe_busy(lvl ? "high" : "low");
+        }
+        gpio_set_level(pin, pads[i].end_high);
+    }
+    printf("disptest pins: done, rebooting to restore SPI\n");
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
 }
 
 static bool disp_spi_init(void)

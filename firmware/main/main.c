@@ -400,6 +400,29 @@ static int cmd_padfix(int argc, char **argv)
     return cmd_padinfo(argc, argv);
 }
 
+// Debug: prints NVS entry usage for the default `nvs` and `msghist` partitions.
+static int cmd_nvsstats(int argc, char **argv)
+{
+    (void) argc;
+    (void) argv;
+    static const char *const parts[] = { NULL, "msghist" }; // NULL = the default "nvs" partition
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        nvs_stats_t st;
+        esp_err_t err = nvs_get_stats(parts[i], &st);
+        const char *label = parts[i] ? parts[i] : "nvs";
+        if (err != ESP_OK) {
+            printf("nvsstats %s: nvs_get_stats failed 0x%x\n", label, (unsigned) err);
+            continue;
+        }
+        printf("nvsstats %s: used=%u free=%u available=%u total=%u namespaces=%u\n", label,
+               (unsigned) st.used_entries, (unsigned) st.free_entries,
+               (unsigned) st.available_entries, (unsigned) st.total_entries,
+               (unsigned) st.namespace_count);
+    }
+    printf("nvsstats: msgq rule - if nvs free < 300 entries, move msgq bodies to msghist\n");
+    return 0;
+}
+
 // `refresh [floor N|ceil N|idle S|gap MS|psmin N|status]` tunes the refresh policy; knobs persist
 // to NVS "disp".
 static int cmd_refresh(int argc, char **argv)
@@ -434,6 +457,7 @@ static int cmd_refresh(int argc, char **argv)
 static int cmd_gpio(int argc, char **argv)
 {
     if (argc < 2) {
+        printf("usage: gpio <0-48> [sample <ms<=5000>] [high|low|in|pu|pd (debug builds)]\n");
         return 1;
     }
     int n = atoi(argv[1]);
@@ -441,6 +465,23 @@ static int cmd_gpio(int argc, char **argv)
         printf("gpio: pin out of range\n");
         return 1;
     }
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+    // Debug builds only: drive/float a pad by hand. Rerouting an SPI pad breaks the display until
+    // reboot.
+    if (argc >= 3 && (strcmp(argv[2], "high") == 0 || strcmp(argv[2], "low") == 0)) {
+        gpio_set_direction((gpio_num_t) n, GPIO_MODE_INPUT_OUTPUT);
+        gpio_set_level((gpio_num_t) n, strcmp(argv[2], "high") == 0);
+        printf("gpio %d: driven %s (reboot to restore normal use)\n", n, argv[2]);
+    } else if (argc >= 3 && (strcmp(argv[2], "in") == 0 || strcmp(argv[2], "pu") == 0 ||
+                             strcmp(argv[2], "pd") == 0)) {
+        gpio_set_direction((gpio_num_t) n, GPIO_MODE_INPUT);
+        gpio_set_pull_mode((gpio_num_t) n, strcmp(argv[2], "pu") == 0   ? GPIO_PULLUP_ONLY
+                                           : strcmp(argv[2], "pd") == 0 ? GPIO_PULLDOWN_ONLY
+                                                                        : GPIO_FLOATING);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        printf("gpio %d: input (%s)\n", n, argv[2]);
+    }
+#endif
     printf("gpio %d: level=%d\n", n, gpio_get_level((gpio_num_t) n));
     if (argc >= 4 && strcmp(argv[2], "sample") == 0) {
         int ms = atoi(argv[3]);
@@ -968,8 +1009,12 @@ static int cmd_light(int argc, char **argv)
         frontlight_set(true);
     } else if (argc >= 2 && strcmp(argv[1], "off") == 0) {
         frontlight_off();
+    } else if (argc >= 2 && atoi(argv[1]) >= 1 && atoi(argv[1]) <= FRONTLIGHT_LEVELS) {
+        frontlight_set_level((uint8_t) atoi(argv[1]));
         frontlight_set(true);
     } else {
+        printf("light on|off|<1-10>   (now %s, level %u)\n", frontlight_is_on() ? "on" : "off",
+               (unsigned) frontlight_get_level());
         return argc >= 2 ? 1 : 0;
     }
     return 0;
@@ -1001,6 +1046,7 @@ static void register_peripheral_cmds(void)
     static const esp_console_cmd_t cmds[] = {
         {.command = "buzz", .help = "buzz <hz> <ms> | msg | mario [n] | off -- carrier piezo", .hint = NULL, .func = &cmd_buzz},
         {.command = "haptic", .help = "haptic <effect> | msg | calibrate | status | cfg <rated_mv> <clamp_mv> <f_hz>", .hint = NULL, .func = &cmd_haptic},
+        {.command = "light", .help = "light on|off|<1-10> -- carrier front light", .hint = NULL, .func = &cmd_light},
         {.command = "led", .help = "led on|off|pulse|breath -- carrier external LED", .hint = NULL, .func = &cmd_led},
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -1546,6 +1592,8 @@ static const char *DISPTEST_USAGE =
     "disptest black|white         -- paint every pixel one colour and full refresh (wiring check)\n"
     "disptest swreset             -- fault injector: send SW reset (0x12) alone, wait BUSY, "
     "nothing else -- leaves the controller on power-on register defaults\n"
+    "disptest pins [ms]          -- bench wiring probe (multimeter on J1): BUSY float test, then drive "
+    "RST/DC/CS/SCK/MOSI high then low, ms each (default 3000, 500..10000); reboots when done\n"
     "NOTE: do not use `wake` or `key` while disptest is running -- the UI render task would "
     "repaint over the test pattern.\n";
 
@@ -1732,6 +1780,13 @@ static int cmd_disptest(int argc, char **argv)
                "power-on register defaults\n");
         return 0;
     }
+    if (argc >= 2 && strcmp(argv[1], "pins") == 0) {
+        long ms = (argc >= 3) ? strtol(argv[2], NULL, 10) : 3000;
+        if (ms < 500) ms = 500;
+        if (ms > 10000) ms = 10000;
+        disp_pin_probe((uint32_t) ms);
+        return 0;
+    }
     printf("%s", DISPTEST_USAGE);
     return 1;
 }
@@ -1910,6 +1965,14 @@ static void start_normal_console(void)
         .func = &cmd_refresh,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&refresh_cmd));
+
+    const esp_console_cmd_t nvsstats_cmd = {
+        .command = "nvsstats",
+        .help = "nvsstats -- nvs_get_stats() of the nvs and msghist partitions",
+        .hint = NULL,
+        .func = &cmd_nvsstats,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&nvsstats_cmd));
 
     const esp_console_cmd_t padinfo_cmd = {
         .command = "padinfo",

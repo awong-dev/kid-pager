@@ -392,6 +392,7 @@ static void on_auth_epoch_wrap(void)
 #define STK_OTA_ERR 67 // short error code, omitted when none
 #define STK_AST 72     // font source: 0 = no assets_ota row, 1 = factory, 2 = assets_ota
 #define STK_AST_ID 73  // 16 hex chars of the active font image, only when ast == 2
+#define STK_MB 76      // max body bytes accepted/sent, always sent; 74/75 are the rcpt keys ref/rsn
 
 #define PAGER_RSSI_UNSET (-1000) // outside net_get_rssi()'s valid [-113,-51] range
 
@@ -578,6 +579,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
         nfields += 1;
     }
     nfields += 1; // key 72 ast: always sent
+    nfields += 1; // key 76 mb: always sent (online status only; the LWT is built elsewhere)
     if (ost.ast == 2) {
         nfields += 1; // key 73 ast_id
     }
@@ -643,6 +645,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
         cbor_w_uint(&w, STK_OTA, 1);
     }
     cbor_w_uint(&w, STK_AST, ost.ast);
+    cbor_w_uint(&w, STK_MB, MSG_BODY_MAX_BYTES); // 1024 (PROTOCOL.md §5.1)
     if (ost.ast == 2) {
         cbor_w_tstr(&w, STK_AST_ID, ost.ast_id, strlen(ost.ast_id));
     }
@@ -708,6 +711,7 @@ static volatile int64_t s_status_publish_pending_since_us = 0;
 
 static void publish_status_online(void)
 {
+    uint8_t buf[480];
     size_t len = 0;
     if (!build_status_cbor(buf, sizeof(buf), &len, "online")) {
         ESP_LOGI(TAG, "status CBOR build failed (buffer too small or auth_sign failed)");
@@ -716,6 +720,7 @@ static void publish_status_online(void)
     char topic[48];
     snprintf(topic, sizeof(topic), "pager/%s/status", net_get_device_id());
 
+    if (net_publish_raw(topic, buf, (uint16_t) len, 1, NULL)) {
         rtc_lock();
         g_rtc.status_pub_count++;
         g_rtc.last_status_epoch = approx_epoch();
@@ -1511,6 +1516,23 @@ static void on_incoming_message(const char *topic, const char *body, uint16_t le
     // `loc_req`: same reason; never a thread entry or ack, answered in any lock state or mode; true
     // only for a well-formed `kind:"loc_req"` envelope.
     if (loc_ingest_req_cbor((const uint8_t *) body, (uint16_t) vlen)) {
+        return;
+    }
+
+    // `rcpt` (the bridge's verdict on an up page) has no `from`/`body`, so it is intercepted here.
+    // Never a thread entry or ack; only a FAILED receipt raises the new-message alert, once.
+    msg_rcpt_alert_t rcpt_alert;
+    if (msg_ingest_rcpt_cbor((const uint8_t *) body, (uint16_t) vlen, &rcpt_alert)) {
+        if (rcpt_alert.valid) {
+            char peer[BOOK_ALIAS_MAX];
+            if (rcpt_alert.peer[0] != '\0') {
+                strncpy(peer, rcpt_alert.peer, sizeof(peer) - 1);
+                peer[sizeof(peer) - 1] = '\0';
+            } else if (!book_get_default_alias(peer, sizeof(peer))) {
+                strcpy(peer, "(default)"); // the no-book placeholder msg_peer_of() uses
+            }
+            modes_alert_incoming(rcpt_alert.id, peer);
+        }
         return;
     }
 

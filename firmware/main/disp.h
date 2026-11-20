@@ -75,6 +75,9 @@ void disp_reset_refresh_stats(void);
 /* Bench fault injector: SW reset (0x12) only, leaving power-on register defaults. */
 void disp_fault_inject_swreset(void);
 
+/* Bench wiring probe: BUSY float test, then each control pad driven high/low. Reboots. */
+void disp_pin_probe(uint32_t ms);
+
 /* One-shot ~200 ms BUSY transition trace at the next disp_note_power_loss(); auto-disarms. */
 void disp_debug_arm_busy_trace(void);
 
