@@ -1397,7 +1397,7 @@
 				(pins "1")
 			)
 		)
-		(attr exclude_from_pos_files exclude_from_bom)
+		(attr exclude_from_bom)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_circle
 			(center 0 0)
@@ -2536,7 +2536,7 @@
 				(pins "1")
 			)
 		)
-		(attr exclude_from_pos_files exclude_from_bom)
+		(attr exclude_from_bom)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_circle
 			(center 0 0)
@@ -4201,7 +4201,7 @@
 				)
 			)
 		)
-		(property "Value" "0.1uF"
+		(property "Value" "100nF"
 			(at 0 1.16 90)
 			(layer "F.Fab")
 			(uuid "8423334e-c6f6-482d-bfaa-6c79e996272c")
@@ -5561,7 +5561,7 @@
 				(pins "1")
 			)
 		)
-		(attr exclude_from_pos_files exclude_from_bom)
+		(attr exclude_from_bom)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_circle
 			(center 0 0)
@@ -9508,7 +9508,7 @@
 				(pins "1")
 			)
 		)
-		(attr exclude_from_pos_files exclude_from_bom)
+		(attr exclude_from_bom)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_circle
 			(center 0 0)
@@ -16598,7 +16598,7 @@
 				(pins "1")
 			)
 		)
-		(attr exclude_from_pos_files exclude_from_bom)
+		(attr exclude_from_bom)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_circle
 			(center 0 0)
@@ -19540,7 +19540,7 @@
 		(layer "Edge.Cuts")
 		(uuid "78ea7668-08a8-49cc-aaf6-f6fabebd7c6e")
 	)
-	(gr_text "CHAM Carrier\n@awongawong\nOct 2026"
+	(gr_text "MACH Carrier\n@awongawong\nOct 2026"
 		(at 92.456 105.8164 0)
 		(layer "F.SilkS")
 		(uuid "62d91824-f724-4f91-af35-99001a768856")
@@ -19578,7 +19578,7 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "MACH Carrier\n@awongawong \nOct 2026"
+	(gr_text "CHAM Carrier\n@awongawong \nOct 2026"
 		(at 103.886 105.7402 0)
 		(layer "B.SilkS")
 		(uuid "39b1c21e-8d1d-45b2-9c23-95e754de17b7")
