@@ -124,7 +124,9 @@ Base envelope:
 | `id` | string | **yes** | `^[a-z0-9_]{3,16}$` | Message id (§1). On an ack, this is the **down message's** id. |
 | `ts` | int | **yes** | 0 or 1×10⁹…2×10⁹ | Unix epoch **seconds, UTC**. Set by the publisher. |
 | `from` | string | yes on content messages, **absent** on acks | `^[a-z0-9][a-z0-9_-]{0,15}$` **or** the literal `system`, ≤16 chars | Author's **alias**. *(a deployment has named users rather than one parent and one student, so `from` carries the sender's alias rather than a two-value enum. `parent` and `student` are ordinary aliases, so an older two-value payload is still valid. **Firmware impact: none** — `msg.c` accepts any 1–16 byte string and renders it verbatim.)* |
+| `body` | string | yes on content messages, **absent** on acks | ≤ **1024 UTF-8 bytes**, **no code-point cap** *(1024 bytes is 1024 Latin characters or about 340 Chinese characters. The byte cap is what firmware sizes its buffers by, and the modem library's 1540-byte receive buffer is what sets the number (§3.3). Anything longer is the **relay's** job: it splits a long text into consecutive messages per recipient, §3.3.)* | Message text. |
 | `ack` | string \| null | yes; `null` on content messages | `shown` \| `read` | Ack state being reported. |
+| `kind` | string | no (default `msg`) | `msg` \| `loc_req` \| `contact_req` \| `book` \| `cfg` \| `sms_log`; `/down`: `msg`/`loc_req`/`book`/`cfg`/`rcpt`; `/up`: `msg`/`contact_req`/`sms_log` | What the message *is* (§3.2). Absent MUST be read as `msg`. *(`/up` also `grp_req`, §3.8.)* |
 | `to` | string | no; `/up` content messages only | same regex as `from` | Recipient alias chosen by the device. Absent → the relay uses the device's configured default recipient, or broadcasts to every user the owner may message. *(the device can address one of several users; optional, so a device that never sets it works unchanged.)* |
 | `sndr` | string | no; `/down` `msg` in a **group** conversation only | same regex as `from`, ≤16 chars | Author's alias when `from` names a **conversation** rather than a person: in a group chat the relay sets `from` = the group's alias (the thread the device replies to with `to`) and `sndr` = the alias of the member who wrote the message. **Absent on every one-to-one page, so existing pages are byte-identical**, and absent MUST be read as "`from` is the author" (the rule). A receiver that does not know this field ignores it under §3.1's unknown-field rule and still threads and replies correctly — it only loses the author's name. *(A group needs both a thread identity and an author identity. Prefixing the author into `body` would spend up to 18 characters of `body` on every group page and make the author unrecoverable by a parser. Costs 26 bytes at §3.3's ceiling, which that section carries. Never sent on `/up`: a device replies to a conversation, and the relay knows which member's device it is.)* |
 | `n` | uint | no; signed envelopes only | 0…2⁵³-1 *(widened from a 32-bit counter; see rationale)* | Per-device, per-direction replay counter (§2.4, §2.5, §14.2). Strictly increasing per publisher. |
@@ -133,14 +135,18 @@ Base envelope:
 | `name` | string | `contact_req` only | ≤16 code points, ≤48 UTF-8 bytes | Contact display name (§4.2). *(Also the group's display name on `/up` `grp_req`, §3.8, same bounds — one name rule for both requests.)* |
 | `ph` | string | `contact_req` only | E.164 or absent | Phone number `+…` or alias reference (§4.2). *(A `contact_req` with `ph` adds the entry at once, §3.2; the digits-only rule is unchanged.)* |
 | `d` | string | `book` only | same regex as `from` | Default recipient alias (`DEVICE_PLAN.md` §4.3). |
+| `c` | array of objects | `book` only | ≤10 contacts | Approved contacts; each has `a` (alias), `n` (name ≤16 cp), `t` (type: `web`/`sms`/`chat`/`grp`, the last for a group conversation, or `fed` for a contact on a federated relay, `docs/FEDERATION_DESIGN.md`) (`DEVICE_PLAN.md` §4.3). *(Firmware: `t` is kept verbatim in a 4-byte field and only `grp` changes behaviour; `fed` is an ordinary peer to the device, plus the bridged tags of §3.2 `rcpt`. A `t` of 5 or more bytes would be rejected, with the whole book, so a new type must stay within 4 bytes.)* *(An owner who holds an `smsNumber` (`users.smsNumber`) gets their SMS contacts in `c[]` with `t:"sms"` and an empty `cfg.sms`; otherwise they arrive as `cfg.sms`.)* *(A bridged Google Chat DM is also `t:"chat"` (docs/BRIDGE_PHONE_DESIGN.md); a bridged group is an ordinary `t:"grp"` group.)* |
 | `p` | array of objects | `book` only | ≤4 pending requests | Pending `contact_req`; each has `n` (name), `s` (status: `pend`/`no`) (`DEVICE_PLAN.md` §4.3). *(Not sent, §3.2; an absent `p` is empty.)* |
 | `more` | bool | `book` only | — | Reserved for chunking if the cap moves (`DEVICE_PLAN.md` §4.3). |
 | `cfg` | object | `/down` `cfg` kind only | — | Configuration map carrying `lock` (object with `clear` bool and `auto` int minutes; full shape in `DEVICE_PLAN.md` §5.8), `ca` (`V02_DESIGN.md` §4.4), and `sms` (§3.6 — the SMS contact allow-list). *(CFG key 3, formerly `wifi`, is retired and never reused, §10.)* *(Also `loc`, §3.2 `cfg.loc`, §10 — `{gnss}`, the GNSS enable flag.)* |
 | `peer` | string | `sms_log` only | E.164 | The other party's phone number (§3.6). |
 | `dir` | string | `sms_log` only | `out` \| `in` | Direction of the SMS this entry audits (§3.6). |
+| `st` | string | `sms_log` and `/down` `rcpt` | `sms_log`: `sent` \| `failed` \| `recv` \| `blocked`; `rcpt`: `sent` \| `failed` | Outcome of the SMS this entry audits (§3.6); on a `rcpt`, what the bridge did with the up page `ref` names (§3.2). |
 | `sms_ts` | int | `sms_log` only | ≥ 0, epoch s | When the SMS itself was sent/received, which may differ from the envelope's own `ts` if the pager was offline and queued the audit entry (§3.6). |
 | `m` | array of strings | `grp_req` only | 1…8 distinct aliases, each the alias regex above | Requested group members, not including the requesting device's owner (§3.8). *(the group request names people by the aliases the device already holds in its book.)* |
 | `url` | string | `/down` `book` nudge only | `https://host[:port]/path`, ≤200 bytes | Where the device fetches the full book (§3.7). *(The device holds no relay URL: its bootstrap bundle names only the broker, and a signed nudge is the one place it can learn one without re-provisioning.)* |
+| `ref` | string | `/down` `rcpt` only | the `/up` wire id, ≤ 16 bytes | The up message a delivery receipt is about (§3.2). CBOR key 74. |
+| `rsn` | string | `/down` `rcpt` with `st:"failed"` only | ≤ 16 bytes | Why the bridge could not deliver (§3.2). CBOR key 75. |
 
 Additional rules:
 - `body` MUST NOT contain Unicode control characters `U+0000`–`U+001F` or `U+007F`. Relay strips
@@ -149,6 +155,7 @@ Additional rules:
 - `body` MUST NOT be empty on a content message.
 - **Unknown fields MUST be ignored, not rejected.** This is the forward-compatibility rule that
   makes §11 additive.
+- Whether a device accepts a 1024-byte body is declared by its online `/status` key `mb` (§5.1, CBOR key 76), the maximum body in bytes. A device that has never reported `mb` is treated as the previous generation: bodies of at most 160 code points and 320 bytes (§3.3). The same key gates `rcpt` receipts (§3.2) and book type `fed` (`FEDERATION_DESIGN.md`).
 - Field order is unspecified; a receiver MUST NOT depend on it. Publishers SHOULD emit
   `v,id,ts,kind,from,to,sndr,body,ack,…,n,sig` in that order to keep logs diffable (`sndr`
   only ever appears on a `/down msg` and takes the slot `to` would occupy on an up
@@ -174,6 +181,7 @@ Additional rules:
 |---|---|---|---|
 | Down message (sender → device) | `/down` | `{"v":1,"id":"m_7f3a","ts":…,"from":"parent","body":"…","ack":null}` — **99 bytes** for the example above | Thread entry, rendered and acked. |
 | Location request | `/down` | `{"v":1,"id":"m_7f3a","ts":…,"kind":"loc_req","from":"mom","ack":null}` — **78 bytes**; no `body` | Not a thread entry; device answers on `/loc` (§13.2). |
+| Delivery receipt (relay → device) | `/down` | `{"v":1,"id":"m_0a1b2c3d","ts":…,"kind":"rcpt","ref":"u_91c0aa11","st":"failed","rsn":"sms_timeout","ack":null,"n":…,"sig":"…"}` — **146 bytes** signed JSON (124 with `st:"sent"` and no `rsn`), ≤ 90 bytes signed CBOR (62–78 typical); no `from`, no `body` | Not a thread entry, never shown/read-acked, QoS 1 with the persistent session only, not re-published (§5.3). Reports what the **bridge** did with an up page: the device's one chat-row tag, not a message (below). |
 | Contact request (device → relay) | `/up` | `{"v":1,"id":"u_2b7c…","ts":…,"kind":"contact_req","name":"Grandma","ph":"+15551234567","ack":null,"n":…,"sig":"…"}` — ≈140 bytes; no `from`, no `body` | Adds a contact (§4.2); rate-limited and deduped on `id`. *(An add, not an approval request; see the paragraph below the table.)* |
 | Book (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"book","bv":7,"d":"mom","c":[{"a":"mom","n":"Mom","t":"web"},…],"p":[{"n":"Uncle Bob","s":"pend"},…],"ack":null,"n":…,"sig":"…"}` — ≈590 bytes max | Not a thread entry; acked `shown` on apply (`DEVICE_PLAN.md` §4.3); only newest re-published. |
 | Book nudge (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"book","bv":7,"url":"https://…/api/device/book","ack":null,"n":…,"sig":"…"}` — ≤338 bytes signed JSON; no `d`/`c`/`p`/`more` | A `book` with no `c` and no `p`. Sent only to a device whose `/status` carries `bpull:1`; the device fetches the book over HTTPS and acks `shown` once it is applied (§3.7); only newest re-published. *(A full book lists every allowed user and group, which no longer fits the 640-byte legacy envelope, §3.7.)* |
@@ -211,6 +219,43 @@ user's alias. It is a request for a fix, not a message:
   *without acking* (§3.4). That is exactly the right behaviour for a device that predates this
   field: the request is never answered, it simply expires, and no message state moves backwards.
   Parsing `kind` is a firmware follow-up, not a prerequisite for the rest of the contract.
+
+**`kind:"rcpt"` (relay → device; delivery receipts, `docs/BRIDGE_RECEIPT_DESIGN.md`).**
+An up page whose delivery is **outbox-backed** (the recipient is reached through a bridge phone or a
+federated relay: a book contact of type `sms`, `chat` or `fed`) is not delivered when the relay stores it,
+so the device's PUBACK would say "sent" long before it is true. The relay therefore tells the device what
+happened, once per transition of that delivery out of `queued`:
+
+| Field | Value |
+|---|---|
+| `kind` | `rcpt` |
+| `ref` (CBOR key **74**) | the up message's wire `id` (`u_…`, ≤ 16 bytes) |
+| `st` (key **46**, shared with `sms_log`) | `sent` (the bridge reports the page left the phone / reached the peer relay) or `failed` |
+| `rsn` (key **75**) | only with `st:"failed"`, ≤ 16 bytes: the stored delivery error (`sms_timeout`, `bridge_offline`, `no_link`, `unpaired`, `reassigned`, `paused`, `sms_<code>`, `peer_offline`, …); an unknown value is shown verbatim |
+| `id` | `m_` + sha256(`rcpt:{deviceId}:{wireId}:{bid}:{st}`)[:8], so a retried ack or a tick re-run re-publishes the same id |
+
+Rules a receiver MUST follow:
+- **Not a thread entry.** Never inserted, never shown or read-acked, never counted by the dedup ring. It has no `from` and no
+  `body` (the device intercepts it before the content path, like `cfg`/`book`/`loc_req`).
+- **Idempotent and monotonic** on the up row named by `ref`: `sent` moves SENT → DELIVERED (a row still pending is first treated as confirmed) and nothing else; `failed` moves SENT
+  or DELIVERED (or a still-pending row) → FAILED (`failed` always wins: a group copy can report both) and stores `rsn`; every other combination is a
+  no-op, so a re-delivered receipt changes nothing and alerts nothing. A `ref` that no longer matches a thread entry is logged
+  and dropped (cosmetic; the 32-deep thread is the bound).
+- **A failure gets attention, not a row.** A `failed` receipt that changes a row raises the standard new-message alert once
+  (buzz/LED, the peer's Home row marked unread until the tag is seen) and the row's own tag carries the failure. No synthetic
+  chat row is inserted.
+- **QoS 1 with the persistent session, never acked, never re-published** (the same durability as the §4.2 case-3 reply and
+  `loc_req`). A lost receipt leaves the row at "relayed"; the web is the source of truth. *(an acked, re-published receipt would
+  cost an up publish per page, the exact cost §4.2 refused; receipts are an indicator, not an audit.)*
+- **Gate = `mb`.** A device whose last online `/status` carried `mb` (§5.1, CBOR key 76) gets `rcpt`; a device that did not gets
+  the phase-1 fallback instead: a `system` down message `to <name> <h:mm>: not delivered (<reason>)` on failure and nothing on
+  success.
+
+The pager renders an up row's tag from the peer's book type `t` and the row state. For `t` in {`sms`, `chat`, `fed`}: PENDING "…",
+SENT "relayed" (the broker has it, §4.2), DELIVERED "sent", FAILED "FAILED <rsn>". For every other peer the tags are the
+long-standing "...", "sent" on the broker's PUBACK, "FAILED" (a receipt that arrives anyway still applies, and a failure
+then reads "FAILED <rsn>"). A bridged page is written to the device's `msghist` three times: at insert, at SENT, and
+once more when a receipt moves it (record version 3 adds `rsn`).
 
 **`kind:"contact_req"` (device → relay).** A contact request is an up message with
 `kind:"contact_req"`, `ack:null`, and either `ph` (E.164 phone number) or neither `ph` nor `body`
@@ -321,6 +366,13 @@ to stop powering the receiver while location keeps working from the serving cell
 
 ### 3.3 Envelope size limit
 
+**Hard limit: 1280 bytes** for the `pager/{device_id}/…` namespace. Any payload larger than
+1280 bytes MUST be dropped unparsed by both relay and device. The ceiling is the 1024-byte body
+(§3.1) plus the envelope; it stays well under the modem library's 1540-byte receive buffer, which is
+what cannot be raised cheaply (8× the increase in internal RAM, `docs/GOTCHAS.md`). A device
+that has not reported `mb` (§5.1) still applies the old 160-code-point / 320-byte body cap and the
+relay still sends it nothing longer; the 1280-byte envelope limit is only ever reached by a device
+that did. 
 Worst case, with every field at its maximum and JSON escaping expanding `"` and `\` to two bytes.
 **This table is a deliberately conservative per-field ceiling, not a payload that can exist**: it
 sums each field's independent maximum, and several of those maxima are mutually exclusive.
@@ -332,17 +384,22 @@ sums each field's independent maximum, and several of those maxima are mutually 
 "id":"<=16>", 24
 "ts":1757700000, 16
 "from":"<=16>", 26
+"body":"<=1024>", 1034  
 "ack":"<=8>", 16
   ----
+  1124 v1 down msg, text fields only  
 
 "sndr":"<=16>", 26   (`/down` group page only, §3.1)
   ----
+  1150 v1 down msg in a group  
 
 "to":"<=16>", 24
   ----
+  1148 up msg with to  
 
 "sig":"<11 base64url chars>", 20   (the tag is 8 bytes, §3.1, which is 11 base64url characters)
   ----
+  1168 up msg with to and sig (signed)  
 ```
 
 **JSON, signed (with `n` and `sig`):**
@@ -350,8 +407,11 @@ sums each field's independent maximum, and several of those maxima are mutually 
 "n":9007199254740991, 19  (n's max grew from 2^32-1 (10 digits) to 2^53-1 (16 digits), +6 B)
 "sig":"<11 base64url>", 20
   ----
+  1153 down msg, signed  
+  1179 down msg in a group, signed (+26 for `sndr`)  
   
   ----
+  1129 up msg without to, signed  
 ```
 
 **CBOR, signed (with `n` and `sig`):**
@@ -360,6 +420,9 @@ sums each field's independent maximum, and several of those maxima are mutually 
   (≈94 B), +6 B at a typical 3-character alias. *(stated because a two-byte integer key plus a
   string head is not the same +26 the JSON form pays.)*
 
+*(Counted from the CBOR encoding that a device and the relay both use.)* The largest content envelope is a **group `/down` message with a 1024-byte body**: signed CBOR ≈ **1114 bytes** (map head 1, `v` 2, `id` 18, `ts` 6, `from` 18, `body` 1028 — a 1024-byte text string has a 3-byte head — `ack` 2, `sndr` 19, `n` ≤10, `sig` 10); an addressed `/up` message is ≈ **1104 bytes**. Headroom under 1280 is **≥ 166 bytes**. The signed **JSON** form with a worst-case body is larger (each `"` and `\` costs two bytes, and a non-ASCII body written as `\uXXXX` costs six per character, §3.3's raw-UTF-8 rule): a publisher that encodes JSON MUST check the encoded length against 1280 before it publishes and MUST NOT send an envelope over it. The pager encodes CBOR only, so this binds the relay (`devcfg._assert_within_envelope_limit`'s equivalent for messages). Every other payload in this section (OTA `cfg` 523/547 bytes, `/status` ≤ 625 JSON) is unchanged and has 600 or more bytes of headroom under 1280.
+
+The two new envelopes sit
 well inside the limit: a maximal `/down` book nudge (§3.7, `url` at 200 bytes, `bv` and `n` at
 their maxima) is **338 bytes** signed JSON; a maximal `/up` `grp_req` (§3.8, `id` 16, `name` 48
 bytes with every byte JSON-escaped, 8 aliases of 16) is **380 bytes** signed JSON and ≈250 bytes
@@ -369,6 +432,8 @@ bound is §3.7's 4096 bytes.
 
 *(The one escaping assumption the limit depends on.)* Publishers MUST serialise non-ASCII `body` characters as **raw UTF-8, not `\uXXXX`
 escapes**. §3's "minified UTF-8 JSON" already implies this, but the consequence is load-bearing:
+a legal 1024-byte non-ASCII `body` (340 CJK characters) emitted with `\u` escaping is about 2040 bytes and would be
+dropped unparsed by every receiver. The relay and the device both emit raw UTF-8.
 
 *(OTA, contact-request replies and battery stats; measured with the relay's own
 encoder so the worst case stays a number in this section.)* A maximal `/down` `cfg.ota` delta job
@@ -658,12 +723,31 @@ state. States are **monotonic** — a message never moves backwards.
 **Up messages have no relay-side lifecycle beyond storage, and the relay sends no ack back to the
 device** *(an ack-of-reply would cost one extra down message plus one extra
 radio wake per reply for information the device already has from its own PUBACK; the parent page is
+the endpoint that matters)*, **with one exception (`docs/BRIDGE_RECEIPT_DESIGN.md`):
+an outbox-backed delivery (`sms`, `bridge` and `fed` backends: a bridge phone or a peer relay acks it later) gets one
+`kind:"rcpt"` receipt (§3.2) when it leaves `queued`**, because there the device does *not* already
+know the outcome. Pager, webapp and Google Chat webhook deliveries are immediate and keep the no-ack rule. A receipt for a reply the device still shows as pending (its PUBACK not yet seen) counts as the broker's confirmation too: the device releases the reply as a PUBACK would, then applies the receipt, so a later PUBACK or the 30 s timeout for that message changes nothing (the relay can fail a bridged page inline inside the same `/up` request).
 
 Device-side only, in RTC memory: a **2-entry** queue holding the reply body at full fidelity
+(§9.3, §9.4). A reply is never truncated to fit; the composer refuses input past 1024 UTF-8 bytes
+instead, with the toast "message full"
+and a `n/1024` counter from 900 bytes. A reply to a peer on the pager's **direct-SMS** list keeps
+the single-part SMS limit (160 GSM-7 / 70 UCS-2 characters, §3.6) and its "message too long for SMS"
+refusal: that path talks to the modem in text mode, which has no concatenation.
 
 ```
+compose --> pending --(modem OK)--> awaiting --(broker PUBACK, rc 0)--> done (entry freed)
+  |                                     |
+  |                                     +--(rc != 0, session dropped, or 30 s of silence)--> one failed attempt
   +--(3 failed attempts, or >2 h old)--> failed (UI shows "not sent", entry freed)
 ```
+
+*(A reply is marked sent only on the broker's PUBACK. The modem's `OK` to `AT+SQNSMQTTPUBLISH`, which only means the
+modem accepted the message; the broker's PUBACK follows as the `+SQNSMQTTONPUBLISH:0,<mid>,<rc>` URC. The device reads the
+`<mid>` from the `+SQNSMQTTPUBLISH: <mid>` line, keeps the reply (RTC slot and `msgq` body) until the URC with that mid and rc 0
+arrives, and counts rc != 0, a dropped session or 30 s without the URC as one failed attempt of the 3 / 2 h rule. A
+reset forgets the "awaiting" state, so the reply is published again under the same `id`, which the relay dedups. Acks are
+unchanged: they are freed on the modem's `OK`.)*
 
 Relay-side an up message is simply inserted with `direction='up'` and served to the reading UI. An
 up message whose `id` already exists is a duplicate and is dropped (QoS 1 redelivery); the dedup
@@ -742,6 +826,7 @@ broker-generated LWT.
 | `ota_err` | string | no | 1–8 lowercase letters | *(OTA)* Why the job failed or was rejected: `base`, `hash`, `osha`, `http`, `budget`, `flash`, `nobl`, `pv`, `size`, `expired`; font jobs add `nopart`, `fmt`, `run`. A relay accepts any code in the range, since the list can grow. **Display only.** |
 | `ast` | int | no | 0, 1 or 2 | *(font OTA, `docs/ASSETS_OTA_DESIGN.md` §3.)* 0 = firmware with font OTA but no `assets_ota` partition, 1 = factory fonts active, 2 = `assets_ota` active. CBOR key 72. Absent means firmware without font OTA. The relay offers a font update only for 1 or 2. |
 | `ast_id` | string | no | 16 lowercase hex chars | *(font OTA)* Short id of the active `assets_ota` image; present only when `ast` is 2. CBOR key 73. The relay treats it equal to a font job's target as that job done. |
+| `mb` | int | no | 1…65535 | *(Long bodies, `docs/LONG_BODY_DESIGN.md`: the capability switch for the long-body features.)* The largest message body, in UTF-8 bytes, this firmware accepts on `/down` and will send on `/up`; sent as `1024` by firmware of this generation in every online `/status`. CBOR key 76 (§10). A relay stores it as `devices.status.mb`. A device that reports `mb` gets bodies up to that size, `rcpt` receipts (§3.2) and book contacts of type `fed` (`FEDERATION_DESIGN.md`); a device that does not is treated as the previous generation (bodies ≤ 160 code points / 320 bytes, failure notices as `system` rows). The relay splits a longer text into consecutive messages per recipient, never refusing it for length. An absent value means "not reported", not 0. |
 | `bs` | map | no | sub-map below | *(battery stats, `docs/BATTERY_STATS_DESIGN.md`: the breadboard build has no fuel gauge, so drain is modelled from time spent in each state. The carrier board's gauge is read for the battery level, not for this window.)* The battery-stats window, in every online `/status` once the window holds ≥ 1 s. CBOR only (§3.3). **Display and modelling only.** |
 | `gnss` | int | no | `0` \| `1` | *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`: shows whether a `cfg.loc` push took effect.)* `1` when the device may power its GNSS receiver, `0` when `cfg.loc` (§3.2) has disabled it. Present in every `/status` from firmware that supports `cfg.loc`; absent means firmware that predates the field, which the relay treats as unknown. **Display only.** |
 | `car` | string | no | ≤24 printable ASCII chars | *(Soracom bearer, `docs/SORACOM_DESIGN.md` §3.4: shows which carrier preset, and so which bearer, the device chose from its SIM.)* Label of the carrier preset in force, e.g. `Soracom`, `US Mobile Dark Star`; absent when no preset is in force (carrier default or typed custom APN) and in firmware that predates the field. A relay drops a malformed value alone, treating it as absent. **Display only.** |
@@ -1416,11 +1501,23 @@ log `sizeof(pager_rtc_t)` at boot and MUST `_Static_assert(sizeof(pager_rtc_t) <
 
 ### 9.4 Reply and unread bodies are full fidelity
 
+§3.1 caps a body at **1024 UTF-8 bytes**.
 
+**Reply bodies (§4.2; `DEVICE_PLAN.md` §5.6).** A composed reply can be up to 1024 UTF-8 bytes of arbitrary Unicode.
+Instead of storing bodies in RTC (which has no headroom), replies are stored in NVS namespace `msgq`
+with full fidelity. The composer MUST **refuse input past 1024 UTF-8 bytes** rather than truncate; a
+truncated reply would be a silent correctness failure. The NVS write happens on submit; the entry is
+erased once the reply is confirmed sent (the broker's PUBACK, §4.2).
 
+**Unread down messages.** The newest unread down message is stored in NVS `msgq` in full (up to 1024
 bytes). In normal operation the UI renders from the RAM copy; on reset, the device restores from NVS
 with full fidelity, never truncated. (Older unread messages beyond the newest are lost to RAM; §9.6
 says so explicitly.)
+
+**`msgq` budget.** `msgq` can hold up to three bodies of 1024 bytes (two pending
+replies and the newest unread), about 100 NVS entries, in the 24 kB main `nvs` partition. The sizing is not yet measured: the `nvsstats` console command prints `nvs_get_stats()` for the
+`nvs` and `msghist` partitions. If `nvs` has fewer than **300 free entries** with a reply pending and
+an unread page stored, the `msgq` bodies move into the `msghist` partition instead.
 
 ### 9.5 RAM and NVS store
 
@@ -1428,13 +1525,21 @@ says so explicitly.)
 
 | Field | Bytes | Purpose |
 |---|---|---|
+| `s_thread[32]` — `msg_t` header only: `ts`, `id[17]`, `from[17]`, `to[17]`, `sndr[17]`, `body_slot`, `body_len`, `dir`, `ack_state`, `flags`, `in_use`, `hist_seq` | ≈ 3.1 kB | Thread history, both directions. **32 entries** for richer history display; §5.3's 10-per-online-edge re-publish cap is about message *state*, not ring depth. *(The header does not carry the text.)* |
+| Body pool: `32 × 1025` bytes, `heap_caps_calloc` once in `msg_init()` | 32 800 B **in PSRAM** | The text of the 32 thread entries, one slot per entry (`msg_t.body_slot`), read with `msg_body_copy()` under the lock. Without PSRAM: **4 internal slots**; the older rows show "(text not kept)". Never allocated after init. |
+| Static scratch: `s_ingest_body[1025]` (modem event task), `s_tx_body[1025]` + `s_tx_buf[1280]` (main task), `s_body_scratch[1025]` (chat screen), record scratch `s_hist_rec[1140]` | ≈ 5.5 kB internal | Replace stack copies on the 8 KB modem event task and the UI task. `scr_chat.c` and `scr_home.c` keep headers only and fetch one body at a time. |
+| `s_composer[1025]` + cursor/length/to | 1032 | In-progress reply text, UTF-8 with IME (§5.2, §9.4); `to` field to track recipient |
 | `ui.c` frame buffers: new plane + shadow (old) plane, 16 B/row × 296 rows each | 9472 | SSD1680 differential partial refresh needs both planes |
 
+Release build (`idf.py size`), with the receipt and PUBACK code included: static internal RAM (`.data` + `.bss`) is 269 859 B, against 295 931 B before the change (**−26.1 kB**; 76.0 kB free, from 49.9 kB), with 32.8 kB of PSRAM taken for the pool. The per-screen `msg_t` copies on the UI task's stack (≈ 12 kB in `scr_chat.c`) are gone too. RAM is not the scarce resource.
 
 **NVS-resident, namespace `msgq` (survives reset and cold boot):**
 
 | Field | Bytes | Purpose |
 |---|---|---|
+| Reply body (each entry) | ≤ 1024 + metadata | Unsent reply body, stored on submit, erased once confirmed sent (§9.4, §4.2) |
+| Unread message body | ≤ 1024 + metadata | Newest unread down message, full fidelity (§9.4) |
+| `msghist` partition record (separate 1 MiB NVS partition, §9.6) | ≤ 1140 | One per thread entry; length is a `u16` (`MSGHIST_REC_MAX` is 1140) |
 
 ### 9.6 What survives what
 
@@ -1486,6 +1591,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 3 | `from` | tstr | `/down` msg, ack, location answer |
 | 4 | `body` | tstr | `/down` msg, `/up` msg, bootstrap ok (if present) |
 | 5 | `ack` | tstr | all envelopes (`shown`, `read`, or `null`) |
+| 6 | `kind` | tstr | `/down` (msg/loc_req/book/cfg/rcpt), `/up` (msg/contact_req), bootstrap ok; `/up` `grp_req`, and the §3.7 fetch response |
 | 7 | `to` | tstr | `/up` content messages |
 | 8 | `loc` | map | `/loc` envelope (§13.2) |
 | 9 | `req` | tstr | `/loc` envelope (§13.2) |
@@ -1525,6 +1631,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 43 | `loc_backoff_s` | int | `/status` (location backoff — §5.1, §13.3) |
 | 44 | `peer` | tstr | `/up` `sms_log` (§3.6 — the other party's E.164 phone number) |
 | 45 | `dir` | tstr | `/up` `sms_log` (§3.6 — `out`/`in`) |
+| 46 | `st` | tstr | `/up` `sms_log` (§3.6 — `sent`/`failed`/`recv`/`blocked`); `/down` `rcpt` (§3.2 — `sent`/`failed`) |
 | 47 | `sms_ts` | int | `/up` `sms_log` (§3.6 — when the SMS itself was sent/received) |
 | 48 | `sms_lost` | int | `/status` (§3.6 — device SMS audit-drop counter) |
 | 49 | `cell` | map | `/loc` envelope, optional (§13.2 — cell-tower location fallback) |
@@ -1552,6 +1659,9 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 71 | `temp_dc` | int | `/status` (modem temperature, tenths of °C, −400…1250, optional) |
 | 72 | `ast` | uint 0–2 | `/status` (font OTA, §5.1 — 0 no `assets_ota` row, 1 factory, 2 `assets_ota` active, optional) |
 | 73 | `ast_id` | tstr, 16 hex | `/status` (font OTA, §5.1 — active `assets_ota` id, only when `ast`=2, optional) |
+| 74 | `ref` | tstr, ≤16 B | `/down` `rcpt` (§3.2 — the `/up` wire id a delivery receipt is about) |
+| 75 | `rsn` | tstr, ≤16 B | `/down` `rcpt` (§3.2 — why a delivery failed, only with `st:"failed"`) |
+| 76 | `mb` | uint, 1…65535 | `/status` (long bodies, §5.1 — max body bytes; firmware of this generation sends `1024`; also the capability gate for `rcpt` and book type `fed`) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1564,6 +1674,7 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 0…268435455), `rsrp=4` (int, dBm, optional). Unknown sub-keys are ignored, per §3.1's usual
 forward-compatibility rule.
 
+`c[]` contact object (inside `/down` `book`): `a=0` (alias), `n=1` (name), `t=2` (type web/sms/chat/grp/fed).
 *(the §3.7 fetch response uses the same `c[]` sub-map, so the device keeps one
 book parser.)*
 

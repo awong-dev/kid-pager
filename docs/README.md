@@ -54,4 +54,13 @@
 - [TWILIO_EVAL.md](TWILIO_EVAL.md): relay-side SMS through Twilio: the evaluation.
 - [RCA_SLEEP_PAGE_LOSS.md](RCA_SLEEP_PAGE_LOSS.md): root-cause analysis of pages lost while the pager light-sleeps.
 - [RCA_SLEEP_PUBLISH.md](RCA_SLEEP_PUBLISH.md): root-cause analysis of the release-only publish payload replaced by AT command text.
+- [RCA_SLEEP_URC.md](RCA_SLEEP_URC.md): root-cause analysis of URCs lost or held at the light-sleep boundary.
+- [VENDOR_BUG_REPORTS.md](VENDOR_BUG_REPORTS.md): draft bug reports for the modem vendor and the library vendor.
 
+## Runbooks
+
+- [FAMILY_MOVE.md](FAMILY_MOVE.md): move one family between servers: freeze, export, import dry run, pager setup codes, back out.
+- [../home/README.md](../home/README.md): the home server runbook.
+- [../infra/README.md](../infra/README.md): the cloud deployment runbook.
+
+Each top-level directory has its own README for running that part: `relay/`, `web/`, `firmware/`, `infra/`, `home/`, `bridge-android/`.

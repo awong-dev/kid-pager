@@ -262,6 +262,23 @@ the relay already treats documents as schemaless and upgrades by tolerating miss
 creation is idempotent at start. An `export` command writes the database as newline-delimited JSON,
 and `import` reads it, so a whole database can move between the cloud and a home server: export with
 `gcloud firestore export`, convert with the same script, import. Secrets (device signing keys, broker
+passwords) are documents too, so they come along, but a pager is not moved by them.
+
+A move of one family uses `python -m app.familyexport` (a `.kpfam` file; runbook in
+`docs/FAMILY_MOVE.md`). Each pager moved this way needs a new setup code, typed on the device,
+because its broker login and host change. A `cfg` push cannot make that change today (it needs
+firmware work). The device keys in the file replace the old ones.
+
+**Deleted data stays deleted (`docs/RETENTION_DESIGN.md`).** The database opens with
+`secure_delete=ON` (a deleted or replaced row's bytes are zeroed in place) and, when created,
+`auto_vacuum=INCREMENTAL`. Every daily sweep ends with `PRAGMA incremental_vacuum` and
+`wal_checkpoint(TRUNCATE)` (`Client.reclaim_space`), so a swept message body is in neither the
+`.sqlite` file nor the `-wal`; a database created before this change gets one full `VACUUM` at its
+first sweep, then incremental. `tests/test_sqlitestore.py` and `tests/test_retention_sweep.py`
+search the raw bytes for a deleted body. A backup copies the live database as it is, so it still
+holds whatever was alive when it was taken: `homebackup` keeps the newest 7 archives
+(`--keep N`, `0` keeps all) and deletes older ones after each run. `pre-restore-*` directories are
+never pruned and hold a full old database, so delete them by hand once a restore is confirmed.
 
 ## 4. Live reads: Firestore listeners or relay SSE
 
@@ -506,6 +523,10 @@ Two checks are needed before this is considered working:
 1. The modem completes a TLS 1.2 handshake with nginx's default `stream` cipher configuration and
    an RSA-2048 certificate from a private CA. Expected to work: this is the EMQX OSS demo-CA case
    `DEVICE_PLAN.md` §3.3 already lists as working locally.
+2. A pager provisioned against the cloud moves to a home server only with a new setup code (a
+   re-provision). A `cfg` push cannot change the broker host today: that needs firmware work and a
+   credential the store does not hold. Whether a `cfg` field for `host` is worth adding is a separate,
+   small firmware decision.
 
 ## 9. Build order
 
@@ -551,6 +572,10 @@ Built in this order; each step keeps both deployments working and can be verifie
   stream ciphers. Verified only with `tools/pager_client.py` (e2e); a real modem is not yet tested.
 - **ECDSA on the modem.** RSA-2048 until a bench run says otherwise.
 - **Beam with a private CA.** Not verified (§7.5).
+- **Moving a pager between deployments** without re-provisioning (§8 item 2): not built, and not
+  planned for v1. The data moves (`dbexport` for the whole database, `familyexport` per family);
+  the pager still needs a new setup code each way. Imported home accounts get an invite code
+  (`docs/FAMILY_EXPORT_DESIGN.md`), not a `reset-password` code. See `docs/FAMILY_MOVE.md`.
 - **`dbexport convert`** is checked against the Firestore emulator's export, not yet against a
   real `gcloud firestore export` (the same format by Google's documentation).
 - **Bridge phone and push on real devices** are not yet tested: the bridge phone against both TLS modes,
