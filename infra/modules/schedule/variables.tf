@@ -29,7 +29,9 @@ variable "tick_schedule" {
 }
 
 variable "sweep_schedule" {
+  description = "docs/SERVER_PLAN.md §5.7/§11 D7: daily, 03:00 local (docs/RETENTION_DESIGN.md decision 4)."
   type        = string
+  default     = "0 3 * * *"
 }
 
 variable "time_zone" {

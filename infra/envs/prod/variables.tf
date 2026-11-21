@@ -109,9 +109,11 @@ variable "tick_schedule" {
 
 variable "sweep_schedule" {
   type    = string
+  default = "0 3 * * *"
 }
 
 variable "time_zone" {
+  description = "docs/SERVER_PLAN.md §5.7/D7: the sweep's daily \"03:00\" is local to this timezone."
   type        = string
   default     = "America/Los_Angeles"
 }

@@ -368,6 +368,17 @@ bucket-level access makes the grant bucket-wide, but the relay only writes under
 
 ---
 
+## 16. Retention and backups (`docs/RETENTION_DESIGN.md`)
+
+The relay deletes by age on its own: the Cloud Scheduler `sweep` job runs daily (03:00 local,
+`sweep_schedule`) and the hourly-first tick removes expired location fixes. The admin Retention
+settings (`messagesDays`, `locationsDays` max 30, `alertsDays`, `batteryDays`) set the windows and
+`settings/meta.lastSweep` shows the last run. Firestore here has no point-in-time recovery,
+scheduled backup or export job (the only Firestore resource is `google_firestore_database.default`
+in `modules/firebase`). Enabling PITR, a backup schedule or a manual `gcloud firestore export`
+keeps every deleted document for that window or until the export is deleted, which extends
+retention by exactly that long; do not export location history casually.
+
 ## Cost summary (recap of `docs/SERVER_PLAN.md` §9.3; verify against current pricing)
 
 Everything here is designed to be $0/month except (a) Secret Manager, Artifact Registry and
