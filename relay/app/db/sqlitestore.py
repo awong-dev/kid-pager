@@ -650,6 +650,10 @@ class Client:
             self._lock_file.close()
             raise DatabaseInUse(f"{path} is open in another relay process") from exc
         self._writer = sqlite3.connect(path, timeout=0, isolation_level=None, check_same_thread=False)
+        # `auto_vacuum` only applies to a database with no tables yet (else `reclaim_space`);
+        # `secure_delete` zeroes deleted rows. Must precede the probe (a write fixes the header).
+        if self._writer.execute("PRAGMA page_count").fetchone()[0] == 0:
+            self._writer.execute("PRAGMA auto_vacuum=INCREMENTAL")
         try:
             self._writer.execute("BEGIN IMMEDIATE")
             self._writer.execute("ROLLBACK")
@@ -657,6 +661,7 @@ class Client:
             self._writer.close()
             self._lock_file.close()
             raise DatabaseInUse(f"{path} is held for writing by another process") from exc
+        self._writer.execute("PRAGMA secure_delete=ON")
         self._writer.execute("PRAGMA journal_mode=WAL")
         self._writer.execute("PRAGMA synchronous=NORMAL")
         self._writer.execute("PRAGMA busy_timeout=5000")
@@ -701,6 +706,19 @@ class Client:
         with self._wlock:
             cur = self._writer.execute("DELETE FROM docs")
         return cur.rowcount
+
+    def reclaim_space(self) -> str:
+        """End-of-sweep: free pages, truncate the WAL; returns "vacuum" or "incremental"."""
+        with self._wlock:
+            if self._writer.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+                self._writer.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                self._writer.execute("VACUUM")
+                mode = "vacuum"
+            else:
+                self._writer.execute("PRAGMA incremental_vacuum")
+                mode = "incremental"
+            self._writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return mode
 
     def document_count(self) -> int:
         """How many documents the database holds."""

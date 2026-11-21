@@ -20,6 +20,7 @@ from app.store import bridges as bridges_store
 from app.store import contacts as contacts_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
+from app.store import fed_links as fed_links_store
 from app.store import users as users_store
 from app.store.devices import SmsContact
 from app.store.users import User
@@ -53,6 +54,9 @@ class BookEntry:
     # The owner added this entry from the pager (`users/{owner}/book/{peer}.added`).
     # Listing only; grants nothing.
     added: bool = False
+    # `{linkId, name, host}` on an external standing for a person in a linked family (`name`,
+    # `host`: that family's name and server).
+    fed: dict | None = None
 
     @property
     def label(self) -> str:
@@ -223,6 +227,22 @@ def bridge_peer_reason(
     return None
 
 
+def fed_link_for(contact: User) -> fed_links_store.FedLink | None:
+    """The link a federated external is reached through (`{ownerFamilyId}_{remoteFedId}`)."""
+    remote = (contact.fed or {}).get("remoteFedId")
+    if not remote or not contact.ownerFamilyId:
+        return None
+    return fed_links_store.get_for(contact.ownerFamilyId, str(remote))
+
+
+def fed_link_reason(contact: User) -> str | None:
+    """Why a linked-family person cannot be written to: `fed_reauth`, `unpeered`."""
+    link = fed_link_for(contact)
+    if link is not None and link.state == "reauth":
+        return "fed_reauth"
+    return None if link is not None and link.state == "active" else "unpeered"
+
+
 def entries_for(owner_uid: str) -> list[BookEntry]:
     """Same-family persons, out-edge peers and groups; `sendable`/`reason` from `policy.check`."""
     owner = users_store.get_user(owner_uid)
@@ -244,6 +264,7 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
 
     sms_contacts = sms_contacts_for(owner)
     chat_contacts: list[User] = []
+    fed_contacts: list[User] = []
     peers: dict[str, tuple[User, bool]] = {}
     if owner.familyId is not None:
         for user in users_store.list_users():
@@ -264,6 +285,14 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
             # Chat and fed contacts are listed from out-edges; SMS contacts come from
             # `sms_contacts_for`; a group's external is represented by the group entry.
             if (
+                user.fed
+                and user.ownerFamilyId == owner.familyId
+                and user.fed.get("remoteFedId")
+            ):
+                # A person in a linked family, listed from the owner's out-edges like a
+                # Chat contact.
+                fed_contacts.append(user)
+            elif (
                 user.chat
                 and user.ownerFamilyId == owner.familyId
                 and not user.chat.get("isGroup")
@@ -370,6 +399,30 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
                 sendable=reason is None,
                 reason=reason,
                 chat={"source": chat.get("source")},
+            )
+        )
+    for contact in fed_contacts:
+        link = fed_link_for(contact)
+        reason = policy_module.check(owner, contact, True, False)
+        if reason is None:
+            reason = fed_link_reason(contact)
+        entries.append(
+            BookEntry(
+                uid=contact.uid,
+                alias=contact.alias,
+                kind="external",
+                displayName=contact.displayName,
+                nick=nicks.get(contact.uid),
+                phone=None,
+                inFamily=False,
+                sendable=reason is None,
+                reason=reason,
+                onPager=reason is None,
+                fed={
+                    "linkId": link.id if link else None,
+                    "name": link.remote.name if link else None,
+                    "host": link.remote.host if link else None,
+                },
             )
         )
     for conv in conversations_store.list_groups_for_member(owner_uid):

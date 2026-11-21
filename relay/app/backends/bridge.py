@@ -7,6 +7,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict
 
+from app import deliveries
 from app.backends.base import DeliverResult, LinkStep
 from app.store import bridge_conversations, bridge_outbox
 from app.store import bridges as bridges_store
@@ -33,8 +34,10 @@ def apply_outbox_state(
     """The outbox row's state decides the delivery's."""
     messages_store.set_delivery_external_id(msg.id, backend_id, item.id)
     if item.state == "sent":
+        deliveries.mark_sent(msg.id, backend_id, kind="bridge")
         return DeliverResult(ok=True, state="sent", external_id=item.id)
     if item.state == "failed":
+        deliveries.mark_failed(msg.id, backend_id, error=item.reason, kind="bridge")
         return DeliverResult(ok=False, state="failed", external_id=item.id, error=item.reason)
     return DeliverResult(ok=True, state="queued", external_id=item.id)
 
@@ -47,6 +50,7 @@ class BridgeBackend:
         config = BridgeConfig.model_validate(backend.config)
         bridge = bridges_store.get(config.bridgeId)
         if bridge is None or not bridge.paired:
+            deliveries.mark_failed(msg.id, backend.id, error="no_bridge", kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="no_bridge")
         row = (
             bridge_conversations.get(bridge.id, config.conversationId)
@@ -54,8 +58,10 @@ class BridgeBackend:
             else None
         )
         if row is not None and row.status == "paused":
+            deliveries.mark_failed(msg.id, backend.id, error="paused", kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="paused")
         if msg.kind != "text" or not msg.body:
+            deliveries.mark_failed(msg.id, backend.id, error="unsupported", kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="unsupported")
         to: dict[str, str | None] = {"conversationId": config.conversationId, "link": config.link}
         if config.conversationId:

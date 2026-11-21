@@ -20,6 +20,10 @@ from app.store import backends as backends_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import users as users_store
+
+# cfg/book/nudge builds stay under the legacy 640-byte envelope so a device that has not
+# reported `mb` (older firmware) can still receive them.
+from app.wire import LEGACY_MAX_ENVELOPE_BYTES as MAX_ENVELOPE_BYTES
 from app.wirecbor import encode as cbor_encode
 from app.wirecbor import to_json_safe
 
@@ -98,6 +102,11 @@ def _contact_type_hint(uid: str) -> str:
     return "web"
 
 
+def _fed_type(device: devices_store.Device) -> str:
+    """`fed` once the pager has reported `mb` (it understands receipts), else `web`."""
+    return "fed" if device.status.mb is not None else "web"
+
+
 def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
     """Every group `owner_uid` belongs to as a `t: "grp"` contact; alias-less groups are skipped."""
     return [
@@ -107,6 +116,7 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
     ]
 
 
+def _approved_contacts(owner_uid: str, *, fed_type: str = "web") -> list[dict[str, Any]]:
     """Every contact the device book may list (sendable or `added`), uncapped and unordered."""
     from app import book
 
@@ -117,6 +127,8 @@ def _group_contacts(owner_uid: str) -> list[dict[str, Any]]:
             "t": (
                 "grp"
                 if e.kind == "group"
+                else fed_type
+                if e.fed
                 else ("chat" if e.chat else "sms")
                 if e.kind == "external"
                 else _contact_type_hint(e.uid)  # type: ignore[arg-type]
@@ -138,7 +150,11 @@ def _contact_sort_key(contact: dict[str, Any], default_alias: str | None) -> tup
     return (rank, contact["n"].casefold(), contact["a"])
 
 
+def _ordered_contacts(
+    owner_uid: str, default_alias: str | None, *, fed_type: str = "web"
+) -> list[dict[str, Any]]:
     """`_approved_contacts` in §3.7 `c[]` order, uncapped."""
+    contacts = _approved_contacts(owner_uid, fed_type=fed_type)
     contacts.sort(key=lambda c: _contact_sort_key(c, default_alias))
     return contacts
 
@@ -188,6 +204,9 @@ def build_book(device_id: str) -> dict[str, Any]:
     default_alias = _default_alias(device)
     if default_alias is not None:
         obj["d"] = default_alias
+    obj["c"] = _ordered_contacts(
+        device.ownerUid, default_alias, fed_type=_fed_type(device)
+    )[:MAX_APPROVED_CONTACTS]
     obj["ack"] = None
     _assert_within_envelope_limit(obj)
     return obj
@@ -200,6 +219,7 @@ def build_book_body(device_id: str) -> dict[str, Any]:
         raise ValueError(f"no such device: {device_id!r}")
 
     default_alias = _default_alias(device)
+    contacts = _ordered_contacts(device.ownerUid, default_alias, fed_type=_fed_type(device))
     truncated = len(contacts) > MAX_PULL_CONTACTS
 
     obj: dict[str, Any] = {

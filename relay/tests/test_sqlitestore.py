@@ -330,3 +330,67 @@ def test_refuses_a_database_another_process_holds_for_writing(tmp_path):
 def test_refuses_a_second_client_on_the_same_file(db):
     with pytest.raises(sqlitestore.DatabaseInUse):
         sqlitestore.Client(db._path)
+
+
+def _file_bytes(path: str) -> bytes:
+    import os
+
+    out = b""
+    for suffix in ("", "-wal"):
+        if os.path.exists(path + suffix):
+            with open(path + suffix, "rb") as f:
+                out += f.read()
+    return out
+
+
+def test_new_database_is_incremental_vacuum_and_secure_delete(db):
+    conn = db._writer
+    assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+def test_deleted_and_replaced_bodies_are_absent_from_db_and_wal_bytes(db):
+    """After deletion (one row first overwritten) and `reclaim_space()`, neither the main file nor
+    the -wal holds the strings."""
+    col = db.collection("messages")
+    secret = "SECRET-BODY-0123456789-" + "x" * 3000  # spills into overflow pages
+    old_version = "OLD-VERSION-9876543210"
+    for i in range(20):
+        col.document(f"m{i}").set({"body": f"{secret}{i}", "n": i})
+    col.document("keep").set({"body": "KEEP-ME-PLEASE", "n": -1})
+    col.document("edit").set({"body": old_version})
+    col.document("edit").set({"body": "replacement"})
+    assert b"SECRET-BODY-0123456789-" in _file_bytes(db._path)  # the check can see them
+    for i in range(20):
+        col.document(f"m{i}").delete()
+    db.reclaim_space()
+    raw = _file_bytes(db._path)
+    assert b"SECRET-BODY-0123456789-" not in raw
+    assert old_version.encode() not in raw
+    assert b"KEEP-ME-PLEASE" in raw
+    assert col.document("keep").get().to_dict()["body"] == "KEEP-ME-PLEASE"
+
+
+def test_reclaim_space_converts_an_old_database_once_and_shrinks_the_file(tmp_path):
+    import os
+
+    path = str(tmp_path / "old.sqlite")
+    seed = sqlite3.connect(path)  # a database made before the pragma existed
+    seed.execute("CREATE TABLE t(x)")
+    seed.commit()
+    seed.close()
+    client = sqlitestore.Client(path)
+    try:
+        assert client._writer.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+        col = client.collection("c")
+        for i in range(200):
+            col.document(f"d{i}").set({"pad": "p" * 2000})
+        for i in range(200):
+            col.document(f"d{i}").delete()
+        big = os.path.getsize(path)
+        assert client.reclaim_space() == "vacuum"
+        assert client._writer.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+        assert os.path.getsize(path) < big
+        assert client.reclaim_space() == "incremental"
+    finally:
+        client.close()

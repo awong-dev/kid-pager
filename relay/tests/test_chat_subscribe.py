@@ -270,9 +270,14 @@ def test_live_event_after_subscribe_is_delivered_with_roster_nick_and_auto_roste
     assert env.events(again) == ["duplicate"]
 
 
+def test_long_subscribed_text_is_split_not_refused(env: Env):
+    """Nothing is refused for length."""
     _group_subscribe(env)
     pages_before = len(env.downs())
+    assert env.events(_ev("Logan", "x" * 200)) == ["delivered"]
+    assert len(env.downs()) == pages_before + 2  # 160 + 40 for a pager that has not reported mb
     held = [h for h in get_db().collection("heldChat").stream() if h.to_dict()["status"] == "too_long"]
+    assert held == []
 
 
 def test_title_change_renames_unless_custom(env: Env):
@@ -467,3 +472,33 @@ def test_slug_nick_rules():
     assert chat_subscribe.slug_nick("", set()).startswith("p")
     assert chat_subscribe.slug_nick("system", set()) == "system-2"
     assert messages_store and bridge_outbox and bridges_store
+
+
+def test_subscribed_group_with_deleted_group_doc_still_delivers_with_slug_nick(env: Env):
+    out = _group_subscribe(env)
+    conv_key = conv_store.get(env.bridge.id, GROUP).convKey
+    get_db().collection("conversations").document(conv_key).delete()
+    assert conversations_store.get_bridge_group(conv_key) is None
+    assert env.events(_ev("Sam Q", "hi all")) == ["delivered"]
+    # With no group doc the text falls back to the owner's DM (no `sndr` on the wire).
+    assert env.downs()[-1]["body"] == "hi all"
+    assert chat_subscribe._nick_for(conv_key, "Sam Q") == "sam-q"
+    assert conversations_store.get_bridge_group(conv_key) is None
+    assert out["alias"]
+
+
+def test_one_failing_event_does_not_fail_the_batch(env: Env, monkeypatch):
+    from app.routers import bridge as bridge_router
+
+    _group_subscribe(env)
+    real = bridge_router.process_event
+    a, bad, c = _ev("Devon P", "one"), _ev("Logan", "two"), _ev("Devon P", "three")
+
+    def flaky(bridge, event, routing, broker):
+        if event.id == bad["id"]:
+            raise RuntimeError("poison")
+        return real(bridge, event, routing, broker)
+
+    monkeypatch.setattr(bridge_router, "process_event", flaky)
+    assert env.events(a, bad, c) == ["delivered", "error", "delivered"]
+    assert [d["body"] for d in env.downs()[-2:]] == ["one", "three"]

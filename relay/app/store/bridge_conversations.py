@@ -18,6 +18,21 @@ PEOPLE_MAX = 64
 PREVIEW_MAX = 160
 
 
+class ConvHealth(BaseModel):
+    """Link health: whether the phone can still reach a subscribed conversation; epoch seconds."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    state: Literal["ok", "failing", "unreachable"] = "ok"
+    okAt: int | None = None
+    # The first strike (a second one at least an hour later makes it `unreachable`).
+    failAt: int | None = None
+    reason: str | None = None
+    # The active probe in flight (outbox id `ob_hc_...`) and when it was enqueued.
+    probeId: str | None = None
+    probeAt: int | None = None
+
+
 class BridgeConversation(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -43,6 +58,7 @@ class BridgeConversation(BaseModel):
     pagerName: str | None = None
     customName: bool = False
     alertId: str | None = None
+    health: ConvHealth | None = None
 
 
 def conv_ref(conversation_id: str) -> str:
@@ -173,3 +189,72 @@ def set_status(row_id_: str, status: ConvStatus) -> None:
 
 def set_fields(row_id_: str, **fields: Any) -> None:
     _col().document(row_id_).update(fields)
+
+
+STRIKE_GAP_S = 3600
+
+
+def _health_txn(row_id_: str, fn) -> tuple[ConvHealth, ConvHealth] | None:
+    """Transactional `health` update by `fn(old) -> new | None`; returns `(old, new)` or None."""
+    ref = _col().document(row_id_)
+
+    def _txn(transaction: Transaction):
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            return None
+        old = ConvHealth.model_validate((snap.to_dict() or {}).get("health") or {})
+        new = fn(old)
+        if new is None or new == old:
+            return None
+        transaction.update(ref, {"health": new.model_dump()})
+        return old, new
+
+    return run_transaction(_txn)
+
+
+def record_ok(
+    row_id_: str, now: int, *, min_interval_s: int = 0
+) -> tuple[ConvHealth, ConvHealth] | None:
+    """Marks the conversation reachable and clears strikes; `min_interval_s` skips recent writes."""
+
+    def fn(old: ConvHealth) -> ConvHealth | None:
+        if old.state == "ok" and old.okAt is not None and now - old.okAt < min_interval_s:
+            return None
+        return old.model_copy(
+            update={"state": "ok", "okAt": now, "failAt": None, "reason": None}
+        )
+
+    return _health_txn(row_id_, fn)
+
+
+def record_failing(
+    row_id_: str, reason: str, now: int
+) -> tuple[ConvHealth, ConvHealth] | None:
+    """First failure: `failing`; a second at least `STRIKE_GAP_S` later: `unreachable`."""
+
+    def fn(old: ConvHealth) -> ConvHealth | None:
+        if old.state == "ok":
+            return old.model_copy(update={"state": "failing", "failAt": now, "reason": reason})
+        if old.state == "failing":
+            if old.failAt is not None and now - old.failAt >= STRIKE_GAP_S:
+                return old.model_copy(
+                    update={"state": "unreachable", "failAt": now, "reason": reason}
+                )
+            return None
+        return old.model_copy(update={"failAt": now, "reason": reason})
+
+    return _health_txn(row_id_, fn)
+
+
+def set_probe(row_id_: str, probe_id: str | None, now: int) -> None:
+    """Marks (or with `None` clears) the active probe on the row."""
+    _health_txn(
+        row_id_,
+        lambda old: old.model_copy(update={"probeId": probe_id, "probeAt": now if probe_id else None}),
+    )
+
+
+def list_subscribed() -> list[BridgeConversation]:
+    """Every subscribed row on every bridge (one single-field query, no index)."""
+    query = _col().where(filter=FieldFilter("status", "==", "subscribed"))
+    return [_from_snap(s) for s in query.stream()]

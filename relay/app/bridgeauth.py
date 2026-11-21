@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
+from datetime import UTC, datetime
 
 from fastapi import HTTPException, Request
 
 from app.store import bridges as bridges_store
+
+logger = logging.getLogger("relay.bridgeauth")
+
+# `require_bridge` writes `lastSeenAt` at most this often per bridge.
+SEEN_WRITE_EVERY_S = 60
 
 
 def _hash(token: str) -> str:
@@ -45,4 +52,19 @@ def require_bridge(request: Request) -> bridges_store.Bridge:
     bridge = verify(token.strip())
     if bridge is None:
         raise _unauthorized()
+    _touch_seen(bridge)
     return bridge
+
+
+def _touch_seen(bridge: bridges_store.Bridge) -> None:
+    """Any authenticated request counts as "seen"; best effort, at most one write a minute."""
+    last = bridge.lastSeenAt
+    if last is not None:
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        if (datetime.now(UTC) - last).total_seconds() < SEEN_WRITE_EVERY_S:
+            return
+    try:
+        bridges_store.touch_seen(bridge.id)
+    except Exception:
+        logger.exception("bridge lastSeenAt touch failed bridge=%s", bridge.id)

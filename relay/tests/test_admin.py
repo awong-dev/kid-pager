@@ -486,6 +486,9 @@ def test_create_device_unknown_owner_alias_is_400(client: TestClient, admin_head
     assert resp.status_code == 400
 
 
+def test_delete_device(
+    client: TestClient, admin_headers: dict[str, str], fake_emqx: FakeEmqxAdmin
+):
     client.post(
         "/api/admin/users",
         json={"alias": "owner2", "displayName": "Owner2", "email": "owner2@example.com"},
@@ -499,6 +502,42 @@ def test_create_device_unknown_owner_alias_is_400(client: TestClient, admin_head
     resp = client.delete("/api/admin/devices/pgr-3003", headers=admin_headers)
     assert resp.status_code == 200
     assert devices_store.get_device("pgr-3003") is None
+    assert "pgr-3003" in fake_emqx.deleted  # the broker credential goes too
+    assert client.delete("/api/admin/devices/pgr-3003", headers=admin_headers).status_code == 404
+
+
+def test_delete_family_requires_frozen_and_cascades(
+    client: TestClient, admin_headers: dict[str, str], fake_emqx: FakeEmqxAdmin
+):
+    from app.db.firestore import get_db
+
+    db = get_db()
+    assert client.delete("/api/admin/families/fz", headers=admin_headers).status_code == 404
+    db.collection("families").document("fz").set({"name": "Doomed"})
+    db.collection("users").document("fz-u").set({"familyId": "fz", "alias": "fzu"})
+    db.collection("devices").document("fz-dev").set(
+        {"familyId": "fz", "ownerUid": "fz-u", "mqttUsername": "fz-dev"}
+    )
+    resp = client.delete("/api/admin/families/fz", headers=admin_headers)
+    assert resp.status_code == 409
+    assert db.collection("users").document("fz-u").get().exists
+
+    db.collection("families").document("fz").set({"name": "Doomed", "frozen": True})
+    resp = client.delete("/api/admin/families/fz", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json()["deleted"]["users"] == 1
+    assert not db.collection("users").document("fz-u").get().exists
+    assert not db.collection("devices").document("fz-dev").get().exists
+    assert not db.collection("families").document("fz").get().exists
+    assert fake_emqx.deleted == ["fz-dev"]
+
+
+def test_delete_family_is_super_only(client: TestClient):
+    plain = fb_auth.create_user(email="plain-fam@example.com")
+    users_store.create_user(uid=plain.uid, alias="plainfam", display_name="Plain")
+    assert (
+        client.delete("/api/admin/families/x", headers=auth_header(plain.uid)).status_code == 403
+    )
 
 
 def test_rotate_credentials_returns_new_setup_code_and_invalidates_old_secret(
@@ -947,13 +986,46 @@ def test_display_name_unchanged_does_not_bump_book(
 def test_put_and_get_settings(client: TestClient, admin_headers: dict[str, str]):
     resp = client.put(
         "/api/admin/settings",
+        json={"messagesDays": 14, "locationsDays": 3},
         headers=admin_headers,
     )
     assert resp.status_code == 200
     data = resp.json()
+    assert data == {"messagesDays": 14, "locationsDays": 3, "alertsDays": 90, "batteryDays": 90}
 
     resp2 = client.get("/api/admin/settings", headers=admin_headers)
     assert resp2.json() == data
+
+    resp3 = client.put("/api/admin/settings", json={"alertsDays": 30}, headers=admin_headers)
+    assert resp3.json() == {**data, "alertsDays": 30}
+
+
+def test_put_settings_legacy_week_shape_is_converted(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    resp = client.put(
+        "/api/admin/settings",
+        json={"messages": {"n": 2, "unit": "weeks"}, "locations": {"n": 3, "unit": "days"}},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["messagesDays"] == 14
+    assert resp.json()["locationsDays"] == 3
+
+
+def test_put_settings_rejects_out_of_bounds(client: TestClient, admin_headers: dict[str, str]):
+    for body in (
+        {"locationsDays": 31},
+        {"locationsDays": 0},
+        {"messagesDays": 366},
+        {"messagesDays": 0},
+        {"alertsDays": 6},
+        {"batteryDays": 400},
+        {"locations": {"n": 5, "unit": "weeks"}},
+        {"locationsDays": None, "bogus": 1},
+    ):
+        resp = client.put("/api/admin/settings", json=body, headers=admin_headers)
+        assert resp.status_code == 422, body
 
 
 def test_non_admin_cannot_reach_admin_routes(client: TestClient):

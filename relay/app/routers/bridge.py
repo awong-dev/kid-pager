@@ -18,7 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from app import alerts as alerts_module
+from app import bridge_health, bridge_numbers, chat_subscribe, deliveries, link_health
 from app.bridgeauth import mint_token, require_bridge
+from app.carriers import service as carriers_service
+from app.carriers.base import SimInfo
 from app.db import sqlitestore
 from app.db.firestore import get_db
 from app.inbound_text import handle_text, placeholder_for
@@ -27,6 +30,7 @@ from app.sms_text import redact_phone, voice_link
 from app.store import bridge_conversations, bridge_outbox
 from app.store import bridges as bridges_store
 from app.store import externals as externals_store
+from app.store import families as families_store
 from app.store import held_chat as held_chat_store
 from app.store import rate_limits as rate_limits_store
 from app.store import users as users_store
@@ -138,6 +142,9 @@ class HeartbeatStatus(BaseModel):
     voiceNumber: str | None = Field(default=None, max_length=32)
     version: str | None = Field(default=None, max_length=40)
     error: str | None = Field(default=None, max_length=200)
+    charging: bool | None = None
+    batteryExempt: bool | None = None
+    carrier: SimInfo | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -169,6 +176,9 @@ def heartbeat(
                 status[key] = None
         elif key in status:
             status[key] = None
+    for key in ("charging", "batteryExempt", "carrier"):
+        if status.get(key) is None:
+            status.pop(key, None)  # absent = unknown: keep what is stored
     bridges_store.touch(bridge.id, status, req.fcmToken)
     if status.get("whatsapp") is None:
         status.pop("whatsapp", None)
@@ -189,11 +199,23 @@ def heartbeat(
         bridges_store.set_error(bridge.id, SIM_CHANGED)
     elif bridge.status.error == SIM_CHANGED:
         bridges_store.set_error(bridge.id, None)
+    _after_heartbeat(bridge.id, request)
     out: dict[str, int] = {"pending": bridge_outbox.count_pending(bridge.id)}
     wait_s = request.app.state.settings.bridge_outbox_wait_s
     if wait_s > 0:
         out["outboxWaitS"] = wait_s
     return out
+
+
+def _after_heartbeat(bridge_id: str, request: Request) -> None:
+    """Evaluate bridge health too, so "restored" is immediate. Never fails the heartbeat."""
+    try:
+        fresh = bridges_store.get(bridge_id)
+        if fresh is not None:
+            carriers_service.on_heartbeat(fresh)
+            bridge_health.evaluate(fresh, heartbeat=True)
+    except Exception:
+        logger.exception("bridge health after heartbeat failed bridge=%s", bridge_id)
 
 
 OUTBOX_WAIT_CAP_S = 25
@@ -244,6 +266,8 @@ class AckRequest(BaseModel):
     state: Literal["sent", "failed"]
     reason: str | None = Field(default=None, max_length=200)
     tier: Literal[1, 2] = 1
+    # SMS parts the phone sent (only with `sent`); lenient so a bad value never fails an ack.
+    parts: int | None = None
 
 
 def apply_ack_to_delivery(item: bridge_outbox.OutboxItem) -> None:
@@ -251,7 +275,9 @@ def apply_ack_to_delivery(item: bridge_outbox.OutboxItem) -> None:
     if not item.msgId or not item.bid:
         return
     if item.state == "sent":
+        deliveries.mark_sent(item.msgId, item.bid)
     elif item.state == "failed":
+        deliveries.mark_failed(item.msgId, item.bid, error=item.reason)
 
 
 @router.post("/outbox/{ob_id}/ack", status_code=204)
@@ -263,6 +289,9 @@ def ack_outbox(
         raise HTTPException(status_code=404, detail="no such outbox item")
     item, transitioned = acked
     apply_ack_to_delivery(item)
+    if transitioned:
+        link_health.on_ack(bridge, item)
+        carriers_service.on_ack(bridge, item, req.parts if req.state == "sent" else None)
     if transitioned and req.tier == 2:
         bridges_store.increment_tier2(bridge.id)
     latency_ms = -1
@@ -317,6 +346,8 @@ class BridgeEvent(BaseModel):
     kind: Literal["message", "inspect"] = "message"
     conversation: EventConversation
     sender: EventSender = Field(default_factory=EventSender)
+    # A sanity bound, not a message limit (the relay splits for the pager).
+    text: str = Field(default="", max_length=8192)
     ts: float = 0
     attachments: list[EventAttachment] = Field(default_factory=list, max_length=20)
     people: list[Annotated[str, Field(max_length=200)]] = Field(default_factory=list, max_length=64)
@@ -371,6 +402,9 @@ def _handle_text_event(
         from_number = externals_store.normalize_phone(event.sender.phone or "")
     except ValueError:
         return "dropped_bad_from"
+    if event.source == "sms" and carriers_service.is_service_number(bridge, from_number):
+        # The carrier's own texts are never a message.
+        return carriers_service.handle_inbound(bridge, from_number, event.text, event.id)
     sid = f"br_{bridge.id}_{event.id}"
     # Voice carries a thread id and a deep link for the tier-2 reply.
     conv_link = voice_link if event.source == "gvoice" else None
@@ -418,6 +452,11 @@ def _handle_chat_event(
 ) -> str:
     """`gchat` events."""
     conv = event.conversation
+    if event.kind == "inspect":
+        # The answer to a health probe is not "add by link".
+        probed = link_health.apply_probe_result(bridge, conv.link, conv.title)
+        if probed is not None:
+            return probed
     existing = bridge_conversations.get(bridge.id, conv.id)
     target = users_store.get_user(bridge.ownerUid)
     if target is None or target.kind != "person" or target.disabled or target.familyId is None:
@@ -475,6 +514,7 @@ def _handle_chat_event(
         preview=body,
     )
     if row.status == "subscribed":
+        link_health.on_inbound(row)
         outcome = chat_subscribe.deliver_subscribed(
             bridge, row, event, routing, broker, existing.title if existing else None
         )
@@ -504,6 +544,9 @@ def _handle_chat_event(
 
 
 def process_event(bridge: bridges_store.Bridge, event: BridgeEvent, routing, broker) -> str:
+    if families_store.is_frozen(bridge.familyId):
+        # `error` keeps the event queued on the phone until the family is unfrozen.
+        return "error"
     if event.source == "whatsapp":
         # every WhatsApp conversation is keyed by its conversation id and takes the chat path
         if not WA_CONV_RE.match(event.conversation.id):
@@ -525,6 +568,14 @@ def process_events(
         raise HTTPException(status_code=429, detail="too many requests")
     results = []
     for event in events:
+        try:
+            outcome = process_event(bridge, event, routing, broker)
+        except Exception:
+            logger.exception(
+                "bridge event failed bridge=%s src=%s conv=%s event=%s",
+                bridge.id, event.source, conv_log_id(event.conversation.id), event.id,
+            )
+            outcome = "error"
         kind = ""
         if event.source == "whatsapp":
             cid = event.conversation.id

@@ -62,6 +62,7 @@ def handle_text(
     voice_conv: str | None = None,
 ) -> str:
     """Blocked, duplicate, empty, known contact -> deliver, else held. Returns the outcome label.
+    `reply` is unused; `via` (`sms`|`gvoice`, bridge only) is recorded per member on delivery."""
     family_id = target.familyId
     assert family_id is not None
     family = families_store.get_family(family_id)

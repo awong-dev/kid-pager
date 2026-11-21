@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from app import deliveries
 from app.backends.base import DeliverResult, LinkStep
 from app.broker import BrokerClient
 from app.store import conversations as conversations_store
@@ -74,6 +75,7 @@ class PagerBackend:
         )
         ok = self._broker.publish_down(device_id, obj)
         if ok:
+            deliveries.mark_sent(msg.id, backend.id, kind=self.kind)
             return DeliverResult(ok=True, state="sent", external_id=device_id)
         return DeliverResult(ok=False, state="queued", error="broker publish failed")
 

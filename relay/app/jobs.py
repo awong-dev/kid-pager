@@ -6,9 +6,11 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 
 from google.cloud.firestore import (
+    DELETE_FIELD,
     Client,
     CollectionGroup,
     FieldFilter,
@@ -16,8 +18,12 @@ from google.cloud.firestore import (
     WriteBatch,
 )
 
+from app import bridge_health, deliveries, link_health, location
 from app.authn_home import SESSION_IDLE
+from app.broker import BrokerClient
+from app.carriers import service as carriers_service
 from app.db.firestore import get_db
+from app.fed import sender as fed_sender
 from app.routing import Routing
 from app.store import bridge_outbox
 from app.store import bridges as bridges_store
@@ -50,9 +56,16 @@ def _fail_stale_bridge_outbox() -> int:
             continue
         failed += 1
         if item.msgId and item.bid:
+            deliveries.mark_failed(item.msgId, item.bid, error="bridge_offline")
     return failed
 
 
+def tick(
+    routing: Routing,
+    *,
+    task_queue: TaskQueue | None = None,
+    broker: BrokerClient | None = None,
+) -> TickResult:
     task_queue = task_queue if task_queue is not None else build_task_queue()
     devices_checked = 0
     retries_attempted = 0
@@ -78,7 +91,26 @@ def _fail_stale_bridge_outbox() -> int:
             )
 
     loc_reqs_cleared = location.clear_stale_loc_reqs()
+    # The location class runs on the first tick of every hour (a fix outlives its limit by <= 1 h).
+    if loc_pass_due(datetime.now(UTC)):
+        location_pass()
     bridge_rows_failed = _fail_stale_bridge_outbox()
+    # Offline edges for every paired bridge.
+    bridge_health.evaluate_all(broker=broker)
+    # Carrier balance checks and low/out edges.
+    try:
+        carriers_service.tick(broker=broker)
+    except Exception:
+        logger.exception("carrier tick failed")
+    # Active link probes, at most one per bridge per hour.
+    try:
+        link_health.enqueue_probes()
+    except Exception:
+        logger.exception("link probes failed")
+
+    # Retry pending peer posts, fail those pending past FED_OFFLINE_AFTER_S, peer up/down notices,
+    # idle pings.
+    fed_sender.tick_pass(broker=broker)
 
     return TickResult(
         bridgeOutboxFailed=bridge_rows_failed,
@@ -121,6 +153,14 @@ class _AutoBatch:
 
     def delete(self, ref) -> None:
         self._batch.delete(ref)
+        self._count += 1
+        if self._count >= MAX_BATCH_WRITES:
+            self._batch.commit()
+            self._batch = self._db.batch()
+            self._count = 0
+
+    def update(self, ref, data: dict) -> None:
+        self._batch.update(ref, data)
         self._count += 1
         if self._count >= MAX_BATCH_WRITES:
             self._batch.commit()
@@ -174,6 +214,11 @@ def _sweep_by_created_at(
 
 
 def _sweep_alerts(cutoff: datetime, batch_size: int) -> int:
+    """`families/{fid}/alerts/{id}` docs with `ts < cutoff`; open alerts are included because they
+    can hold a held-SMS body and a peer phone number."""
+    return _sweep_by_created_at(
+        lambda: get_db().collection_group("alerts"), cutoff, batch_size, created_at_field="ts"
+    )
 
 
 def _sweep_expired(
@@ -223,12 +268,108 @@ class SweepResult:
     sessionsDeleted: int = 0
     inviteCodesDeleted: int = 0
     webauthnChallengesDeleted: int = 0
+    smsLogDeleted: int = 0
+    topupsDeleted: int = 0
+    rateLimitsDeleted: int = 0
+    cellsDeleted: int = 0
+    contactRequestsDeleted: int = 0
+    setupCodesDeleted: int = 0
+    locMessagesScrubbed: int = 0
+    deviceStatusScrubbed: int = 0
+    fedInvitesDeleted: int = 0
+    fedOutboxDeleted: int = 0
+    # oldest surviving `createdAt` per class (None = class empty)
+    oldest: dict[str, datetime | None] | None = None
+
+
+TOPUP_KEEP = timedelta(days=400)
+RATE_LIMIT_KEEP_S = 86400
+CELL_CACHE_MAX_AGE = timedelta(days=30)
+CONTACT_REQUEST_MAX_AGE = timedelta(days=90)
+FED_OUTBOX_RETENTION = timedelta(days=7)
+LOC_EXPIRED_BODY = "location (expired)"
+
+
+def _scrub_loc_messages(cutoff: datetime, batch_size: int) -> int:
+    """Strip the coordinates from `kind:"loc"` messages older than the location limit, keeping the
+    message as "location (expired)". Filters in Python after a `kind` equality stream."""
+    db = get_db()
+    scrubbed = 0
+    batch = _AutoBatch(db)
+    for snap in db.collection("messages").where(filter=FieldFilter("kind", "==", "loc")).stream():
+        data = snap.to_dict() or {}
+        created = data.get("createdAt")
+        if data.get("loc") is None or created is None or created >= cutoff:
+            continue
+        batch.update(snap.reference, {"loc": None, "body": LOC_EXPIRED_BODY, "locExpired": True})
+        scrubbed += 1
+    batch.commit()
+    return scrubbed
+
+
+def _scrub_device_status(cutoff: datetime) -> int:
+    """`devices/{id}.status.lastCell` is a position; drop it once older than the location limit."""
+    db = get_db()
+    cutoff_s = cutoff.timestamp()
+    scrubbed = 0
+    for snap in db.collection("devices").stream():
+        status = (snap.to_dict() or {}).get("status") or {}
+        cell = status.get("lastCell")
+        if not cell:
+            continue
+        ts = cell.get("ts") if cell.get("ts") is not None else status.get("ts")
+        if ts is not None and ts >= cutoff_s:
+            continue
+        snap.reference.set({"status": {"lastCell": DELETE_FIELD}}, merge=True)
+        scrubbed += 1
+    return scrubbed
+
+
+def location_pass(*, now: datetime | None = None) -> dict[str, int]:
+    """The `location` retention class, run from `sweep()` and the first tick of every hour."""
+    db = get_db()
+    batch_size = _sweep_batch_size()
+    cutoff = _cutoff(settings_store.get_retention().locationsDays * 86400)
+    counts = {
+        "locationsDeleted": _sweep_by_created_at(
+            lambda: db.collection_group("locations"), cutoff, batch_size
+        ),
+        "locWireIdsDeleted": _sweep_by_created_at(
+            lambda: db.collection("locWireIds"), cutoff, batch_size
+        ),
+        "locReqsDeleted": _sweep_by_created_at(
+            lambda: db.collection("locReqs"), cutoff, batch_size
+        ),
+        "locMessagesScrubbed": _scrub_loc_messages(cutoff, batch_size),
+        "deviceStatusScrubbed": _scrub_device_status(cutoff),
+    }
+    settings_store.mark_loc_pass()
+    return counts
+
+
+def loc_pass_due(now: datetime) -> bool:
+    """True on the first tick of each hour: no pass recorded yet, or the last fell in an earlier hour."""
+    last = settings_store.get_meta().lastLocPassAt
+    if last is None:
+        return True
+    return last.astimezone(UTC).replace(minute=0, second=0, microsecond=0) < now.astimezone(
+        UTC
+    ).replace(minute=0, second=0, microsecond=0)
+
+
+def _oldest(query_factory, field: str = "createdAt") -> datetime | None:
+    docs = list(query_factory().order_by(field).limit(1).stream())
+    if not docs:
+        return None
+    value = (docs[0].to_dict() or {}).get(field)
+    return value if isinstance(value, datetime) else None
 
 
 def sweep() -> SweepResult:
     db = get_db()
     retention = settings_store.get_retention()
     batch_size = _sweep_batch_size()
+    msg_cutoff = _cutoff(retention.messagesDays * 86400)
 
     wire_ids_deleted = 0
 
@@ -241,20 +382,39 @@ def sweep() -> SweepResult:
             batch.delete(db.collection("wireIds").document(f"{wire_id}_{recipient_uid}"))
             wire_ids_deleted += 1
 
+    # Location class first (the strictest), so a later failure cannot leave it behind; `loc`
+    # messages are scrubbed before the message pass deletes any also past the message limit.
+    loc = location_pass()
+
     messages_deleted = _sweep_by_created_at(
         lambda: db.collection("messages"),
         msg_cutoff,
         batch_size,
         on_doc=_delete_companion_wire_id,
     )
+    # `wireIds` docs are also swept by `messagesDays`, so a doc orphaned by any other deletion path
+    # is reclaimed; the paired pass above has already removed its own.
     orphaned_wire_ids_deleted = _sweep_by_created_at(
         lambda: db.collection("wireIds"), msg_cutoff, batch_size
     )
+    # `conversations/{convKey}` summaries (`lastPreview` is a truncated body)
+    # inherit the message class, by `lastMessageAt`.
     conversations_deleted = _sweep_by_created_at(
+        lambda: db.collection("conversations"),
+        msg_cutoff,
+        batch_size,
+        created_at_field="lastMessageAt",
     )
+    # `devices/*/smsLog`: SMS bodies and numbers, the message class.
+    sms_log_deleted = _sweep_by_created_at(
+        lambda: db.collection_group("smsLog"), msg_cutoff, batch_size, created_at_field="receivedAt"
+    )
+    # `gchatLinkCodes` -- swept by its own `expiresAt` (an int epoch, already-expired cutoff).
     gchat_link_codes_deleted = _sweep_expired(
         lambda: db.collection("gchatLinkCodes"), int(time.time()), batch_size
     )
+    # `families/{fid}/alerts/{id}` -- `alertsDays`, open alerts included.
+    alerts_deleted = _sweep_alerts(_cutoff(retention.alertsDays * 86400), batch_size)
 
     # `devices/{id}/battery` samples.
     battery_deleted = _sweep_by_created_at(
@@ -268,6 +428,7 @@ def sweep() -> SweepResult:
         lambda: db.collection("heldSms"), msg_cutoff, batch_size, created_at_field="receivedAt"
     )
 
+    # Held Chat texts likewise.
     held_chat_deleted = _sweep_by_created_at(
         lambda: db.collection("heldChat"), msg_cutoff, batch_size, created_at_field="receivedAt"
     )
@@ -280,6 +441,14 @@ def sweep() -> SweepResult:
 
     outbox_deleted = bridge_outbox.delete_acked_before(datetime.now(UTC) - BRIDGE_ACKED_RETENTION)
 
+    # Top-up history, 400 days (by `at`).
+    topups_deleted = _sweep_by_created_at(
+        lambda: db.collection_group("topups"), datetime.now(UTC) - TOPUP_KEEP, batch_size,
+        created_at_field="at",
+    )
+
+    # Ephemeral class: sessions idle past `SESSION_IDLE`, invite codes,
+    # WebAuthn challenges and device setup codes past their own `expiresAt`.
     now = datetime.now(UTC)
     sessions_deleted = _sweep_by_created_at(
         lambda: db.collection("sessions"), now - SESSION_IDLE, batch_size, created_at_field="lastSeenAt"
@@ -290,9 +459,47 @@ def sweep() -> SweepResult:
     challenges_deleted = _sweep_by_created_at(
         lambda: db.collection("webauthnChallenges"), now, batch_size, created_at_field="expiresAt"
     )
+    setup_codes_deleted = _sweep_by_created_at(
+        lambda: db.collection("setupCodes"), now, batch_size, created_at_field="expiresAt"
     )
+    # `rateLimits/{key}` doc ids embed client IPs; a window older than a day
+    # protects nothing and identifies a visitor (`windowStart` is epoch seconds).
+    rate_limits_deleted = _sweep_expired(
+        lambda: db.collection("rateLimits"),
+        int(time.time()) - RATE_LIMIT_KEEP_S,
+        batch_size,
+        expires_field="windowStart",
+    )
+    contact_requests_deleted = _sweep_by_created_at(
+        lambda: db.collection("contactRequests"), now - CONTACT_REQUEST_MAX_AGE, batch_size
+    )
+    # Cache class: resolved cell positions older than 30 days.
+    cells_deleted = _sweep_by_created_at(
+        lambda: db.collection("cells"), now - CELL_CACHE_MAX_AGE, batch_size, created_at_field="resolvedAt"
+    )
+
+    fed_invites_deleted = _sweep_expired(
+        lambda: db.collection("fedInvites"), int(time.time()), batch_size
+    )
+    # `fedOutbox` rows that are not pending carry `ackedAt` (acked and failed alike).
+    fed_outbox_deleted = _sweep_by_created_at(
+        lambda: db.collection("fedOutbox"),
+        now - FED_OUTBOX_RETENTION,
+        batch_size,
+        created_at_field="ackedAt",
+    )
+
+    oldest = {
+        "messages": _oldest(lambda: db.collection("messages")),
+        "locations": _oldest(lambda: db.collection_group("locations")),
+    }
+
+    result = SweepResult(
         messagesDeleted=messages_deleted,
         wireIdsDeleted=wire_ids_deleted,
+        locationsDeleted=loc["locationsDeleted"],
+        locWireIdsDeleted=loc["locWireIdsDeleted"],
+        locReqsDeleted=loc["locReqsDeleted"],
         orphanedWireIdsDeleted=orphaned_wire_ids_deleted,
         conversationsDeleted=conversations_deleted,
         gchatLinkCodesDeleted=gchat_link_codes_deleted,
@@ -305,4 +512,25 @@ def sweep() -> SweepResult:
         sessionsDeleted=sessions_deleted,
         inviteCodesDeleted=invite_codes_deleted,
         webauthnChallengesDeleted=challenges_deleted,
+        smsLogDeleted=sms_log_deleted,
+        topupsDeleted=topups_deleted,
+        rateLimitsDeleted=rate_limits_deleted,
+        cellsDeleted=cells_deleted,
+        contactRequestsDeleted=contact_requests_deleted,
+        setupCodesDeleted=setup_codes_deleted,
+        locMessagesScrubbed=loc["locMessagesScrubbed"],
+        deviceStatusScrubbed=loc["deviceStatusScrubbed"],
+        fedInvitesDeleted=fed_invites_deleted,
+        fedOutboxDeleted=fed_outbox_deleted,
+        oldest=oldest,
     )
+    counts = {k: v for k, v in asdict(result).items() if isinstance(v, int)}
+    settings_store.mark_swept({"at": now, "counts": counts, "oldest": oldest})
+    # On the home store: return free pages and truncate the WAL (the Firestore client has no such
+    # method).
+    reclaim = getattr(db, "reclaim_space", None)
+    if reclaim is not None:
+        logger.info("sweep space reclaim: %s", reclaim())
+
+    logger.info("sweep complete: %s", counts)
+    return result

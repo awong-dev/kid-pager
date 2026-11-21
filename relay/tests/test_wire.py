@@ -59,6 +59,31 @@ def test_content_message_without_body_is_malformed():
         )
 
 
+def _up_with_body(body: str) -> dict:
+    return {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "student", "body": body, "ack": None}
+
+
+def test_content_message_body_cap_is_1024_utf8_bytes_with_no_codepoint_cap():
+    assert UpEnvelope.model_validate(_up_with_body("a" * 1024)).body == "a" * 1024
+    assert UpEnvelope.model_validate(_up_with_body("é" * 512)).body == "é" * 512
+    for too_long in ("a" * 1025, "é" * 513):
+        with pytest.raises(ValidationError):
+            UpEnvelope.model_validate(_up_with_body(too_long))
+
+
+def test_status_mb_is_modelled_and_an_out_of_range_value_is_dropped():
+    assert StatusEnvelope.model_validate(_online_status(mb=1024)).mb == 1024
+    assert StatusEnvelope.model_validate(_online_status()).mb is None
+    for bad in (0, -1, 8193):
+        assert StatusEnvelope.model_validate(_online_status(mb=bad)).mb is None
+
+
+def test_status_mb_cbor_key_is_76():
+    from app import wirecbor
+
+    assert wirecbor.KEYMAP["mb"] == 76 and 52 not in wirecbor.KEYMAP.values()
+    raw = wirecbor.encode({"v": 1, "state": "online", "mb": 1024})
+    assert wirecbor.decode(raw)["mb"] == 1024
 
 
 def test_content_message_body_with_control_char_is_malformed():
@@ -341,6 +366,7 @@ def test_status_still_ignores_a_genuinely_unknown_field():
 
 
 def test_parse_envelope_bytes_rejects_oversize():
+    huge = b'{"body":"' + b"x" * 1300 + b'"}'
     assert parse_envelope_bytes(huge) is None
 
 
@@ -851,6 +877,7 @@ def test_loc_envelope_neither_loc_nor_err_set_is_malformed():
 
 
 def test_loc_envelope_oversize_payload_rejected():
+    huge = json.dumps(_base_loc()).encode("utf-8") + b" " * 1300
     assert parse_envelope_bytes(huge) is None
 
 

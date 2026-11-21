@@ -331,6 +331,26 @@ def test_bridge_collections_are_default_deny(two_pairs):
             assert not _write(path, p, {"tokenHash": "hacked"})
 
 
+def test_federation_collections_are_default_deny(two_pairs):
+    db = get_db()
+    paths = (
+        "fedFamilies/famA",
+        "fedLinks/famA_f_abcdefghijklmnopqrst",
+        "fedInvites/abc",
+        "fedOutbox/ob_1",
+    )
+    for path in paths:
+        coll, doc = path.split("/")
+        db.collection(coll).document(doc).set({"familyId": "famA", "privateKey": "x"})
+    admin = _make_family_admin("fed-admin", "fedadm", "famA")
+    for p in (P("u1"), P("u1", "super"), admin, None):
+        for path in paths:
+            assert not _get(path, p), (path, p)
+            assert not _write(path, p, {"privateKey": "hacked"})
+            assert not readauth.query_admissible(p, {"doc": path}) if p else True
+    assert not readauth.query_admissible(P("u1", "super"), {"collection": "fedFamilies"})
+
+
 def test_device_secrets_is_default_deny(two_pairs):
     _device("pgr-secret-rules-1", "u1")
     device_secrets_store.create("pgr-secret-rules-1", hmac_key=b"k" * 32, mqtt_password_hash="hash")
@@ -759,3 +779,14 @@ def test_refuses_doc_query_the_rule_denies(two_pairs):
 def test_refuses_unsupported_operator(two_pairs):
     q = {"collection": "users", "where": [["familyId", ">=", "famA"]]}
     assert not readauth.query_admissible(P("u1", "super"), q)
+
+
+def test_settings_federation_is_server_only(two_pairs):
+    # the server switch lives there
+    get_db().collection("settings").document("federation").set({"enabled": True})
+    for p in (P("u1"), P("u1", "super"), P("u1", "admin", "famA")):
+        assert not _get("settings/federation", p)
+        assert not readauth.query_admissible(p, {"doc": "settings/federation"})
+        assert not readauth.query_admissible(p, {"collection": "settings"})
+    # the other settings documents stay single-document readable
+    assert readauth.query_admissible(P("u1"), {"doc": "settings/retention"})

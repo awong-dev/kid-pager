@@ -11,6 +11,8 @@ from google.api_core.exceptions import AlreadyExists
 from app.db.firestore import get_db
 from app.store import allow as allow_store
 from app.store import backends as backends_store
+from app.store import families as families_store
+from app.store import fed_families as fed_families_store
 from app.store import users as users_store
 from app.store.users import User
 
@@ -30,6 +32,8 @@ def normalize_phone(phone: str, *, default_region: str = DEFAULT_REGION) -> str:
 
 
 def contact_ids(family_id: str, e164: str) -> tuple[str, str]:
+    """`(uid, alias)` of `family_id`'s contact for `e164`, hashed from `idSeed or id`."""
+    h = hashlib.sha256(f"{families_store.seed_for(family_id)}|{e164}".encode()).hexdigest()
     return f"x_{h[:16]}", f"x{h[:11]}"
 
 
@@ -216,6 +220,108 @@ def get_or_create_chat(
     assert fetched is not None
     ensure_bridge_backend(fetched, config)
     return fetched
+
+
+def _local_fed_id(family_id: str) -> str:
+    identity = fed_families_store.get(family_id)
+    if identity is None:
+        raise LookupError(f"family {family_id} has no federation identity")
+    return identity.fedId
+
+
+def fed_ids(local_fed_id: str, remote_fed_id: str, rid: str) -> str:
+    """`x_f` + sha256(localFedId:remoteFedId:rid)[:16]; both fedIds survive a family move."""
+    h = hashlib.sha256(f"{local_fed_id}:{remote_fed_id}:{rid}".encode()).hexdigest()
+    return f"x_f{h[:16]}"
+
+
+def ensure_fed_backend(user: User, remote_fed_id: str, rid: str) -> str:
+    """The id of an external's `fed` backend row (fixed id `fed`), created or refreshed."""
+    config = {"remoteFedId": remote_fed_id, "rid": rid}
+    for b in backends_store.list_backends(user.uid):
+        if b.kind == "fed":
+            if b.config != config:
+                backends_store.update_backend(user.uid, b.id, config=config)
+            return b.id
+    created = backends_store.create_backend(
+        user.uid, kind="fed", config=config, enabled=True, bid="fed"
+    )
+    return created.id
+
+
+def get_family_fed(family_id: str, remote_fed_id: str, rid: str) -> User | None:
+    """The family's external for `(remote_fed_id, rid)`, or `None`."""
+    identity = fed_families_store.get(family_id)
+    if identity is None:
+        return None
+    user = users_store.get_user(fed_ids(identity.fedId, remote_fed_id, rid))
+    if (
+        user is None
+        or user.kind != "external"
+        or user.ownerFamilyId != family_id
+        or (user.fed or {}).get("remoteFedId") != remote_fed_id
+        or (user.fed or {}).get("rid") != rid
+    ):
+        return None
+    return user
+
+
+def get_or_create_fed(
+    family_id: str,
+    remote_fed_id: str,
+    rid: str,
+    remote_alias: str,
+    display_name: str,
+    *,
+    alias: str | None = None,
+) -> User:
+    """Idempotent on `(family_id, remote_fed_id, rid)`; may raise `ContactNameTaken`."""
+    uid = fed_ids(_local_fed_id(family_id), remote_fed_id, rid)
+    existing = users_store.get_user(uid)
+    if existing is not None:
+        ensure_fed_backend(existing, remote_fed_id, rid)
+        return existing
+
+    chosen = (alias or remote_alias).strip().lower()
+    key = name_key(display_name)
+    _reserve(family_id, key, uid, display_name)
+    fed = {"remoteFedId": remote_fed_id, "rid": rid, "remoteAlias": remote_alias}
+    try:
+        users_store.create_user(
+            uid=uid,
+            alias=chosen,
+            display_name=display_name,
+            phone=None,
+            family_id=None,
+            kind="external",
+            owner_family_id=family_id,
+            fed=fed,
+        )
+    except users_store.AliasTaken:
+        raced = users_store.get_user(uid)
+        if raced is None:
+            _release(family_id, key, uid)
+            raise
+        ensure_fed_backend(raced, remote_fed_id, rid)
+        return raced
+    except Exception:
+        _release(family_id, key, uid)
+        raise
+    fetched = users_store.get_user(uid)
+    assert fetched is not None
+    ensure_fed_backend(fetched, remote_fed_id, rid)
+    return fetched
+
+
+def list_fed_externals(family_id: str, remote_fed_id: str | None = None) -> list[User]:
+    """The family's federated externals, those of one remote family when given."""
+    return [
+        u
+        for u in list_family_contacts(family_id)
+        if u.fed
+        and u.fed.get("remoteFedId")
+        and (remote_fed_id is None or u.fed.get("remoteFedId") == remote_fed_id)
+    ]
 
 
 def clear_member_channels(family_id: str, member_uid: str) -> int:

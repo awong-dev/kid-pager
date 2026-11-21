@@ -121,8 +121,14 @@ service cloud.firestore {
       );
     }
 
+    // `settings/federation` (the federation switch) is server-only; a collection query cannot prove
+    // `s != 'federation'`, so it is refused too. The web reads `settings/retention` as a document.
     match /settings/{s} {
+      allow read: if registered() && s != 'federation';
     }
+
+    // `fedFamilies` (a family's federation private key), `fedLinks`, `fedInvites` and `fedOutbox`
+    // (message text) are server-only: no match block, default-deny.
 
     // `bridges` (+ `outbox`), `bridgePairCodes`, `bridgeConversations` and `heldChat` are
     // server-only (token hashes, FCM tokens, chat text): no match block, default-deny.

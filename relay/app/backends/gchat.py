@@ -16,6 +16,7 @@ import google.auth.transport.requests as google_requests
 import google.oauth2.id_token as google_id_token
 from pydantic import BaseModel, ConfigDict
 
+from app import deliveries
 from app.backends.base import DeliverResult, LinkStep
 from app.store import backends as backends_store
 from app.store.backends import Backend as BackendRow
@@ -141,6 +142,7 @@ class GChatBackend:
         except Exception as exc:  # noqa: BLE001 -- best-effort delivery
             logger.warning("gchat send failed (space=%s): %r", space, exc)
             return DeliverResult(ok=False, state="queued", error=str(exc))
+        deliveries.mark_sent(msg.id, backend.id, kind=self.kind)
         return DeliverResult(ok=True, state="sent", external_id=message_name)
 
     def start_link(self, user: User, backend: BackendRow) -> LinkStep | None:

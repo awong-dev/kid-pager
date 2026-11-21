@@ -39,6 +39,9 @@ class Delivery(BaseModel):
     state: DeliveryState = "queued"
     attempts: int = 0
     externalId: str | None = None
+    # A `fed` delivery: the other family's name and server host, for the web chip.
+    server: str | None = None
+    serverHost: str | None = None
     error: str | None = None
     sentTs: int | None = None
     shownTs: int | None = None
@@ -60,6 +63,8 @@ class Message(BaseModel):
     wireId: str | None = None
     originBackendKind: str | None = None
     originBackendId: str | None = None
+    # The pager a pager-origin message came from (receipts go to it only); absent otherwise.
+    originDeviceId: str | None = None
     ts: int
     createdAt: datetime | None = None
     deliveries: dict[str, Delivery] = {}
@@ -68,6 +73,10 @@ class Message(BaseModel):
     # alias, denormalised to avoid a `users` read per delivery. Both `None` on a DM copy.
     groupMsgId: str | None = None
     senderAlias: str | None = None
+    # `hooks.{hookId} {action, labels, reason, at}` from a filter verdict or callback; `hookRef`
+    # is the `message.ref` the hooks were given. Absent unless a hook ran.
+    hooks: dict[str, dict] = {}
+    hookRef: str | None = None
     # Sorted unique non-null `familyId` over this message's `uids`; an admin-read rule lookup field.
     familyIds: list[str] = []
 
@@ -210,6 +219,9 @@ def create_message(
     seq: int | None = None,
     group_msg_id: str | None = None,
     sender_alias: str | None = None,
+    hooks: dict[str, dict] | None = None,
+    hook_ref: str | None = None,
+    origin_device_id: str | None = None,
 ) -> Message | None:
     """One transaction: `wireId` dedup (None if seen), `seq`, message create, conversation."""
     msg_id = new_id("m_")
@@ -245,9 +257,15 @@ def create_message(
                     meta_ref, {"schemaVersion": 2, "lastSweepAt": None, "seqCounter": new_seq}
                 )
 
+        extra: dict[str, object] = {}
+        if hooks:
+            extra["hooks"] = hooks
+        if hook_ref is not None:
+            extra["hookRef"] = hook_ref
         transaction.set(
             msg_ref,
             {
+                **extra,
                 "seq": new_seq,
                 "convKey": key,
                 "uids": pair,
@@ -259,6 +277,7 @@ def create_message(
                 "wireId": wire_id,
                 "originBackendKind": origin_backend_kind,
                 "originBackendId": origin_backend_id,
+                "originDeviceId": origin_device_id,
                 "ts": ts,
                 "createdAt": SERVER_TIMESTAMP,
                 "deliveries": deliveries or {},
@@ -331,6 +350,27 @@ def list_thread(key: str, *, limit: int = 50) -> list[Message]:
     ]
 
 
+def list_split_siblings(msg: Message) -> list[Message]:
+    """All stored parts of split message `msg` (wire id `<base>` or `<base>~<i>`)."""
+    if not msg.wireId:
+        return [msg]
+    base = msg.wireId.split("~", 1)[0]
+    query = (
+        _messages()
+        .where(filter=FieldFilter("wireId", ">=", base))
+        .where(filter=FieldFilter("wireId", "<", base + "\uffff"))
+    )
+    out: list[Message] = []
+    for snap in query.stream():
+        m = Message.model_validate({"id": snap.id, **(snap.to_dict() or {})})
+        suffix = (m.wireId or "")[len(base) :]
+        if m.wireId != base and not (suffix.startswith("~") and suffix[1:].isdigit()):
+            continue
+        if m.senderUid == msg.senderUid and m.recipientUid == msg.recipientUid:
+            out.append(m)
+    return out
+
+
 def list_pending_for_device(
     device_id: str, *, limit: int = 10, max_age_s: int | None = EXPIRY_SECONDS
 ) -> list[Message]:
@@ -367,31 +407,43 @@ def find_delivery_by_kind(msg: Message, kind: str) -> str | None:
     return None
 
 
+def mark_delivery_sent_if_queued(msg_id: str, backend_id: str) -> bool:
     """`queued` -> `sent` only, in a transaction (PROTOCOL.md §4.1 rule 2); True if written."""
     ref = _messages().document(msg_id)
 
+    def _txn(transaction: Transaction) -> bool:
         snap = ref.get(transaction=transaction)
         if not snap.exists:
+            return False
         delivery = ((snap.to_dict() or {}).get("deliveries") or {}).get(backend_id)
         if delivery and delivery.get("state") == "queued":
             transaction.update(ref, {f"deliveries.{backend_id}.state": "sent"})
+            return True
+        return False
 
+    return run_transaction(_txn)
 
 
 def mark_delivery_failed_if_queued(
     msg_id: str, backend_id: str, *, error: str | None = None
+) -> bool:
     """`queued` -> `failed` for a delivery that can never succeed; stores `error`; True if moved."""
     ref = _messages().document(msg_id)
 
+    def _txn(transaction: Transaction) -> bool:
         snap = ref.get(transaction=transaction)
         if not snap.exists:
+            return False
         delivery = ((snap.to_dict() or {}).get("deliveries") or {}).get(backend_id)
         if delivery and delivery.get("state") == "queued":
             updates: dict[str, object] = {f"deliveries.{backend_id}.state": "failed"}
             if error is not None:
                 updates[f"deliveries.{backend_id}.error"] = error
             transaction.update(ref, updates)
+            return True
+        return False
 
+    return run_transaction(_txn)
 
 
 def set_delivery_external_id(msg_id: str, backend_id: str, external_id: str) -> None:
@@ -465,23 +517,35 @@ def record_delivery_attempt(
     error: str | None,
     device_id: str | None = None,
     max_attempts: int = MAX_DELIVERY_ATTEMPTS,
+) -> bool:
     """Counts a delivery attempt; at `max_attempts` marks it `failed`. True if it failed."""
     ref = _messages().document(msg_id)
 
+    def _txn(transaction: Transaction) -> bool:
         snap = ref.get(transaction=transaction)
         if not snap.exists:
+            return False
         data = snap.to_dict() or {}
         delivery = (data.get("deliveries") or {}).get(backend_id)
         if delivery is None:
+            return False
         attempts = (delivery.get("attempts") or 0) + 1
         state = delivery.get("state")
+        updates: dict[str, object] = {f"deliveries.{backend_id}.attempts": attempts}
+        if error is not None or state != "failed":
+            # A delivery that already failed keeps the reason it was given.
+            updates[f"deliveries.{backend_id}.error"] = error
         reached_success = state not in ("queued", "failed")
+        flipped = False
         if not ok and not reached_success and attempts >= max_attempts:
             updates[f"deliveries.{backend_id}.state"] = "failed"
+            flipped = state == "queued"
             if device_id is not None:
                 updates["pendingDeviceIds"] = ArrayRemove([device_id])
         transaction.update(ref, updates)
+        return flipped
 
+    return run_transaction(_txn)
 
 
 def set_pending_device_ids(msg_id: str, device_ids: list[str]) -> None:

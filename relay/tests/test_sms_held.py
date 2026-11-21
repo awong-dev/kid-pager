@@ -247,11 +247,18 @@ def test_photo_without_body_becomes_photo_marker(client: TestClient, world: Worl
     assert msg.body == "[photo]"
 
 
+def test_long_text_from_known_contact_is_delivered_whole_and_gets_no_hint(
     client: TestClient, world: World, outbound: OutboundSms, caplog
 ):
+    """Nothing is refused for length; with no pager the cap is 1024 bytes and one message carries
+    it."""
     caplog.set_level(logging.INFO, logger="relay.inbound_text")
     ext = _approved_contact(world)
     _inbound(client, "x" * 161)
+    assert _outcome(caplog) == "delivered"
+    bodies = [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))]
+    assert bodies == ["x" * 161]
+    assert outbound.sent == []
 
 
 def test_too_long_from_unknown_number_is_held_without_reply(
@@ -354,13 +361,42 @@ def test_approve_delivers_backlog_in_order_and_is_idempotent(client: TestClient,
     assert [m.body for m in messages_store.list_thread(key)] == ["first", "second"]
 
 
+def test_approve_delivers_long_rows_and_rows_an_older_relay_marked_too_long(
+    client: TestClient, world: World
+):
     _inbound(client, "z" * 200, from_=STRANGER, sid="SMb1")
     _inbound(client, "short", from_=STRANGER, sid="SMb2")
+    _inbound(client, "old", from_=STRANGER, sid="SMb3")
+    held_sms_store.set_status(["SMb3"], "too_long")
     (alert,) = _open_alerts(world)
     resp = client.post(
         f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
     )
+    assert resp.json()["delivered"] == 3
     rows = {r.id: r.status for r in held_sms_store.list_held(world.family_id, STRANGER, None, status=None)}
+    assert rows == {"SMb1": "delivered", "SMb2": "delivered", "SMb3": "delivered"}
+
+
+def test_a_held_text_that_is_empty_after_cleanup_is_marked_empty(
+    client: TestClient, world: World
+):
+    _inbound(client, "real", from_=STRANGER, sid="SMe2")
+    (alert,) = _open_alerts(world)
+    # the inbound path never holds such a text
+    held_sms_store.create(
+        "SMe1", family_id=world.family_id, to_uid="kid", from_phone=STRANGER,
+        body="\x01\x02 \x7f", alert_id=alert.id,
+    )
+    resp = client.post(
+        f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
+    )
+    assert resp.status_code == 200, resp.text
+    rows = {r.id: r.status for r in held_sms_store.list_held(world.family_id, STRANGER, None, status=None)}
+    assert rows == {"SMe1": "empty", "SMe2": "delivered"}
+    # the web-facing list model carries the status as is
+    got = client.get(f"/api/family/alerts/{alert.id}/held", headers=world.admin_headers)
+    assert got.status_code == 200, got.text
+    assert {h["id"]: h["status"] for h in got.json()["held"]} == rows
 
 
 def test_approve_refused_when_inbound_policy_is_none_and_writes_nothing(
@@ -514,10 +550,16 @@ def test_inbound_control_chars_become_spaces(client: TestClient, world: World):
     assert msg.body == "a b c"
 
 
+def test_inbound_over_320_bytes_is_delivered_whole_to_a_recipient_without_a_pager(
     client: TestClient, world: World, outbound: OutboundSms, caplog
 ):
     caplog.set_level(logging.INFO, logger="relay.inbound_text")
     ext = _approved_contact(world)
+    _inbound(client, "\U0001F600" * 100)  # 100 code points, 400 bytes
+    assert _outcome(caplog) == "delivered"
+    bodies = [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))]
+    assert bodies == ["\U0001F600" * 100]  # 400 bytes, under the 1024 cap
+    assert outbound.sent == []
 
 
 def test_approve_uses_pager_body_and_keeps_raw_in_held_row(client: TestClient, world: World):
@@ -528,7 +570,13 @@ def test_approve_uses_pager_body_and_keeps_raw_in_held_row(client: TestClient, w
     resp = client.post(
         f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
     )
+    assert resp.json()["delivered"] == 2
     ext = externals_store.get_family_contact(world.family_id, STRANGER)
+    assert [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))] == [
+        "x y",
+        "\U0001F600" * 100,
+    ]
+    assert held_sms_store.get("SMc2").status == "delivered"
 
 
 def test_contact_create_refreshes_book_of_a_numbered_owner(

@@ -267,6 +267,20 @@ def test_registered_user_can_read_settings(two_pairs):
     assert resp.status_code == 200
 
 
+def test_settings_federation_is_server_only(two_pairs):
+    # the server switch lives there
+    get_db().collection("settings").document("federation").set({"enabled": True})
+    for uid in ("u1", "u2"):
+        assert _get("settings/federation", mint_id_token(uid)).status_code == 403
+    # a list of the collection would return it too, so that is refused as well
+    assert _get("settings", mint_id_token("u1")).status_code == 403
+    # the other settings documents stay readable by a registered user
+    get_db().collection("settings").document("meta").set({"v": 1})
+    get_db().collection("settings").document("retention").set({"v": 1})
+    for doc in ("meta", "retention"):
+        assert _get(f"settings/{doc}", mint_id_token("u1")).status_code == 200
+
+
 def test_device_owner_can_read_their_device(two_pairs):
     devices_store.create_device(
         device_id="pgr-rules-1",
@@ -595,6 +609,24 @@ def test_bridge_collections_are_default_deny(two_pairs):
         for path in paths:
             assert _get(path, token).status_code == 403, (path, token is None)
             assert _write(path, token, {"tokenHash": "hacked"}).status_code == 403
+
+
+def test_federation_collections_are_default_deny(two_pairs):
+    """A family's federation private key, links, invites and outbox have no `match` block: no client
+    reads or writes them."""
+    paths = (
+        "fedFamilies/famA",
+        "fedLinks/famA_f_abcdefghijklmnopqrst",
+        "fedInvites/abc",
+        "fedOutbox/ob_1",
+    )
+    for path in paths:
+        coll, doc = path.split("/")
+        get_db().collection(coll).document(doc).set({"familyId": "famA", "privateKey": "x"})
+    for token in (mint_id_token("u1"), None):
+        for path in paths:
+            assert _get(path, token).status_code == 403
+            assert _write(path, token, {"privateKey": "hacked"}).status_code == 403
 
 
 def test_device_secrets_is_default_deny(two_pairs):

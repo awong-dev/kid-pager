@@ -41,6 +41,8 @@ class BookEntryOut(BaseModel):
     onPager: bool
     # `{source}` for a Google Chat / Voice contact.
     chat: dict | None = None
+    # `{linkId, name, host}` for a person in a linked family; null once the link is gone.
+    fed: dict | None = None
     # The owner added this entry from the pager.
     added: bool = False
 
@@ -99,6 +101,7 @@ def _view(owner_uid: str) -> BookOut:
             sendable=e.sendable,
             reason=e.reason,
             chat=e.chat,
+            fed=e.fed,
             added=e.added,
             onPager=bool(e.onPager)
             if e.kind == "external" and not e.chat

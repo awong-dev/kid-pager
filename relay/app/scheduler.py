@@ -15,6 +15,7 @@ logger = logging.getLogger("relay.scheduler")
 
 FIRST_TICK_DELAY_S = 30.0
 TICK_INTERVAL_S = 300.0
+SWEEP_INTERVAL = timedelta(hours=23)
 
 
 def sweep_due(now: datetime) -> bool:

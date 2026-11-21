@@ -1184,6 +1184,27 @@ def test_create_member_normalises_phone_and_rejects_garbage(client: TestClient):
     assert users_store.get_uid_for_alias("fam30-bad") is None
 
 
+def test_patch_family_settings_on_a_doc_without_a_settings_map(client: TestClient):
+    """Dotted `settings.*` updates must create the missing map (Firestore emulator and SQLite)."""
+    from firebase_admin import firestore as _fs
+
+    from app.db.firestore import get_db
+
+    family = _make_family("NoSettings")
+    admin = _make_family_admin("fam31b-admin", "fam31b-admin", family.id)
+    ref = get_db().collection("families").document(family.id)
+    ref.update({"settings": _fs.DELETE_FIELD})
+    assert "settings" not in (ref.get().to_dict() or {})
+    resp = client.patch(
+        "/api/family",
+        json={"settings": {"topup": {"mode": "limited", "perMonth": 3}, "linkChecks": True}},
+        headers=admin,
+    )
+    assert resp.status_code == 200, resp.text
+    got = families_store.get_family(family.id).settings
+    assert got.topup.mode == "limited" and got.topup.perMonth == 3 and got.linkChecks is True
+
+
 def test_family_admin_renames_own_family(client: TestClient):
     family = _make_family("Old Name")
     other = _make_family("Other")
@@ -1580,3 +1601,120 @@ def test_remove_added_other_family_404(client: TestClient):
 
     assert resp.status_code == 404
     assert _marker("kid1", ext_uid)["added"] is True
+
+
+def test_contacts_list_reports_fed_link_and_sendability(client: TestClient):
+    from app.store import fed_families, fed_links
+
+    family = _make_family("Fedful")
+    admin = _make_family_admin("fedc-admin", "fedc-admin", family.id)
+    ident = fed_families.get_or_create(family.id)
+    remote_id = "f_abcdefghijklmnopqrst"
+    plain = externals_store.get_or_create(family.id, "+12065550142", "Plain")
+    fed = externals_store.get_or_create_fed(family.id, remote_id, "r1", "remote", "Remote Rae")
+    assert ident.fedId != remote_id
+    got = {c["uid"]: c for c in client.get("/api/family/contacts", headers=admin).json()}
+    assert got[plain.uid]["fed"] is None and got[plain.uid]["sendable"] is None
+    assert got[plain.uid]["reason"] is None
+    c = got[fed.uid]
+    assert c["fed"] == {"linkId": None, "name": None, "host": None, "rid": "r1"}
+    assert (c["sendable"], c["reason"]) == (False, "unpeered")
+    link = fed_links.create(
+        family.id,
+        remote=fed_links.Remote(
+            fedId=remote_id,
+            name="Remote Family",
+            publicKey="x",
+            host="peer.example.org",
+        ),
+        created_by=None,
+    )
+    c = {c["uid"]: c for c in client.get("/api/family/contacts", headers=admin).json()}[fed.uid]
+    assert (c["sendable"], c["reason"]) == (True, None)
+    assert c["fed"] == {
+        "linkId": link.id,
+        "name": "Remote Family",
+        "host": "peer.example.org",
+        "rid": "r1",
+    }
+    fed_links.set_state(link.id, "suspended")
+    c = {c["uid"]: c for c in client.get("/api/family/contacts", headers=admin).json()}[fed.uid]
+    assert (c["sendable"], c["reason"]) == (False, "unpeered")
+
+
+@pytest.fixture
+def cloud_accounts(monkeypatch):
+    """The suite may run with AUTH_BACKEND=home; this route is cloud-only, so flip the router's
+    view of it and record Firebase calls instead of making them."""
+    from app.routers import family as family_router
+
+    monkeypatch.setattr(family_router, "auth_backend", lambda: "cloud")
+    calls: dict[str, list] = {"create": [], "claims": []}
+    taken: set[str] = set()
+
+    real_create = fb_auth.create_user
+
+    def create(**kw):
+        if kw["uid"].endswith("-admin"):  # the test's own admin account: a real emulator user
+            return real_create(**kw)
+        if kw["email"] in taken:
+            raise fb_auth.EmailAlreadyExistsError("dup", None, None)
+        if kw["uid"] in {c["uid"] for c in calls["create"]}:
+            raise fb_auth.UidAlreadyExistsError("dup", None, None)
+        calls["create"].append(kw)
+
+    monkeypatch.setattr(fb_auth, "create_user", create)
+    monkeypatch.setattr(family_router, "set_claims", lambda *a: calls["claims"].append(a))
+    return calls, taken
+
+
+def _kid_without_account(family_id: str, uid: str = "acct-kid") -> None:
+    users_store.create_user(uid=uid, alias=uid, display_name=uid, role="member", family_id=family_id)
+
+
+def test_person_account_created_for_an_imported_person(
+    client: TestClient, cloud_accounts, monkeypatch
+):
+    calls, _ = cloud_accounts
+    family = _make_family("Acct")
+    admin = _make_family_admin("acct-admin", "acct-admin", family.id)
+    _kid_without_account(family.id)
+    r = client.post(
+        "/api/family/people/acct-kid/account", json={"email": "Kid@Example.com"}, headers=admin
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "kid@example.com"
+    assert calls["create"][-1] == {"uid": "acct-kid", "email": "kid@example.com"}
+    assert calls["claims"][-1] == ("acct-kid", "member", family.id)
+    assert users_store.get_user("acct-kid").email == "kid@example.com"
+    # a second time: already has an account
+    r = client.post(
+        "/api/family/people/acct-kid/account", json={"email": "other@example.com"}, headers=admin
+    )
+    assert r.status_code == 409
+
+
+def test_person_account_refusals(client: TestClient, cloud_accounts):
+    _, taken = cloud_accounts
+    family, other = _make_family("A1"), _make_family("A2")
+    admin = _make_family_admin("acct2-admin", "acct2-admin", family.id)
+    _kid_without_account(family.id, "acct2-kid")
+    _kid_without_account(other.id, "acct2-far")
+    url = "/api/family/people/{}/account"
+    assert client.post(url.format("acct2-kid"), json={"email": "nope"}, headers=admin).status_code == 400
+    assert client.post(url.format("acct2-far"), json={"email": "a@b.co"}, headers=admin).status_code == 404
+    assert client.post(url.format("ghost"), json={"email": "a@b.co"}, headers=admin).status_code == 404
+    taken.add("used@example.com")
+    assert client.post(url.format("acct2-kid"), json={"email": "used@example.com"}, headers=admin).status_code == 409
+    assert users_store.get_user("acct2-kid").email is None
+
+
+def test_person_account_is_404_on_a_home_server(client: TestClient, monkeypatch):
+    from app.routers import family as family_router
+
+    monkeypatch.setattr(family_router, "auth_backend", lambda: "home")
+    family = _make_family("Home")
+    admin = _make_family_admin("acct3-admin", "acct3-admin", family.id)
+    _kid_without_account(family.id, "acct3-kid")
+    r = client.post("/api/family/people/acct3-kid/account", json={"email": "a@b.co"}, headers=admin)
+    assert r.status_code == 404

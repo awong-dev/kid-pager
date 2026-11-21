@@ -446,6 +446,7 @@ def _backdate_alert(family_id: str, alert_id: str, days_ago: int) -> None:
     ).update({"ts": datetime.now(UTC) - timedelta(days=days_ago)})
 
 
+def test_sweep_removes_old_alerts_open_ones_included():
     family = _make_family("Sweep")
 
     old_handled = alerts_module.create(family.id, _minimal_alert("handled", "old handled"))
@@ -461,3 +462,5 @@ def _backdate_alert(family_id: str, alert_id: str, days_ago: int) -> None:
     jobs.sweep()
 
     remaining_ids = {a.id for a in list_alerts(family.id, "all")}
+    # An open alert expires too (it can hold a held SMS body).
+    assert remaining_ids == {young_handled}

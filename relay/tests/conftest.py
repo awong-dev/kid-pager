@@ -31,6 +31,7 @@ if DB_BACKEND == "sqlite":
 from app.db.firestore import get_app, get_db
 from app.ingest import Ingest
 from tests.fake_transport import FakeBrokerClient
+from tests.fed_world import make_relay, net  # noqa: F401 -- fixtures for the federation tests
 
 FIRESTORE_HOST = os.environ["FIRESTORE_EMULATOR_HOST"]
 AUTH_HOST = os.environ["FIREBASE_AUTH_EMULATOR_HOST"]
@@ -130,6 +131,42 @@ def _clean_emulators() -> Iterator[None]:
     if not HOME_AUTH:
         httpx.delete(AUTH_WIPE_URL, timeout=10.0)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_fed_state() -> Iterator[None]:
+    """Drops the federation switch cache (30 s) and any injected federation client."""
+    from app.fed import client as fed_client
+    from app.store import fed_state
+
+    fed_state.invalidate_cache()
+    fed_client.set_default_client(None)
+    yield
+    fed_state.invalidate_cache()
+    fed_client.set_default_client(None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_hooks_cache() -> Iterator[None]:
+    """Drops the 30 s enabled-hook cache."""
+    from app.store import hooks as hooks_store
+
+    hooks_store.invalidate_cache()
+    yield
+    hooks_store.invalidate_cache()
+
+
+@pytest.fixture(autouse=True)
+def _inline_background() -> Iterator[None]:
+    """Runs `app.hooks.spawn` inline and resets the federation sender's settings."""
+    from app import hooks as hooks_module
+    from app.fed import sender as fed_sender
+
+    hooks_module.set_background(spawn=lambda fn: fn())
+    fed_sender.configure(None)
+    yield
+    hooks_module.set_background()
+    fed_sender.configure(None)
 
 
 @pytest.fixture(autouse=True)

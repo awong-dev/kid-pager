@@ -7,6 +7,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict
 
+from app import deliveries
 from app.backends.base import DeliverResult, LinkStep
 from app.backends.bridge import apply_outbox_state
 from app.sms_text import redact_phone, voice_link
@@ -45,6 +46,7 @@ class SmsBackend:
         phone = backend.config.get("phone")
         if not phone:
             logger.warning("sms backend %s has no phone configured", backend.id)
+            deliveries.mark_failed(msg.id, backend.id, kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="sms backend missing phone")
 
         sender = users_store.get_user(msg.senderUid)
@@ -54,6 +56,7 @@ class SmsBackend:
                 "sms out to=%s from=- sid=- status=failed code=no_sms_number",
                 redact_phone(phone),
             )
+            deliveries.mark_failed(msg.id, backend.id, kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="no_sms_number")
 
         # The sender's number must be a paired bridge's SIM or Voice number and the phone
@@ -65,6 +68,7 @@ class SmsBackend:
                 redact_phone(phone),
                 redact_phone(from_number),
             )
+            deliveries.mark_failed(msg.id, backend.id, error="no_bridge", kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="no_bridge")
         return self._deliver_via_bridge(msg, backend, bridge, phone, from_number)
 
@@ -91,6 +95,7 @@ class SmsBackend:
                 redact_phone(phone),
                 redact_phone(from_number),
             )
+            deliveries.mark_failed(msg.id, backend.id, error="no_bridge", kind=self.kind)
             return DeliverResult(ok=False, state="failed", error="no_bridge")
         via = chosen
         to: dict[str, str] = {"phone": phone}

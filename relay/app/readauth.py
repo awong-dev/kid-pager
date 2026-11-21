@@ -254,7 +254,12 @@ def contact_requests(p: Principal | None, r: str, data: Data) -> bool:
     )
 
 
+# `settings/federation` is server-only; other fed collections have no readable path.
+_SERVER_ONLY_SETTINGS = {"federation"}
+
+
 def settings(p: Principal | None, s: str, data: Data) -> bool:
+    return s not in _SERVER_ONLY_SETTINGS and registered(p)
 
 
 # `match` block by path shape (`*` = wildcard); anything absent is default-deny.
@@ -396,6 +401,9 @@ def _list_contact_requests(p: Principal, w: _Filters) -> bool:
 
 
 def _list_settings(p: Principal, w: _Filters) -> bool:
+    # A list rule cannot name the document id, so a collection query would return
+    # `settings/federation`: denied.
+    return False
 
 
 _LIST: dict[tuple[str, ...], Callable[..., bool]] = {

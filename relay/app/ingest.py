@@ -16,6 +16,7 @@ from app import alerts, book, devauth, devcfg, devsetup, location, wire
 from app import policy as policy_module
 from app.broker import BrokerClient
 from app.routing import Routing
+from app.sms_text import redact_phone
 from app.store import alerts as alerts_store
 from app.store import allow as allow_store
 from app.store import battery as battery_store
@@ -28,6 +29,7 @@ from app.store import messages as messages_store
 from app.store import rate_limits as rate_limits_store
 from app.store import sms as sms_store
 from app.store import users as users_store
+from app.sysmsg import derived_id, send_system_text
 from app.wire import (
     LocEnvelope,
     SmsLogEnvelope,
@@ -404,6 +406,13 @@ class Ingest:
         if result is None:
             return
         data, _encoding = result
+        if self._frozen(device):
+            # The family is being moved; answer anything but an ack with a `system` reply.
+            if not (isinstance(data.get("ack"), str) and data.get("body") is None):
+                cause = data.get("id")
+                if isinstance(cause, str) and device is not None:
+                    self._send_system_reply(device.id, families_store.FROZEN_REPLY, cause_id=cause)
+            return
 
         # `kind:"contact_req"` is dispatched on the raw dict before `UpEnvelope.model_validate`,
         # which rejects any non-null `kind` (docs/PROTOCOL.md §3.4).
@@ -731,10 +740,12 @@ class Ingest:
             env.id,
             device_id,
             env.dir,
+            redact_phone(env.peer),
             env.st,
             "" if created else " (duplicate, already stored)",
         )
         if env.st == "blocked":
+            logger.warning("SECURITY sms-blocked device=%s peer=%s", device_id, redact_phone(env.peer))
         if (
             created
             and env.dir == "in"
@@ -808,10 +819,22 @@ class Ingest:
             origin_backend_kind="pager",
             wire_id=env.id,
             device_id=device.id,
+            origin_device_id=device.id,
             ts=resolve_ts(env.ts),
         )
+        # A hook block can sit anywhere in `rejected` (after the gate's own refusals) and a group or
+        # broadcast send can be partly delivered, so look at every row, not the first.
+        hook_blocked = any(r.reason == "hook_blocked" for r in result.rejected)
+        refusals = [r for r in result.rejected if r.reason != "hook_blocked"]
+        if hook_blocked and result.notify:
+            # A filter hook blocked it for every admitted recipient. The sender hears `notifySender`
+            # as a `system` reply when the hook gave one; otherwise it is dropped silently.
+            self._send_system_reply(device.id, result.notify, cause_id=env.id)
+            return
+        if env.to is not None and refusals:
             # docs/PROTOCOL.md §4.2 case 3: an unknown or disallowed explicit `to` gets exactly one
             # `system` down reply, never stored as a message, one per offending up message.
+            first = refusals[0]
             body = (
                 self._added_refusal_body(device, first.uid, env.to, first.reason)
                 if first.reason in _ADDED_REFUSALS and first.uid is not None
@@ -823,6 +846,8 @@ class Ingest:
                     if first.reason == "no_sms_number"
                     else NO_BRIDGE_BODY
                     if first.reason == "no_bridge"
+                    else families_store.FROZEN_REPLY
+                    if first.reason == "family_frozen"
                     else UNKNOWN_RECIPIENT_BODY
                 )
             self._send_system_reply(device.id, body, cause_id=env.id)
@@ -854,9 +879,16 @@ class Ingest:
             return refused_declined_body(label)
         return refused_needs_ok_body(label)
 
+    @staticmethod
+    def _frozen(device: devices_store.Device | None) -> bool:
+        return device is not None and families_store.is_frozen(device.familyId)
+
     def _send_system_reply(self, device_id: str, body: str, *, cause_id: str) -> None:
         # The reply's `id` is derived from the offending up message's id (docs/PROTOCOL.md §4.2);
         # a fresh id would re-alert on a QoS 1 redelivery.
+        msg_id = derived_id("sys", device_id, cause_id)
+        # docs/PROTOCOL.md §14.5: signed and `n`-numbered like every `/down`.
+        send_system_text(self._broker, device_id, body, msg_id=msg_id)
 
 
     def handle_status(self, topic: str, payload: bytes) -> None:
@@ -873,6 +905,9 @@ class Ingest:
         if result is None:
             return
         data, _encoding = result
+        if self._frozen(device):
+            logger.info("status from frozen family device %s dropped", device_id)
+            return
         try:
             env = StatusEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
@@ -901,6 +936,10 @@ class Ingest:
         # batt_mv/temp_dc are omitted until the modem has a reading this boot; an online status
         # without them must not leave the last boot's value.
         if env.state == "online":
+            # `mb` is kept while the reported firmware is unchanged and cleared when the firmware
+            # changed and no longer reports it.
+            if env.mb is None and env.fw is not None and env.fw != previous_status.fw:
+                ota_clear += ("mb",)
             ota_clear += tuple(
                 k
                 for k, v in (
@@ -929,6 +968,7 @@ class Ingest:
             locBackoffS=env.loc_backoff_s,
             locMoveS=env.loc_move_s,
             gnss=env.gnss,
+            mb=env.mb,
             car=env.car,
             smsLost=env.sms_lost,
             link=env.link,
@@ -946,6 +986,15 @@ class Ingest:
             assetsSrc=env.ast,
             assetsId=env.ast_id,
         )
+
+        # A pager's `fed` book type depends on whether it reports `mb`; re-send the book when that
+        # flips for an owner who lists a person on a peer relay.
+        if (
+            env.state == "online"
+            and (previous_status.mb is None) != (env.mb is None)
+            and any(e.fed for e in book.entries_for(device.ownerUid))
+        ):
+            book.bump_and_push({device.ownerUid}, self._broker, reason="fed_type")
 
         # An online status without `ast` is firmware without font OTA, so drop the pending font job
         # and its web job.
@@ -1031,6 +1080,9 @@ class Ingest:
         if result is None:
             return
         data, _encoding = result
+        if self._frozen(device):
+            logger.info("loc from frozen family device %s dropped", device_id)
+            return
         try:
             env = LocEnvelope.model_validate(data)
         except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above

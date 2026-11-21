@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.backends.base import Backend
 from app.backends.bridge import BridgeBackend
+from app.backends.fed import FedBackend
 from app.backends.gchat import ChatClient, GChatBackend
 from app.backends.pager import PagerBackend
 from app.backends.sms import SmsBackend
@@ -26,4 +27,6 @@ def build_registry(
         "sms": SmsBackend(),
         # a subscribed Google Chat conversation; the row lives on an external.
         "bridge": BridgeBackend(),
+        # a person on a peer relay; the row lives on an external.
+        "fed": FedBackend(),
     }

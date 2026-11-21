@@ -77,6 +77,7 @@ def resolve(cell: CellInfo) -> CellFix | None:
             logger.warning("unknown CELL_GEO_PROVIDER=%r; skipping cell lookup", name)
             return None
     except Exception as exc:  # noqa: BLE001 -- must never break the /webhooks/mqtt ingest path
+        logger.warning("cell geolocation lookup failed (provider=%s): %s", name, type(exc).__name__)
         return None
 
     if fix is None:
@@ -84,6 +85,8 @@ def resolve(cell: CellInfo) -> CellFix | None:
         return None
     if not _sane(fix):
         logger.warning(
+            "cell geolocation lookup returned an implausible fix (provider=%s, acc_m=%s); "
+            "treated as unresolved",
             name,
             fix.acc_m,
         )

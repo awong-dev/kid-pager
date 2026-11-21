@@ -62,10 +62,13 @@ def test_first_slot_ticks_and_sweeps_a_never_swept_store(monkeypatch):
     assert meta.lastTickAt is not None and meta.lastSweepAt is not None
 
 
+def test_a_recent_sweep_is_not_repeated_and_a_day_old_one_is(monkeypatch):
     calls = _Calls(monkeypatch)
     settings_store.mark_swept()
     scheduler.run_once(routing=None)  # type: ignore[arg-type]
     assert (calls.ticks, calls.sweeps) == (1, 0)
+    day_later = datetime.now(UTC) + timedelta(hours=23, minutes=1)
+    scheduler.run_once(routing=None, now=day_later)  # type: ignore[arg-type]
     assert calls.sweeps == 1
 
 

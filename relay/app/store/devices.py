@@ -53,6 +53,9 @@ class DeviceStatus(BaseModel):
     session: str | None = None
     ts: int | None = None
     fw: str | None = None
+    # `mb` (docs/PROTOCOL.md §5.1, key 76): the largest body the firmware accepts; gates `rcpt`.
+    # `None` = legacy 160 cp / 320 B pager; offline statuses leave it, a changed `fw` clears it.
+    mb: int | None = None
     locPeriodS: int | None = None
     locMinS: int | None = None
     # Trust state and the pinned CA's short fingerprint.

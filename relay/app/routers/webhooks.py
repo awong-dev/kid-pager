@@ -106,6 +106,7 @@ async def mqtt_webhook(request: Request) -> Response:
     body = await request.body()
     parsed = broker.parse_webhook(body)
     if parsed is None:
+        logger.warning("unparsable webhook body (%d bytes)", len(body))
         return Response(status_code=200)
 
     topic, payload, _qos = parsed
@@ -129,6 +130,8 @@ async def mqtt_webhook(request: Request) -> Response:
 
 
 def _reject_hint(reason: str) -> str:
+    if reason == "family_frozen":
+        return "that family is moving servers, try later"
     return "unknown recipient" if reason == "unknown_alias" else "not allowed to message that recipient"
 
 
@@ -237,5 +240,7 @@ async def gchat_webhook(request: Request) -> Response:
         origin_backend_id=bid,
     )
     if result.rejected:
+        if result.rejected[0].reason == "hook_blocked":
+            return _chat_json({})  # dropped silently
         return _chat_json({"text": _reject_hint(result.rejected[0].reason)})
     return _chat_json({})

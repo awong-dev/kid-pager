@@ -105,6 +105,12 @@ KEYMAP: dict[str, int] = {
     # active) and the active assets_ota id (16 lowercase hex, only when ast == 2).
     "ast": 72,
     "ast_id": 73,
+    # `rcpt` (PROTOCOL.md §3.2): the up page's wire id (tstr <= 16) and the failure reason
+    # (tstr <= 16, only with `st:"failed"`); `st` reuses key 46.
+    "ref": 74,
+    "rsn": 75,
+    # `/status` max body bytes (uint, 1024 on long-message firmware). Never 52.
+    "mb": 76,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 

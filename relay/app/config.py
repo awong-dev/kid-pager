@@ -73,6 +73,9 @@ class Settings:
     webpush_vapid_private_key: str | None = None
     webpush_vapid_public_key: str | None = None
     webpush_subject: str | None = None
+    # The public URL of the family web app, for the links a reauthorization invite is shown
+    # with. Optional; `WEB_BASE_URL`.
+    web_base_url: str | None = None
     # "rest" keeps the relay off MQTT (REST publish + `/webhooks/mqtt`); "mqtt" makes it one
     # persistent client (`app/broker_mqtt.py`) logged in as `broker_mqtt_username`.
     broker_mode: BrokerMode = "rest"
@@ -80,6 +83,9 @@ class Settings:
     broker_mqtt_port: int = 1883
     broker_mqtt_username: str = "relay"
     broker_mqtt_password: str | None = None
+    # PEM of this relay's own TLS root for link invites (`FED_CA_PEM` / `FED_CA_PEM_FILE`); with
+    # `TLS_MODE=selfsigned` it defaults to `BROKER_CA_PEM`. Unset: invites carry no `ca`.
+    fed_ca_pem: str | None = None
 
     @property
     def webpush_configured(self) -> bool:
@@ -136,11 +142,19 @@ class Settings:
             or None,
             webpush_subject=(os.environ.get("WEBPUSH_SUBJECT") or "").strip()
             or _https_or_none(os.environ.get("PUBLIC_BASE_URL")),
+            web_base_url=_https_or_none(os.environ.get("WEB_BASE_URL")),
             broker_mode=_broker_mode(os.environ.get("BROKER_MODE", "")),
             broker_mqtt_host=(os.environ.get("BROKER_MQTT_HOST") or "").strip() or "localhost",
             broker_mqtt_port=int((os.environ.get("BROKER_MQTT_PORT") or "").strip() or "1883"),
             broker_mqtt_username=(os.environ.get("BROKER_MQTT_USERNAME") or "").strip() or "relay",
             broker_mqtt_password=(os.environ.get("BROKER_MQTT_PASSWORD") or "").strip() or None,
+            fed_ca_pem=os.environ.get("FED_CA_PEM")
+            or _read_pem_file(os.environ.get("FED_CA_PEM_FILE"))
+            or (
+                os.environ.get("BROKER_CA_PEM") or _read_pem_file(os.environ.get("BROKER_CA_PEM_FILE"))
+                if tls_mode() == "selfsigned"
+                else None
+            ),
         )
 
 

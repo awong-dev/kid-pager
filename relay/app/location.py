@@ -110,12 +110,17 @@ def _resolve_cell_fallback(cell: CellInfo, fix_ts: int) -> LocFix | None:
     try:
         resolved = cellgeo.resolve(cell)
     except Exception as exc:  # noqa: BLE001 -- must never break /webhooks/mqtt ingest
+        logger.warning("cellgeo.resolve() raised unexpectedly: %s", type(exc).__name__)
         resolved = None
     if resolved is None:
         return None
     try:
         return LocFix(lat=resolved.lat, lon=resolved.lon, acc=resolved.acc_m, fix_ts=fix_ts, src="cell")
     except Exception as exc:  # noqa: BLE001 -- a malformed provider response must not break ingest
+        # the exception text carries the offending lat/lon, so only its type is logged
+        logger.warning(
+            "cell-resolved fix failed validation, treated as unresolved: %s", type(exc).__name__
+        )
         return None
 
 

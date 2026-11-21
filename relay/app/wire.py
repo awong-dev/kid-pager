@@ -22,6 +22,15 @@ from app import wirecbor
 
 logger = logging.getLogger("relay.wire")
 
+# A message carries up to 1024 UTF-8 bytes in an envelope of up to 1280 bytes; a device that
+# does not report `mb` keeps the legacy 160 code points / 320 bytes below.
+MAX_ENVELOPE_BYTES = 1280
+LEGACY_MAX_ENVELOPE_BYTES = 640
+BODY_MAX_UTF8_BYTES = 1024
+LEGACY_BODY_MAX_CODEPOINTS = 160
+LEGACY_BODY_MAX_UTF8_BYTES = 320
+# The `mb` capability value this relay understands (bytes, sanity bound).
+MB_MAX = 8192
 
 # docs/PROTOCOL.md §1: ids are opaque; one generic shape for all id kinds.
 ID_RE = re.compile(r"^[a-z0-9_]{3,16}$")
@@ -83,6 +92,7 @@ def validate_body(body: str) -> None:
     if CONTROL_CHAR_RE.search(body):
         raise ValueError("body contains control characters")
     if len(body.encode("utf-8")) > BODY_MAX_UTF8_BYTES:
+        raise ValueError(f"body exceeds {BODY_MAX_UTF8_BYTES} UTF-8 bytes")
 
 
 def validate_ts(ts: int) -> None:
@@ -254,6 +264,9 @@ class StatusEnvelope(BaseModel):
     loc_move_s: int | None = None
     # 1 = GNSS enabled, 0 = disabled by `cfg.loc.gnss`; display only. Other values drop to `None`.
     gnss: int | None = None
+    # Largest message body in UTF-8 bytes the firmware accepts and sends (CBOR key 76, 1024); absent
+    # = legacy pager; an out-of-range value drops to `None`.
+    mb: int | None = None
     # Carrier name the pager detected (key 70), display only; over-long or non-printable values
     # drop to `None`.
     car: str | None = None
@@ -320,6 +333,11 @@ class StatusEnvelope(BaseModel):
         if value is not None and not (0 <= value <= 65535):
             raise ValueError("abn out of range")
         return value
+
+    @field_validator("mb")
+    @classmethod
+    def _check_mb(cls, value: int | None) -> int | None:
+        return value if value is not None and 1 <= value <= MB_MAX else None
 
     @field_validator("gnss")
     @classmethod
@@ -655,6 +673,7 @@ class LocEnvelope(BaseModel):
         try:
             CellInfo.model_validate(cell)
         except Exception:  # noqa: BLE001 -- any validation error means "treat as absent"
+            logger.info("malformed /loc cell field treated as absent")
             data = dict(data)
             data.pop("cell", None)
         return data

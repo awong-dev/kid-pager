@@ -349,6 +349,37 @@ Scenario descriptions are in the list above.
 rules for the bridge collections are in `test_rules.py`). The Android unit tests are in
 `bridge-android/app/src/test`, run with `./gradlew testDebugUnitTest`.
 
+## Moving a family: `python -m app.familyexport`
+
+Moves one family between servers as a `.kpfam` file (runbook: `docs/FAMILY_MOVE.md`). Run it
+from `relay/` with the venv, or inside the container:
+
+```bash
+python -m app.familyexport export <family> --passphrase-file <passphrase-file>    # freeze the family first
+python -m app.familyexport import <file> --dry-run --passphrase-file <passphrase-file> [--as <newId>]
+python -m app.familyexport inspect <file> --passphrase-file <passphrase-file>     # print the manifest
+```
+
+The passphrase comes from `--passphrase-file`, else `$KPFAM_PASSPHRASE`, else a prompt. Under
+SQLite, stop the relay first. Tests: `tests/test_familyexport.py`, `tests/test_family_move_routes.py`.
+
+Environment variables added by the federation, hooks, bridge-health and family-move designs. All
+optional:
+
+| Variable | Default | Read in | Meaning |
+|---|---|---|---|
+| `FED_CA_PEM`, `FED_CA_PEM_FILE` | unset | `config.py` | PEM of this relay's TLS trust root, put in link invites. Under `TLS_MODE=selfsigned` it defaults to `BROKER_CA_PEM` |
+| `FED_OFFLINE_AFTER_S` | `86400` | `app/fed/sender.py` | seconds a message may wait for a peer before it fails `peer_offline` |
+| `FED_DOWN_AFTER_S` | `900` | `app/fed/sender.py` | seconds without a reply, with messages waiting, before the family is told the link is down |
+| `WEB_BASE_URL` | unset | `config.py` | public URL of the family web app; makes a federation reauthorization invite a clickable link (`/fed/v1/info` `web`) |
+| `BRIDGE_OFFLINE_AFTER_S` | `900` | `app/bridge_health.py` | seconds of silence before a bridge phone counts as offline |
+| `FAMILY_IMPORT_MAX_MB` | `512` | `app/routers/family_move.py` | upload cap for `POST /api/admin/families/import` |
+| `KPFAM_PASSPHRASE` | unset | `app/familyexport.py` | passphrase for the CLI |
+
+Message hooks have no environment variables. They are registered at `/api/admin/hooks`; the
+protocol is in `docs/HOOKS_PROTOCOL.md`. Federation is described in `docs/FEDERATION_PROTOCOL.md`.
+`FED_CA_PEM`, `FAMILY_IMPORT_MAX_MB` and `KPFAM_PASSPHRASE` are not in `.env.example`.
+
 ## CLI Tools
 
 For sending messages via the relay API and driving a simulated device +

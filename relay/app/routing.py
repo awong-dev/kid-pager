@@ -8,8 +8,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app import alerts as alerts_module
+from app import bodysplit, book, deliveries
+from app import hooks as hooks_module
 from app import policy as policy_module
 from app.backends.base import Backend, DeliverResult
+from app.backends.fed import link_for as fed_backend_link
 from app.backends.registry import build_registry
 from app.broker import BrokerClient
 from app.ids import new_id
@@ -18,12 +21,20 @@ from app.store import backends as backends_store
 from app.store import bridges as bridges_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
+from app.store import families as families_store
+from app.store import fed_links as fed_links_store
+from app.store import fed_state
 from app.store import messages as messages_store
 from app.store import users as users_store
 from app.store.backends import Backend as BackendRow
 from app.store.conversations import Conversation
 from app.store.messages import Delivery, Message, MessageKind
 from app.store.users import User
+from app.wire import (
+    BODY_MAX_UTF8_BYTES,
+    LEGACY_BODY_MAX_CODEPOINTS,
+    LEGACY_BODY_MAX_UTF8_BYTES,
+)
 
 logger = logging.getLogger("relay.routing")
 
@@ -40,6 +51,11 @@ RejectReason = Literal[
     "sms_contact",
     "no_sms_number",
     "no_bridge",
+    "hook_blocked",
+    "no_peer",
+    "fed_reauth",
+    "fed_off",
+    "family_frozen",
 ]
 
 
@@ -54,10 +70,29 @@ class RejectedRecipient:
 class SendResult:
     messages: list[Message] = field(default_factory=list)
     rejected: list[RejectedRecipient] = field(default_factory=list)
+    # A blocking filter's `notifySender` text, shown to the sender.
+    notify: str | None = None
 
     @property
     def ok(self) -> bool:
         return bool(self.messages) and not self.rejected
+
+
+def _part_id(wire_id: str | None, index: int) -> str | None:
+    """Part 0 keeps the wire id, part `i` is `<wire>~<i>`; no wire id stays none."""
+    return wire_id if index == 0 or wire_id is None else f"{wire_id}~{index}"
+
+
+@dataclass
+class _Staged:
+    """What the hook stage hands the storage stage."""
+
+    body: str | None
+    blocked: bool = False
+    notify: str | None = None
+    ctx: hooks_module.MessageCtx | None = None
+    annotations: dict[str, dict] = field(default_factory=dict)
+    ref: str | None = None
 
 
 def _is_external(uid: str) -> bool:
@@ -84,8 +119,13 @@ class Routing:
         device_id: str | None = None,
         ts: int | None = None,
         sender_alias: str | None = None,
+        origin_device_id: str | None = None,
     ) -> SendResult:
+        """`origin_device_id` limits the delivery receipt to that pager; `sender_alias` overrides
+        the group copy's `senderAlias`."""
         ts = ts if ts is not None else int(time.time())
+        if families_store.user_family_frozen(sender_uid):
+            raise families_store.FamilyFrozen(sender_uid)
 
         if recipient_alias is not None:
             group = conversations_store.get_by_alias(recipient_alias)
@@ -101,11 +141,21 @@ class Routing:
                     wire_id=wire_id,
                     ts=ts,
                     sender_alias=sender_alias,
+                    origin_device_id=origin_device_id,
                 )
 
         candidates, rejected = self._candidate_recipients(sender_uid, recipient_alias, device_id)
 
+        # Stage 1: the per-recipient gate. Nothing is stored yet.
+        admitted: list[str] = []
         for recipient_uid in candidates:
+            if families_store.user_family_frozen(recipient_uid):
+                rejected.append(
+                    RejectedRecipient(
+                        alias=recipient_alias, uid=recipient_uid, reason="family_frozen"
+                    )
+                )
+                continue
             sms_reason = self._sms_route_reject(sender_uid, recipient_uid)
             if sms_reason is not None:
                 logger.warning(
@@ -132,6 +182,29 @@ class Routing:
                     RejectedRecipient(alias=recipient_alias, uid=recipient_uid, reason=reason)
                 )
                 continue
+            admitted.append(recipient_uid)
+
+        # Stage 2: the hook filter chain, once for the whole message.
+        staged = self._filter_stage(
+            sender_uid=sender_uid,
+            admitted=admitted,
+            kind=kind,
+            body=body,
+            origin_backend_kind=origin_backend_kind,
+            wire_id=wire_id,
+            ts=ts,
+            conv_key=(
+                messages_store.conv_key(sender_uid, admitted[0]) if admitted else None
+            ),
+            group=None,
+        )
+        if staged.blocked:
+            return self._blocked_result(staged, recipient_alias, admitted, rejected)
+        body = staged.body
+
+        # Stage 3: store and deliver, per recipient, with the final body.
+        created: list[Message] = []
+        for recipient_uid in admitted:
             # Read before storing: create_message does not report whether the doc existed.
             conv_existed = (
                 messages_store.get_conversation(
@@ -139,7 +212,148 @@ class Routing:
                 )
                 is not None
             )
+            # One message per part, sized for this recipient's pager.
+            parts = self._split_for(kind, body, [recipient_uid])
+            first: Message | None = None
+            for index, part in enumerate(parts):
+                msg = self._create_and_deliver(
+                    sender_uid=sender_uid,
+                    recipient_uid=recipient_uid,
+                    kind=kind,
+                    body=part,
+                    loc=loc,
+                    origin_backend_kind=origin_backend_kind,
+                    origin_backend_id=origin_backend_id,
+                    wire_id=_part_id(wire_id, index),
+                    ts=ts,
+                    sender_alias=sender_alias,
+                    origin_device_id=origin_device_id,
+                    hooks=staged.annotations,
+                    hook_ref=staged.ref,
+                )
+                if msg is not None:
+                    created.append(msg)
+                    first = first or msg
+            if first is not None and not conv_existed:
+                self._maybe_alert_new_conversation(sender_uid, recipient_uid, first.convKey, body)
+        self._after_store(staged, created)
         return SendResult(messages=created, rejected=rejected)
+
+
+    def _filter_stage(
+        self,
+        *,
+        sender_uid: str,
+        admitted: list[str],
+        kind: MessageKind,
+        body: str | None,
+        origin_backend_kind: str,
+        wire_id: str | None,
+        ts: int,
+        conv_key: str | None,
+        group: Conversation | None,
+    ) -> _Staged:
+        """Runs the hook chain between the policy gate and storage."""
+        staged = _Staged(body=body)
+        if kind != "text" or not body or not admitted or conv_key is None:
+            return staged
+        hooks = hooks_module.active_hooks()
+        if not hooks:
+            return staged
+        if wire_id is not None and all(
+            messages_store.wire_id_exists(wire_id, uid) for uid in admitted
+        ):
+            # A QoS-1 redelivery already stored for everyone: skip the hooks.
+            return staged
+        ctx = hooks_module.build_ctx(
+            sender_uid=sender_uid,
+            recipient_uids=admitted,
+            conv_key=conv_key,
+            conv_kind="group" if group is not None else "dm",
+            conv_name=group.name if group is not None else None,
+            origin_backend_kind=origin_backend_kind,
+            wire_id=wire_id,
+            ts=ts,
+        )
+        if ctx is None:
+            return staged
+        covering = [h for h in hooks if h.covers(ctx.family_ids)]
+        if not covering:
+            return staged
+        chain = hooks_module.run_filters(covering, ctx, body)
+        staged.ctx = ctx
+        staged.body = chain.body
+        staged.blocked = chain.blocked
+        staged.notify = chain.notify
+        staged.annotations = chain.annotations
+        staged.ref = ctx.ref
+        return staged
+
+
+    def _split_for(self, kind: MessageKind, body: str | None, recipient_uids: list[str]) -> list[str | None]:
+        """`[body]` unless a text body exceeds the smallest recipient cap."""
+        if kind != "text" or not body:
+            return [body]
+        if len(body) <= LEGACY_BODY_MAX_CODEPOINTS and len(body.encode("utf-8")) <= (
+            LEGACY_BODY_MAX_UTF8_BYTES
+        ):
+            return [body]
+        max_bytes = BODY_MAX_UTF8_BYTES
+        max_cp: int | None = None
+        for uid in recipient_uids:
+            b, cp = self._recipient_cap(uid)
+            max_bytes = min(max_bytes, b)
+            if cp is not None:
+                max_cp = cp if max_cp is None else min(max_cp, cp)
+        return list(bodysplit.split_body(body, max_bytes=max_bytes, max_codepoints=max_cp))
+
+    @staticmethod
+    def _recipient_cap(recipient_uid: str) -> tuple[int, int | None]:
+        """`(max bytes, max code points | None)`: minimum over the recipient's live pagers."""
+        max_bytes = BODY_MAX_UTF8_BYTES
+        max_cp: int | None = None
+        for b in backends_store.list_backends(recipient_uid):
+            if b.kind != "pager" or not b.enabled:
+                continue
+            device = devices_store.get_device(str(b.config.get("deviceId") or ""))
+            if device is None or device.revokedAt is not None:
+                continue
+            mb = device.status.mb
+            if mb:
+                max_bytes = min(max_bytes, mb)
+            else:
+                max_bytes = min(max_bytes, LEGACY_BODY_MAX_UTF8_BYTES)
+                max_cp = LEGACY_BODY_MAX_CODEPOINTS
+        return max_bytes, max_cp
+
+    @staticmethod
+    def _after_store(staged: _Staged, created: list[Message]) -> None:
+        """Tells hook processors about the stored message."""
+        if staged.ctx is None or not created or staged.body is None:
+            return
+        hooks_module.dispatch_processors(
+            hooks_module.active_hooks(),
+            staged.ctx,
+            body=staged.body,
+            message_ids=[m.id for m in created],
+        )
+
+    @staticmethod
+    def _blocked_result(
+        staged: _Staged,
+        alias: str | None,
+        admitted: list[str],
+        rejected: list[RejectedRecipient],
+    ) -> SendResult:
+        """Stored nowhere; every admitted recipient is reported `hook_blocked`."""
+        return SendResult(
+            messages=[],
+            rejected=[
+                *rejected,
+                *(RejectedRecipient(alias=alias, uid=uid, reason="hook_blocked") for uid in admitted),
+            ],
+            notify=staged.notify,
+        )
 
     def _maybe_alert_new_conversation(
         self, sender_uid: str, recipient_uid: str, conv_key: str, body: str | None = None
@@ -202,12 +416,28 @@ class Routing:
             # A contact belongs to one family and must be live.
             if ext.disabled or person is None or ext.ownerFamilyId != person.familyId:
                 return "sms_contact"
+            if ext.fed:
+                # A federated contact has no number or bridge; its link must be active.
+                return self._fed_route_reject(ext)
             if bridge_row is _UNSET:
                 bridge_row = backends_store.get_backend(ext.uid, "bridge")
             if bridge_row is not None:
                 return self._bridge_route_reject(ext, person, bridge_row, outbound=recipient_ext)
             if not person.smsNumber:
                 return "no_sms_number"
+        return None
+
+    @staticmethod
+    def _fed_route_reject(ext: User) -> RejectReason | None:
+        if not fed_state.family_enabled(ext.ownerFamilyId):
+            return "fed_off"
+        link = fed_links_store.get_for(
+            ext.ownerFamilyId, str((ext.fed or {}).get("remoteFedId") or "")
+        )
+        if link is not None and link.state == "reauth":
+            return "fed_reauth"
+        if link is None or link.state != "active":
+            return "no_peer"
         return None
 
     def _bridge_route_reject(
@@ -249,6 +479,7 @@ class Routing:
         wire_id: str | None,
         ts: int,
         sender_alias: str | None = None,
+        origin_device_id: str | None = None,
     ) -> SendResult:
         if sender_uid not in group.uids:
             logger.warning(
@@ -275,6 +506,7 @@ class Routing:
 
         created: list[Message] = []
         rejected: list[RejectedRecipient] = []
+        admitted: list[str] = []
         sender_is_external = _is_external(sender_uid)
         # One `bridge` backend read per external, reused for the skip decision and route check.
         sender_bridge_row = (
@@ -284,6 +516,13 @@ class Routing:
         for recipient_uid in sorted(uid for uid in group.uids if uid != sender_uid):
             # SMS contacts never join a relay group; a stale member is skipped. A bridge external
             # may send or receive, and every pair with an external runs the route check first.
+            if families_store.user_family_frozen(recipient_uid):
+                rejected.append(
+                    RejectedRecipient(
+                        alias=group.alias, uid=recipient_uid, reason="family_frozen"
+                    )
+                )
+                continue
             recipient_is_external = _is_external(recipient_uid)
             recipient_bridge_row = (
                 backends_store.get_backend(recipient_uid, "bridge")
@@ -326,6 +565,51 @@ class Routing:
                     RejectedRecipient(alias=group.alias, uid=recipient_uid, reason=reason)
                 )
                 continue
+            admitted.append(recipient_uid)
+
+        # The hook filter chain, once for the whole group message.
+        staged = self._filter_stage(
+            sender_uid=sender_uid,
+            admitted=admitted,
+            kind=kind,
+            body=body,
+            origin_backend_kind=origin_backend_kind,
+            wire_id=group_msg_id,
+            ts=ts,
+            conv_key=group.convKey,
+            group=group,
+        )
+        if staged.blocked:
+            return self._blocked_result(staged, group.alias, admitted, rejected)
+        body = staged.body
+
+        # Every member gets the same parts: the cap is the smallest across them.
+        parts = self._split_for(kind, body, admitted)
+        for index, part in enumerate(parts):
+            part_id = _part_id(group_msg_id, index)
+            part_seq = seq if index == 0 else messages_store.allocate_seq()
+            for recipient_uid in admitted:
+                msg = self._create_and_deliver(
+                    sender_uid=sender_uid,
+                    recipient_uid=recipient_uid,
+                    kind=kind,
+                    body=part,
+                    loc=loc,
+                    origin_backend_kind=origin_backend_kind,
+                    origin_backend_id=origin_backend_id,
+                    wire_id=part_id,
+                    ts=ts,
+                    conv_key=group.convKey,
+                    seq=part_seq,
+                    group_msg_id=part_id,
+                    sender_alias=sender_alias,
+                    origin_device_id=origin_device_id,
+                    hooks=staged.annotations,
+                    hook_ref=staged.ref,
+                )
+                if msg is not None:
+                    created.append(msg)
+        self._after_store(staged, created)
         return SendResult(messages=created, rejected=rejected)
 
     def redeliver_pager(self, msg: Message, device_id: str) -> bool:
@@ -375,6 +659,9 @@ class Routing:
         seq: int | None = None,
         group_msg_id: str | None = None,
         sender_alias: str | None = None,
+        hooks: dict[str, dict] | None = None,
+        hook_ref: str | None = None,
+        origin_device_id: str | None = None,
     ) -> Message | None:
         # Self-loop guard: excludes the origin backend (by id if given, else by kind) only when
         # the recipient is the sender.
@@ -404,6 +691,12 @@ class Routing:
                     continue
                 entry["externalId"] = pager_device_id
                 pending_device_ids.append(pager_device_id)
+            elif b.kind == "fed" and b.config.get("remoteFedId"):
+                # the other family's name and server, so the web chip can name them
+                fed_link = fed_backend_link(recipient_uid, str(b.config["remoteFedId"]))
+                if fed_link is not None:
+                    entry["server"] = fed_link.remote.name
+                    entry["serverHost"] = fed_link.remote.host
             deliveries[b.id] = entry
 
         msg = messages_store.create_message(
@@ -422,6 +715,9 @@ class Routing:
             seq=seq,
             group_msg_id=group_msg_id,
             sender_alias=sender_alias,
+            origin_device_id=origin_device_id,
+            hooks=hooks,
+            hook_ref=hook_ref,
         )
         if msg is None:
             # Already created by an earlier webhook redelivery.
@@ -460,4 +756,11 @@ class Routing:
             )
         # Applies the attempts/failed bookkeeping that adapters do not persist themselves.
         device_id = delivery.externalId if backend_row.kind == "pager" else None
+        deliveries.record_attempt(
+            msg.id,
+            bid,
+            ok=result.ok,
+            error=result.error,
+            device_id=device_id,
+            kind=backend_row.kind,
         )

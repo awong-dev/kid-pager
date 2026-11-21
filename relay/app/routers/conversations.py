@@ -43,6 +43,10 @@ _POLICY_REJECT_MESSAGES = {
     "sms_contact": "SMS contacts can't text each other.",
     "no_sms_number": "You have no SMS number; ask your family admin.",
     "no_bridge": "Google Chat is not set up for this chat; ask your family admin.",
+    "family_frozen": "That family is moving servers; try again later.",
+    "no_peer": "That server is not connected; ask your family admin.",
+    "fed_reauth": "That family was restored from a backup and must be re-linked; ask your family admin.",
+    "fed_off": "Messaging other servers is turned off; ask your server admin.",
 }
 
 
@@ -92,7 +96,11 @@ def send_message(
         raise HTTPException(
             status_code=400, detail="body is empty after stripping control characters"
         )
+    # one web message is one wire message (1024 bytes); a longer text is split by Routing
     if len(body.encode("utf-8")) > BODY_MAX_UTF8_BYTES:
+        raise HTTPException(
+            status_code=400, detail=f"body exceeds {BODY_MAX_UTF8_BYTES} UTF-8 bytes"
+        )
 
     resolved_alias = _resolve_message_alias(alias, authed.uid)
     result = routing.send(
@@ -108,6 +116,15 @@ def send_message(
             raise HTTPException(status_code=404, detail="unknown recipient")
         if reason == "not_member":
             raise HTTPException(status_code=403, detail="not allowed to message this recipient")
+        if reason == "hook_blocked":
+            # the web shows `notifySender`
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "reason": reason,
+                    "message": result.notify or "This message was blocked by a filter.",
+                },
+            )
         # policy_out / policy_in / not_allowed: the web shows the server's `{reason, message}`.
         message = (
             f"@{alias} is not accepting messages from you."

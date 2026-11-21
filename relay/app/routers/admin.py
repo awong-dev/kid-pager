@@ -14,6 +14,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from firebase_admin import auth as fb_auth
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app import (
     apn_presets,
@@ -23,6 +24,7 @@ from app import (
     devcfg,
     devsetup,
     firmware,
+    purge,
     soracom,
 )
 from app.auth import AuthedUser, principal_for, require_super, set_claims
@@ -31,6 +33,7 @@ from app.broker_admin import BrokerAdmin, EmqxResult, make_broker_admin
 from app.config import Settings, auth_backend
 from app.db.firestore import get_db
 from app.device_ids import DEVICE_ID_ATTEMPTS, new_device_id
+from app.fed import linking as fed_linking
 from app.ingest import Ingest
 from app.store import allow as allow_store
 from app.store import backends as backends_store
@@ -260,8 +263,13 @@ def patch_user(
 
 
 @router.delete("/users/{uid}", dependencies=[Depends(require_admin_write_rate_limit)])
+def delete_user(
+    uid: str, emqx: Annotated[BrokerAdmin, Depends(get_emqx)]
+) -> dict[str, bool]:
+    """Cascade via `app.purge.purge_user`: everything naming the uid."""
     if users_store.get_user(uid) is None:
         raise HTTPException(status_code=404, detail="no such user")
+    purge.purge_user(uid, emqx)
     if auth_backend() == "home":
         authn_home.delete_account(uid)
         return {"ok": True}
@@ -569,11 +577,35 @@ def list_devices(family: Annotated[str | None, Query()] = None) -> list[Device]:
     return devices
 
 
+def _delete_device_impl(device_id: str, emqx: BrokerAdmin) -> dict[str, bool]:
+    """Cascade via `app.purge.purge_device`: the device, its rows, backend row and credential."""
+    if devices_store.get_device(device_id) is None:
         raise HTTPException(status_code=404, detail="no such device")
+    purge.purge_device(device_id, emqx)
     return {"ok": True}
 
 
 @router.delete("/devices/{device_id}", dependencies=[Depends(require_admin_write_rate_limit)])
+def delete_device(
+    device_id: str, emqx: Annotated[BrokerAdmin, Depends(get_emqx)]
+) -> dict[str, bool]:
+    return _delete_device_impl(device_id, emqx)
+
+
+@router.delete("/families/{family_id}", dependencies=[Depends(require_admin_write_rate_limit)])
+def delete_family(
+    family_id: str, emqx: Annotated[BrokerAdmin, Depends(get_emqx)]
+) -> dict[str, object]:
+    """Super only; the family must be frozen or it is a 409."""
+    snap = get_db().collection("families").document(family_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="no such family")
+    if not purge.is_frozen(family_id):
+        raise HTTPException(status_code=409, detail="family must be frozen before it is deleted")
+    # linked families are told (best effort) before the rows go
+    fed_linking.unlink_family(family_id)
+    report = purge.purge_family(family_id, emqx)
+    return {"ok": True, "deleted": dict(report.deleted), "broker": report.broker}
 
 
 def _rotate_credentials_impl(
@@ -1017,10 +1049,40 @@ def push_ota(
 
 
 class PutSettingsRequest(BaseModel):
+    """Every field optional (merge write); out-of-bounds is a 422; legacy `{n, unit}` becomes days."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messagesDays: int | None = Field(default=None, ge=1, le=365)
+    locationsDays: int | None = Field(default=None, ge=1, le=30)
+    alertsDays: int | None = Field(default=None, ge=7, le=365)
+    batteryDays: int | None = Field(default=None, ge=7, le=365)
+    messages: RetentionSetting | None = None
+    locations: RetentionSetting | None = None
+
+    @model_validator(mode="after")
+    def _legacy_bounds(self) -> PutSettingsRequest:
+        for legacy, days, name in (
+            (self.messages, self.messagesDays, "messages"),
+            (self.locations, self.locationsDays, "locations"),
+        ):
+            if legacy is not None and days is None:
+                lo, hi = (1, 365) if name == "messages" else (1, 30)
+                if not lo <= legacy.days() <= hi:
+                    raise ValueError(f"{name} must be {lo}..{hi} days")
+        return self
 
 
 @router.put("/settings", dependencies=[Depends(require_admin_write_rate_limit)])
 def put_settings(req: PutSettingsRequest) -> RetentionSettings:
+    return settings_store.set_retention(
+        messagesDays=req.messagesDays,
+        locationsDays=req.locationsDays,
+        alertsDays=req.alertsDays,
+        batteryDays=req.batteryDays,
+        messages=req.messages,
+        locations=req.locations,
+    )
 
 
 @router.get("/settings")

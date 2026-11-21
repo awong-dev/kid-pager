@@ -14,6 +14,7 @@ from app.db.firestore import get_db, run_transaction
 
 logger = logging.getLogger(__name__)
 
+BackendKind = Literal["pager", "webapp", "gchat", "sms", "bridge", "fed"]
 
 
 class Backend(BaseModel):
@@ -46,6 +47,7 @@ def create_backend(
             "kind": kind,
             "config": config or {},
             "enabled": enabled,
+            "verifiedAt": SERVER_TIMESTAMP if kind in ("webapp", "sms", "bridge", "fed") else None,
         }
     )
     fetched = get_backend(uid, bid)
@@ -58,6 +60,8 @@ def _owner_is_external(uid: str) -> bool:
     return snap.exists and (snap.to_dict() or {}).get("kind") == "external"
 
 
+# Backend kinds valid only on an external user.
+_EXTERNAL_ONLY_KINDS = ("sms", "bridge", "fed")
 
 
 def _live_kind(uid: str, bid: str, data: dict, external: bool | None = None) -> bool:

@@ -139,10 +139,37 @@ def enqueue_hint(
     )
 
 
+CARRIER_PREFIX = "ob_cr_"
+
+
+def enqueue_carrier(
+    bridge: bridges_store.Bridge, ob_id: str, *, phone: str, text: str
+) -> OutboxItem:
+    """A command text to the carrier's service number; id `ob_cr_...` is acked by prefix."""
+    return _create(
+        bridge,
+        ob_id,
+        {"kind": "send", "source": "sms", "to": {"phone": phone}, "text": text,
+         "msgId": None, "bid": None, "replyHint": None},
+    )
+
+
 def enqueue_inspect(bridge: bridges_store.Bridge, link: str) -> OutboxItem:
     return _create(
         bridge,
         new_id("ob_"),
+        {"kind": "inspect", "source": None, "to": {"link": link}, "text": None,
+         "msgId": None, "bid": None, "replyHint": None},
+    )
+
+
+def enqueue_probe(bridge: bridges_store.Bridge, ob_id: str, link: str) -> OutboxItem | None:
+    """A health probe: an `inspect` item with the caller's `ob_hc_...` id; None if it exists."""
+    if get(bridge.id, ob_id) is not None:
+        return None
+    return _create(
+        bridge,
+        ob_id,
         {"kind": "inspect", "source": None, "to": {"link": link}, "text": None,
          "msgId": None, "bid": None, "replyHint": None},
     )

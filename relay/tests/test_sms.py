@@ -151,8 +151,11 @@ def test_sms_log_blocked_logs_security(caplog: pytest.LogCaptureFixture):
     entries = sms_store.list_log("pgr-s-3")
     assert entries[0].st == "blocked"
     assert any(
+        "SECURITY sms-blocked device=pgr-s-3 peer=...7777" in rec.message
         for rec in caplog.records
     )
+    # the full number is never logged
+    assert not any("+15558887777" in rec.message for rec in caplog.records)
 
 
 def test_sms_log_empty_body_is_allowed():

@@ -194,12 +194,21 @@ def test_attachments_only_text_becomes_a_placeholder(
     assert sorted(m.to_dict()["body"] for m in _inbox()) == ["[attachment]", "[photo]"]
 
 
+def test_long_text_is_split_for_a_legacy_pager_and_not_refused_or_duplicated(
     client: TestClient, world: World, broker: FakeBrokerClient
 ):
+    """No hint means no `too_long`; a pager that has not reported `mb` gets 160-code-point parts,
+    and a repeated batch adds nothing."""
     _kid_setup(world, broker)
     bridge, headers = pair_bridge(client, world)
     _mom(world)
     ev = _ev(text="x" * 200)
+    assert _post(client, headers, ev) == ["delivered"]
+    assert _post(client, headers, ev) == ["duplicate"]
+    assert bridge_outbox.list_pending(bridge.id) == []
+    bodies = sorted(m.to_dict()["body"] for m in _inbox())
+    assert bodies == ["x" * 40, "x" * 160]
+    assert list(get_db().collection("heldSms").stream()) == []
 
 
 def test_rate_limit_121_events_in_a_minute_is_429(client: TestClient, world: World, broker: FakeBrokerClient):
@@ -214,6 +223,7 @@ def test_rate_limit_121_events_in_a_minute_is_429(client: TestClient, world: Wor
 
 def test_validation_bounds_are_422(client: TestClient, world: World):
     _, headers = pair_bridge(client, world)
+    assert client.post("/bridge/events", json={"events": [_ev(text="x" * 8193)]}, headers=headers).status_code == 422
     bad_id = _ev()
     bad_id["id"] = "has space"
     assert client.post("/bridge/events", json={"events": [bad_id]}, headers=headers).status_code == 422

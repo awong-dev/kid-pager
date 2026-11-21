@@ -14,12 +14,14 @@ from fastapi.responses import JSONResponse
 
 from app import alerts as alerts_module
 from app import live, push_webpush, scheduler, static_web
+from app import sysmsg as sysmsg_module
 from app.backends.registry import build_registry
 from app.backends.webapp import NullFCMClient
 from app.broker import BrokerClient, make_broker_client
 from app.broker_mqtt import MqttBrokerClient
 from app.config import Settings, auth_backend
 from app.db.firestore import get_db
+from app.fed import sender as fed_sender
 from app.ingest import Ingest
 from app.location import Location
 from app.logging_config import configure_logging, request_id_var
@@ -36,14 +38,21 @@ from app.routers import (
     device_book,
     devices,
     family,
+    family_bridge_health,
     family_bridges,
+    family_move,
+    fed,
+    fed_admin,
     fwcache,
+    hooks_admin,
+    hooks_api,
     internal,
     me,
     push,
     webhooks,
 )
 from app.routing import Routing
+from app.store.families import FROZEN_REPLY, FamilyFrozen
 
 configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("relay.api")
@@ -71,6 +80,9 @@ def create_app(
             fcm_client = FirebaseFCMClient()
         # alerts keeps a module-level FCM client; reset it on every create_app().
         alerts_module.set_fcm_client(fcm_client if fcm_client is not None else NullFCMClient())
+        sysmsg_module.set_broker(app.state.broker)
+        # The sender has no request to read settings from.
+        fed_sender.configure(settings)
         push_webpush.set_sender(
             push_webpush.WebPushSender(
                 settings.webpush_vapid_private_key,  # type: ignore[arg-type]
@@ -116,10 +128,16 @@ def create_app(
         response.headers[REQUEST_ID_HEADER] = request_id
         return response
 
+    @app.exception_handler(FamilyFrozen)
+    async def _family_frozen(_request: Request, _exc: FamilyFrozen) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": FROZEN_REPLY})
+
     app.include_router(webhooks.router)
     app.include_router(bridge.router)
     app.include_router(ca.router)
     app.include_router(admin.router)
+    app.include_router(hooks_admin.router)
+    app.include_router(hooks_api.router)
     app.include_router(dev.router)
     if settings.dev_mode:
         # Raw store access for e2e tooling; never registered in a real deployment.
@@ -130,10 +148,17 @@ def create_app(
     app.include_router(conversations.router)
     app.include_router(family.router)
     app.include_router(family_bridges.router)
+    app.include_router(family_bridges.me_router)
+    app.include_router(family_move.router)
+    app.include_router(family_bridge_health.router)
     app.include_router(book.router)
     app.include_router(me.router)
     app.include_router(push.router)
     app.include_router(internal.router)
+    app.include_router(fed.router)
+    app.include_router(fed_admin.state_router)
+    app.include_router(fed_admin.admin_router)
+    app.include_router(fed_admin.family_router)
     if auth_backend() == "home":
         app.include_router(auth_home.router)
         app.include_router(auth_home.setup_router)

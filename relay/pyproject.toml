@@ -34,6 +34,8 @@ dependencies = [
     "pywebpush",
     # Persistent MQTT client under BROKER_MODE=mqtt (`app/broker_mqtt.py`), tools/pager_client.py.
     "paho-mqtt>=2",
+    # app/clockfmt.py: IANA zones for the `5:21p` pager text; slim images ship no zoneinfo.
+    "tzdata",
 ]
 
 [project.scripts]

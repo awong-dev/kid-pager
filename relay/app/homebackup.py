@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import re
 import shutil
 import sqlite3
 import sys
@@ -13,6 +14,29 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 TAR_MEMBERS = ("secrets.env", "certs", "mosquitto", "emqx")
+DEFAULT_KEEP = 7
+_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
+
+
+def prune(data: Path, keep: int) -> list[str]:
+    """Keep the `keep` newest `<stamp>.sqlite` / `<stamp>.tar.gz` pairs, delete the rest (0 keeps
+    all). `pre-restore-*` directories are never touched. Returns the stamps removed."""
+    if keep <= 0:
+        return []
+    out = data / "backups"
+    stamps = sorted(
+        {f.name.split(".", 1)[0] for f in out.iterdir() if f.is_file() and _STAMP_RE.match(f.name.split(".", 1)[0])}
+    )
+    removed = stamps[:-keep] if len(stamps) > keep else []
+    for stamp in removed:
+        for suffix in (".sqlite", ".tar.gz"):
+            (out / f"{stamp}{suffix}").unlink(missing_ok=True)
+    return removed
+
+
+def backup(
+    data: Path, now: datetime | None = None, keep: int = DEFAULT_KEEP
+) -> tuple[Path, Path]:
     stamp = (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H%M%SZ")
     out = data / "backups"
     out.mkdir(parents=True, exist_ok=True)
@@ -34,6 +58,7 @@ TAR_MEMBERS = ("secrets.env", "certs", "mosquitto", "emqx")
             if (data / name).exists():
                 tar.add(data / name, arcname=name)
     tar_out.chmod(0o600)
+    prune(data, keep)
     return db_out, tar_out
 
 
@@ -72,6 +97,12 @@ def restore(data: Path, stamp: str, now: datetime | None = None) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="homebackup", description=__doc__.split("\n\n")[0])
     parser.add_argument("--data", type=Path, default=Path("/data"))
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=DEFAULT_KEEP,
+        help=f"newest archives to keep after a backup (default {DEFAULT_KEEP}; 0 keeps all)",
+    )
     sub = parser.add_subparsers(dest="command")
     p_restore = sub.add_parser("restore", help="put backup <stamp> back (stack stopped)")
     p_restore.add_argument("stamp", help="e.g. 2026-10-31T120005Z, from data/backups/<stamp>.sqlite")
@@ -81,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             aside = restore(args.data, args.stamp)
             print(f"homebackup: restored {args.stamp}; the previous database is in {aside}")
             return 0
+        db_out, tar_out = backup(args.data, keep=args.keep)
     except (OSError, sqlite3.Error, RelayRunning) as exc:
         print(f"homebackup: {exc}", file=sys.stderr)
         return 1

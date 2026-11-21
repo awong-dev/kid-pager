@@ -14,6 +14,23 @@ from app.db.firestore import get_db, run_transaction
 APPROVAL_REOPEN_AFTER = timedelta(hours=24)
 ApprovalOutcome = Literal["created", "open", "reopened", "declined"]
 
+AlertKind = Literal[
+    "new_conversation",
+    "sms_unknown",
+    "contact_request",
+    "chat_unknown",
+    "system",
+    # `hook_down` goes to super admins when a hook fails three calls running.
+    "hook_flag",
+    "hook_down",
+    # A linked family's person added a member as a contact or wrote to one we have no contact
+    # for, or a linked family moved to another server.
+    "fed_contact",
+    "fed_unknown",
+    "fed_moved",
+    # A linked family restored from a backup was re-linked.
+    "fed_reauth",
+]
 AlertStatus = Literal["open", "handled", "dismissed"]
 
 
@@ -47,6 +64,22 @@ class Alert(BaseModel):
     isGroup: bool | None = None
     people: list[str] = []
     source: str | None = None
+    # `hook_flag` / `hook_down` carry the hook's title (<= 60) and which hook raised them; the
+    # text is in `preview`.
+    title: str | None = None
+    hookId: str | None = None
+    hookName: str | None = None
+    # `fed_*` alerts name the link and remote family (`fedName`, `fedHost`) and the remote person
+    # (`peerAlias`, `peerName`, `fedRid`); `subjectUid` is the local member. `fed_moved` adds
+    # `fedOldHost`.
+    fedLinkId: str | None = None
+    fedName: str | None = None
+    fedHost: str | None = None
+    fedOldHost: str | None = None
+    fedRid: str | None = None
+    # A `system` alert is `sys_<code>_<key>`.
+    code: str | None = None
+    key: str | None = None
 
 
 def _alerts(family_id: str):
@@ -117,6 +150,95 @@ def decide(family_id: str, alert_id: str, status: Literal["handled", "dismissed"
     fetched = get(family_id, alert_id)
     assert fetched is not None
     return fetched
+
+
+def upsert_keyed(
+    family_id: str,
+    alert_id: str,
+    alert: dict,
+    *,
+    reopen_after: timedelta | None,
+    now: datetime | None = None,
+) -> ApprovalOutcome:
+    """Create; no-op if open; reopen once decided `reopen_after` ago; else decline."""
+    now = now or datetime.now(UTC)
+    ref = _alerts(family_id).document(alert_id)
+
+    def _txn(transaction: Transaction) -> ApprovalOutcome:
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            transaction.create(ref, {**alert, "ts": SERVER_TIMESTAMP})
+            return "created"
+        data = snap.to_dict() or {}
+        if data.get("status") == "open":
+            return "open"
+        decided_at = data.get("decidedAt")
+        if (
+            reopen_after is None
+            or not isinstance(decided_at, datetime)
+            or now - decided_at < reopen_after
+        ):
+            return "declined"
+        transaction.set(ref, {**alert, "ts": SERVER_TIMESTAMP})
+        return "reopened"
+
+    return run_transaction(_txn)
+
+
+SystemOutcome = Literal["created", "updated", "unchanged", "reopened"]
+
+
+def system_alert_id(code: str, key: str) -> str:
+    return f"sys_{code}_{key}"
+
+
+def upsert_system(
+    family_id: str, alert_id: str, alert: dict, *, status: Literal["open", "handled"] = "open"
+) -> SystemOutcome:
+    """Upserts the `system` alert `sys_<code>_<key>` in one transaction."""
+    ref = _alerts(family_id).document(alert_id)
+    closed = (
+        {"status": "handled", "decidedAt": SERVER_TIMESTAMP, "decidedBy": "system"}
+        if status == "handled"
+        else {}
+    )
+
+    def _txn(transaction: Transaction) -> SystemOutcome:
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            transaction.create(ref, {**alert, **closed, "ts": SERVER_TIMESTAMP})
+            return "created"
+        data = snap.to_dict() or {}
+        if status == "handled":
+            transaction.set(ref, {**alert, **closed, "ts": SERVER_TIMESTAMP})
+            return "reopened"
+        if data.get("status") == "open":
+            if data.get("preview") == alert.get("preview"):
+                return "unchanged"
+            transaction.update(
+                ref, {"preview": alert.get("preview"), "updatedAt": SERVER_TIMESTAMP}
+            )
+            return "updated"
+        transaction.set(ref, {**alert, "ts": SERVER_TIMESTAMP})
+        return "reopened"
+
+    return run_transaction(_txn)
+
+
+def resolve_system(family_id: str, alert_id: str, by: str = "system") -> bool:
+    """Closes an open `system` alert; True only when this call closed it."""
+    ref = _alerts(family_id).document(alert_id)
+
+    def _txn(transaction: Transaction) -> bool:
+        snap = ref.get(transaction=transaction)
+        if not snap.exists or (snap.to_dict() or {}).get("status") != "open":
+            return False
+        transaction.update(
+            ref, {"status": "handled", "decidedAt": SERVER_TIMESTAMP, "decidedBy": by}
+        )
+        return True
+
+    return run_transaction(_txn)
 
 
 def approval_alert_id(owner_uid: str, peer_uid: str) -> str:

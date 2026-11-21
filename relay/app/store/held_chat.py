@@ -15,6 +15,7 @@ from app.db.firestore import get_db
 HeldChatStatus = Literal["held", "delivered", "too_long", "dismissed"]
 
 HELD_CAP = 25
+BODY_MAX_CODEPOINTS = 8192
 
 
 class HeldChat(BaseModel):

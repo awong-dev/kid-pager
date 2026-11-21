@@ -74,6 +74,8 @@ class User(BaseModel):
     # Set on an external standing for a subscribed Google Chat conversation: `{bridgeId,
     # conversationId, source, link, isGroup, title, canReply}`.
     chat: dict | None = None
+    # Set on an external standing for a person in a linked family: `{remoteFedId, rid, ...}`.
+    fed: dict | None = None
 
 
 class SmsNumberTaken(Exception):
@@ -117,6 +119,7 @@ def create_user(
     kind: Kind = "person",
     owner_family_id: str | None = None,
     chat: dict | None = None,
+    fed: dict | None = None,
 ) -> User:
     """Creates the user and alias atomically (`AliasTaken` if taken); policy defaults by `role`."""
     _validate_alias(alias)
@@ -146,6 +149,7 @@ def create_user(
                 "disabled": False,
                 "createdAt": SERVER_TIMESTAMP,
                 **({"chat": chat} if chat is not None else {}),
+                **({"fed": fed} if fed is not None else {}),
             },
         )
 

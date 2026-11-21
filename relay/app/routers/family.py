@@ -8,10 +8,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import AlreadyExists
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app import (
     apn_presets,
@@ -29,6 +31,7 @@ from app.broker import BrokerClient
 from app.broker_admin import BrokerAdmin, make_broker_admin
 from app.config import Settings, auth_backend
 from app.db.firestore import get_db
+from app.familyexport import normalize_email
 from app.ingest import Ingest
 from app.routers import admin as admin_router
 from app.routers import conversations as conversations_router
@@ -40,7 +43,9 @@ from app.store import conversations as conversations_store
 from app.store import devices as devices_store
 from app.store import externals as externals_store
 from app.store import families as families_store
+from app.store import fed_state
 from app.store import held_sms as held_sms_store
+from app.store import hooks as hooks_store
 from app.store import rate_limits as rate_limits_store
 from app.store import users as users_store
 from app.store.alerts import Alert
@@ -86,9 +91,19 @@ def get_app_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
+class HookDisclosure(BaseModel):
+    """A hook that reads this family's messages."""
+
+    id: str
+    name: str
+    mode: str
+    host: str
+
+
 class FamilyOut(Family):
     memberCount: int
     deviceCount: int
+    hooks: list[HookDisclosure] = Field(default_factory=list)
 
 
 def _family_out(family_id: str) -> FamilyOut:
@@ -97,6 +112,21 @@ def _family_out(family_id: str) -> FamilyOut:
         raise HTTPException(status_code=404, detail="no such family")
     member_count = sum(1 for u in users_store.list_users() if u.familyId == family_id)
     device_count = sum(1 for d in devices_store.list_devices() if d.familyId == family_id)
+    return FamilyOut(
+        # `federation` is the effective state (server and family switch), not the stored flag
+        **{**family.model_dump(), "federation": fed_state.family_enabled(family_id)},
+        memberCount=member_count,
+        deviceCount=device_count,
+        hooks=_hook_disclosures(family_id),
+    )
+
+
+def _hook_disclosures(family_id: str) -> list[HookDisclosure]:
+    return [
+        HookDisclosure(id=h.id, name=h.name, mode=h.mode, host=urlsplit(h.url).netloc)
+        for h in hooks_store.list_hooks()
+        if h.enabled and h.covers({family_id})
+    ]
 
 
 @router.get("")
@@ -106,13 +136,29 @@ def get_family(scope: FamilyScope) -> FamilyOut:
 
 
 class PatchFamilyRequest(BaseModel):
+    name: str | None = None
+    # notice, link-check and top-up policy
+    settings: families_store.FamilySettingsPatch | None = None
+
+    @model_validator(mode="after")
+    def _something_to_patch(self) -> PatchFamilyRequest:
+        if self.name is None and self.settings is None:
+            raise ValueError("send a name and/or settings")
+        return self
 
 
 @router.patch("", dependencies=[Depends(require_family_write_rate_limit)])
 def patch_family(req: PatchFamilyRequest, scope: FamilyScope) -> FamilyOut:
     """Rename the family (web only: no book bump, no push) and/or patch `settings` partially."""
     _, family_id = scope
+    name = None
+    if req.name is not None:
+        try:
+            name = families_store.validate_family_name(req.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
+        families_store.update_family(family_id, name=name, settings=req.settings)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="no such family") from exc
     return _family_out(family_id)
@@ -267,6 +313,39 @@ def invite_member(uid: str, scope: FamilyScope) -> InviteResponse:
     return InviteResponse(code=code, expiresAt=expires)
 
 
+class CreateAccountRequest(BaseModel):
+    email: str
+
+
+@router.post("/people/{uid}/account", dependencies=[Depends(require_family_write_rate_limit)])
+def create_person_account(uid: str, req: CreateAccountRequest, scope: FamilyScope) -> User:
+    """Give a person with no sign-in a Firebase account (cloud only); 409 if one exists.
+
+    A family admin cannot do this for a `super`.
+    """
+    principal, family_id = scope
+    if auth_backend() == "home":
+        raise HTTPException(status_code=404, detail="not found")
+    user = users_store.get_user(uid)
+    if user is None or user.familyId != family_id or user.kind != "person":
+        raise HTTPException(status_code=404, detail="no such person in this family")
+    if user.role == "super" and principal.role != "super":
+        raise HTTPException(status_code=403, detail="only a super admin can do this for a super admin")
+    email = normalize_email(req.email)
+    if email is None:
+        raise HTTPException(status_code=400, detail="not an email address")
+    if user.email:
+        raise HTTPException(status_code=409, detail="this person already has an account")
+    try:
+        fb_auth.create_user(uid=uid, email=email)
+    except fb_auth.UidAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="this person already has an account") from exc
+    except fb_auth.EmailAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="email already registered") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    set_claims(uid, user.role, user.familyId)
+    return users_store.update_user(uid, email=email)
 
 
 def _require_family_owner(owner_alias: str, family_id: str) -> str:
@@ -441,8 +520,14 @@ def set_device_apn(
 
 
 @router.delete("/devices/{device_id}", dependencies=[Depends(require_family_write_rate_limit)])
+def delete_device(
+    device_id: str,
+    scope: FamilyScope,
+    emqx: Annotated[BrokerAdmin, Depends(get_emqx)],
+) -> dict[str, bool]:
     _, family_id = scope
     _require_family_device(device_id, family_id)
+    return admin_router._delete_device_impl(device_id, emqx)
 
 
 class CreateGroupRequest(BaseModel):
@@ -636,12 +721,23 @@ def put_approved(
     return _approved_out(uid, family_id)
 
 
+class ContactFedOut(BaseModel):
+    linkId: str | None = None  # null once the link is gone
+    name: str | None = None  # the other family's name
+    host: str | None = None  # and its server
+    rid: str | None = None
+
+
 class ContactOut(BaseModel):
     uid: str
     alias: str
     phone: str | None
     displayName: str
     approvedFor: list[str]
+    # A person in a linked family; `sendable`/`reason` are the book's link-state verdict.
+    fed: ContactFedOut | None = None
+    sendable: bool | None = None
+    reason: str | None = None
     # Members who hold the contact through their outbound policy alone (open / any_sms).
     impliedFor: list[str] = []
 
@@ -649,6 +745,24 @@ class ContactOut(BaseModel):
 def _name_taken(family_id: str, exc: externals_store.ContactNameTaken) -> HTTPException:
     logger.info("contact name taken family=%s", family_id)
     return HTTPException(status_code=409, detail=str(exc))
+
+
+def _fed_fields(ext: users_store.User) -> dict[str, object]:
+    if not (ext.fed or {}).get("remoteFedId"):
+        return {}
+    link = book.fed_link_for(ext)
+    reason = book.fed_link_reason(ext)
+    rid = (ext.fed or {}).get("rid")
+    return {
+        "fed": ContactFedOut(
+            linkId=link.id if link else None,
+            name=link.remote.name if link else None,
+            host=link.remote.host if link else None,
+            rid=str(rid) if rid else None,
+        ),
+        "sendable": reason is None,
+        "reason": reason,
+    }
 
 
 def _list_contacts(family_id: str) -> list[ContactOut]:
@@ -677,6 +791,7 @@ def _list_contacts(family_id: str) -> list[ContactOut]:
             displayName=ext.displayName,
             approvedFor=sorted(approved_for.get(ext.uid, set())),
             impliedFor=sorted(set(implying) - has_edge.get(ext.uid, set())),
+            **_fed_fields(ext),
         )
         for ext in externals_store.list_family_contacts(family_id)
         if not ext.chat
@@ -825,6 +940,14 @@ def _approve_sms_unknown(
     if target is None or target.familyId != family_id:
         raise HTTPException(status_code=403, detail="target is not a member of this family")
 
+    # rows marked `too_long` go out with the rest
+    held = sorted(
+        [
+            *held_sms_store.list_held(family_id, alert.peerPhone, target_uid, status="held"),
+            *held_sms_store.list_held(family_id, alert.peerPhone, target_uid, status="too_long"),
+        ],
+        key=lambda r: (r.receivedAt, r.id),
+    )
     # (a) nothing is written if the member's inbound policy refuses numbers.
     if held and policy_module.rule(target.policy.in_, "external") == "none":
         raise HTTPException(
@@ -858,6 +981,8 @@ def _approve_sms_unknown(
         inbound_text.record_channel(external.uid, bid, target_uid, channel_row.via, channel_row.conv)
     for row in held:
         pager_text = sms_text.pager_body(row.body)
+        if not pager_text:
+            held_sms_store.set_status([row.id], "empty")
             continue
         result = routing.send(
             sender_uid=external.uid,
@@ -958,6 +1083,16 @@ def approve_alert(
     elif alert.kind == "chat_unknown":
         raise HTTPException(
             status_code=400, detail="subscribe this conversation under People \u2192 Google Chat"
+        )
+    elif alert.kind in ("hook_flag", "hook_down") or alert.kind == "fed_moved":
+        raise HTTPException(status_code=400, detail="nothing to approve; dismiss it")
+    elif alert.kind == "fed_contact":
+        from app.routers.fed_admin import approve_fed_contact_alert
+
+        approve_fed_contact_alert(alert, family_id, broker, alias=req.alias, name=req.name)
+    elif alert.kind == "fed_unknown":
+        raise HTTPException(
+            status_code=400, detail="add them under Family > Contacts (a federated person), or dismiss"
         )
     else:  # "contact_request"
         _approve_contact_request(alert, req, broker)

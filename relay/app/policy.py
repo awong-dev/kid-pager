@@ -31,6 +31,7 @@ def rule(policy_code: str, peer_kind: PeerKind) -> Rule:
 
 def _peer_kind(user: _UserLike) -> PeerKind:
     """Externals standing for a Chat subscription or a federated person count as people."""
+    if user.kind == "external" and (getattr(user, "chat", None) or getattr(user, "fed", None)):
         return "person"
     return user.kind  # type: ignore[return-value]
 

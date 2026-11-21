@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from datetime import UTC, datetime
+
 from app.backends.webapp import FCMClient, NullFCMClient
 from app.backends.webapp import push_alert as _push_alert
 from app.store import alerts as alerts_store
@@ -161,6 +164,31 @@ def approval_upsert(owner: User, peer: User) -> alerts_store.ApprovalOutcome:
     return outcome
 
 
+def system_notice(family_id: str, code: str, key: str, text: str, *, closed: bool = False) -> str:
+    """The family's `system` alert `sys_<code>_<key>`, pushed to admins when new or changed."""
+    alert_id = alerts_store.system_alert_id(code, key)
+    alert = _base_alert("system")
+    alert.update(
+        {
+            "status": "handled" if closed else "open",
+            "preview": text[:PREVIEW_MAX_CHARS],
+            "code": code,
+            "key": key,
+        }
+    )
+    outcome = alerts_store.upsert_system(
+        family_id, alert_id, alert, status="handled" if closed else "open"
+    )
+    if outcome != "unchanged":
+        _push_alert(family_id, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return alert_id
+
+
+def resolve_system(family_id: str, code: str, key: str) -> bool:
+    """Closes the open `sys_<code>_<key>` alert, if any."""
+    return alerts_store.resolve_system(family_id, alerts_store.system_alert_id(code, key))
+
+
 _SOURCE_LABELS = {"whatsapp": "WhatsApp", "gchat": "Google Chat", "gvoice": "Google Voice"}
 
 
@@ -213,3 +241,122 @@ def chat_held_upsert(family_id: str, target: User, row, body: str, sender_name: 
         family_id, {**alert, "id": alert_id, "pushBody": push_body}, fcm_client=_fcm_client
     )
     return alert_id
+
+
+def fed_contact(
+    link, target: User, rid: str, alias: str, name: str
+) -> alerts_store.ApprovalOutcome:
+    """`<family>: <name> added <member> as a contact. Add them back?`; reopened after 24 h."""
+    if target.familyId is None:
+        return "open"
+    remote = link.remote
+    digest = hashlib.sha256(f"{remote.fedId}|{rid}|{target.uid}".encode()).hexdigest()[:24]
+    alert_id = f"fc_{digest}"
+    alert = _base_alert("fed_contact")
+    alert.update(
+        {
+            "status": "open",
+            "subjectUid": target.uid,
+            "subjectAlias": target.alias,
+            "peerAlias": alias,
+            "peerName": name,
+            "fedLinkId": link.id,
+            "fedName": remote.name,
+            "fedHost": remote.host,
+            "fedRid": rid,
+            "preview": f"{remote.name}: {name} added {target.displayName} as a contact. Add them back?"[
+                :PREVIEW_MAX_CHARS
+            ],
+        }
+    )
+    outcome = alerts_store.upsert_keyed(
+        target.familyId, alert_id, alert, reopen_after=alerts_store.APPROVAL_REOPEN_AFTER
+    )
+    if outcome in ("created", "reopened"):
+        _push_alert(target.familyId, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return outcome
+
+
+def fed_unknown(
+    link, target: User, rid: str, *, now: datetime | None = None
+) -> alerts_store.ApprovalOutcome:
+    """A refused message from a person in a linked family with no contact; one alert per UTC day."""
+    if target.familyId is None:
+        return "open"
+    now = now or datetime.now(UTC)
+    remote = link.remote
+    digest = hashlib.sha256(f"{remote.fedId}|{rid}|{target.uid}".encode()).hexdigest()[:24]
+    alert_id = f"fu_{digest}_{now:%Y%m%d}"
+    alert = _base_alert("fed_unknown")
+    alert.update(
+        {
+            "status": "open",
+            "subjectUid": target.uid,
+            "subjectAlias": target.alias,
+            "fedLinkId": link.id,
+            "fedName": remote.name,
+            "fedHost": remote.host,
+            "fedRid": rid,
+            "preview": f"A person in {remote.name} wrote to {target.displayName}; they are not a contact."[
+                :PREVIEW_MAX_CHARS
+            ],
+        }
+    )
+    outcome = alerts_store.upsert_keyed(target.familyId, alert_id, alert, reopen_after=None, now=now)
+    if outcome == "created":
+        _push_alert(target.familyId, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return outcome
+
+
+def fed_moved(
+    family_id: str,
+    *,
+    link_id: str,
+    name: str,
+    old_host: str,
+    new_host: str,
+    epoch: int,
+) -> alerts_store.ApprovalOutcome:
+    """A linked family announced a new address and key; one alert per `(link, epoch)`."""
+    alert_id = f"fm_{hashlib.sha256(f'{link_id}|{epoch}'.encode()).hexdigest()[:24]}"
+    alert = _base_alert("fed_moved")
+    alert.update(
+        {
+            "status": "open",
+            "fedLinkId": link_id,
+            "fedName": name,
+            "fedHost": new_host,
+            "fedOldHost": old_host,
+            "preview": (
+                f"{name} moved from {old_host} to {new_host}. "
+                "Suspend the link if you did not expect this."
+            )[:PREVIEW_MAX_CHARS],
+        }
+    )
+    outcome = alerts_store.upsert_keyed(family_id, alert_id, alert, reopen_after=None)
+    if outcome == "created":
+        _push_alert(family_id, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return outcome
+
+
+def fed_reauth(
+    family_id: str, *, link_id: str, name: str, host: str, epoch: int
+) -> alerts_store.ApprovalOutcome:
+    """A linked family restored from a backup was re-linked; one alert per `(link, epoch)`."""
+    alert_id = f"fr_{hashlib.sha256(f'{link_id}|{epoch}'.encode()).hexdigest()[:24]}"
+    alert = _base_alert("fed_reauth")
+    alert.update(
+        {
+            "status": "open",
+            "fedLinkId": link_id,
+            "fedName": name,
+            "fedHost": host,
+            "preview": f"{name} was restored from a backup and re-linked from {host}."[
+                :PREVIEW_MAX_CHARS
+            ],
+        }
+    )
+    outcome = alerts_store.upsert_keyed(family_id, alert_id, alert, reopen_after=None)
+    if outcome == "created":
+        _push_alert(family_id, {**alert, "id": alert_id}, fcm_client=_fcm_client)
+    return outcome

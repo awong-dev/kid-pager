@@ -107,6 +107,9 @@ def test_sweep_runs_and_reports_zero_deletions_with_nothing_stale(client: TestCl
     """Route wiring: `POST /internal/sweep` returns all zeros on a fresh emulator."""
     resp = client.post("/internal/sweep")
     assert resp.status_code == 200
+    body = resp.json()
+    assert body.pop("oldest") == {"messages": None, "locations": None}
+    assert body == {
         "messagesDeleted": 0,
         "wireIdsDeleted": 0,
         "locationsDeleted": 0,
@@ -124,6 +127,16 @@ def test_sweep_runs_and_reports_zero_deletions_with_nothing_stale(client: TestCl
         "sessionsDeleted": 0,
         "inviteCodesDeleted": 0,
         "webauthnChallengesDeleted": 0,
+        "smsLogDeleted": 0,
+        "topupsDeleted": 0,
+        "rateLimitsDeleted": 0,
+        "cellsDeleted": 0,
+        "contactRequestsDeleted": 0,
+        "setupCodesDeleted": 0,
+        "locMessagesScrubbed": 0,
+        "deviceStatusScrubbed": 0,
+        "fedInvitesDeleted": 0,
+        "fedOutboxDeleted": 0,
     }
 
 

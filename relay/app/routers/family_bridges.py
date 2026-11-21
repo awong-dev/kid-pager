@@ -12,7 +12,10 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app import bridge_health, bridge_numbers, chat_subscribe, deliveries, devcfg
+from app.auth import AuthedUser, require_user
 from app.broker import BrokerClient
+from app.carriers import service as carriers_service
 from app.chat_subscribe import ChatError
 from app.routers.bridge import normalize_optional_phone
 from app.routers.family import (
@@ -31,6 +34,8 @@ from app.store.bridge_conversations import BridgeConversation
 logger = logging.getLogger("relay.family_bridges")
 
 router = APIRouter(prefix="/api/family")
+# `GET /api/me/bridges`: a member's own bridge phones (any signed-in member, not an admin route).
+me_router = APIRouter(prefix="/api/me")
 
 
 def get_broker(request: Request) -> BrokerClient:
@@ -76,6 +81,13 @@ class PatchConversationRequest(BaseModel):
     roster: list[RosterEntry] | None = Field(default=None, max_length=64)
 
 
+class ConvHealthOut(BaseModel):
+    state: str
+    okAt: int | None
+    failAt: int | None
+    reason: str | None
+
+
 class ConversationOut(BaseModel):
     ref: str
     bridgeId: str
@@ -96,6 +108,8 @@ class ConversationOut(BaseModel):
     pagerName: str | None
     customName: bool
     alertId: str | None
+    # `{state: ok|failing|unreachable, okAt, failAt, reason}` (epoch seconds); null until seen.
+    health: ConvHealthOut | None = None
     # Subscribed rows only: the alias the pager addresses, whether the kid can
     # reply, the roster (group) and whether it is within the pager's first 32.
     alias: str | None = None
@@ -140,6 +154,16 @@ def _row_out(row: BridgeConversation, *, on_pager: set[str] | None = None) -> Co
         pagerName=row.pagerName,
         customName=row.customName,
         alertId=row.alertId,
+        health=(
+            ConvHealthOut(
+                state=row.health.state,
+                okAt=row.health.okAt,
+                failAt=row.health.failAt,
+                reason=row.health.reason,
+            )
+            if row.health is not None
+            else None
+        ),
     )
     if row.status in ("subscribed", "paused") and row.uid:
         ext = users_store.get_user(row.uid)
@@ -339,6 +363,13 @@ def inspect_link(bridge_id: str, req: InspectRequest, scope: FamilyScope) -> dic
     return {"outboxId": item.id}
 
 
+class HealthOut(BaseModel):
+    state: str
+    since: int
+    flags: list[str]
+    notifiedAt: int | None
+
+
 class BridgeOut(BaseModel):
     """A bridge as the web sees it: never `tokenHash` or `fcmToken`."""
 
@@ -355,6 +386,10 @@ class BridgeOut(BaseModel):
     status: bridges_store.BridgeStatus
     caps: bridges_store.BridgeCaps
     createdAt: datetime | None
+    # `{state: ok|offline|degraded, since, flags[], notifiedAt}` (epoch s); null until evaluated.
+    health: HealthOut | None = None
+    # carrier, texts left and where the number comes from
+    carrier: carriers_service.CarrierView | None = None
     # Only on `PATCH` reassign: subscribed Chat conversations unsubscribed by the owner change.
     unsubscribed: int = 0
 
@@ -400,6 +435,17 @@ def _bridge_out(bridge: bridges_store.Bridge) -> BridgeOut:
         status=bridge.status,
         caps=bridge.caps,
         createdAt=bridge.createdAt,
+        health=(
+            HealthOut(
+                state=bridge.health.state,
+                since=bridge.health.since,
+                flags=bridge.health.flags,
+                notifiedAt=bridge.health.notifiedAt,
+            )
+            if bridge.health is not None
+            else None
+        ),
+        carrier=carriers_service.view(bridge) if bridge.paired else None,
     )
 
 
@@ -410,6 +456,34 @@ def _require_active_person(uid: str, family_id: str) -> users_store.User:
     if owner.disabled:
         raise HTTPException(status_code=409, detail="that member is disabled")
     return owner
+
+
+class MyBridgeOut(BaseModel):
+    """The slice of a bridge its owner may see: enough to render the top-up block."""
+
+    id: str
+    label: str
+    paired: bool
+    health: HealthOut | None = None
+    carrier: carriers_service.CarrierView | None = None
+
+
+@me_router.get("/bridges")
+def list_my_bridges(authed: Annotated[AuthedUser, Depends(require_user)]) -> list[MyBridgeOut]:
+    """Bridges whose `ownerUid` is the caller."""
+    out: list[MyBridgeOut] = []
+    for b in bridges_store.list_for_owner(authed.uid):
+        full = _bridge_out(b)
+        out.append(
+            MyBridgeOut(
+                id=full.id,
+                label=full.label,
+                paired=full.paired,
+                health=full.health,
+                carrier=full.carrier,
+            )
+        )
+    return out
 
 
 @router.get("/bridges")
@@ -501,6 +575,7 @@ def patch_bridge(
         )
         for item in bridge_outbox.fail_pending(bridge.id, "reassigned"):
             if item.msgId and item.bid:
+                deliveries.mark_failed(item.msgId, item.bid, error="reassigned")
     if bridge.paired:
         # release the previous owner's or numbers first
         bridge_numbers.release_numbers(bridge, broker)
@@ -573,8 +648,10 @@ def unpair_bridge(
     _, family_id = scope
     bridge = _require_bridge(bridge_id, family_id)
     bridges_store.unpair(bridge.id)
+    bridge_health.forget(bridge)
     for item in bridge_outbox.fail_pending(bridge.id, "unpaired"):
         if item.msgId and item.bid:
+            deliveries.mark_failed(item.msgId, item.bid, error="unpaired")
     bridge_numbers.release_numbers(bridge, broker)
     fresh = bridges_store.get(bridge.id)
     assert fresh is not None

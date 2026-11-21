@@ -8,6 +8,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from app import deliveries, push_webpush
 from app.backends.base import DeliverResult, LinkStep
 from app.store import conversations as conversations_store
 from app.store import push_subscriptions as subs_store
@@ -116,6 +117,7 @@ class WebappBackend:
         return data
 
     def deliver(self, msg: Message, delivery: Delivery, backend: BackendRow) -> DeliverResult:
+        deliveries.mark_sent(msg.id, backend.id, kind=self.kind)
         try:
             self._push.send(msg.recipientUid, lambda: self._payload(msg))
         except Exception:
@@ -141,7 +143,14 @@ _ALERT_TITLES = {
     "new_conversation": lambda a: f"New chat: @{a['subjectAlias']} ↔ @{a.get('peerAlias')}",
     "sms_unknown": lambda a: f"Text from an unknown number for @{a['subjectAlias']}",
     "contact_request": lambda a: f"Contact request from @{a['subjectAlias']}'s pager",
+    "system": lambda a: "Pager system notice",
     "chat_unknown": lambda a: f"Google Chat for @{a['subjectAlias']}: {a.get('convTitle') or 'a conversation'}",
+    "hook_flag": lambda a: a.get("title") or "A message was flagged",
+    "hook_down": lambda a: a.get("title") or f"Hook {a.get('hookName') or ''} is failing",
+    "fed_contact": lambda a: f"{a.get('peerName') or 'Someone'} in {a.get('fedName')} added @{a['subjectAlias']}",
+    "fed_unknown": lambda a: f"Unknown person in {a.get('fedName')} wrote to @{a['subjectAlias']}",
+    "fed_moved": lambda a: f"{a.get('fedName')} moved to {a.get('fedHost')}",
+    "fed_reauth": lambda a: f"{a.get('fedName')} was re-linked",
 }
 
 

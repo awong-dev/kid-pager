@@ -348,6 +348,7 @@ def test_tick_and_sweep_make_no_per_bridge_outbox_queries(
         raise AssertionError("per-bridge outbox query")
 
     monkeypatch.setattr(bridge_outbox, "_outbox", lambda bid: _NoScan(real_outbox(bid)))
+    # One `bridges` listing per tick is fine; a per-bridge outbox query is not.
     result = jobs.tick(Routing(broker), task_queue=InlineTaskQueue())
     assert result.bridgeOutboxFailed == 3
     monkeypatch.setattr(bridge_outbox, "_outbox", real_outbox)

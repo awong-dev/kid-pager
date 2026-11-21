@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 from google.api_core.exceptions import AlreadyExists, NotFound
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter, Transaction
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.carriers.base import CarrierState, SimInfo
 from app.db.firestore import get_db, run_transaction
 from app.ids import new_id
 
@@ -30,7 +33,38 @@ PHONE_STATUS_KEYS = (
     "simNumber",
     "voiceNumber",
     "version",
+    "charging",
+    "batteryExempt",
+    "carrier",
 )
+
+
+class HealthTrack(BaseModel):
+    """One hold-off track: `state`, outage `since`, and the last announced "down" (`notifiedAt`)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    state: str = "ok"
+    since: int = 0
+    notifiedAt: int | None = None
+
+
+class BridgeHealth(BaseModel):
+    """`bridges/{id}.health`; three tracks keep each notice code's hold-off apart. Epoch seconds."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    state: Literal["ok", "offline", "degraded"] = "ok"
+    since: int = 0
+    # Lost capabilities while degraded: `sms`, `listener`, `accessibility`.
+    flags: list[str] = Field(default_factory=list)
+    # Last announced offline.
+    notifiedAt: int | None = None
+    # Capabilities seen working at least once: only those can be "lost".
+    expect: list[str] = Field(default_factory=list)
+    offline: HealthTrack = Field(default_factory=HealthTrack)
+    degraded: HealthTrack = Field(default_factory=HealthTrack)
+    battery: HealthTrack = Field(default_factory=HealthTrack)
 
 
 class BridgeStatus(BaseModel):
@@ -52,6 +86,11 @@ class BridgeStatus(BaseModel):
     version: str | None = None
     error: str | None = None
     unpaired: bool = False
+    # What the phone adds to its heartbeat.
+    charging: bool | None = None
+    batteryExempt: bool | None = None
+    # TelephonyManager: {simOperator: "<mccmnc>", simName, netName}, each optional.
+    carrier: SimInfo | None = None
 
 
 class BridgeCaps(BaseModel):
@@ -80,6 +119,11 @@ class Bridge(BaseModel):
     caps: BridgeCaps = Field(default_factory=BridgeCaps)
     createdAt: datetime | None = None
     createdBy: str | None = None
+    health: BridgeHealth | None = None
+    # `app.carriers`: the carrier id, balance model and check bookkeeping.
+    carrier: CarrierState | None = None
+    # Epoch seconds of the last active link probe enqueued on this bridge.
+    linkProbeAt: int | None = None
 
     @property
     def paired(self) -> bool:
@@ -239,6 +283,36 @@ def touch(bridge_id: str, status: dict, fcm_token: str | None = None) -> None:
     _update(bridge_id, updates)
 
 
+def touch_seen(bridge_id: str) -> None:
+    """`lastSeenAt` only: any authenticated request counts as "seen"."""
+    _update(bridge_id, {"lastSeenAt": SERVER_TIMESTAMP})
+
+
+def set_health(bridge_id: str, health: BridgeHealth | None) -> None:
+    _update(bridge_id, {"health": health.model_dump() if health is not None else None})
+
+
+def update_carrier(bridge_id: str, fn: Callable[[CarrierState], CarrierState]) -> CarrierState:
+    """Transactional update of `bridges/{id}.carrier`; returns the new state or `KeyError`."""
+    ref = _bridges().document(bridge_id)
+
+    def _txn(transaction: Transaction) -> CarrierState:
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            raise KeyError(f"no such bridge: {bridge_id!r}")
+        old = CarrierState.model_validate((snap.to_dict() or {}).get("carrier") or {})
+        new = fn(old.model_copy(deep=True))
+        if new != old or (snap.to_dict() or {}).get("carrier") is None:
+            transaction.update(ref, {"carrier": new.model_dump()})
+        return new
+
+    return run_transaction(_txn)
+
+
+def set_link_probe_at(bridge_id: str, epoch_s: int) -> None:
+    _update(bridge_id, {"linkProbeAt": epoch_s})
+
+
 def increment_tier2(bridge_id: str) -> None:
     from google.cloud.firestore import Increment
 
@@ -247,6 +321,10 @@ def increment_tier2(bridge_id: str) -> None:
 
 def unpair(bridge_id: str) -> None:
     """Clears the token and FCM token, keeps the row."""
+    _update(
+        bridge_id,
+        {"tokenHash": None, "fcmToken": None, "status.unpaired": True, "health": None},
+    )
 
 
 def delete(bridge_id: str) -> None:

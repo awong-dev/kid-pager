@@ -11,6 +11,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from google.api_core.exceptions import NotFound
+
 from app import book, sms_text
 from app import policy as policy_module
 from app.broker import BrokerClient
@@ -128,7 +130,14 @@ def _nick_for(conv_key: str, sender_name: str) -> str:
         if name == sender_name:
             return nick
     nick = slug_nick(sender_name or "someone", roster)
+    if group is None:
+        logger.warning("group doc %s missing; roster not updated", conv_key)
+        return nick
     roster[nick] = sender_name or "someone"
+    try:
+        conversations_store.update_bridge_group(conv_key, roster=roster)
+    except NotFound:
+        logger.warning("group doc %s missing; roster not updated", conv_key)
     return nick
 
 
@@ -166,7 +175,14 @@ def _send_text(
 def release_backlog(row: BridgeConversation, owner: User, routing: Routing) -> tuple[int, int]:
     """Delivers every `held`/`too_long` row, oldest first; returns `(delivered, undelivered)`."""
     delivered = undelivered = 0
+    rows = [
+        *held_chat_store.list_for_conversation(row.id, "held"),
+        *held_chat_store.list_for_conversation(row.id, "too_long"),
+    ]
+    rows.sort(key=lambda r: (r.receivedAt, r.id))
+    for held in rows:
         text = sms_text.pager_body(held.body)
+        if not text:
             held_chat_store.set_status([held.id], "too_long")
             undelivered += 1
             continue

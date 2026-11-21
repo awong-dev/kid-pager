@@ -12,9 +12,13 @@ from pydantic import BaseModel, ConfigDict
 
 from app.db.firestore import get_db
 
+# `empty`: nothing left after the pager's control-character cleanup, so there is nothing to send.
+# `too_long` rows are still sent on approval.
+HeldStatus = Literal["held", "delivered", "too_long", "empty", "blocked", "dismissed"]
 
 # Cap per (familyId, fromPhone, toUid) of rows in status `held`.
 HELD_CAP = 25
+HELD_BODY_MAX_CODEPOINTS = 8192
 
 
 class HeldSms(BaseModel):

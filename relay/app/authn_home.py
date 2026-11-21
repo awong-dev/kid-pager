@@ -163,10 +163,12 @@ def _normalize_code(code: str) -> str:
     return "".join(ch for ch in code.upper() if ch.isalnum())
 
 
+def mint_invite(uid: str, created_by: str, db=None) -> tuple[str, datetime]:
     """Returns `(code, expiresAt)`; the code is shown once, any case/dashes accepted back."""
     raw = "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(_INVITE_LEN))
     now = _now()
     expires = now + INVITE_TTL
+    (db or get_db()).collection("inviteCodes").document(_digest(raw)).set(
         {"uid": uid, "createdBy": created_by, "createdAt": now, "expiresAt": expires}
     )
     return "-".join(raw[i : i + 4] for i in range(0, _INVITE_LEN, 4)), expires
