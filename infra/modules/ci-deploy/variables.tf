@@ -8,7 +8,7 @@ variable "github_org" {
 }
 
 variable "github_repo" {
-  description = "Repo name only (no org prefix), e.g. \"pager\"."
+  description = "Repo name only (no org prefix), e.g. \"kid-pager\"."
   type        = string
 }
 

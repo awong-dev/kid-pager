@@ -4,7 +4,7 @@
 project_id  = "my-pager-project"
 region      = "us-central1"
 github_org  = "my-github-org"
-github_repo = "pager"
+github_repo = "kid-pager"
 
 # relay_image is deliberately not set here: CI passes it per deploy, and an empty value keeps the
 # running image. Only the first apply passes it on the command line (infra/README.md step 8).

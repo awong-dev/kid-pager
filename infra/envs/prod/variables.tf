@@ -124,7 +124,7 @@ variable "github_org" {
 
 variable "github_repo" {
   type    = string
-  default = "pager"
+  default = "kid-pager"
 }
 
 variable "use_broker_gce" {
