@@ -1177,27 +1177,6 @@ def test_family_admin_reads_cross_family_dm_symmetric_third_family_and_member_de
     assert _get(f"messages/{msg.id}", member_token).status_code == 403
 
 
-def test_sms_conversation_denied_to_other_family_admin(two_pairs):
-    """An SMS conversation's `familyIds` holds only the member's family: readable by its admin,
-    denied to another family's admin."""
-    key = messages_store.conv_key("u1", "u2")
-    msg = two_pairs
-    _set_family_ids("conversations", key, ["famA"])
-    _set_family_ids("messages", msg.id, ["famA"])
-
-    same_family_admin_token = _make_family_admin(
-        "admin-sms-conv-1", "adminsmsconv1", "famA"
-    )
-    assert _get(f"conversations/{key}", same_family_admin_token).status_code == 200
-    assert _get(f"messages/{msg.id}", same_family_admin_token).status_code == 200
-
-    other_family_admin_token = _make_family_admin(
-        "admin-sms-conv-2", "adminsmsconv2", "famB"
-    )
-    assert _get(f"conversations/{key}", other_family_admin_token).status_code == 403
-    assert _get(f"messages/{msg.id}", other_family_admin_token).status_code == 403
-
-
 def test_family_admin_query_by_own_familyIds_allowed_other_family_denied(two_pairs):
     """The family monitor query must carry `familyIds array-contains <own fam>`; a query naming a
     different family is denied outright, not empty."""

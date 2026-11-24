@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from app import devauth, devcfg
 from app.ingest import Ingest
 from app.routing import Routing
@@ -81,8 +83,12 @@ def _pager_delivery_state(msg_id: str) -> str:
     return msg.deliveries[bid].state
 
 
-def test_unknown_to_alias_gets_one_system_reply_and_is_not_stored():
+@pytest.mark.parametrize("alias", ["stranger", "stranger2"], ids=["unknown", "disallowed"])
+def test_unknown_or_disallowed_to_alias_gets_one_system_reply_and_is_not_stored(alias):
     _make_user("student", "student")
+    if alias == "stranger2":
+        # Deliberately no allow edge student->stranger2.
+        _make_user("stranger2", "stranger2")
     _make_pager_device("pgr-v2-1", "student")
 
     ingest, broker = _ingest()
@@ -94,7 +100,7 @@ def test_unknown_to_alias_gets_one_system_reply_and_is_not_stored():
                 "id": "u_unknown1",
                 "ts": int(time.time()),
                 "from": "student",
-                "to": "stranger",
+                "to": alias,
                 "body": "hi",
                 "ack": None,
             }
@@ -107,35 +113,7 @@ def test_unknown_to_alias_gets_one_system_reply_and_is_not_stored():
     assert sent["body"] == "unknown recipient"
 
     # The dropped up-message was never stored as a message doc for anyone.
-    key = messages_store.conv_key("student", "stranger")
-    assert messages_store.get_conversation(key) is None
-
-
-def test_disallowed_to_alias_gets_system_reply_and_security_drop():
-    _make_user("student", "student")
-    _make_user("stranger2", "stranger2")
-    _make_pager_device("pgr-v2-2", "student")
-    # Deliberately no allow edge student->stranger2.
-
-    ingest, broker = _ingest()
-    ingest.handle_up(
-        up_topic("pgr-v2-2"),
-        json.dumps(
-            {
-                "v": 1,
-                "id": "u_unknown2",
-                "ts": int(time.time()),
-                "from": "student",
-                "to": "stranger2",
-                "body": "hi",
-                "ack": None,
-            }
-        ).encode("utf-8"),
-    )
-    assert len(broker.published) == 1
-    sent = json.loads(broker.published[0].payload)
-    assert sent["from"] == "system"
-    assert sent["body"] == "unknown recipient"
+    assert messages_store.get_conversation(messages_store.conv_key("student", alias)) is None
 
 
 def test_no_to_and_no_allowed_contacts_gets_no_system_reply():
@@ -296,7 +274,8 @@ def test_v2_republish_on_link_change_same_session_resends_still_pending():
     assert len(matches) == 1
 
 
-def test_v2_no_republish_when_link_unchanged():
+@pytest.mark.parametrize("baseline_link", [1, None], ids=["link_unchanged", "link_newly_appears"])
+def test_v2_no_republish_on_an_unchanged_session_when_link_is_unchanged_or_first_reported(baseline_link):
     _make_user("mom", "mom")
     _make_user("student", "student")
     allow_store.set_edge("mom", "student", message=True, locate=True)
@@ -307,9 +286,9 @@ def test_v2_no_republish_when_link_unchanged():
     ingest = Ingest(broker, routing)
 
     # The first online /status publishes a bootstrap book (PROTOCOL.md §5.3); cleared here.
-    ingest.handle_status(
-        status_topic("pgr-v2-link-2"), online_status_payload("s_00000002", link=1)
-    )
+    # With `baseline_link` None the device never reported `link`.
+    extra = {} if baseline_link is None else {"link": baseline_link}
+    ingest.handle_status(status_topic("pgr-v2-link-2"), online_status_payload("s_00000002", **extra))
     assert [json.loads(p.payload)["kind"] for p in broker.published] == ["book"]
     broker.clear()
 
@@ -323,45 +302,12 @@ def test_v2_no_republish_when_link_unchanged():
     )
     broker.fail_publish = False
 
-    # Same session, same link, already online: no edge.
+    # Same session, same link (or `link` present for the first time): no edge.
     ingest.handle_status(
         status_topic("pgr-v2-link-2"), online_status_payload("s_00000002", link=1)
     )
     assert broker.published == []
-
-
-def test_v2_no_republish_when_link_newly_appears_on_unchanged_session():
-    """A device that never reported `link` must not trigger a republish when it first appears."""
-    _make_user("mom", "mom")
-    _make_user("student", "student")
-    allow_store.set_edge("mom", "student", message=True, locate=True)
-    _make_pager_device("pgr-v2-link-3", "student")
-
-    broker = FakeBrokerClient()
-    routing = Routing(broker)
-    ingest = Ingest(broker, routing)
-
-    # Baseline: no `link` field. The first online /status publishes a bootstrap book; cleared here.
-    ingest.handle_status(status_topic("pgr-v2-link-3"), online_status_payload("s_00000003"))
-    assert [json.loads(p.payload)["kind"] for p in broker.published] == ["book"]
-    broker.clear()
-
-    broker.fail_publish = True
-    routing.send(
-        sender_uid="mom",
-        recipient_alias="student",
-        kind="text",
-        body="hi",
-        origin_backend_kind="webapp",
-    )
-    broker.fail_publish = False
-
-    # Same session; `link` now present for the first time.
-    ingest.handle_status(
-        status_topic("pgr-v2-link-3"), online_status_payload("s_00000003", link=1)
-    )
-    assert broker.published == []
-    assert devices_store.get_device("pgr-v2-link-3").status.link == 1
+    assert devices_store.get_device("pgr-v2-link-2").status.link == 1
 
 
 def test_republish_reuses_id_but_gets_a_fresh_n_and_both_publishes_verify():
@@ -399,7 +345,8 @@ def test_republish_reuses_id_but_gets_a_fresh_n_and_both_publishes_verify():
     assert decoded[0]["n"] != decoded[1]["n"]
 
 
-def test_hmac_valid_signed_json_up_message_is_accepted():
+@pytest.mark.parametrize("sign, wire", [(devauth.sign_json, "json"), (devauth.sign_cbor, "cbor")])
+def test_hmac_valid_signed_up_message_is_accepted(sign, wire):
     _make_user("mom", "mom")
     _make_user("student", "student")
     allow_store.set_edge("mom", "student", message=True, locate=True)
@@ -413,36 +360,11 @@ def test_hmac_valid_signed_json_up_message_is_accepted():
     ).messages[0]
 
     topic = up_topic("pgr-hmac-1")
-    payload = devauth.sign_json(
-        key, topic, {"v": 1, "id": msg.id, "ts": 1_700_000_100, "ack": "shown", "n": 1}
-    )
+    payload = sign(key, topic, {"v": 1, "id": msg.id, "ts": 1_700_000_100, "ack": "shown", "n": 1})
     ingest.handle_up(topic, payload)
 
     assert _pager_delivery_state(msg.id) == "shown"
-    assert devices_store.get_device("pgr-hmac-1").wire == "json"
-
-
-def test_hmac_valid_signed_cbor_up_message_is_accepted():
-    _make_user("mom", "mom")
-    _make_user("student", "student")
-    allow_store.set_edge("mom", "student", message=True, locate=True)
-    allow_store.set_edge("student", "mom", message=True, locate=True)
-    key = _make_hmac_pager_device("pgr-hmac-2", "student")
-
-    ingest, _broker = _ingest()
-    msg = ingest._routing.send(
-        sender_uid="mom", recipient_alias="student", kind="text", body="hi",
-        origin_backend_kind="webapp",
-    ).messages[0]
-
-    topic = up_topic("pgr-hmac-2")
-    payload = devauth.sign_cbor(
-        key, topic, {"v": 1, "id": msg.id, "ts": 1_700_000_100, "ack": "shown", "n": 1}
-    )
-    ingest.handle_up(topic, payload)
-
-    assert _pager_delivery_state(msg.id) == "shown"
-    assert devices_store.get_device("pgr-hmac-2").wire == "cbor"
+    assert devices_store.get_device("pgr-hmac-1").wire == wire
 
 
 def test_hmac_device_wire_flips_to_cbor_after_one_cbor_envelope():
@@ -594,225 +516,129 @@ def test_unsigned_lwt_status_is_accepted_from_hmac_device():
     assert device_secrets_store.get("pgr-hmac-lwt").sigFailures == 0
 
 
-def test_status_persists_tls_ca_fp_loc_backoff_s_sms_lost():
-    _make_user("catrustuser", "catrustuser")
-    _make_pager_device("pgr-catrust-1", "catrustuser")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-catrust-1"),
-        online_status_payload(
-            "s_00000001", tls="pinned", ca_fp="0123456789abcdef", loc_backoff_s=40, sms_lost=1
+@pytest.mark.parametrize(
+    "fields, expect, logs",
+    [
+        pytest.param(
+            {"tls": "pinned", "ca_fp": "0123456789abcdef", "loc_backoff_s": 40, "sms_lost": 1},
+            {"tls": "pinned", "caFp": "0123456789abcdef", "locBackoffS": 40, "smsLost": 1},
+            [],
+            id="tls_ca_fp_loc_backoff_s_sms_lost",
         ),
-    )
-
-    status = devices_store.get_device("pgr-catrust-1").status
-    assert status.tls == "pinned"
-    assert status.caFp == "0123456789abcdef"
-    assert status.locBackoffS == 40
-    assert status.smsLost == 1
-
-
-def test_status_with_loc_move_s_stores_loc_move_s():
-    _make_user("loctrackuser", "loctrackuser")
-    _make_pager_device("pgr-locmove-1", "loctrackuser")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-locmove-1"),
-        online_status_payload("s_00000001", loc_move_s=3600),
-    )
-
-    assert devices_store.get_device("pgr-locmove-1").status.locMoveS == 3600
-
-
-def test_status_with_retired_xport_is_accepted_and_not_stored():
-    _make_user("xportuser1", "xportuser1")
-    _make_pager_device("pgr-xport-1", "xportuser1")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-xport-1"), online_status_payload("s_00000001", xport="wifi")
-    )
-
-    dev = devices_store.get_device("pgr-xport-1")
-    assert dev.status.state == "online"
-    assert not hasattr(dev.status, "xport")
-
-
-def test_status_persists_rst_stage_abn_and_logs_accepted_status(caplog):
-    _make_user("crashuser1", "crashuser1")
-    _make_pager_device("pgr-crash-1", "crashuser1")
+        pytest.param({"loc_move_s": 3600}, {"locMoveS": 3600}, [], id="loc_move_s"),
+        pytest.param(
+            {"rst": 4, "stage": 6, "abn": 2, "link": 1},
+            {"rst": 4, "stage": 6, "abn": 2},
+            # rst=4 is panic, stage=6 is "input/ui" per the firmware's stage table.
+            ["status {dev}: state=online link=1 rst=4 stage=input/ui abn=2"],
+            id="rst_stage_abn",
+        ),
+        pytest.param(
+            {"stallcmd": "AT+CEREG?"},
+            {"stallcmd": "AT+CEREG?"},
+            ["status {dev}: state=online link=None rst=None stage=None abn=None stallcmd=AT+CEREG?"],
+            id="stallcmd",
+        ),
+        # A `stage` index the relay's table predates (future firmware) is logged as the raw int.
+        pytest.param({"stage": 200}, {"stage": 200}, ["stage=200"], id="unresolved_stage_index_as_raw_int"),
+    ],
+)
+def test_status_fields_are_persisted_and_logged(caplog, fields, expect, logs):
+    _make_user("statususer1", "statususer1")
+    _make_pager_device("pgr-status-1", "statususer1")
     ingest, _broker = _ingest()
 
     with caplog.at_level("INFO", logger="relay.ingest"):
-        ingest.handle_status(
-            status_topic("pgr-crash-1"),
-            online_status_payload("s_00000001", rst=4, stage=6, abn=2, link=1),
-        )
+        ingest.handle_status(status_topic("pgr-status-1"), online_status_payload("s_00000001", **fields))
 
-    status = devices_store.get_device("pgr-crash-1").status
-    assert status.rst == 4
-    assert status.stage == 6
-    assert status.abn == 2
-
-    # rst=4 is panic, stage=6 is "input/ui" per the firmware's stage table.
-    assert any(
-        "status pgr-crash-1: state=online link=1 rst=4 stage=input/ui abn=2" in rec.message
-        for rec in caplog.records
-    )
+    status = devices_store.get_device("pgr-status-1").status
+    for attr, value in expect.items():
+        assert getattr(status, attr) == value
+    for fragment in logs:
+        assert any(fragment.format(dev="pgr-status-1") in rec.message for rec in caplog.records)
 
 
-def test_status_without_rst_stage_abn_stores_nothing_for_them(caplog):
-    """Firmware without `rst`/`stage`/`abn` still validates and stores them as `None`; the log line
-    is still emitted (PROTOCOL.md §0)."""
-    _make_user("crashuser2", "crashuser2")
-    _make_pager_device("pgr-crash-2", "crashuser2")
+@pytest.mark.parametrize(
+    "fields, expect, logs, absent",
+    [
+        # Firmware without `rst`/`stage`/`abn`/`stallcmd` still validates and stores them as `None`; the
+        # log line is still emitted and prints `-` for `stallcmd` (PROTOCOL.md §0).
+        pytest.param(
+            {},
+            {"rst": None, "stage": None, "abn": None, "stallcmd": None, "state": "online"},
+            [
+                "status {dev}: state=online link=None rst=None stage=None abn=None",
+                "status {dev}: state=online link=None rst=None stage=None abn=None stallcmd=-",
+            ],
+            [],
+            id="without_rst_stage_abn_stallcmd",
+        ),
+        pytest.param({"xport": "wifi"}, {"state": "online"}, [], ["xport"], id="retired_xport"),
+    ],
+)
+def test_status_with_absent_or_retired_fields_is_accepted_and_stores_nothing_for_them(
+    caplog, fields, expect, logs, absent
+):
+    _make_user("statususer2", "statususer2")
+    _make_pager_device("pgr-status-2", "statususer2")
     ingest, _broker = _ingest()
 
     with caplog.at_level("INFO", logger="relay.ingest"):
-        ingest.handle_status(
-            status_topic("pgr-crash-2"), online_status_payload("s_00000001")
-        )
+        ingest.handle_status(status_topic("pgr-status-2"), online_status_payload("s_00000001", **fields))
 
-    status = devices_store.get_device("pgr-crash-2").status
-    assert status.rst is None
-    assert status.stage is None
-    assert status.abn is None
-    assert status.state == "online"
-    assert any(
-        "status pgr-crash-2: state=online link=None rst=None stage=None abn=None" in rec.message
-        for rec in caplog.records
-    )
+    status = devices_store.get_device("pgr-status-2").status
+    for attr, value in expect.items():
+        assert getattr(status, attr) == value
+    for attr in absent:
+        assert not hasattr(status, attr)
+    for fragment in logs:
+        assert any(fragment.format(dev="pgr-status-2") in rec.message for rec in caplog.records)
 
 
-def test_status_logs_unresolved_stage_index_as_raw_int(caplog):
-    """A `stage` index the relay's table predates (future firmware) is
-    logged as the raw int, not raised."""
-    _make_user("crashuser3", "crashuser3")
-    _make_pager_device("pgr-crash-3", "crashuser3")
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        pytest.param([{"rst": 256}, {"stage": -1}, {"abn": 65536}], id="out_of_range_rst_stage_abn"),
+        pytest.param([{"stallcmd": "A" * 25}, {"stallcmd": "AT+\x00BAD"}], id="bad_stallcmd"),
+    ],
+)
+def test_status_with_malformed_fields_is_rejected(bad_fields):
+    _make_user("statususer3", "statususer3")
+    _make_pager_device("pgr-status-3", "statususer3")
     ingest, _broker = _ingest()
 
-    with caplog.at_level("INFO", logger="relay.ingest"):
+    for i, fields in enumerate(bad_fields, start=1):
         ingest.handle_status(
-            status_topic("pgr-crash-3"), online_status_payload("s_00000001", stage=200)
+            status_topic("pgr-status-3"), online_status_payload(f"s_0000000{i}", **fields)
         )
-
-    assert devices_store.get_device("pgr-crash-3").status.stage == 200
-    assert any("stage=200" in rec.message for rec in caplog.records)
-
-
-def test_status_rejects_out_of_range_rst_stage_abn_as_malformed():
-    _make_user("crashuser4", "crashuser4")
-    _make_pager_device("pgr-crash-4", "crashuser4")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-crash-4"), online_status_payload("s_00000001", rst=256)
-    )
-    ingest.handle_status(
-        status_topic("pgr-crash-4"), online_status_payload("s_00000002", stage=-1)
-    )
-    ingest.handle_status(
-        status_topic("pgr-crash-4"), online_status_payload("s_00000003", abn=65536)
-    )
 
     # No status was stored for this device.
-    assert devices_store.get_device("pgr-crash-4").status.state is None
+    assert devices_store.get_device("pgr-status-3").status.state is None
 
 
-def test_status_persists_stallcmd_and_logs_accepted_status(caplog):
-    _make_user("crashuser5", "crashuser5")
-    _make_pager_device("pgr-crash-5", "crashuser5")
-    ingest, _broker = _ingest()
-
-    with caplog.at_level("INFO", logger="relay.ingest"):
-        ingest.handle_status(
-            status_topic("pgr-crash-5"),
-            online_status_payload("s_00000001", stallcmd="AT+CEREG?"),
-        )
-
-    status = devices_store.get_device("pgr-crash-5").status
-    assert status.stallcmd == "AT+CEREG?"
-    assert any(
-        "status pgr-crash-5: state=online link=None rst=None stage=None abn=None "
-        "stallcmd=AT+CEREG?" in rec.message
-        for rec in caplog.records
-    )
-
-
-def test_status_without_stallcmd_stores_nothing_for_it_and_logs_dash(caplog):
-    """Firmware without `stallcmd` still validates and stores it as `None`; the log line prints `-`
-    (PROTOCOL.md §0)."""
-    _make_user("crashuser6", "crashuser6")
-    _make_pager_device("pgr-crash-6", "crashuser6")
-    ingest, _broker = _ingest()
-
-    with caplog.at_level("INFO", logger="relay.ingest"):
-        ingest.handle_status(
-            status_topic("pgr-crash-6"), online_status_payload("s_00000001")
-        )
-
-    status = devices_store.get_device("pgr-crash-6").status
-    assert status.stallcmd is None
-    assert status.state == "online"
-    assert any(
-        "status pgr-crash-6: state=online link=None rst=None stage=None abn=None "
-        "stallcmd=-" in rec.message
-        for rec in caplog.records
-    )
-
-
-def test_status_rejects_bad_stallcmd_as_malformed():
-    _make_user("crashuser7", "crashuser7")
-    _make_pager_device("pgr-crash-7", "crashuser7")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-crash-7"),
-        online_status_payload("s_00000001", stallcmd="A" * 25),
-    )
-    ingest.handle_status(
-        status_topic("pgr-crash-7"),
-        online_status_payload("s_00000002", stallcmd="AT+\x00BAD"),
-    )
-
-    # No status was stored for this device.
-    assert devices_store.get_device("pgr-crash-7").status.state is None
-
-
-def test_status_logs_security_event_on_transition_into_broken(caplog):
+@pytest.mark.parametrize(
+    "first_tls, logged",
+    [("pinned", True), ("broken", False)],
+    ids=["transition_into_broken", "already_broken"],
+)
+def test_status_logs_security_event_only_on_transition_into_broken(caplog, first_tls, logged):
     _make_user("catrustuser2", "catrustuser2")
     _make_pager_device("pgr-catrust-2", "catrustuser2")
     ingest, _broker = _ingest()
 
     ingest.handle_status(
-        status_topic("pgr-catrust-2"), online_status_payload("s_00000001", tls="pinned")
+        status_topic("pgr-catrust-2"), online_status_payload("s_00000001", tls=first_tls)
     )
     with caplog.at_level("ERROR", logger="relay.ingest"):
+        caplog.clear()
         ingest.handle_status(
             status_topic("pgr-catrust-2"), online_status_payload("s_00000002", tls="broken")
         )
     assert any(
         "SECURITY tls-broken device=pgr-catrust-2" in rec.message for rec in caplog.records
-    )
-    assert devices_store.get_device("pgr-catrust-2").status.tls == "broken"
-
-
-def test_status_does_not_re_log_while_already_broken(caplog):
-    _make_user("catrustuser3", "catrustuser3")
-    _make_pager_device("pgr-catrust-3", "catrustuser3")
-    ingest, _broker = _ingest()
-
-    ingest.handle_status(
-        status_topic("pgr-catrust-3"), online_status_payload("s_00000001", tls="broken")
-    )
-    with caplog.at_level("ERROR", logger="relay.ingest"):
-        caplog.clear()
-        ingest.handle_status(
-            status_topic("pgr-catrust-3"), online_status_payload("s_00000002", tls="broken")
-        )
-    assert not any("SECURITY tls-broken" in rec.message for rec in caplog.records)
+    ) is logged
+    if logged:
+        assert devices_store.get_device("pgr-catrust-2").status.tls == "broken"
 
 
 def test_status_accepts_n_well_above_the_old_32_bit_ceiling():
@@ -843,83 +669,47 @@ def test_status_accepts_n_well_above_the_old_32_bit_ceiling():
     assert device_secrets_store.get("pgr-bign").upN == n_big
 
 
-def test_status_bootstrap_bumps_zero_to_one_and_pushes():
+def _signed_online(key: bytes, topic: str, *, ts: int, n: int) -> bytes:
+    return devauth.sign_json(
+        key,
+        topic,
+        {
+            "v": 1,
+            "state": "online",
+            "mode": "sleep",
+            "batt_mv": 3300,
+            "rssi": -90,
+            "session": "s_00000001",
+            "ts": ts,
+            "n": n,
+        },
+    )
+
+
+def _books(broker: FakeBrokerClient) -> list[dict]:
+    return [json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"]
+
+
+def test_status_bootstrap_bumps_zero_to_one_and_pushes_once():
     key = _make_hmac_pager_device("pgr-boot-1", "student-boot1")
     _make_user("student-boot1", "student-boot1")
     ingest, broker = _ingest()
     status_t = status_topic("pgr-boot-1")
 
-    online = devauth.sign_json(
-        key,
-        status_t,
-        {
-            "v": 1,
-            "state": "online",
-            "mode": "sleep",
-            "batt_mv": 3300,
-            "rssi": -90,
-            "session": "s_00000001",
-            "ts": 1_700_000_000,
-            "n": 1,
-        },
-    )
-    ingest.handle_status(status_t, online)
+    ingest.handle_status(status_t, _signed_online(key, status_t, ts=1_700_000_000, n=1))
 
     assert devcfg.get_book_version("pgr-boot-1") == 1
-    books = [
-        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
-    ]
+    books = _books(broker)
     assert len(books) == 1
     assert books[0]["bv"] == 1
-
-
-def test_status_bootstrap_is_once():
-    key = _make_hmac_pager_device("pgr-boot-2", "student-boot2")
-    _make_user("student-boot2", "student-boot2")
-    ingest, broker = _ingest()
-    status_t = status_topic("pgr-boot-2")
-
-    online1 = devauth.sign_json(
-        key,
-        status_t,
-        {
-            "v": 1,
-            "state": "online",
-            "mode": "sleep",
-            "batt_mv": 3300,
-            "rssi": -90,
-            "session": "s_00000001",
-            "ts": 1_700_000_000,
-            "n": 1,
-        },
-    )
-    ingest.handle_status(status_t, online1)
-    assert devcfg.get_book_version("pgr-boot-2") == 1
     broker.clear()
 
     # Second status, same session: no edge, so `bootstrap_book_version` is a no-op
     # (bookVersion is already 1).
-    online2 = devauth.sign_json(
-        key,
-        status_t,
-        {
-            "v": 1,
-            "state": "online",
-            "mode": "sleep",
-            "batt_mv": 3300,
-            "rssi": -90,
-            "session": "s_00000001",
-            "ts": 1_700_000_001,
-            "n": 2,
-        },
-    )
-    ingest.handle_status(status_t, online2)
+    ingest.handle_status(status_t, _signed_online(key, status_t, ts=1_700_000_001, n=2))
 
-    assert devcfg.get_book_version("pgr-boot-2") == 1
-    books = [
-        json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
-    ]
-    assert books == []
+    assert devcfg.get_book_version("pgr-boot-1") == 1
+    assert _books(broker) == []
 
 
 def test_status_bv_behind_renudges_same_id(monkeypatch):
@@ -1119,7 +909,8 @@ def _count_pushes(monkeypatch) -> list[dict]:
     return pushed
 
 
-def test_refused_added_fixable_alerts_once(monkeypatch):
+def test_refused_added_fixable_alerts_once_uses_the_nickname_and_stores_nothing(monkeypatch):
+    from app.db.firestore import get_db
     from app.store import alerts as alerts_store
 
     pushed = _count_pushes(monkeypatch)
@@ -1138,17 +929,16 @@ def test_refused_added_fixable_alerts_once(monkeypatch):
     assert alerts[0].contactRequestKey is None and alerts[0].peerPhone == "+12065550100"
     assert len(pushed) == 1
 
-
-def test_refused_added_uses_the_nickname():
-    from app.db.firestore import get_db
-
-    _fam, ext = _added_world()
     get_db().collection("users").document("student").collection("book").document(ext.uid).update(
         {"nick": "Gran"}
     )
-    ingest, broker = _ingest()
     _send(ingest, "pgr-ad", "u_ad3", ext.alias)
-    assert [r["body"] for r in _system(broker)] == ["Gran: needs a parent's OK; resend once approved"]
+    assert _system(broker)[-1]["body"] == "Gran: needs a parent's OK; resend once approved"
+
+    for msg_id in ("u_ad1", "u_ad2", "u_ad3"):
+        assert messages_store.get_message(msg_id) is None
+    assert list(get_db().collection("messages").stream()) == []
+    assert messages_store.get_conversation(messages_store.conv_key("student", ext.uid)) is None
 
 
 def test_refused_added_unfixable_no_alert(monkeypatch):
@@ -1219,19 +1009,6 @@ def test_dismissed_25h_reopens(monkeypatch):
     assert reopened.status == "open" and reopened.decidedAt is None
     assert len(alerts_store.list_alerts(fam, "all")) == 1
     assert len(pushed) == 2
-
-
-def test_refused_message_not_stored():
-    from app.db.firestore import get_db
-
-    _fam, ext = _added_world()
-    ingest, _broker = _ingest()
-
-    _send(ingest, "pgr-ad", "u_ad10", ext.alias)
-
-    assert messages_store.get_message("u_ad10") is None
-    assert list(get_db().collection("messages").stream()) == []
-    assert messages_store.get_conversation(messages_store.conv_key("student", ext.uid)) is None
 
 
 def test_marker_never_permits():

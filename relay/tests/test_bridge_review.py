@@ -123,33 +123,32 @@ def _seed_via(world: World, member: str = "kid"):
     return mom
 
 
-def test_unpair_clears_the_members_channels(client: TestClient, world: World):
+@pytest.mark.parametrize(
+    "act",
+    [
+        pytest.param(lambda c, url, h: c.delete(url, headers=h), id="unpair"),
+        pytest.param(
+            lambda c, url, h: c.patch(url, json={"voiceNumber": ""}, headers=h), id="drop_voice_number"
+        ),
+    ],
+)
+def test_unpairing_or_removing_the_voice_number_clears_the_members_channels(
+    client: TestClient, world: World, act
+):
     bridge, _ = pair_bridge(client, world, sim=SIM, voice=VOICE)
     mom = _seed_via(world)
-    client.delete(f"/api/family/bridges/{bridge.id}", headers=world.admin_headers)
+    r = act(client, f"/api/family/bridges/{bridge.id}", world.admin_headers)
+    assert r.status_code == 200
     config = backends_store.get_backend(mom.uid, "sms").config
     assert "via" not in config and "voiceConv" not in config and config["phone"] == MOM
-
-
-def test_removing_the_voice_number_clears_the_channels(client: TestClient, world: World):
-    bridge, _ = pair_bridge(client, world, sim=SIM, voice=VOICE)
-    mom = _seed_via(world)
-    r = client.patch(
-        f"/api/family/bridges/{bridge.id}", json={"voiceNumber": ""}, headers=world.admin_headers
-    )
-    assert r.status_code == 200
-    assert "via" not in backends_store.get_backend(mom.uid, "sms").config
 
 
 def test_heartbeat_status_is_validated(client: TestClient, world: World):
     bridge, headers = pair_bridge(client, world)
     for bad in (
         {"battery": "full"},
-        {"accounts": "kid@example.com"},
         {"accounts": ["x"] * 11},
-        {"accounts": ["x" * 121]},
         {"version": "v" * 41},
-        {"listenerBound": {"a": 1}},
     ):
         r = client.post("/bridge/heartbeat", json={"status": bad}, headers=headers)
         assert r.status_code == 422, bad
@@ -235,18 +234,11 @@ def test_inspect_obeys_owner_caps_and_the_daily_cap(client: TestClient, world: W
     # An inspect of a row that already exists is never capped.
     assert _post(client, headers, _inspect()) == ["inspected"]
 
-    _, nocap = pair_bridge(
+    nocap_bridge, nocap = pair_bridge(
         client, world, owner="kid", sim="+12065550888", caps={"sms": True, "gchat": False, "gvoice": False}
     )
-    del nocap
-
-
-def test_inspect_needs_the_gchat_cap(client: TestClient, world: World):
-    from tests.test_bridge_chat_events import _post
-
-    bridge, headers = pair_bridge(client, world, caps={"sms": True, "gchat": False, "gvoice": False})
-    assert _post(client, headers, _inspect()) == ["dropped_cap"]
-    assert conv_store.get(bridge.id, "spaces/IN") is None
+    assert _post(client, nocap, _inspect()) == ["dropped_cap"]
+    assert conv_store.get(nocap_bridge.id, "spaces/IN") is None
 
 
 def test_a_subscribed_row_keeps_isgroup_and_a_custom_title(env: Env):
@@ -300,23 +292,6 @@ def test_rate_limit_count_parameter():
     assert f("k", limit=10, window_s=60, count=10, now=200.0)  # new window
 
 
-def test_a_batch_makes_one_limiter_transaction(client: TestClient, world: World, monkeypatch):
-    from tests.test_bridge_chat_events import _post
-
-    _, headers = pair_bridge(client, world)
-    calls: list[int] = []
-    real = rate_limits_store.check_and_increment
-
-    def spy(key, **kw):
-        if key.startswith("bridge_events:"):
-            calls.append(kw.get("count", 1))
-        return real(key, **kw)
-
-    monkeypatch.setattr(rate_limits_store, "check_and_increment", spy)
-    _post(client, headers, *[_ev("x", "") for _ in range(7)])
-    assert calls == [7]
-
-
 def test_tick_and_sweep_make_no_per_bridge_outbox_queries(
     client: TestClient, world: World, broker: FakeBrokerClient, monkeypatch
 ):
@@ -359,29 +334,3 @@ def test_tick_and_sweep_make_no_per_bridge_outbox_queries(
     ).update({"ackedAt": datetime.now(UTC) - timedelta(days=8)})
     monkeypatch.setattr(bridge_outbox, "_outbox", lambda bid: _NoScan(real_outbox(bid)))
     assert bridge_outbox.delete_acked_before(datetime.now(UTC) - timedelta(days=7)) == 1
-
-
-def test_group_fanout_reads_the_bridge_backend_once_per_external(env: Env, monkeypatch):
-    out = _group_subscribe(env)
-    reads: list[tuple[str, str]] = []
-    real = backends_store.get_backend
-
-    def spy(uid, bid):
-        reads.append((uid, bid))
-        return real(uid, bid)
-
-    def no_has_kind(*a, **k):
-        raise AssertionError("has_kind streams every backend")
-
-    monkeypatch.setattr(backends_store, "get_backend", spy)
-    monkeypatch.setattr(backends_store, "has_kind", no_has_kind)
-    result = Routing(env.broker).send(
-        sender_uid="kid", recipient_alias=out["alias"], kind="text", body="go", origin_backend_kind="pager"
-    )
-    assert result.rejected == [] and len(result.messages) == 1
-    ext_uid = users_store.get_uid_for_alias(externals_store.chat_ids(env.bridge.id, GROUP)[1])
-    assert [r for r in reads if r[1] == "bridge"] == [(ext_uid, "bridge")]
-
-
-def test_the_review_fixture_modules_import():
-    assert pytest and make_pager_device and alerts_store

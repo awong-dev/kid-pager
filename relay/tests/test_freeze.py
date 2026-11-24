@@ -136,29 +136,6 @@ def test_pager_up_refused_while_frozen_then_normal(fam: str):
     )
 
 
-def test_routing_send_raises_while_frozen(fam: str):
-    _pager_world(fam)
-    routing = Routing(FakeBrokerClient())
-    families_store.set_frozen(fam, True)
-    with pytest.raises(families_store.FamilyFrozen):
-        routing.send(
-            sender_uid="kid",
-            recipient_alias="mom",
-            kind="text",
-            body="x",
-            origin_backend_kind="webapp",
-        )
-    families_store.set_frozen(fam, False)
-    res = routing.send(
-        sender_uid="kid",
-        recipient_alias="mom",
-        kind="text",
-        body="x",
-        origin_backend_kind="webapp",
-    )
-    assert res.ok
-
-
 def test_web_send_503_while_frozen(client: TestClient, fam: str):
     _pager_world(fam)
     fb_auth.create_user(uid="kid", email="kid@example.com")

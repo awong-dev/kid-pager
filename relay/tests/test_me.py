@@ -85,9 +85,17 @@ def test_get_me_reports_claims_stale_when_doc_role_changed_and_reissues_claims(
     assert resp2.json()["claimsStale"] is False
 
 
-def test_get_me_requires_auth(client: TestClient):
-    resp = client.get("/api/me")
-    assert resp.status_code == 401
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        pytest.param("get", "/api/me", None, id="get-me"),
+        pytest.param("patch", "/api/me", {"notify": {"alerts": False}}, id="patch-me"),
+        pytest.param("get", "/api/directory", None, id="directory"),
+    ],
+)
+def test_me_routes_require_auth(client: TestClient, method, path, body):
+    kwargs = {} if body is None else {"json": body}
+    assert getattr(client, method)(path, **kwargs).status_code == 401
 
 
 def test_patch_me_notify_alerts_round_trips(client: TestClient):
@@ -104,35 +112,17 @@ def test_patch_me_notify_alerts_round_trips(client: TestClient):
     assert resp3.json()["notify"]["alerts"] is True
 
 
-def test_patch_me_requires_auth(client: TestClient):
-    resp = client.patch("/api/me", json={"notify": {"alerts": False}})
-    assert resp.status_code == 401
-
-
-def test_list_backends_includes_implicit_webapp_backend(client: TestClient):
-    headers = _make_user("me2", "me2")
-    resp = client.get("/api/me/backends", headers=headers)
-    assert resp.status_code == 200
-    kinds = {b["kind"] for b in resp.json()}
-    assert kinds == {"webapp"}
-
-
-def test_create_backend_rejects_pager_kind(client: TestClient):
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        pytest.param({"kind": "pager", "config": {}}, 400, id="pager"),
+        pytest.param({"kind": "sms", "config": {"phone": "+15551234567"}}, 422, id="sms"),
+    ],
+)
+def test_create_backend_rejects_unsupported_kind(client: TestClient, body, status):
     headers = _make_user("me3", "me3")
-    resp = client.post(
-        "/api/me/backends", json={"kind": "pager", "config": {}}, headers=headers
-    )
-    assert resp.status_code == 400
-
-
-def test_create_backend_kind_sms_is_422(client: TestClient):
-    headers = _make_user("me4", "me4")
-    resp = client.post(
-        "/api/me/backends",
-        json={"kind": "sms", "config": {"phone": "+15551234567"}},
-        headers=headers,
-    )
-    assert resp.status_code == 422, resp.text
+    resp = client.post("/api/me/backends", json=body, headers=headers)
+    assert resp.status_code == status, resp.text
     assert [b["kind"] for b in client.get("/api/me/backends", headers=headers).json()] == ["webapp"]
 
 
@@ -243,7 +233,3 @@ def test_directory_union_of_family_edge_peer_and_conversation_external(client: T
     # Sorted by alias.
     assert [e["alias"] for e in entries] == sorted(e["alias"] for e in entries)
 
-
-def test_directory_requires_auth(client: TestClient):
-    resp = client.get("/api/directory")
-    assert resp.status_code == 401

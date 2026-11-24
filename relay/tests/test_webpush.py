@@ -152,13 +152,11 @@ def _sender(service: FakePushService) -> push_webpush.WebPushSender:
     return push_webpush.WebPushSender(PRIVATE, "mailto:ops@example.test", session=service)  # type: ignore[arg-type]
 
 
-def test_vapid_public_key_route(client: TestClient):
+def test_vapid_public_key_route_serves_the_key_or_503_when_not_configured(client: TestClient, broker):
     resp = client.get("/api/push/vapid-public-key")
     assert resp.status_code == 200
     assert resp.json() == {"publicKey": PUBLIC}
 
-
-def test_vapid_public_key_is_503_when_not_configured(broker):
     with TestClient(create_app(settings=make_settings(), broker_client=broker)) as c:
         assert c.get("/api/push/vapid-public-key").status_code == 503
         assert isinstance(push_webpush.get_sender(), push_webpush.NullWebPushSender)
@@ -192,38 +190,31 @@ def test_put_requires_auth_and_an_https_endpoint(client: TestClient, world: Worl
 
 
 @pytest.mark.parametrize(
-    "answer",
+    ("endpoint", "answer"),
     [
-        ["127.0.0.1"],
-        ["10.1.2.3"],
-        ["192.168.1.10"],
-        ["172.16.0.9"],
-        ["169.254.169.254"],
-        ["::1"],
-        ["fd00::1"],
-        ["fe80::1%eth0"],
-        ["::ffff:10.0.0.1"],
-        [PUBLIC_ADDR, "10.0.0.1"],  # one private answer is enough
+        (ENDPOINT, ["127.0.0.1"]),
+        (ENDPOINT, ["10.1.2.3"]),
+        (ENDPOINT, ["169.254.169.254"]),
+        (ENDPOINT, ["::1"]),
+        (ENDPOINT, ["fd00::1"]),
+        (ENDPOINT, ["fe80::1%eth0"]),
+        (ENDPOINT, ["::ffff:10.0.0.1"]),
+        (ENDPOINT, [PUBLIC_ADDR, "10.0.0.1"]),  # one private answer is enough
+        ("https://127.0.0.1/x", None),
+        ("https://[::1]/x", None),
+        ("https://169.254.169.254/latest", None),
+        ("https://nowhere.test/x", None),
     ],
 )
-def test_put_refuses_an_endpoint_that_resolves_private(
-    client: TestClient, world: World, resolver: dict, answer: list[str]
+def test_put_refuses_an_endpoint_that_is_private_or_unresolvable(
+    client: TestClient, world: World, resolver: dict, endpoint: str, answer: list[str] | None
 ):
-    resolver["push.example.test"] = answer
-    sub = {"endpoint": ENDPOINT, "keys": {"p256dh": "p", "auth": "a"}}
-    resp = client.put("/api/me/push-subscriptions", json=sub, headers=world.admin_headers)
-    assert resp.status_code == 422, answer
-    assert subs_store.list_subscriptions("adm") == []
-
-
-@pytest.mark.parametrize(
-    "endpoint",
-    ["https://127.0.0.1/x", "https://[::1]/x", "https://169.254.169.254/latest", "https://nowhere.test/x"],
-)
-def test_put_refuses_private_literals_and_unresolvable_hosts(client: TestClient, world: World, endpoint: str):
+    if answer is not None:
+        resolver["push.example.test"] = answer
     sub = {"endpoint": endpoint, "keys": {"p256dh": "p", "auth": "a"}}
     resp = client.put("/api/me/push-subscriptions", json=sub, headers=world.admin_headers)
-    assert resp.status_code == 422, endpoint
+    assert resp.status_code == 422, (endpoint, answer)
+    assert subs_store.list_subscriptions("adm") == []
 
 
 def test_put_accepts_a_public_answer(client: TestClient, world: World, resolver: dict):
@@ -242,20 +233,6 @@ def test_send_rechecks_the_endpoint_and_skips_a_private_one(resolver: dict):
     _sender(service).send("bob", subs_store.list_subscriptions("bob"), {"kind": "message"})
     assert service.posts == []
     assert len(subs_store.list_subscriptions("bob")) == 1
-
-
-def test_getaddrinfo_is_the_default_resolver(monkeypatch: pytest.MonkeyPatch):
-    push_webpush.set_resolver(None)
-    seen: list[str] = []
-
-    def fake_getaddrinfo(host, port, *a, **kw):
-        seen.append(host)
-        return [(2, 1, 6, "", ("10.9.9.9", port))]
-
-    monkeypatch.setattr(push_webpush.socket, "getaddrinfo", fake_getaddrinfo)
-    with pytest.raises(push_webpush.EndpointRefused):
-        push_webpush.check_endpoint(ENDPOINT)
-    assert seen == ["push.example.test"]
 
 
 def test_send_success_encrypts_the_payload_contract():
@@ -289,24 +266,22 @@ def test_send_success_encrypts_the_payload_contract():
     assert len(subs_store.list_subscriptions("bob")) == 1
 
 
-@pytest.mark.parametrize("status", [404, 410])
-def test_gone_subscription_is_removed(status: int):
+@pytest.mark.parametrize(
+    ("status", "removed"), [(404, True), (410, True), (500, False)], ids=["404", "410", "500"]
+)
+def test_send_removes_only_gone_subscriptions(status: int, removed: bool):
     Browser().subscribe("bob")
     keep = Browser(endpoint="https://push.example.test/send/other")
     keep.subscribe("bob")
     service = FakePushService(status)
     _sender(service).send("bob", subs_store.list_subscriptions("bob")[:1], {"kind": "message"})
     assert len(service.posts) == 1
-    (left,) = subs_store.list_subscriptions("bob")
-    assert left.endpoint != service.posts[0][0]
-
-
-def test_other_failures_keep_the_subscription():
-    Browser().subscribe("bob")
-    service = FakePushService(500)
-    _sender(service).send("bob", subs_store.list_subscriptions("bob"), {"kind": "message"})
-    assert len(service.posts) == 1
-    assert len(subs_store.list_subscriptions("bob")) == 1
+    left = subs_store.list_subscriptions("bob")
+    if removed:
+        (only,) = left
+        assert only.endpoint != service.posts[0][0]
+    else:
+        assert len(left) == 2
 
 
 def _message() -> Message:

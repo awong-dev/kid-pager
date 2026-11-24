@@ -255,33 +255,27 @@ async def test_snapshot_drops_documents_can_read_refuses(world):
 
 @needs_sqlite
 @pytest.mark.anyio
-async def test_inadmissible_query_is_403(world):
+@pytest.mark.parametrize(
+    ("query", "status"),
+    [
+        pytest.param(
+            {"collection": "messages", "where": [["convKey", "==", messages_store.conv_key("u1", "u2")]]},
+            403,
+            id="messages-by-convKey",
+        ),
+        pytest.param({"collection": "families"}, 403, id="families"),
+        pytest.param({"collection": "deviceSecrets"}, 403, id="deviceSecrets"),
+        pytest.param({"collection": "users", "where": [["familyId", ">=", "famA"]]}, 400, id="bad-operator"),
+        pytest.param({"collection": "users/u1"}, 400, id="collection-path"),
+        pytest.param({"doc": "users"}, 400, id="doc-not-a-doc-path"),
+        pytest.param({"collection": "users", "limit": 0}, 400, id="limit-zero"),
+    ],
+)
+async def test_bad_subscribe_query_is_refused_with_its_status_and_no_event(world, query, status):
     st = await _open(world, "u1", "s1")
     try:
-        key = messages_store.conv_key("u1", "u2")
-        resp = await _sub(world, "u1", "s1", "t", {"collection": "messages", "where": [["convKey", "==", key]]})
-        assert resp.status_code == 403
-        resp = await _sub(world, "u1", "s1", "f", {"collection": "families"})
-        assert resp.status_code == 403
-        resp = await _sub(world, "u1", "s1", "x", {"collection": "deviceSecrets"})
-        assert resp.status_code == 403
+        assert (await _sub(world, "u1", "s1", "q", query)).status_code == status
         await st.none_within()
-    finally:
-        await st.close()
-
-
-@needs_sqlite
-@pytest.mark.anyio
-async def test_malformed_query_is_400(world):
-    st = await _open(world, "u1", "s1")
-    try:
-        for bad in (
-            {"collection": "users", "where": [["familyId", ">=", "famA"]]},
-            {"collection": "users/u1"},
-            {"doc": "users"},
-            {"collection": "users", "limit": 0},
-        ):
-            assert (await _sub(world, "u1", "s1", "b", bad)).status_code == 400, bad
     finally:
         await st.close()
 

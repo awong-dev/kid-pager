@@ -39,35 +39,21 @@ def test_the_canonical_string_is_pinned():
 
 
 @pytest.mark.parametrize(
-    "tamper",
+    "request_tamper, header_tamper",
     [
-        {"method": "GET"},
-        {"path": "/fed/v1/directory"},
-        {"body": b'{"v":2}'},
+        pytest.param({"method": "GET"}, {}, id="method"),
+        pytest.param({"path": "/fed/v1/directory"}, {}, id="path"),
+        pytest.param({"body": b'{"v":2}'}, {}, id="body"),
+        pytest.param({}, {sign.H_TO: C}, id="to_replayed_at_another_family"),
+        pytest.param({}, {sign.H_FROM: C}, id="from"),
     ],
 )
-def test_a_tampered_request_fails(pair, tamper):
-    private, public = pair
-    with pytest.raises(sign.SignatureError) as exc:
-        check(public, signed(private), **tamper)
-    assert exc.value.code == "bad_sig"
-
-
-def test_to_is_inside_the_signature_so_a_request_cannot_be_replayed_at_another_family(pair):
-    private, public = pair
-    headers = signed(private, to=B)
-    headers[sign.H_TO] = C  # replayed at family C on the same relay
-    with pytest.raises(sign.SignatureError) as exc:
-        check(public, headers)
-    assert exc.value.code == "bad_sig"
-
-
-def test_from_is_inside_the_signature(pair):
+def test_a_tampered_request_fails(pair, request_tamper, header_tamper):
     private, public = pair
     headers = signed(private)
-    headers[sign.H_FROM] = C
+    headers.update(header_tamper)
     with pytest.raises(sign.SignatureError) as exc:
-        check(public, headers)
+        check(public, headers, **request_tamper)
     assert exc.value.code == "bad_sig"
 
 

@@ -41,7 +41,9 @@ def _create(client: TestClient, headers: dict[str, str], body: dict) -> dict:
     return resp.json()
 
 
-def test_generated_id_matches_wire_format_and_is_unique(client, admin_headers):
+def test_generated_id_matches_wire_format_is_unique_and_supplied_id_is_ignored(
+    client, admin_headers
+):
     _owner(client, admin_headers)
     ids = set()
     for _ in range(2):
@@ -52,9 +54,6 @@ def test_generated_id_matches_wire_format_and_is_unique(client, admin_headers):
         ids.add(did)
     assert len(ids) == 2
 
-
-def test_supplied_device_id_is_ignored(client, admin_headers):
-    _owner(client, admin_headers)
     data = _create(
         client, admin_headers, {"deviceId": "mine-1234", "ownerAlias": "own1", "label": "p"}
     )

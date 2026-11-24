@@ -211,17 +211,17 @@ def test_sha_mismatch_on_fetched_image_falls_back(world):
     assert world["storage"].uploads == []
 
 
-def test_head_500_treated_as_absent_then_generated(world):
-    world["head_status"] = 500
-    d = firmware.delta_on_demand(_index(world), B16, N16, settings())
-    assert d is not None and len(world["storage"].uploads) == 1
-
-
-def test_head_missing_header_treated_as_absent(world):
-    dz, meta = _cached_object()
-    del meta["osha"]
-    world["cached"] = (dz, meta)
-    assert firmware.cached_delta(_index(world), B16, N16, settings()) is None
+@pytest.mark.parametrize("anomaly", ["status_500", "missing_osha_header"])
+def test_a_head_anomaly_is_treated_as_a_cache_miss(world, anomaly):
+    if anomaly == "status_500":
+        world["head_status"] = 500
+        d = firmware.delta_on_demand(_index(world), B16, N16, settings())
+        assert d is not None and len(world["storage"].uploads) == 1
+    else:
+        dz, meta = _cached_object()
+        del meta["osha"]
+        world["cached"] = (dz, meta)
+        assert firmware.cached_delta(_index(world), B16, N16, settings()) is None
 
 
 def test_path_validator_accepts_cache_shape():
@@ -272,26 +272,23 @@ def test_push_generation_exception_falls_back_to_full(
     assert devices_store.get_device("pgr-ota-r").otaJob.onDemand is False
 
 
-def test_preview_never_generates_and_flags_on_demand(
-    ota_client, admin_headers, world  # noqa: F811
+@pytest.mark.parametrize("cached", [False, True])
+def test_preview_never_generates_and_reports_a_cached_delta_or_flags_on_demand(
+    ota_client, admin_headers, world, cached  # noqa: F811
 ):
+    if cached:
+        world["cached"] = _cached_object()
     _ota_device(img=B16)
     builds = ota_client.get("/api/admin/firmware?device=pgr-ota-r", headers=admin_headers).json()[
         "builds"]
     new = next(b for b in builds if b["id16"] == N16)
-    assert new["kind"] == "full" and new["onDemandDelta"] is True
-    old = next(b for b in builds if b["id16"] == B16)
-    assert "onDemandDelta" not in old
-    assert world["storage"].uploads == [] and world["gets"] == []
-
-
-def test_preview_reports_cached_delta(ota_client, admin_headers, world):  # noqa: F811
-    world["cached"] = _cached_object()
-    _ota_device(img=B16)
-    builds = ota_client.get("/api/admin/firmware?device=pgr-ota-r", headers=admin_headers).json()[
-        "builds"]
-    new = next(b for b in builds if b["id16"] == N16)
-    assert new["kind"] == "delta" and new["osz"] == len(world["cached"][0])
+    if cached:
+        assert new["kind"] == "delta" and new["osz"] == len(world["cached"][0])
+    else:
+        assert new["kind"] == "full" and new["onDemandDelta"] is True
+        old = next(b for b in builds if b["id16"] == B16)
+        assert "onDemandDelta" not in old
+        assert world["gets"] == []
     assert world["storage"].uploads == []
 
 

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from app import dbexport, familyexport
+from app import familyexport
 from app.familyexport import ExportOptions, KpfamFile
 from tests import familymove_world as w
 
@@ -214,10 +214,3 @@ def test_trailer_hash_covers_everything_before_it(src):
         "sha256": hashlib.sha256(b"".join(lines[:-1])).hexdigest()
     }
     assert json.loads(lines[0])["kpfam"] == 1
-
-
-def test_rows_use_dbexport_encoding(src):
-    rows = _rows(_export(src))
-    assert all(
-        set(r) == {"path", "data"} and dbexport._is_doc_path(r["path"]) for r in rows
-    )

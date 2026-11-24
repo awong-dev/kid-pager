@@ -106,30 +106,33 @@ def test_update_remote_and_announce():
     assert row["announce"] == {"pending": True, "since": 7, "attempts": 0, "nextAt": 0}
 
 
-def test_invite_is_single_use():
-    fed_links.create_invite("code-1", A, "u1")
-    assert fed_links.consume_invite("code-1", A, used_by=R1, used_pk="pk") == "ok"
-    assert fed_links.consume_invite("code-1", A) == "used"
-    inv = fed_links.get_invite("code-1")
-    assert (inv["usedBy"], inv["usedPk"]) == (R1, "pk")
-    assert fed_links.consume_invite("nope", A) == "unknown"
+DAY = 24 * 3600
 
 
-def test_invite_expires_and_the_code_is_not_stored():
-    fed_links.create_invite("code-2", A, "u1", now=1000)
-    assert fed_links.consume_invite("code-2", A, now=1000 + 24 * 3600 + 1) == "expired"
-    assert fed_links.get_invite("code-2")["usedAt"] is None  # left for the sweep
-    assert fed_links.consume_invite("code-2", A, now=1000 + 24 * 3600) == "ok"
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param([("code", A, 1000, "ok"), ("code", A, 1000, "used")], id="single_use"),
+        pytest.param([("nope", A, 1000, "unknown")], id="unknown"),
+        pytest.param([("code", A, 1000 + DAY + 1, "expired"), ("code", A, 1000 + DAY, "ok")], id="expires"),
+        pytest.param([("code", "famB", 1000, "wrong_family"), ("code", A, 1000, "ok")], id="belongs_to_its_family"),
+    ],
+)
+def test_consume_invite_outcomes(steps):
+    fed_links.create_invite("code", A, "u1", now=1000)
+    consumed = False
+    for code, family, now, expected in steps:
+        assert fed_links.consume_invite(code, family, used_by=R1, used_pk="pk", now=now) == expected
+        consumed = consumed or expected == "ok"
+        if code == "code":
+            inv = fed_links.get_invite(code)
+            assert (inv["usedAt"] is not None) == consumed  # an expired code is left for the sweep
+            if consumed:
+                assert (inv["usedBy"], inv["usedPk"]) == (R1, "pk")
     from app.db.firestore import get_db
 
     ids = [s.id for s in get_db().collection("fedInvites").stream()]
-    assert ids == [fed_links.code_hash("code-2")] and "code-2" not in ids
-
-
-def test_an_invite_belongs_to_its_family():
-    fed_links.create_invite("code-3", A, "u1")
-    assert fed_links.consume_invite("code-3", "famB") == "wrong_family"
-    assert fed_links.consume_invite("code-3", A) == "ok"
+    assert ids == [fed_links.code_hash("code")] and "code" not in ids
 
 
 def test_enqueue_is_idempotent_and_pending():

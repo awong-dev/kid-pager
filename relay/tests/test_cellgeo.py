@@ -48,27 +48,32 @@ def _backdate(mcc: str, mnc: str, tac: int, ci: int, *, seconds_ago: int) -> Non
     ref.set(data)
 
 
-def test_provider_defaults_to_none():
-    assert cellgeo.provider_name() == "none"
-
-
-def test_resolve_is_a_noop_when_provider_is_none():
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({}, id="provider_none"),
+        pytest.param({"CELL_GEO_PROVIDER": "google"}, id="key_missing"),
+        pytest.param(
+            {"CELL_GEO_PROVIDER": "not-a-real-provider", "CELL_GEO_API_KEY": "k"}, id="unknown_provider"
+        ),
+    ],
+)
+def test_resolve_is_a_noop_without_a_usable_provider_config(monkeypatch: pytest.MonkeyPatch, env: dict):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     assert cellgeo.resolve(_cell()) is None
 
 
-def test_resolve_skips_the_lookup_when_key_is_missing(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    # CELL_GEO_API_KEY deliberately left unset.
-    assert cellgeo.resolve(_cell()) is None
-
-
-def test_resolve_never_raises_on_an_unknown_provider_name(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "not-a-real-provider")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "k")
-    assert cellgeo.resolve(_cell()) is None
-
-
-def test_google_request_shape_and_response_mapping(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    ("overrides", "signal"),
+    [
+        pytest.param({}, {"signalStrength": -95}, id="with_rsrp"),
+        pytest.param({"ci": 102, "rsrp": None}, {}, id="rsrp_absent"),
+    ],
+)
+def test_google_request_shape_and_response_mapping(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any], signal: dict[str, int]
+):
     monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
     monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
     captured: dict[str, Any] = {}
@@ -81,7 +86,8 @@ def test_google_request_shape_and_response_mapping(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(cellgeo.httpx, "post", fake_post)
 
-    fix = cellgeo.resolve(_cell())
+    cell = _cell(**overrides)
+    fix = cellgeo.resolve(cell)
     assert fix is not None
     assert fix.lat == 1.5
     assert fix.lon == 2.5
@@ -95,51 +101,31 @@ def test_google_request_shape_and_response_mapping(monkeypatch: pytest.MonkeyPat
     assert captured["json"]["radioType"] == "lte"
     tower = captured["json"]["cellTowers"][0]
     assert tower == {
-        "cellId": 87654321,
+        "cellId": cell.ci,
         "locationAreaCode": 12345,
         "mobileCountryCode": 310,
         "mobileNetworkCode": 410,
-        "signalStrength": -95,
+        **signal,
     }
 
 
-def test_google_omits_signal_strength_when_rsrp_absent(monkeypatch: pytest.MonkeyPatch):
+def _raise_timeout(*a: Any, **k: Any):
+    raise httpx.ConnectTimeout("simulated timeout")
+
+
+@pytest.mark.parametrize(
+    "fake_post",
+    [
+        pytest.param(lambda *a, **k: FakeResponse(404, {"error": {}}), id="404_unknown_cell"),
+        pytest.param(lambda *a, **k: FakeResponse(500, {}), id="non_2xx"),
+        pytest.param(_raise_timeout, id="transport_failure"),
+    ],
+)
+def test_google_failures_resolve_to_none_and_never_raise(monkeypatch: pytest.MonkeyPatch, fake_post: Any):
     monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
     monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    captured: dict[str, Any] = {}
-
-    def fake_post(url: str, *, params=None, json=None, timeout=None):
-        captured["json"] = json
-        return FakeResponse(200, {"location": {"lat": 1.0, "lng": 2.0}, "accuracy": 30})
-
     monkeypatch.setattr(cellgeo.httpx, "post", fake_post)
-    cellgeo.resolve(_cell(ci=102, rsrp=None))
-    assert "signalStrength" not in captured["json"]["cellTowers"][0]
-
-
-def test_google_404_means_unknown_cell(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    monkeypatch.setattr(cellgeo.httpx, "post", lambda *a, **k: FakeResponse(404, {"error": {}}))
     assert cellgeo.resolve(_cell(ci=103)) is None
-
-
-def test_google_non_2xx_returns_none(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    monkeypatch.setattr(cellgeo.httpx, "post", lambda *a, **k: FakeResponse(500, {}))
-    assert cellgeo.resolve(_cell(ci=104)) is None
-
-
-def test_google_transport_failure_never_raises(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-
-    def boom(*a: Any, **k: Any):
-        raise httpx.ConnectTimeout("simulated timeout")
-
-    monkeypatch.setattr(cellgeo.httpx, "post", boom)
-    assert cellgeo.resolve(_cell(ci=105)) is None
 
 
 def test_opencellid_request_shape_and_response_mapping(monkeypatch: pytest.MonkeyPatch):
@@ -171,57 +157,39 @@ def test_opencellid_request_shape_and_response_mapping(monkeypatch: pytest.Monke
     }
 
 
-def test_opencellid_unknown_cell_response(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "fake_get",
+    [
+        pytest.param(lambda *a, **k: FakeResponse(200, {"error": "not found"}), id="unknown_cell"),
+        pytest.param(_raise_timeout, id="transport_failure"),
+    ],
+)
+def test_opencellid_failures_resolve_to_none_and_never_raise(monkeypatch: pytest.MonkeyPatch, fake_get: Any):
     monkeypatch.setenv("CELL_GEO_PROVIDER", "opencellid")
     monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    monkeypatch.setattr(
-        cellgeo.httpx, "get", lambda *a, **k: FakeResponse(200, {"error": "not found"})
-    )
+    monkeypatch.setattr(cellgeo.httpx, "get", fake_get)
     assert cellgeo.resolve(_cell(ci=202)) is None
 
 
-def test_opencellid_transport_failure_never_raises(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "opencellid")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-
-    def boom(*a: Any, **k: Any):
-        raise httpx.ConnectTimeout("simulated timeout")
-
-    monkeypatch.setattr(cellgeo.httpx, "get", boom)
-    assert cellgeo.resolve(_cell(ci=203)) is None
-
-
-def test_sanity_rejects_accuracy_over_50km(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    ("lat", "lng", "accuracy", "accepted"),
+    [
+        pytest.param(1.0, 2.0, 50_001, False, id="accuracy_over_50km"),
+        pytest.param(1.0, 2.0, 50_000, True, id="accuracy_at_exactly_50km"),
+        pytest.param(0.0, 0.0, 30, False, id="exactly_0_0"),
+    ],
+)
+def test_sanity_checks_on_the_provider_fix(
+    monkeypatch: pytest.MonkeyPatch, lat: float, lng: float, accuracy: int, accepted: bool
+):
     monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
     monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
     monkeypatch.setattr(
         cellgeo.httpx,
         "post",
-        lambda *a, **k: FakeResponse(200, {"location": {"lat": 1.0, "lng": 2.0}, "accuracy": 50_001}),
+        lambda *a, **k: FakeResponse(200, {"location": {"lat": lat, "lng": lng}, "accuracy": accuracy}),
     )
-    assert cellgeo.resolve(_cell(ci=301)) is None
-
-
-def test_sanity_accepts_accuracy_at_exactly_50km(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    monkeypatch.setattr(
-        cellgeo.httpx,
-        "post",
-        lambda *a, **k: FakeResponse(200, {"location": {"lat": 1.0, "lng": 2.0}, "accuracy": 50_000}),
-    )
-    assert cellgeo.resolve(_cell(ci=302)) is not None
-
-
-def test_sanity_rejects_exactly_0_0(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    monkeypatch.setattr(
-        cellgeo.httpx,
-        "post",
-        lambda *a, **k: FakeResponse(200, {"location": {"lat": 0.0, "lng": 0.0}, "accuracy": 30}),
-    )
-    assert cellgeo.resolve(_cell(ci=303)) is None
+    assert (cellgeo.resolve(_cell(ci=301)) is not None) is accepted
 
 
 def test_cache_hit_skips_a_second_http_call(monkeypatch: pytest.MonkeyPatch):
@@ -241,25 +209,37 @@ def test_cache_hit_skips_a_second_http_call(monkeypatch: pytest.MonkeyPatch):
     assert calls["n"] == 1
 
 
-def test_cache_expires_after_30_days(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    ("negative", "ttl_s", "lat"),
+    [
+        pytest.param(False, cells_store.POSITIVE_TTL_S, 9.0, id="positive_30_days"),
+        pytest.param(True, cells_store.NEGATIVE_TTL_S, 1.0, id="negative_1_day"),
+    ],
+)
+def test_cache_entries_expire_after_their_ttl(
+    monkeypatch: pytest.MonkeyPatch, negative: bool, ttl_s: int, lat: float
+):
     monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
     monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
     cell = _cell(ci=402)
-    cells_store.remember_resolved(
-        cell.mcc, cell.mnc, cell.tac, cell.ci, lat=1.0, lon=1.0, acc_m=10, provider="google"
-    )
-    _backdate(cell.mcc, cell.mnc, cell.tac, cell.ci, seconds_ago=cells_store.POSITIVE_TTL_S + 1)
+    if negative:
+        cells_store.remember_unknown(cell.mcc, cell.mnc, cell.tac, cell.ci, provider="google")
+    else:
+        cells_store.remember_resolved(
+            cell.mcc, cell.mnc, cell.tac, cell.ci, lat=1.0, lon=1.0, acc_m=10, provider="google"
+        )
+    _backdate(cell.mcc, cell.mnc, cell.tac, cell.ci, seconds_ago=ttl_s + 1)
 
     calls = {"n": 0}
 
     def fake_post(*a: Any, **k: Any):
         calls["n"] += 1
-        return FakeResponse(200, {"location": {"lat": 9.0, "lng": 9.0}, "accuracy": 20})
+        return FakeResponse(200, {"location": {"lat": lat, "lng": lat}, "accuracy": 20})
 
     monkeypatch.setattr(cellgeo.httpx, "post", fake_post)
     fix = cellgeo.resolve(cell)
     assert fix is not None
-    assert fix.lat == 9.0
+    assert fix.lat == lat
     assert calls["n"] == 1
 
 
@@ -276,23 +256,4 @@ def test_negative_cache_skips_repeat_calls_within_a_day(monkeypatch: pytest.Monk
     cell = _cell(ci=403)
     assert cellgeo.resolve(cell) is None
     assert cellgeo.resolve(cell) is None
-    assert calls["n"] == 1
-
-
-def test_negative_cache_expires_after_1_day(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("CELL_GEO_PROVIDER", "google")
-    monkeypatch.setenv("CELL_GEO_API_KEY", "test-key")
-    cell = _cell(ci=404)
-    cells_store.remember_unknown(cell.mcc, cell.mnc, cell.tac, cell.ci, provider="google")
-    _backdate(cell.mcc, cell.mnc, cell.tac, cell.ci, seconds_ago=cells_store.NEGATIVE_TTL_S + 1)
-
-    calls = {"n": 0}
-
-    def fake_post(*a: Any, **k: Any):
-        calls["n"] += 1
-        return FakeResponse(200, {"location": {"lat": 1.0, "lng": 1.0}, "accuracy": 10})
-
-    monkeypatch.setattr(cellgeo.httpx, "post", fake_post)
-    fix = cellgeo.resolve(cell)
-    assert fix is not None
     assert calls["n"] == 1

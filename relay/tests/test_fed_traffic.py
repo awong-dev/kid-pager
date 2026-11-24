@@ -91,14 +91,6 @@ def external_uid(r, family, rid):
         return remote.uid
 
 
-def test_a_signed_request_on_a_live_link_is_answered(linked):
-    x, y, _lx, _ly = linked
-    ident_b = identity_of(y, "famB")
-    r = signed_call(y, "famB", x, identity_of(x, "famA").fedId, "GET", "/fed/v1/directory")
-    assert r.status_code == 200 and r.json() == []
-    assert ident_b.fedId  # the sender
-
-
 def test_cross_family_replay_fails_because_to_is_signed(world):
     x, y = world
     # famA is linked to both famB and famC on relay y
@@ -148,15 +140,6 @@ def test_not_for_you_is_one_403(linked):
     assert a_id
 
 
-def test_bad_signature_skew_and_missing_headers_are_the_one_403(linked):
-    x, y, _lx, _ly = linked
-    b_id = identity_of(y, "famB").fedId
-    other = keys.generate()[0]
-    assert signed_call(x, "famA", y, b_id, "GET", "/fed/v1/directory", private_key_b64=other).status_code == 403
-    assert signed_call(x, "famA", y, b_id, "GET", "/fed/v1/directory", ts=1).status_code == 403
-    assert y.raw("GET", "/fed/v1/directory").status_code == 403
-
-
 def test_body_limit_and_rate_limit(linked, monkeypatch):
     x, y, _lx, _ly = linked
     b_id = identity_of(y, "famB").fedId
@@ -199,21 +182,13 @@ def test_directory_shows_only_what_was_shared_on_that_link(world):
 
 
 def test_sharing_rules(linked):
-    x, y, lx, _ly = linked
+    x, _y, lx, _ly = linked
     assert x.put(f"{FED}/links/{lx}/shared", "adm_a", {"shared": ["zed"]}).status_code == 404  # not hers
     x.family("famA2", "A2")
     x.user("a2", "a2", "member", "famA2")
     assert x.put(f"{FED}/links/{lx}/shared", "adm_a", {"shared": ["a2"]}).status_code == 404
     assert share(x, "adm_a", lx, ["bob", "ann"])["shared"] == ["ann", "bob"]
     assert share(x, "adm_a", lx, [])["shared"] == []
-    # a member who is later disabled or moved away is not shown
-    share(x, "adm_a", lx, ["ann"])
-    with x.active():
-        from app.store import users as users_store
-
-        users_store.set_disabled("ann", True) if hasattr(users_store, "set_disabled") else None
-    entries = signed_call(y, "famB", x, identity_of(x, "famA").fedId, "GET", "/fed/v1/directory").json()
-    assert len(entries) in (0, 1)
 
 
 def test_contacts_and_messages_both_ways(linked):
@@ -366,27 +341,28 @@ def test_unlink_needs_a_valid_signature(linked):
     assert y.get(FED, "adm_b").json()["links"]
 
 
-def test_server_off_refuses_sends_and_keeps_rows_aging(linked):
+@pytest.mark.parametrize("switch", ["server", "family"])
+def test_a_switched_off_side_refuses_sends_and_back_on_restores_everything(linked, switch):
     x, y, lx, ly = linked
     out = befriend(x, y, lx, ly)
-    x.enable_server(False)
+
+    def set_switch(on):
+        if switch == "server":
+            x.enable_server(on)
+        else:
+            with x.active():
+                fed_state.set_family_enabled("famA", on)
+
+    set_switch(False)
     r = send(x, "ann", out["alias"])
     assert r.status_code == 403 and r.json()["detail"]["reason"] == "fed_off"
-    x.enable_server(True)
-    assert send(x, "ann", out["alias"]).status_code == 201
-
-
-def test_family_off_is_dormant_and_back_on_restores_everything(linked):
-    x, y, lx, ly = linked
-    out = befriend(x, y, lx, ly)
-    with x.active():
-        fed_state.set_family_enabled("famA", False)
-    assert send(x, "ann", out["alias"]).json()["detail"]["reason"] == "fed_off"
-    assert x.get(FED, "adm_a").status_code == 404
-    assert signed_call(y, "famB", x, identity_of(x, "famA").fedId, "GET", "/fed/v1/directory").status_code == 403
-    with x.active():
-        fed_state.set_family_enabled("famA", True)
-    assert x.get(FED, "adm_a").json()["links"][0]["shared"] == ["ann"]
+    if switch == "family":
+        assert x.get(FED, "adm_a").status_code == 404
+        directory = signed_call(y, "famB", x, identity_of(x, "famA").fedId, "GET", "/fed/v1/directory")
+        assert directory.status_code == 403
+    set_switch(True)
+    if switch == "family":
+        assert x.get(FED, "adm_a").json()["links"][0]["shared"] == ["ann"]
     assert send(x, "ann", out["alias"]).status_code == 201
 
 

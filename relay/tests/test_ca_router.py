@@ -50,12 +50,15 @@ def test_get_ca_pem_serves_a_known_hash_no_auth_needed(client: TestClient):
     assert "max-age=31536000" in resp.headers["cache-control"]
 
 
-def test_get_ca_pem_404s_an_unknown_hash(client: TestClient):
-    resp = client.get(f"/ca/{'cd' * 32}.pem")
-    assert resp.status_code == 404
-
-
-def test_get_ca_pem_404s_a_malformed_hash_rather_than_500(client: TestClient):
-    for bad in ("not-hex.pem", "ab" * 31 + ".pem", "AB" * 32 + ".pem", "../../etc/passwd.pem"):
-        resp = client.get(f"/ca/{bad}")
-        assert resp.status_code == 404, bad
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param("cd" * 32 + ".pem", id="unknown_hash"),
+        pytest.param("not-hex.pem", id="not_hex"),
+        pytest.param("ab" * 31 + ".pem", id="too_short"),
+        pytest.param("AB" * 32 + ".pem", id="uppercase"),
+        pytest.param("../../etc/passwd.pem", id="path_traversal"),
+    ],
+)
+def test_get_ca_pem_404s_an_unknown_or_malformed_hash_rather_than_500(client: TestClient, ref: str):
+    assert client.get(f"/ca/{ref}").status_code == 404

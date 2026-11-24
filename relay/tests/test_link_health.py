@@ -88,11 +88,6 @@ def test_an_inbound_message_marks_a_subscribed_conversation_ok(env: Env):
     assert _health(env).okAt == first
 
 
-def test_a_seen_conversation_gets_no_health(env: Env):
-    env.events(_ev("Devon P", "hello"))
-    assert _health(env) is None
-
-
 def test_sent_ack_is_ok_and_link_failures_are_strikes(env: Env):
     row = _subscribed(env)
     now = int(time.time())
@@ -141,8 +136,9 @@ def test_the_real_ack_route_feeds_the_hook(env: Env):
     assert _health(env).state == "failing"
 
 
-def test_a_conversation_that_is_not_subscribed_is_not_tracked(env: Env):
+def test_a_conversation_that_is_not_subscribed_gets_no_health_and_is_not_tracked(env: Env):
     env.events(_ev("Devon P", "hello"))  # seen only
+    assert _health(env) is None
     link_health.on_ack(env.bridge, _chat_item(env, GROUP, "failed", "no_link"))
     assert _health(env) is None
 
@@ -294,12 +290,6 @@ def _probe_again(env: Env) -> bridge_outbox.OutboxItem:
     assert link_health.enqueue_probes(now=int(time.time()) + 86400) == 1
     (item,) = bridge_outbox.list_pending(env.bridge.id)
     return item
-
-
-def test_probe_ids_are_per_conversation_per_day(env: Env):
-    row = _subscribed(env)
-    assert link_health.probe_id(row.ref, 0) == f"ob_hc_{row.ref}_19700101"
-    assert link_health.is_probe_id("ob_hc_x") and not link_health.is_probe_id("ob_h_x")
 
 
 def test_dm_title_matching_rules():

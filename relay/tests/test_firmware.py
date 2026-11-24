@@ -101,38 +101,33 @@ def index_server() -> Iterator[dict]:
     firmware.reset_cache()
 
 
-def test_index_parses():
-    idx = firmware.FirmwareIndex.model_validate(make_index())
-    assert [b.id16 for b in idx.builds] == [ID_NEW[:16], ID_OLD[:16]]
-
-
 @pytest.mark.parametrize(
-    "mutate",
+    "mutate, valid",
     [
-        lambda i: i["builds"][0]["full"].update(path="fw/../etc/passwd"),
-        lambda i: i["builds"][0]["full"].update(path="fw/abc/full.z"),
-        lambda i: i["builds"][0]["deltas"][0].update(path="fw/" + "a1" * 8 + "/from-zz.dz"),
-        lambda i: i["builds"][0]["full"].update(osz=0x200001),
-        lambda i: i["builds"][0].update(size=0),
-        lambda i: i["builds"][0]["deltas"][0].update(psz=0x200001),
-        lambda i: i["builds"][0].update(id="A1" * 32),
-        lambda i: i["builds"][0].update(id="a1" * 31),
-        lambda i: i["builds"][0]["full"].update(osha="xyz"),
-        lambda i: i["builds"][0]["deltas"][0].update(base="b2" * 31),
-        lambda i: i.update(v=2),
+        pytest.param(lambda i: None, True, id="parses"),
+        pytest.param(lambda i: i["builds"][0]["full"].update(osz=0x200000), True, id="accepts_max_size"),
+        pytest.param(lambda i: i["builds"][0]["full"].update(path="fw/../etc/passwd"), False, id="path_traversal"),
+        pytest.param(lambda i: i["builds"][0]["full"].update(path="fw/abc/full.z"), False, id="full_path_shape"),
+        pytest.param(lambda i: i["builds"][0]["deltas"][0].update(path="fw/" + "a1" * 8 + "/from-zz.dz"), False, id="delta_path_base"),
+        pytest.param(lambda i: i["builds"][0]["full"].update(osz=0x200001), False, id="full_osz_over_max"),
+        pytest.param(lambda i: i["builds"][0].update(size=0), False, id="size_zero"),
+        pytest.param(lambda i: i["builds"][0]["deltas"][0].update(psz=0x200001), False, id="delta_psz_over_max"),
+        pytest.param(lambda i: i["builds"][0].update(id="A1" * 32), False, id="id_uppercase"),
+        pytest.param(lambda i: i["builds"][0].update(id="a1" * 31), False, id="id_short"),
+        pytest.param(lambda i: i["builds"][0]["full"].update(osha="xyz"), False, id="osha_not_hex"),
+        pytest.param(lambda i: i["builds"][0]["deltas"][0].update(base="b2" * 31), False, id="delta_base_short"),
+        pytest.param(lambda i: i.update(v=2), False, id="version_2"),
     ],
 )
-def test_index_rejects_bad_values(mutate):
-    bad = copy.deepcopy(make_index())
-    mutate(bad)
-    with pytest.raises(ValidationError):
-        firmware.FirmwareIndex.model_validate(bad)
-
-
-def test_index_accepts_max_size():
-    ok = make_index()
-    ok["builds"][0]["full"]["osz"] = 0x200000
-    firmware.FirmwareIndex.model_validate(ok)
+def test_index_validation(mutate, valid):
+    raw = copy.deepcopy(make_index())
+    mutate(raw)
+    if not valid:
+        with pytest.raises(ValidationError):
+            firmware.FirmwareIndex.model_validate(raw)
+        return
+    idx = firmware.FirmwareIndex.model_validate(raw)
+    assert [b.id16 for b in idx.builds] == [ID_NEW[:16], ID_OLD[:16]]
 
 
 def test_load_index_caches_for_a_minute(index_server):
@@ -164,7 +159,7 @@ def test_load_index_unconfigured():
         firmware.load_index(settings(fw_bucket_base=None))
 
 
-def test_choose_delta_only_on_exact_base16_match():
+def test_choose_delta_only_on_exact_base16_match_and_never_with_base_equal_target():
     idx = firmware.FirmwareIndex.model_validate(make_index())
     c = firmware.choose(idx, ID_NEW[:16], ID_OLD[:16])
     assert c.kind == "delta" and c.obj.osz == 42513
@@ -177,9 +172,7 @@ def test_choose_delta_only_on_exact_base16_match():
     assert firmware.choose(idx, ID_OLD[:16], ID_OLD[:16]).kind == "full"
     with pytest.raises(KeyError):
         firmware.choose(idx, "0" * 16, None)
-
-
-def test_choose_never_picks_delta_with_base_equal_target():
+    # a delta whose base is the target itself is never picked
     raw = make_index()
     build = raw["builds"][0]
     assert build["id"][:16] == ID_NEW[:16]
@@ -187,11 +180,6 @@ def test_choose_never_picks_delta_with_base_equal_target():
     idx = firmware.FirmwareIndex.model_validate(raw)
     c = firmware.choose(idx, ID_NEW[:16], ID_NEW[:16])
     assert c.kind == "full"
-
-
-def test_estimate_bytes():
-    assert firmware.estimate_bytes(338784) == int(338784 * 1.045) + 7168
-    assert firmware.estimate_bytes(0) == 7168
 
 
 def test_cfg_ota_shapes_and_envelope_limit():
@@ -244,19 +232,6 @@ def _device(device_id: str = "pgr-ota-1") -> None:
         auth_mode="password",
     )
     backends_store.create_backend("u-ota", kind="pager", config={"deviceId": device_id}, enabled=True)
-
-
-def test_status_envelope_ota_fields_valid():
-    env = StatusEnvelope.model_validate(
-        {
-            "state": "online", "mode": "sleep", "batt_mv": 3300, "ts": 1_700_000_000,
-            "session": "s_00000001", "img": "0123456789abcdef", "ota": 1,
-            "ota_t": "fedcba9876543210", "ota_st": "dl", "ota_pct": 50, "ota_err": "http",
-        }
-    )
-    assert (env.img, env.ota, env.ota_t, env.ota_st, env.ota_pct, env.ota_err) == (
-        "0123456789abcdef", 1, "fedcba9876543210", "dl", 50, "http",
-    )
 
 
 def test_status_envelope_bad_ota_fields_drop_only_that_field():

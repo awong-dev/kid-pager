@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import clockfmt, deliveries, jobs, receipts, wirecbor
@@ -78,13 +79,18 @@ def _down(broker: FakeBrokerClient) -> list[dict]:
     return [d for d in out if d.get("from") == "system" or d.get("kind") == "rcpt"]
 
 
-def test_failed_without_mb_is_a_system_row_once(
-    client: TestClient, world: World, broker
+@pytest.mark.parametrize("state", ["failed", "sent"])
+def test_without_mb_only_a_failed_ack_is_a_system_row_once(
+    client: TestClient, world: World, broker, state: str
 ):
     _, headers = pair_bridge(client, world)
     ext = _setup(world)
     msg = _send(broker, ext.alias)
-    _ack(client, headers, msg, "failed", "sms_timeout")
+    args = ("failed", "sms_timeout") if state == "failed" else ("sent",)
+    _ack(client, headers, msg, *args)
+    if state == "sent":
+        assert _down(broker) == []
+        return
     (down,) = _down(broker)
     assert down["from"] == "system" and "kind" not in down and down["ack"] is None
     when = clockfmt.clock(msg.ts, world.family_id)
@@ -98,16 +104,8 @@ def test_failed_without_mb_is_a_system_row_once(
     )
     assert broker.published[0].qos == 1
     # a retried ack is not a transition
-    _ack(client, headers, msg, "failed", "sms_timeout")
+    _ack(client, headers, msg, *args)
     assert len(_down(broker)) == 1
-
-
-def test_sent_without_mb_sends_nothing(client: TestClient, world: World, broker):
-    _, headers = pair_bridge(client, world)
-    ext = _setup(world)
-    msg = _send(broker, ext.alias)
-    _ack(client, headers, msg, "sent")
-    assert _down(broker) == []
 
 
 def test_mb_device_gets_rcpt_for_sent_and_failed(

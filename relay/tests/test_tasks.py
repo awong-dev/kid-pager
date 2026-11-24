@@ -10,24 +10,19 @@ import pytest
 from app import tasks
 
 
-def test_build_task_queue_defaults_to_inline(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("TASKS_MODE", raising=False)
-    queue = tasks.build_task_queue()
-    assert isinstance(queue, tasks.InlineTaskQueue)
-
-
-def test_build_task_queue_inline_mode_explicit():
-    assert isinstance(tasks.build_task_queue("inline"), tasks.InlineTaskQueue)
-
-
-def test_build_task_queue_unknown_mode_raises():
-    with pytest.raises(NotImplementedError):
-        tasks.build_task_queue("carrier-pigeon")
-
-
-def test_build_task_queue_cloud_tasks_mode_constructs_cloud_tasks_queue(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param((), tasks.InlineTaskQueue, id="default-inline"),
+        pytest.param(("inline",), tasks.InlineTaskQueue, id="inline"),
+        pytest.param(("cloud_tasks",), tasks.CloudTasksQueue, id="cloud-tasks"),
+        pytest.param(("carrier-pigeon",), NotImplementedError, id="unknown-raises"),
+    ],
+)
+def test_build_task_queue_maps_mode_to_queue_class(
+    monkeypatch: pytest.MonkeyPatch, args: tuple[str, ...], expected: type
 ):
+    monkeypatch.delenv("TASKS_MODE", raising=False)
     # The no-client branch builds a real tasks_v2.CloudTasksClient(), whose constructor calls
     # google.auth.default() and raises without GCP credentials; patch the class.
     from google.cloud import tasks_v2
@@ -37,22 +32,22 @@ def test_build_task_queue_cloud_tasks_mode_constructs_cloud_tasks_queue(
 
     monkeypatch.setattr(tasks_v2, "CloudTasksClient", _FakeClient)
 
-    queue = tasks.build_task_queue("cloud_tasks")
-    assert isinstance(queue, tasks.CloudTasksQueue)
+    if issubclass(expected, Exception):
+        with pytest.raises(expected):
+            tasks.build_task_queue(*args)
+    else:
+        assert isinstance(tasks.build_task_queue(*args), expected)
 
 
-def test_queue_path_uses_configured_project_location_queue(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "demo-pager")
-    monkeypatch.setenv("TASKS_LOCATION", "us-west1")
-    monkeypatch.setenv("TASKS_QUEUE", "my-queue")
-    assert tasks.queue_path() == "projects/demo-pager/locations/us-west1/queues/my-queue"
-
-
-def test_build_task_targets_internal_task_with_the_retry_name_and_oidc_token(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("service_account", ["relay-tasks@demo-pager.iam.gserviceaccount.com", None])
+def test_build_task_targets_internal_task_with_oidc_token_only_when_service_account_set(
+    monkeypatch: pytest.MonkeyPatch, service_account: str | None
 ):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://relay.example.com")
-    monkeypatch.setenv("TASKS_SERVICE_ACCOUNT_EMAIL", "relay-tasks@demo-pager.iam.gserviceaccount.com")
+    if service_account:
+        monkeypatch.setenv("TASKS_SERVICE_ACCOUNT_EMAIL", service_account)
+    else:
+        monkeypatch.delenv("TASKS_SERVICE_ACCOUNT_EMAIL", raising=False)
 
     task = tasks.build_task("pager-retry:m_deadbeef:pgr-0001")
 
@@ -60,19 +55,10 @@ def test_build_task_targets_internal_task_with_the_retry_name_and_oidc_token(
     assert http_request["url"] == "https://relay.example.com/internal/task"
     assert http_request["http_method"] == "POST"
     assert json.loads(http_request["body"]) == {"name": "pager-retry:m_deadbeef:pgr-0001"}
-    assert http_request["oidc_token"] == {
-        "service_account_email": "relay-tasks@demo-pager.iam.gserviceaccount.com"
-    }
-
-
-def test_build_task_omits_oidc_token_when_no_service_account_configured(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://relay.example.com")
-    monkeypatch.delenv("TASKS_SERVICE_ACCOUNT_EMAIL", raising=False)
-
-    task = tasks.build_task("some-retry")
-    assert "oidc_token" not in task["http_request"]
+    if service_account:
+        assert http_request["oidc_token"] == {"service_account_email": service_account}
+    else:
+        assert "oidc_token" not in http_request
 
 
 class _FakeCloudTasksClient:

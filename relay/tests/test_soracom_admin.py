@@ -93,15 +93,11 @@ def _use(fake: FakeSoracom) -> None:
     soracom._transport = httpx.MockTransport(fake)
 
 
-def test_unconfigured_list(admin_headers):  # noqa: F811
+def test_unconfigured_client_lists_empty_and_refuses_enroll(admin_headers):  # noqa: F811
     with _client(False) as c:
         r = c.get("/api/admin/soracom/sims", headers=admin_headers)
-    assert r.status_code == 200
-    assert r.json() == {"configured": False, "group": "pager-beam", "groupId": None, "sims": []}
-
-
-def test_unconfigured_enroll_503(admin_headers):  # noqa: F811
-    with _client(False) as c:
+        assert r.status_code == 200
+        assert r.json() == {"configured": False, "group": "pager-beam", "groupId": None, "sims": []}
         assert c.post("/api/admin/soracom/sims/295050000000001/enroll", headers=admin_headers).status_code == 503
         assert c.post("/api/admin/soracom/enroll-all", headers=admin_headers).status_code == 503
 

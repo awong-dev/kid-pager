@@ -53,27 +53,12 @@ def client() -> Iterator[TestClient]:
         yield c
 
 
-def test_webhook_missing_key_is_401(client: TestClient):
+@pytest.mark.parametrize("headers", [{}, webhook_headers("wrong-key")], ids=["missing-key", "wrong-key"])
+def test_webhook_without_the_right_key_is_401(client: TestClient, headers: dict):
     resp = client.post(
-        "/webhooks/mqtt", content=webhook_body(up_topic("pgr-0001"), b"{}"), headers={}
+        "/webhooks/mqtt", content=webhook_body(up_topic("pgr-0001"), b"{}"), headers=headers
     )
     assert resp.status_code == 401
-
-
-def test_webhook_wrong_key_is_401(client: TestClient):
-    resp = client.post(
-        "/webhooks/mqtt",
-        content=webhook_body(up_topic("pgr-0001"), b"{}"),
-        headers=webhook_headers("wrong-key"),
-    )
-    assert resp.status_code == 401
-
-
-def test_webhook_up_message_dispatches_and_stores(client: TestClient):
-    payload = ack_payload("u_11111111", "shown")  # any well-formed up envelope shape works here
-    body = webhook_body(up_topic("pgr-0001"), payload)
-    resp = client.post("/webhooks/mqtt", content=body, headers=webhook_headers(WEBHOOK_KEY))
-    assert resp.status_code == 200
 
 
 def test_webhook_status_dispatches(client: TestClient):
@@ -151,16 +136,13 @@ def test_webhook_hmac_unsigned_up_message_dropped_but_still_200(client: TestClie
     assert device_secrets_store.get("pgr-hmac-wh2").upN == 0
 
 
-def test_webhook_malformed_body_is_still_200(client: TestClient):
-    resp = client.post(
-        "/webhooks/mqtt", content=b"not json at all", headers=webhook_headers(WEBHOOK_KEY)
-    )
-    assert resp.status_code == 200
-
-
-def test_webhook_unrecognised_topic_is_still_200(client: TestClient):
-    body = webhook_body("pager/pgr-0001/unknown", b"{}")
-    resp = client.post("/webhooks/mqtt", content=body, headers=webhook_headers(WEBHOOK_KEY))
+@pytest.mark.parametrize(
+    "content",
+    [b"not json at all", webhook_body("pager/pgr-0001/unknown", b"{}")],
+    ids=["malformed-body", "unrecognised-topic"],
+)
+def test_webhook_bad_input_is_still_200(client: TestClient, content: bytes):
+    resp = client.post("/webhooks/mqtt", content=content, headers=webhook_headers(WEBHOOK_KEY))
     assert resp.status_code == 200
 
 

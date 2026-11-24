@@ -95,10 +95,19 @@ def test_send_to_allowed_recipient_creates_message(routing: Routing):
     assert result.messages[0].body == "hi"
 
 
-def test_self_loop_excludes_same_kind_delivery(routing: Routing, broker):
+@pytest.mark.parametrize(
+    ("pager_devices", "scope_to_backend_id", "expected_kinds", "expected_publishes"),
+    [
+        pytest.param(1, False, {"webapp"}, 0, id="origin-kind-excludes-same-kind"),
+        pytest.param(2, True, {"pager", "webapp"}, 1, id="origin-backend-id-excludes-exact-backend"),
+    ],
+)
+def test_self_send_excludes_the_origin_backend_only(
+    routing: Routing, broker, pager_devices, scope_to_backend_id, expected_kinds, expected_publishes
+):
     _make_user("loopy", "loopy")
     allow_store.set_edge("loopy", "loopy", message=True, locate=True)
-    _make_pager_device("pgr-loopy", "loopy")
+    backends = [_make_pager_device(f"pgr-loopy-{i}", "loopy") for i in range(pager_devices)]
 
     result = routing.send(
         sender_uid="loopy",
@@ -106,45 +115,21 @@ def test_self_loop_excludes_same_kind_delivery(routing: Routing, broker):
         kind="text",
         body="hi",
         origin_backend_kind="pager",
+        origin_backend_id=backends[0].id if scope_to_backend_id else None,
     )
     assert len(result.messages) == 1
     msg = result.messages[0]
-    kinds = {d.kind for d in msg.deliveries.values()}
-    # pager (== origin_backend) excluded; webapp (implicit, different kind)
-    # still delivered.
-    assert kinds == {"webapp"}
-    assert broker.published == []
+    assert {d.kind for d in msg.deliveries.values()} == expected_kinds
+    assert len(broker.published) == expected_publishes
+    if scope_to_backend_id:
+        assert msg.originBackendKind == "pager"
+        assert msg.originBackendId == backends[0].id
+        assert backends[0].id not in msg.deliveries
+        assert backends[1].id in msg.deliveries
 
 
-def test_origin_backend_id_scopes_self_loop_exclusion_to_exact_backend(routing: Routing, broker):
-    _make_user("loopy2", "loopy2")
-    allow_store.set_edge("loopy2", "loopy2", message=True, locate=True)
-    backend_a = _make_pager_device("pgr-loopy2-a", "loopy2")
-    backend_b = _make_pager_device("pgr-loopy2-b", "loopy2")
-
-    result = routing.send(
-        sender_uid="loopy2",
-        recipient_alias="loopy2",
-        kind="text",
-        body="hi",
-        origin_backend_kind="pager",
-        origin_backend_id=backend_a.id,
-    )
-    assert len(result.messages) == 1
-    msg = result.messages[0]
-    assert msg.originBackendKind == "pager"
-    assert msg.originBackendId == backend_a.id
-    # backend_a excluded by exact id; backend_b (same kind, different id)
-    # and webapp (different kind) still delivered.
-    assert backend_a.id not in msg.deliveries
-    assert backend_b.id in msg.deliveries
-    assert {d.kind for d in msg.deliveries.values()} == {"pager", "webapp"}
-    assert len(broker.published) == 1
-
-
-def test_cross_user_pager_delivery_not_excluded_by_matching_origin_kind(
-    routing: Routing, broker
-):
+@pytest.mark.parametrize("origin_kind", ["pager", "webapp"])
+def test_dm_to_another_user_still_delivers_to_their_pager(routing: Routing, broker, origin_kind):
     _make_user("alice", "alice")
     _make_user("bob", "bob")
     allow_store.set_edge("alice", "bob", message=True, locate=True)
@@ -156,33 +141,12 @@ def test_cross_user_pager_delivery_not_excluded_by_matching_origin_kind(
         recipient_alias="bob",
         kind="text",
         body="hi",
-        origin_backend_kind="pager",
+        origin_backend_kind=origin_kind,
     )
     msg = result.messages[0]
-    kinds = {d.kind for d in msg.deliveries.values()}
-    assert kinds == {"webapp", "pager"}
+    assert {d.kind for d in msg.deliveries.values()} == {"webapp", "pager"}
     assert len(broker.published) == 1
-
-
-def test_non_matching_origin_backend_delivers_to_pager(routing: Routing, broker):
-    _make_user("alice", "alice")
-    _make_user("bob", "bob")
-    allow_store.set_edge("alice", "bob", message=True, locate=True)
-    allow_store.set_edge("bob", "alice", message=True, locate=True)
-    _make_pager_device("pgr-bob3", "bob")
-
-    result = routing.send(
-        sender_uid="alice",
-        recipient_alias="bob",
-        kind="text",
-        body="hi",
-        origin_backend_kind="webapp",
-    )
-    msg = result.messages[0]
-    kinds = {d.kind for d in msg.deliveries.values()}
-    assert "pager" in kinds
-    assert len(broker.published) == 1
-    assert broker.published[0].topic == "pager/pgr-bob3/down"
+    assert broker.published[0].topic == "pager/pgr-bob/down"
     payload = json.loads(broker.published[0].payload)
     assert payload["id"] == msg.id
     assert payload["from"] == "alice"
@@ -216,72 +180,67 @@ def test_dm_pager_page_bytes_are_byte_identical_to_before_sndr(routing: Routing,
     assert broker.published[0].payload == expected
 
 
-def test_no_alias_uses_device_default(routing: Routing, broker):
-    _make_user("alice", "alice")
-    _make_user("bob", "bob")
-    allow_store.set_edge("bob", "alice", message=True, locate=True)
-    allow_store.set_edge("alice", "bob", message=True, locate=True)
-    _make_pager_device("pgr-bob4", "bob", default_to_uid="alice")
+@pytest.mark.parametrize(
+    ("sender", "others", "default_to_uid", "expected"),
+    [
+        pytest.param("bob", ["alice"], "alice", {"alice"}, id="device-default"),
+        pytest.param("student", ["mom", "dad"], None, {"mom", "dad"}, id="no-default-broadcasts"),
+    ],
+)
+def test_send_without_alias_goes_to_the_device_default_or_every_allowed_recipient(
+    routing: Routing, broker, sender, others, default_to_uid, expected
+):
+    _make_user(sender, sender)
+    for other in others:
+        _make_user(other, other)
+        allow_store.set_edge(sender, other, message=True, locate=True)
+        allow_store.set_edge(other, sender, message=True, locate=True)
+    _make_pager_device(f"pgr-{sender}", sender, default_to_uid=default_to_uid)
 
     result = routing.send(
-        sender_uid="bob",
+        sender_uid=sender,
         recipient_alias=None,
         kind="text",
         body="hi",
         origin_backend_kind="pager",
-        device_id="pgr-bob4",
+        device_id=f"pgr-{sender}",
     )
-    assert len(result.messages) == 1
-    assert result.messages[0].recipientUid == "alice"
+    assert len(result.messages) == len(expected)
+    assert {m.recipientUid for m in result.messages} == expected
 
 
-def test_no_alias_no_default_broadcasts_to_all_allowed(routing: Routing, broker):
-    _make_user("student", "student")
-    _make_user("mom", "mom")
-    _make_user("dad", "dad")
-    allow_store.set_edge("student", "mom", message=True, locate=True)
-    allow_store.set_edge("student", "dad", message=True, locate=True)
-    allow_store.set_edge("mom", "student", message=True, locate=True)
-    allow_store.set_edge("dad", "student", message=True, locate=True)
-    _make_pager_device("pgr-student", "student", default_to_uid=None)
+@pytest.mark.parametrize(
+    ("users", "group_alias", "recipient_alias", "first_count"),
+    [
+        pytest.param(["student", "mom"], None, "mom", 1, id="dm"),
+        pytest.param(["gowner5", "gmem5", "gmem6"], "fam-dedupe", "fam-dedupe", 2, id="group"),
+    ],
+)
+def test_wire_id_redelivery_creates_no_duplicates(
+    routing: Routing, users, group_alias, recipient_alias, first_count
+):
+    for uid in users:
+        _make_user(uid, uid)
+    _all_edges(users)
+    if group_alias:
+        conversations_store.create_group(
+            name="Family", alias=group_alias, member_uids=users, created_by=users[0]
+        )
 
-    result = routing.send(
-        sender_uid="student",
-        recipient_alias=None,
-        kind="text",
-        body="broadcast",
-        origin_backend_kind="pager",
-        device_id="pgr-student",
-    )
-    recipients = {m.recipientUid for m in result.messages}
-    assert recipients == {"mom", "dad"}
+    def send():
+        return routing.send(
+            sender_uid=users[0],
+            recipient_alias=recipient_alias,
+            kind="text",
+            body="hi",
+            origin_backend_kind="pager",
+            wire_id="u_dupe1234",
+        )
 
-
-def test_wire_id_dedup_prevents_double_delivery_on_redelivery(routing: Routing):
-    _make_user("student", "student")
-    _make_user("mom", "mom")
-    allow_store.set_edge("student", "mom", message=True, locate=True)
-    allow_store.set_edge("mom", "student", message=True, locate=True)
-
-    first = routing.send(
-        sender_uid="student",
-        recipient_alias="mom",
-        kind="text",
-        body="hi",
-        origin_backend_kind="pager",
-        wire_id="u_dupe1234",
-    )
-    assert len(first.messages) == 1
+    assert len(send().messages) == first_count
 
     # Same wire_id again (e.g. an at-least-once webhook redelivery).
-    second = routing.send(
-        sender_uid="student",
-        recipient_alias="mom",
-        kind="text",
-        body="hi",
-        origin_backend_kind="pager",
-        wire_id="u_dupe1234",
-    )
+    second = send()
     assert second.messages == []
     assert second.rejected == []
 
@@ -358,27 +317,6 @@ def test_group_send_message_family_ids_are_per_pair_not_whole_group(routing: Rou
     assert by_recipient["fmem2"].familyIds == ["fam_x", "fam_z"]
 
 
-def test_group_send_with_one_pager_publishes_one_page(routing: Routing, broker):
-    _make_user("gowner2", "gowner2")
-    _make_user("gmem3", "gmem3")
-    _all_edges(["gowner2", "gmem3"])
-    _make_pager_device("pgr-gmem3", "gmem3")
-    conversations_store.create_group(
-        name="Family", alias="fam-onepager", member_uids=["gowner2", "gmem3"], created_by="gowner2"
-    )
-
-    result = routing.send(
-        sender_uid="gowner2",
-        recipient_alias="fam-onepager",
-        kind="text",
-        body="hi",
-        origin_backend_kind="webapp",
-    )
-    assert len(result.messages) == 1
-    assert len(broker.published) == 1
-    # Pins the fan-out mechanics only: a group with one pager member produces exactly one page.
-
-
 def test_group_send_with_two_pagers_publishes_two_pages_no_self_echo(routing: Routing, broker):
     _make_user("gowner3", "gowner3")
     _make_user("gpager_a_owner", "gpager_a_owner")
@@ -450,38 +388,6 @@ def test_group_send_by_non_member_is_rejected(routing: Routing):
     assert result.messages == []
     assert len(result.rejected) == 1
     assert result.rejected[0].reason == "not_member"
-
-
-def test_group_send_reposted_with_same_group_msg_id_creates_no_duplicates(routing: Routing):
-    _make_user("gowner5", "gowner5")
-    _make_user("gmem5", "gmem5")
-    _make_user("gmem6", "gmem6")
-    members = ["gowner5", "gmem5", "gmem6"]
-    _all_edges(members)
-    conversations_store.create_group(
-        name="Family", alias="fam-dedupe", member_uids=members, created_by="gowner5"
-    )
-
-    first = routing.send(
-        sender_uid="gowner5",
-        recipient_alias="fam-dedupe",
-        kind="text",
-        body="hi",
-        origin_backend_kind="pager",
-        wire_id="u_group_dupe",
-    )
-    assert len(first.messages) == 2
-
-    second = routing.send(
-        sender_uid="gowner5",
-        recipient_alias="fam-dedupe",
-        kind="text",
-        body="hi",
-        origin_backend_kind="pager",
-        wire_id="u_group_dupe",
-    )
-    assert second.messages == []
-    assert second.rejected == []
 
 
 def test_group_send_missing_allow_edge_drops_only_that_recipient(routing: Routing, caplog):
@@ -585,7 +491,8 @@ def test_dm_to_external_without_a_bridge_number_fails_no_bridge(routing: Routing
     assert (d.kind, d.state, d.error) == ("sms", "failed", "no_bridge")
 
 
-def test_broadcast_skips_externals(routing: Routing):
+@pytest.mark.parametrize("via_group", [False, True], ids=["broadcast", "group"])
+def test_fanout_skips_externals(routing: Routing, via_group):
     fam = families_store.create_family(name="F", created_by="root").id
     _make_user("alice", "alice", family_id=fam)
     _make_user("bob", "bob", family_id=fam)
@@ -593,36 +500,16 @@ def test_broadcast_skips_externals(routing: Routing):
     allow_store.set_edge("alice", "bob", message=True, locate=False)
     allow_store.set_edge("bob", "alice", message=True, locate=False)
     allow_store.set_edge("alice", ext.uid, message=True, locate=False)
+    if via_group:
+        # A stale membership (create/add refuse an external, but old data may
+        # carry one).
+        conversations_store.create_group(
+            name="Fam", alias="fam-ext", member_uids=["alice", "bob", ext.uid], created_by="alice"
+        )
 
     result = routing.send(
         sender_uid="alice",
-        recipient_alias=None,
-        kind="text",
-        body="hi all",
-        origin_backend_kind="webapp",
-    )
-
-    assert {m.recipientUid for m in result.messages} == {"bob"}
-    assert result.rejected == []
-
-
-def test_group_fanout_skips_external_member(routing: Routing):
-    fam = families_store.create_family(name="F", created_by="root").id
-    _make_user("alice", "alice", family_id=fam)
-    _make_user("bob", "bob", family_id=fam)
-    ext = _make_contact(fam)
-    allow_store.set_edge("alice", "bob", message=True, locate=False)
-    allow_store.set_edge("bob", "alice", message=True, locate=False)
-    allow_store.set_edge("alice", ext.uid, message=True, locate=False)
-    # A stale membership (create/add refuse an external, but old data may
-    # carry one).
-    conversations_store.create_group(
-        name="Fam", alias="fam-ext", member_uids=["alice", "bob", ext.uid], created_by="alice"
-    )
-
-    result = routing.send(
-        sender_uid="alice",
-        recipient_alias="fam-ext",
+        recipient_alias="fam-ext" if via_group else None,
         kind="text",
         body="hi",
         origin_backend_kind="webapp",

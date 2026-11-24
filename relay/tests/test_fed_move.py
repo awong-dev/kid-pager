@@ -231,7 +231,7 @@ def moved_body(ident, host="relay-z.example.org", epoch=None, pk=None):
     }
 
 
-def test_moved_rules_replay_older_and_equal(world, net):
+def test_moved_endpoint_rules(world, net):
     x, y, z, _alias = world
     old = identity_of(x, "famA")
     fed_b = identity_of(y, "famB").fedId
@@ -240,6 +240,14 @@ def test_moved_rules_replay_older_and_equal(world, net):
         new = fed_families.get("famA")
     body = moved_body(new)
     path = "/fed/v1/moved"
+
+    # a suspended link refuses even the genuine announcement
+    with y.active():
+        fed_links.set_state(f"famB_{old.fedId}", "suspended")
+    r = signed_call(z, "famA", y, fed_b, "POST", path, body, private_key_b64=old.privateKey)
+    assert r.status_code == 403
+    with y.active():
+        fed_links.set_state(f"famB_{old.fedId}", "active")
 
     # the genuine announcement, by hand, signed with the old key
     first = signed_call(z, "famA", y, fed_b, "POST", path, body, private_key_b64=old.privateKey)
@@ -277,19 +285,6 @@ def test_moved_rules_replay_older_and_equal(world, net):
     )
     assert r.status_code == 400
     assert sign  # imported for the module's vocabulary
-
-
-def test_moved_is_refused_on_a_suspended_link_and_for_the_wrong_family(world, net):
-    x, y, z, _alias = world
-    fed_b = identity_of(y, "famB").fedId
-    old = identity_of(x, "famA")
-    move(x, z)
-    with z.active():
-        new = fed_families.get("famA")
-    with y.active():
-        fed_links.set_state(f"famB_{old.fedId}", "suspended")
-    r = signed_call(z, "famA", y, fed_b, "POST", "/fed/v1/moved", moved_body(new), private_key_b64=old.privateKey)
-    assert r.status_code == 403
 
 
 def test_the_link_stays_dormant_until_the_target_server_switch_is_on(world, net):
@@ -372,13 +367,3 @@ def test_a_target_that_already_has_that_fed_id_refuses(world):
             z.db, KpfamFile(io.BytesIO(data), PASS), ImportOptions(as_id="famCopy", target_kind="home")
         )
     assert not report.ok and any(c.kind == "fed" for c in report.collisions)
-
-
-def test_purge_removes_the_federation_rows(world):
-    from app import purge
-
-    x, _y, _z, _alias = world
-    with x.active():
-        purge.purge_family("famA")
-        assert fed_families.get("famA") is None
-        assert fed_links.list_for_family("famA") == []

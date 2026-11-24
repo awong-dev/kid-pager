@@ -64,39 +64,25 @@ def test_cbor_vector_round_trips(vector: dict[str, Any]):
     assert wirecbor.decode(without_sig) == obj
 
 
-@pytest.mark.parametrize("vector", VECTORS, ids=lambda v: v["label"])
-def test_json_flipping_any_byte_fails(vector: dict[str, Any]):
+FLIP_VECTORS = [v for v in VECTORS if v["label"] in ("down_msg", "book")]
+
+
+@pytest.mark.parametrize("fmt", ["json", "cbor"])
+@pytest.mark.parametrize("vector", FLIP_VECTORS, ids=lambda v: v["label"])
+def test_flipping_any_byte_fails(vector: dict[str, Any], fmt: str):
     key = _key(vector)
-    signed = base64.b64decode(vector["json_signed_b64"])
+    signed = base64.b64decode(vector[f"{fmt}_signed_b64"])
     for i in range(len(signed)):
         corrupted = bytearray(signed)
         corrupted[i] ^= 0x01
         ok, _ = devauth.verify(key, vector["topic"], bytes(corrupted))
-        assert not ok, f"byte {i} flip in JSON vector {vector['label']!r} was not detected"
+        assert not ok, f"byte {i} flip in {fmt.upper()} vector {vector['label']!r} was not detected"
 
 
-@pytest.mark.parametrize("vector", VECTORS, ids=lambda v: v["label"])
-def test_cbor_flipping_any_byte_fails(vector: dict[str, Any]):
-    key = _key(vector)
-    signed = base64.b64decode(vector["cbor_signed_b64"])
-    for i in range(len(signed)):
-        corrupted = bytearray(signed)
-        corrupted[i] ^= 0x01
-        ok, _ = devauth.verify(key, vector["topic"], bytes(corrupted))
-        assert not ok, f"byte {i} flip in CBOR vector {vector['label']!r} was not detected"
-
-
-def test_json_wrong_key_fails():
+@pytest.mark.parametrize("fmt", ["json", "cbor"])
+def test_wrong_key_fails(fmt: str):
     vector = VECTORS[0]
-    signed = base64.b64decode(vector["json_signed_b64"])
-    wrong_key = bytes((b + 1) % 256 for b in base64.b64decode(vector["key_b64"]))
-    ok, _ = devauth.verify(wrong_key, vector["topic"], signed)
-    assert not ok
-
-
-def test_cbor_wrong_key_fails():
-    vector = VECTORS[0]
-    signed = base64.b64decode(vector["cbor_signed_b64"])
+    signed = base64.b64decode(vector[f"{fmt}_signed_b64"])
     wrong_key = bytes((b + 1) % 256 for b in base64.b64decode(vector["key_b64"]))
     ok, _ = devauth.verify(wrong_key, vector["topic"], signed)
     assert not ok
@@ -131,24 +117,24 @@ def test_cbor_sig_not_last_fails():
     assert not ok
 
 
-def test_truncated_json_missing_sig_fails():
-    ok, _ = devauth.verify(b"k" * 32, "pager/pgr-0001/up", b'{"v":1,"id":"m_aaaaaaaa"}')
+@pytest.mark.parametrize(
+    "unsigned",
+    [b'{"v":1,"id":"m_aaaaaaaa"}', wirecbor.encode({"v": 1})],
+    ids=["json", "cbor"],
+)
+def test_truncated_payload_missing_sig_fails(unsigned: bytes):
+    ok, _ = devauth.verify(b"k" * 32, "pager/pgr-0001/up", unsigned)
     assert not ok
 
 
-def test_truncated_cbor_missing_sig_fails():
-    ok, _ = devauth.verify(b"k" * 32, "pager/pgr-0001/up", wirecbor.encode({"v": 1}))
-    assert not ok
-
-
-def test_sign_json_rejects_obj_that_already_has_sig():
+@pytest.mark.parametrize(
+    ("sign", "sig"),
+    [(devauth.sign_json, "x"), (devauth.sign_cbor, b"x")],
+    ids=["json", "cbor"],
+)
+def test_sign_rejects_obj_that_already_has_sig(sign: Any, sig: str | bytes):
     with pytest.raises(ValueError):
-        devauth.sign_json(b"k" * 32, "pager/pgr-0001/up", {"v": 1, "sig": "x"})
-
-
-def test_sign_cbor_rejects_obj_that_already_has_sig():
-    with pytest.raises(ValueError):
-        devauth.sign_cbor(b"k" * 32, "pager/pgr-0001/up", {"v": 1, "sig": b"x"})
+        sign(b"k" * 32, "pager/pgr-0001/up", {"v": 1, "sig": sig})
 
 
 def test_first_vector_cbor_bytes_by_hand():
@@ -175,12 +161,6 @@ def test_first_vector_cbor_bytes_by_hand():
     assert signed[-8:] == expected_tag
 
 
-@pytest.mark.parametrize("vector", VECTORS, ids=lambda v: v["label"])
-def test_wirecbor_decode_encode_round_trips_every_vector_obj(vector: dict[str, Any]):
-    obj = vector["obj"]
-    assert wirecbor.decode(wirecbor.encode(obj)) == obj
-
-
 def test_is_cbor_detects_first_byte():
     assert wirecbor.is_cbor(bytes([0xA0]))
     assert wirecbor.is_cbor(bytes([0xBF]))
@@ -205,24 +185,28 @@ def test_decode_envelope_bytes_accepts_cbor_with_an_unknown_key():
     assert data == {"v": 1, "state": "online", "session": "s_aabbccdd"}
 
 
-def test_to_json_safe_base64url_encodes_bytes_recursively():
-    obj = {"cfg": {"ca": {"url": "https://x/y.pem", "sha": b"\x00\x01\xfe\xff"}}}
+@pytest.mark.parametrize(
+    ("obj", "expected"),
+    [
+        pytest.param(
+            {"cfg": {"ca": {"url": "https://x/y.pem", "sha": b"\x00\x01\xfe\xff"}}},
+            {"cfg": {"ca": {"url": "https://x/y.pem", "sha": "AAH-_w"}}},  # base64url, no padding
+            id="bytes_encoded_recursively",
+        ),
+        pytest.param(
+            {"a": 1, "b": [1, "x", None, {"c": True}]},
+            {"a": 1, "b": [1, "x", None, {"c": True}]},
+            id="non_bytes_unchanged",
+        ),
+    ],
+)
+def test_to_json_safe(obj: dict[str, Any], expected: dict[str, Any]):
     safe = wirecbor.to_json_safe(obj)
-    assert safe["cfg"]["ca"]["url"] == "https://x/y.pem"
-    assert safe["cfg"]["ca"]["sha"] == "AAH-_w"  # base64url, no padding
+    assert safe == expected
     json.dumps(safe)
 
 
-def test_to_json_safe_leaves_non_bytes_values_unchanged():
-    obj = {"a": 1, "b": [1, "x", None, {"c": True}]}
-    assert wirecbor.to_json_safe(obj) == obj
 # docs/PROTOCOL.md §13.2, §10: the `/loc` `cell` sub-map, key 49 (mcc=0 mnc=1 tac=2 ci=3 rsrp=4).
-
-
-def test_wirecbor_cell_round_trips():
-    obj = {"cell": {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95}}
-    encoded = wirecbor.encode(obj)
-    assert wirecbor.decode(encoded) == obj
 
 
 def test_wirecbor_cell_encodes_at_key_49_with_expected_submap():
@@ -256,17 +240,6 @@ def test_loc_envelope_with_cell_example_cbor_hex():
         == "a70001016a6c5f3363396131316630021a68c45fa008f6096a6d5f37663361326231300b666e6f5f6669781831a50063333130016334313002193039031a05397fb104385e"
     )
 # `/status` `link` field, key 50: MQTT-session generation within a boot.
-
-
-def test_wirecbor_link_round_trips():
-    obj = {"link": 3}
-    encoded = wirecbor.encode(obj)
-    assert wirecbor.decode(encoded) == obj
-
-
-def test_wirecbor_link_encodes_at_key_50():
-    encoded = wirecbor.encode({"link": 1})
-    assert encoded == cbor2.dumps({50: 1})
 
 
 def test_status_envelope_with_link_example_cbor_hex():

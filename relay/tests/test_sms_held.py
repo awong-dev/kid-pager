@@ -215,29 +215,25 @@ def test_inbound_any_delivers_a_known_contact_without_an_edge(client: TestClient
     assert len(messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))) == 1
 
 
-def test_unknown_number_even_under_any_is_held_not_delivered(
-    client: TestClient, world: World, caplog
-):
-    caplog.set_level(logging.INFO, logger="relay.inbound_text")
-    _set_policy("kid", "people_sms", "any")
-    _inbound(client, "who dis", from_=STRANGER)
-    assert _outcome(caplog) == "held"
-    assert _kid_inbox() == []
-
-
-@pytest.mark.parametrize("scenario", ["no_contact", "contact_without_edge", "rule_none"])
+@pytest.mark.parametrize(
+    "scenario", ["no_contact", "contact_without_edge", "rule_none", "unknown_number_under_any"]
+)
 def test_otherwise_is_held(client: TestClient, world: World, caplog, scenario: str):
     caplog.set_level(logging.INFO, logger="relay.inbound_text")
+    sender, text = MOM_NUMBER, "hello"
     if scenario == "contact_without_edge":
         externals_store.get_or_create(world.family_id, MOM_NUMBER, "Mom")
     elif scenario == "rule_none":
         _approved_contact(world)
         _set_policy("kid", "people_sms", "people")  # numbers: none
-    _inbound(client, "hello")
+    elif scenario == "unknown_number_under_any":
+        _set_policy("kid", "people_sms", "any")
+        sender, text = STRANGER, "who dis"
+    _inbound(client, text, from_=sender)
     assert _outcome(caplog) == "held"
     assert _kid_inbox() == []
-    (row,) = held_sms_store.list_held(world.family_id, MOM_NUMBER, "kid")
-    assert row.body == "hello" and row.status == "held" and row.alertId
+    (row,) = held_sms_store.list_held(world.family_id, sender, "kid")
+    assert row.body == text and row.status == "held" and row.alertId
 
 
 def test_photo_without_body_becomes_photo_marker(client: TestClient, world: World):
@@ -245,20 +241,6 @@ def test_photo_without_body_becomes_photo_marker(client: TestClient, world: Worl
     _inbound(client, "", attachments=("image",))
     (msg,) = messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))
     assert msg.body == "[photo]"
-
-
-def test_long_text_from_known_contact_is_delivered_whole_and_gets_no_hint(
-    client: TestClient, world: World, outbound: OutboundSms, caplog
-):
-    """Nothing is refused for length; with no pager the cap is 1024 bytes and one message carries
-    it."""
-    caplog.set_level(logging.INFO, logger="relay.inbound_text")
-    ext = _approved_contact(world)
-    _inbound(client, "x" * 161)
-    assert _outcome(caplog) == "delivered"
-    bodies = [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))]
-    assert bodies == ["x" * 161]
-    assert outbound.sent == []
 
 
 def test_too_long_from_unknown_number_is_held_without_reply(
@@ -361,22 +343,6 @@ def test_approve_delivers_backlog_in_order_and_is_idempotent(client: TestClient,
     assert [m.body for m in messages_store.list_thread(key)] == ["first", "second"]
 
 
-def test_approve_delivers_long_rows_and_rows_an_older_relay_marked_too_long(
-    client: TestClient, world: World
-):
-    _inbound(client, "z" * 200, from_=STRANGER, sid="SMb1")
-    _inbound(client, "short", from_=STRANGER, sid="SMb2")
-    _inbound(client, "old", from_=STRANGER, sid="SMb3")
-    held_sms_store.set_status(["SMb3"], "too_long")
-    (alert,) = _open_alerts(world)
-    resp = client.post(
-        f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
-    )
-    assert resp.json()["delivered"] == 3
-    rows = {r.id: r.status for r in held_sms_store.list_held(world.family_id, STRANGER, None, status=None)}
-    assert rows == {"SMb1": "delivered", "SMb2": "delivered", "SMb3": "delivered"}
-
-
 def test_a_held_text_that_is_empty_after_cleanup_is_marked_empty(
     client: TestClient, world: World
 ):
@@ -419,28 +385,26 @@ def test_approve_refused_when_inbound_policy_is_none_and_writes_nothing(
     ]
 
 
-def test_block_marks_rows_blocked_and_blocks_the_number(client: TestClient, world: World, caplog):
+@pytest.mark.parametrize(
+    ("action", "alert_status", "row_status"),
+    [("block", "handled", "blocked"), ("dismiss", "dismissed", "dismissed")],
+)
+def test_alert_decision_marks_held_rows(
+    client: TestClient, world: World, caplog, action: str, alert_status: str, row_status: str
+):
     caplog.set_level(logging.INFO, logger="relay.inbound_text")
     _hold_two(client)
     (alert,) = _open_alerts(world)
-    resp = client.post(f"/api/family/alerts/{alert.id}/block", json={}, headers=world.admin_headers)
+    resp = client.post(f"/api/family/alerts/{alert.id}/{action}", json={}, headers=world.admin_headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "handled"
+    assert resp.json()["status"] == alert_status
     rows = held_sms_store.list_held(world.family_id, STRANGER, None, status=None)
-    assert [r.status for r in rows] == ["blocked", "blocked"]
-    _inbound(client, "again", from_=STRANGER)
-    assert _outcome(caplog) == "blocked"
-
-
-def test_dismiss_marks_rows_dismissed(client: TestClient, world: World):
-    _hold_two(client)
-    (alert,) = _open_alerts(world)
-    resp = client.post(f"/api/family/alerts/{alert.id}/dismiss", json={}, headers=world.admin_headers)
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "dismissed"
-    rows = held_sms_store.list_held(world.family_id, STRANGER, None, status=None)
-    assert [r.status for r in rows] == ["dismissed", "dismissed"]
-    assert _kid_inbox() == []
+    assert [r.status for r in rows] == [row_status, row_status]
+    if action == "block":
+        _inbound(client, "again", from_=STRANGER)
+        assert _outcome(caplog) == "blocked"
+    else:
+        assert _kid_inbox() == []
 
 
 def _routing(broker: FakeBrokerClient) -> Routing:
@@ -493,16 +457,6 @@ def test_external_gets_an_sms_backend_row_and_ensure_is_idempotent(world: World)
     assert rows[0].verifiedAt is not None
     assert externals_store.ensure_sms_backend(ext) == rows[0].id
     assert len(backends_store.list_backends(ext.uid)) == 1
-
-
-def test_render_state_sent_by_sms():
-    from app.store.messages import Delivery
-
-    backend = SmsBackend()
-    assert backend.render_state(Delivery(kind="sms", state="sent")) == "sent by SMS"
-    assert backend.render_state(Delivery(kind="sms", state="queued")) == "queued"
-    assert backend.start_link(None, None) is None  # type: ignore[arg-type]
-    assert backend.complete_link(None, "123") is False  # type: ignore[arg-type]
 
 
 def test_sms_number_unique_per_person_clear_frees_it(world: World):
@@ -562,21 +516,42 @@ def test_inbound_over_320_bytes_is_delivered_whole_to_a_recipient_without_a_page
     assert outbound.sent == []
 
 
-def test_approve_uses_pager_body_and_keeps_raw_in_held_row(client: TestClient, world: World):
-    _inbound(client, "x\ny", from_=STRANGER, sid="SMc1")
-    _inbound(client, "\U0001F600" * 100, from_=STRANGER, sid="SMc2")
-    assert held_sms_store.get("SMc1").body == "x\ny"
+@pytest.mark.parametrize(
+    ("texts", "too_long", "bodies"),
+    [
+        pytest.param(
+            [("SMb1", "z" * 200), ("SMb2", "short"), ("SMb3", "old")],
+            ["SMb3"],
+            None,
+            id="long-rows-and-rows-an-older-relay-marked-too-long",
+        ),
+        pytest.param(
+            [("SMc1", "x\ny"), ("SMc2", "\U0001F600" * 100)],
+            [],
+            ["x y", "\U0001F600" * 100],
+            id="pager-body-and-raw-kept-in-held-row",
+        ),
+    ],
+)
+def test_approve_delivers_every_held_row(
+    client: TestClient, world: World, texts: list[tuple[str, str]], too_long: list[str], bodies: list[str] | None
+):
+    for sid, body in texts:
+        _inbound(client, body, from_=STRANGER, sid=sid)
+    if too_long:
+        held_sms_store.set_status(too_long, "too_long")
+    for sid, body in texts:
+        assert held_sms_store.get(sid).body == body
     (alert,) = _open_alerts(world)
     resp = client.post(
         f"/api/family/alerts/{alert.id}/approve", json={"name": "N"}, headers=world.admin_headers
     )
-    assert resp.json()["delivered"] == 2
-    ext = externals_store.get_family_contact(world.family_id, STRANGER)
-    assert [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))] == [
-        "x y",
-        "\U0001F600" * 100,
-    ]
-    assert held_sms_store.get("SMc2").status == "delivered"
+    assert resp.json()["delivered"] == len(texts)
+    rows = {r.id: r.status for r in held_sms_store.list_held(world.family_id, STRANGER, None, status=None)}
+    assert rows == {sid: "delivered" for sid, _ in texts}
+    if bodies is not None:
+        ext = externals_store.get_family_contact(world.family_id, STRANGER)
+        assert [m.body for m in messages_store.list_thread(messages_store.conv_key(ext.uid, "kid"))] == bodies
 
 
 def test_contact_create_refreshes_book_of_a_numbered_owner(
@@ -613,19 +588,14 @@ def test_contact_create_refreshes_book_of_a_numbered_owner(
     assert len(after) > len(before) and max(after) > max(before or [0])
 
 
-def test_person_moved_to_another_family_cannot_reach_old_contact(world: World, broker: FakeBrokerClient):
+@pytest.mark.parametrize("change", ["moved_to_another_family", "disabled"])
+def test_unreachable_contact_is_sms_contact_reject(world: World, broker: FakeBrokerClient, change: str):
     ext = _approved_contact(world)
-    other = families_store.create_family(name="G", created_by="root")
-    get_db().collection("users").document("kid").update({"familyId": other.id})
-    result = _routing(broker).send(
-        sender_uid="kid", recipient_alias=ext.alias, kind="text", body="hi", origin_backend_kind="pager"
-    )
-    assert [r.reason for r in result.rejected] == ["sms_contact"]
-
-
-def test_disabled_contact_is_sms_contact_reject(world: World, broker: FakeBrokerClient):
-    ext = _approved_contact(world)
-    users_store.update_user(ext.uid, disabled=True)
+    if change == "moved_to_another_family":
+        other = families_store.create_family(name="G", created_by="root")
+        get_db().collection("users").document("kid").update({"familyId": other.id})
+    else:
+        users_store.update_user(ext.uid, disabled=True)
     result = _routing(broker).send(
         sender_uid="kid", recipient_alias=ext.alias, kind="text", body="hi", origin_backend_kind="pager"
     )

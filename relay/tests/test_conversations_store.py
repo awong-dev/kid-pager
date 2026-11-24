@@ -34,30 +34,23 @@ def test_create_group_returns_conversation_with_sorted_members():
     assert conv.convKey.startswith("g_")
 
 
-def test_create_group_alias_collision_raises_already_exists():
+@pytest.mark.parametrize(
+    ("alias", "taken_by_group"),
+    [("dupe-group", True), ("alice2", False)],
+    ids=["group_alias", "user_alias"],
+)
+def test_create_group_alias_collision_raises_already_exists(alias: str, taken_by_group: bool):
+    """The alias namespace is shared: a group cannot take a user's alias, or vice versa."""
     _make_user("alice2", "alice2")
     _make_user("bob2", "bob2")
-    conversations_store.create_group(
-        name="Family", alias="dupe-group", member_uids=["alice2", "bob2"], created_by="alice2"
-    )
-
-    with pytest.raises(AlreadyExists):
+    if taken_by_group:
         conversations_store.create_group(
-            name="Family Again",
-            alias="dupe-group",
-            member_uids=["alice2", "bob2"],
-            created_by="alice2",
+            name="Family", alias=alias, member_uids=["alice2", "bob2"], created_by="alice2"
         )
 
-
-def test_create_group_alias_collides_with_user_alias():
-    """The alias namespace is shared: a group cannot take a user's alias, or vice versa."""
-    _make_user("dave", "dave")
-    _make_user("erin", "erin")
-
     with pytest.raises(AlreadyExists):
         conversations_store.create_group(
-            name="Dave's group", alias="dave", member_uids=["dave", "erin"], created_by="dave"
+            name="Family Again", alias=alias, member_uids=["alice2", "bob2"], created_by="alice2"
         )
 
 
@@ -69,27 +62,11 @@ def test_create_group_requires_two_distinct_members():
         )
 
 
-def test_get_by_alias_roundtrip():
-    _make_user("frank", "frank")
-    _make_user("gina", "gina")
-    created = conversations_store.create_group(
-        name="Fam", alias="famalias", member_uids=["frank", "gina"], created_by="frank"
-    )
-
-    fetched = conversations_store.get_by_alias("famalias")
-    assert fetched is not None
-    assert fetched.convKey == created.convKey
-    assert fetched.kind == "group"
-
-
-def test_get_by_alias_none_for_unknown_alias():
-    assert conversations_store.get_by_alias("nope-does-not-exist") is None
-
-
-def test_get_by_alias_none_for_user_alias():
+@pytest.mark.parametrize("alias", ["nope-does-not-exist", "harry"], ids=["unknown_alias", "user_alias"])
+def test_get_by_alias_none_for_a_non_group_alias(alias: str):
     """A user's `aliases/{alias}` doc has `uid`, not `convKey`: the group lookup ignores it."""
     _make_user("harry", "harry")
-    assert conversations_store.get_by_alias("harry") is None
+    assert conversations_store.get_by_alias(alias) is None
 
 
 def test_add_member_then_remove_member():
@@ -117,24 +94,6 @@ def test_add_member_then_remove_member():
 def test_add_member_unknown_conversation_raises_key_error():
     with pytest.raises(KeyError):
         conversations_store.add_member("g_doesnotexist", "someone")
-
-
-def test_dm_create_message_output_unchanged_field_for_field():
-    """With no group keyword argument every field is what a DM call produces, `groupMsgId` and
-    `senderAlias` being `None`."""
-    msg = messages_store.create_message(
-        sender_uid="mom", recipient_uid="kid", kind="text", ts=1000, body="hi"
-    )
-    assert msg is not None
-    assert msg.convKey == messages_store.conv_key("mom", "kid")
-    assert msg.uids == sorted(["mom", "kid"])
-    assert msg.groupMsgId is None
-    assert msg.senderAlias is None
-
-    conv = messages_store.get_conversation(msg.convKey)
-    assert conv is not None
-    assert conv.kind == "dm"
-    assert conv.uids == sorted(["mom", "kid"])
 
 
 def test_group_copies_share_one_seq_and_group_msg_id():
@@ -194,10 +153,9 @@ def test_group_copies_share_one_seq_and_group_msg_id():
     assert "owner1" not in conv_after.unread
 
 
-def test_create_group_carries_family_ids_of_every_member():
-    _make_user("g_fam_a", "g_fam_a", family_id="fam_a")
-    _make_user("g_fam_b", "g_fam_b", family_id="fam_b")
-    _make_user("g_fam_c", "g_fam_c", family_id="fam_c")
+def test_group_family_ids_and_participants_follow_create_join_and_leave():
+    for suffix in "abcd":
+        _make_user(f"g_fam_{suffix}", f"g_fam_{suffix}", family_id=f"fam_{suffix}")
 
     conv = conversations_store.create_group(
         name="Three families",
@@ -205,35 +163,15 @@ def test_create_group_carries_family_ids_of_every_member():
         member_uids=["g_fam_a", "g_fam_b", "g_fam_c"],
         created_by="g_fam_a",
     )
-
     assert conv.familyIds == ["fam_a", "fam_b", "fam_c"]
     assert set(conv.participants) == {"g_fam_a", "g_fam_b", "g_fam_c"}
     assert conv.participants["g_fam_b"].alias == "g_fam_b"
 
+    joined = conversations_store.add_member(conv.convKey, "g_fam_d")
+    assert joined.familyIds == ["fam_a", "fam_b", "fam_c", "fam_d"]
+    assert "g_fam_d" in joined.participants
+    assert joined.participants["g_fam_d"].alias == "g_fam_d"
 
-def test_add_member_adds_the_new_members_family_and_participant_entry():
-    _make_user("j_fam_a", "j_fam_a", family_id="fam_a")
-    _make_user("j_fam_b", "j_fam_b", family_id="fam_b")
-    _make_user("j_fam_d", "j_fam_d", family_id="fam_d")
-
-    conv = conversations_store.create_group(
-        name="Pair", alias="join-pair", member_uids=["j_fam_a", "j_fam_b"], created_by="j_fam_a"
-    )
-    assert conv.familyIds == ["fam_a", "fam_b"]
-
-    joined = conversations_store.add_member(conv.convKey, "j_fam_d")
-    assert joined.familyIds == ["fam_a", "fam_b", "fam_d"]
-    assert "j_fam_d" in joined.participants
-    assert joined.participants["j_fam_d"].alias == "j_fam_d"
-
-
-def test_remove_member_drops_participant_entry():
-    _make_user("l_fam_a", "l_fam_a", family_id="fam_a")
-    _make_user("l_fam_b", "l_fam_b", family_id="fam_b")
-
-    conv = conversations_store.create_group(
-        name="Pair", alias="leave-pair", member_uids=["l_fam_a", "l_fam_b"], created_by="l_fam_a"
-    )
-    left = conversations_store.remove_member(conv.convKey, "l_fam_b")
-    assert left.familyIds == ["fam_a"]
-    assert "l_fam_b" not in left.participants
+    left = conversations_store.remove_member(conv.convKey, "g_fam_b")
+    assert left.familyIds == ["fam_a", "fam_c", "fam_d"]
+    assert "g_fam_b" not in left.participants

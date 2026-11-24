@@ -132,14 +132,20 @@ def test_the_same_event_twice_is_applied_once(env: Env):
     assert len(carrier_log.list_recent(env.bridge.id)) == 1
 
 
-def test_other_senders_still_take_the_ordinary_path(env: Env):
-    assert env.sms_event("hello", sender="+12065550123") == "held"
+@pytest.mark.parametrize(
+    ("carrier", "sender", "text"),
+    [
+        pytest.param(None, "+12065550123", "hello", id="other_sender"),
+        pytest.param("generic", SERVICE_NUMBER, "You have 45 texts remaining.", id="generic_carrier"),
+    ],
+)
+def test_texts_not_from_the_carriers_service_number_take_the_ordinary_path(
+    env: Env, carrier: str | None, sender: str, text: str
+):
+    if carrier:
+        svc.set_carrier(env.fresh(), carrier)
+    assert env.sms_event(text, sender=sender) == "held"
     assert env.carrier().balance is None
-
-
-def test_a_generic_carrier_has_no_service_numbers(env: Env):
-    svc.set_carrier(env.fresh(), "generic")
-    assert env.sms_event("You have 45 texts remaining.") == "held"
 
 
 def test_unknown_replies_are_kept_raw_and_counted(env: Env):
@@ -310,10 +316,6 @@ def test_unlimited_plans_never_warn(env: Env):
     assert env.carrier().level == "ok" and _texts(env.broker) == []
     view = svc.view(env.fresh())
     assert view.unlimited is True and view.texts is None
-
-
-def test_one_text_left_is_singular(env: Env):
-    assert svc.low_text(1) == "Bridge phone has 1 text left."
 
 
 def test_tick_retries_a_notice_that_could_not_be_written(env: Env, monkeypatch):

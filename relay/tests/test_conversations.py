@@ -111,40 +111,30 @@ def test_send_message_success_returns_201_with_id(client: TestClient):
     assert msg.body == "pickup at 3"
 
 
-def test_send_message_unknown_alias_is_404(client: TestClient):
-    mom_headers = _make_user("mom2", "mom2")
-    resp = client.post(
-        "/api/conversations/ghost/messages", json={"body": "hi"}, headers=mom_headers
-    )
-    assert resp.status_code == 404
+@pytest.mark.parametrize(
+    ("recipient", "edge", "alias", "body", "authed", "status"),
+    [
+        pytest.param(False, False, "ghost", "hi", True, 404, id="unknown_alias"),
+        pytest.param(True, False, "kid3", "hi", True, 403, id="disallowed_recipient"),
+        pytest.param(True, True, "kid3", "\x00\x01", True, 400, id="empty_body_after_strip"),
+        pytest.param(False, False, "kid", "hi", False, 401, id="requires_auth"),
+    ],
+)
+def test_send_message_refusals(
+    client: TestClient, recipient: bool, edge: bool, alias: str, body: str, authed: bool, status: int
+):
+    headers = _make_user("mom3", "mom3") if authed else {}
+    if recipient:
+        _make_user("kid3", "kid3")
+    if edge:
+        allow_store.set_edge("mom3", "kid3", message=True, locate=True)
+
+    resp = client.post(f"/api/conversations/{alias}/messages", json={"body": body}, headers=headers)
+
+    assert resp.status_code == status
 
 
-def test_send_message_disallowed_recipient_is_403(client: TestClient):
-    mom_headers = _make_user("mom3", "mom3")
-    _make_user("kid3", "kid3")
-    # No allow edge.
-    resp = client.post(
-        "/api/conversations/kid3/messages", json={"body": "hi"}, headers=mom_headers
-    )
-    assert resp.status_code == 403
-
-
-def test_send_message_empty_body_after_strip_is_400(client: TestClient):
-    mom_headers = _make_user("mom4", "mom4")
-    _make_user("kid4", "kid4")
-    allow_store.set_edge("mom4", "kid4", message=True, locate=True)
-    resp = client.post(
-        "/api/conversations/kid4/messages", json={"body": "\x00\x01"}, headers=mom_headers
-    )
-    assert resp.status_code == 400
-
-
-def test_send_message_requires_auth(client: TestClient):
-    resp = client.post("/api/conversations/kid/messages", json={"body": "hi"})
-    assert resp.status_code == 401
-
-
-def test_mark_read_sets_webapp_delivery_to_read(client: TestClient):
+def test_mark_read_sets_webapp_delivery_to_read_and_clears_unread_for_the_recipient(client: TestClient):
     mom_headers = _make_user("mom5", "mom5")
     kid_headers = _make_user("kid5", "kid5")
     allow_store.set_edge("mom5", "kid5", message=True, locate=True)
@@ -155,6 +145,11 @@ def test_mark_read_sets_webapp_delivery_to_read(client: TestClient):
     )
     msg_id = resp.json()["id"]
 
+    conv_key = messages_store.conv_key("mom5", "kid5")
+    conv_before = messages_store.get_conversation(conv_key)
+    assert conv_before is not None
+    assert conv_before.unread["kid5"] == 1
+
     # {alias} names the other party: kid5 (the recipient) posts to the conversation with mom5.
     read_resp = client.post(
         f"/api/conversations/mom5/messages/{msg_id}/read", headers=kid_headers
@@ -164,39 +159,25 @@ def test_mark_read_sets_webapp_delivery_to_read(client: TestClient):
     msg = messages_store.get_message(msg_id)
     webapp_bid = next(bid for bid, d in msg.deliveries.items() if d.kind == "webapp")
     assert msg.deliveries[webapp_bid].state == "read"
-
-
-def test_mark_read_clears_conversation_unread_for_recipient(client: TestClient):
-    mom_headers = _make_user("mom5b", "mom5b")
-    kid_headers = _make_user("kid5b", "kid5b")
-    allow_store.set_edge("mom5b", "kid5b", message=True, locate=True)
-    allow_store.set_edge("kid5b", "mom5b", message=True, locate=True)
-
-    resp = client.post(
-        "/api/conversations/kid5b/messages", json={"body": "hi"}, headers=mom_headers
-    )
-    msg_id = resp.json()["id"]
-
-    conv_key = messages_store.conv_key("mom5b", "kid5b")
-    conv_before = messages_store.get_conversation(conv_key)
-    assert conv_before is not None
-    assert conv_before.unread["kid5b"] == 1
-
-    read_resp = client.post(
-        f"/api/conversations/mom5b/messages/{msg_id}/read", headers=kid_headers
-    )
-    assert read_resp.status_code == 200, read_resp.text
-
     conv_after = messages_store.get_conversation(conv_key)
     assert conv_after is not None
-    assert conv_after.unread["kid5b"] == 0
+    assert conv_after.unread["kid5"] == 0
 
 
-def test_mark_read_mismatched_alias_is_404(client: TestClient):
+@pytest.mark.parametrize(
+    ("alias", "reader"),
+    [
+        pytest.param("other5c", "kid", id="mismatched_alias"),
+        pytest.param("kid5c", "stranger", id="non_recipient"),
+    ],
+)
+def test_mark_read_by_the_wrong_alias_or_a_non_recipient_is_404(
+    client: TestClient, alias: str, reader: str
+):
     """The `{alias}` path segment must name this message's conversation; a read against another
-    alias must not succeed."""
+    alias, or by someone who is not the recipient, must not succeed."""
     mom_headers = _make_user("mom5c", "mom5c")
-    kid_headers = _make_user("kid5c", "kid5c")
+    readers = {"kid": _make_user("kid5c", "kid5c"), "stranger": _make_user("stranger5c", "stranger5c")}
     _make_user("other5c", "other5c")
     allow_store.set_edge("mom5c", "kid5c", message=True, locate=True)
     allow_store.set_edge("kid5c", "mom5c", message=True, locate=True)
@@ -208,33 +189,14 @@ def test_mark_read_mismatched_alias_is_404(client: TestClient):
     )
     msg_id = resp.json()["id"]
 
-    # kid5c is the recipient but names the wrong conversation.
     read_resp = client.post(
-        f"/api/conversations/other5c/messages/{msg_id}/read", headers=kid_headers
+        f"/api/conversations/{alias}/messages/{msg_id}/read", headers=readers[reader]
     )
     assert read_resp.status_code == 404
 
     msg = messages_store.get_message(msg_id)
     webapp_bid = next(bid for bid, d in msg.deliveries.items() if d.kind == "webapp")
     assert msg.deliveries[webapp_bid].state != "read"
-
-
-def test_mark_read_by_non_recipient_is_404(client: TestClient):
-    mom_headers = _make_user("mom6", "mom6")
-    _make_user("kid6", "kid6")
-    stranger_headers = _make_user("stranger6", "stranger6")
-    allow_store.set_edge("mom6", "kid6", message=True, locate=True)
-    allow_store.set_edge("kid6", "mom6", message=True, locate=True)
-
-    resp = client.post(
-        "/api/conversations/kid6/messages", json={"body": "hi"}, headers=mom_headers
-    )
-    msg_id = resp.json()["id"]
-
-    read_resp = client.post(
-        f"/api/conversations/kid6/messages/{msg_id}/read", headers=stranger_headers
-    )
-    assert read_resp.status_code == 404
 
 
 def _make_pager_device(device_id: str, owner_uid: str):
@@ -265,39 +227,53 @@ def test_locate_success_returns_202_with_request_id(client: TestClient):
     assert body["cached"] is False
 
 
-def test_locate_unknown_alias_is_404(client: TestClient):
-    mom_headers = _make_user("mom8", "mom8")
-    resp = client.post("/api/conversations/nobody/locate", headers=mom_headers)
-    assert resp.status_code == 404
+@pytest.mark.parametrize("case", ["edge_denies_locate", "no_allow_edge_at_all", "other_familys_admin"])
+def test_locate_without_permission_is_403(client: TestClient, case: str):
+    if case == "other_familys_admin":
+        family_a = families_store.create_family(name="loc-fam-b1", created_by="root-uid")
+        family_b = families_store.create_family(name="loc-fam-b2", created_by="root-uid")
+        headers = _make_family_admin_in("locadm2", "locadm2", family_a.id)
+        _make_family_member_in("lockid2", "lockid2", family_b.id)
+        _make_pager_device("pgr-conv-fam-2", "lockid2")
+        target = "lockid2"
+    else:
+        headers = _make_user("mom9", "mom9")
+        _make_user("kid9", "kid9")
+        target = "kid9"
+        if case == "edge_denies_locate":
+            # message allowed, locate explicitly denied.
+            allow_store.set_edge("mom9", "kid9", message=True, locate=False)
+            _make_pager_device("pgr-conv-2", "kid9")
 
+    resp = client.post(f"/api/conversations/{target}/locate", headers=headers)
 
-def test_locate_without_locate_permission_is_403(client: TestClient):
-    mom_headers = _make_user("mom9", "mom9")
-    _make_user("kid9", "kid9")
-    # message allowed, locate explicitly denied.
-    allow_store.set_edge("mom9", "kid9", message=True, locate=False)
-    _make_pager_device("pgr-conv-2", "kid9")
-
-    resp = client.post("/api/conversations/kid9/locate", headers=mom_headers)
     assert resp.status_code == 403
 
 
-def test_locate_no_allow_edge_at_all_is_403(client: TestClient):
-    mom_headers = _make_user("mom10", "mom10")
-    _make_user("kid10", "kid10")
+@pytest.mark.parametrize(
+    ("case", "status"),
+    [
+        pytest.param("unknown_alias", 404, id="unknown_alias"),
+        pytest.param("target_without_device", 409, id="target_without_device"),
+        pytest.param("owner_without_device_locating_self", 409, id="owner_without_device_locating_self"),
+        pytest.param("no_auth", 401, id="requires_auth"),
+    ],
+)
+def test_locate_refusals_other_than_403(client: TestClient, case: str, status: int):
+    headers = {} if case == "no_auth" else _make_user("mom11", "mom11")
+    target = "nobody"
+    if case == "target_without_device":
+        _make_user("kid11", "kid11")
+        allow_store.set_edge("mom11", "kid11", message=True, locate=True)
+        target = "kid11"
+    elif case == "owner_without_device_locating_self":
+        target = "mom11"
+    elif case == "no_auth":
+        target = "kid7"
 
-    resp = client.post("/api/conversations/kid10/locate", headers=mom_headers)
-    assert resp.status_code == 403
+    resp = client.post(f"/api/conversations/{target}/locate", headers=headers)
 
-
-def test_locate_target_with_no_device_is_409(client: TestClient):
-    mom_headers = _make_user("mom11", "mom11")
-    _make_user("kid11", "kid11")
-    allow_store.set_edge("mom11", "kid11", message=True, locate=True)
-    # kid11 owns no device at all.
-
-    resp = client.post("/api/conversations/kid11/locate", headers=mom_headers)
-    assert resp.status_code == 409
+    assert resp.status_code == status
 
 
 def test_owner_can_locate_own_device_without_allow_edge(client: TestClient):
@@ -337,29 +313,6 @@ def test_family_admin_can_locate_family_members_device_without_edge(client: Test
 
     resp = client.post("/api/conversations/lockid1/locate", headers=admin_headers)
     assert resp.status_code == 202, resp.text
-
-
-def test_family_admin_cannot_locate_other_familys_device(client: TestClient):
-    """Same as above, but the target is in a different family."""
-    family_a = families_store.create_family(name="loc-fam-b1", created_by="root-uid")
-    family_b = families_store.create_family(name="loc-fam-b2", created_by="root-uid")
-    admin_headers = _make_family_admin_in("locadm2", "locadm2", family_a.id)
-    _make_family_member_in("lockid2", "lockid2", family_b.id)
-    _make_pager_device("pgr-conv-fam-2", "lockid2")
-
-    resp = client.post("/api/conversations/lockid2/locate", headers=admin_headers)
-    assert resp.status_code == 403
-
-
-def test_owner_with_no_device_locating_self_is_409(client: TestClient):
-    kid_headers = _make_user("kid14", "kid14")
-    resp = client.post("/api/conversations/kid14/locate", headers=kid_headers)
-    assert resp.status_code == 409
-
-
-def test_locate_requires_auth(client: TestClient):
-    resp = client.post("/api/conversations/kid7/locate")
-    assert resp.status_code == 401
 
 
 def test_send_group_message_and_mark_read(client: TestClient):
@@ -444,6 +397,8 @@ def test_add_member_then_leave(client: TestClient):
     assert "gapi-newmem" in add_resp.json()["uids"]
     assert allow_store.is_message_allowed("gapi-newmem", "gapi-admin7")
     assert allow_store.is_message_allowed("gapi-admin7", "gapi-newmem")
+    edge = allow_store.get_edge("gapi-newmem", "gapi-admin7")
+    assert edge is not None and edge.message is True and edge.locate is False
 
     leave_resp = client.delete("/api/conversations/gapi-fam7/members/me", headers=kid_headers)
     assert leave_resp.status_code == 200, leave_resp.text
@@ -479,37 +434,6 @@ def test_add_member_by_non_member_is_403(client: TestClient):
         headers=outsider_headers,
     )
     assert resp.status_code == 403
-
-
-def test_add_member_writes_message_edge_only_not_locate(client: TestClient):
-    """Group join has no mutual-`locate` side effect: only `message`, both ways."""
-    family = families_store.create_family(name="gapi-fam8b-family", created_by="root-uid")
-    admin_headers = _make_family_admin_in("gapi-admin8b", "gapi-admin8b", family.id)
-    _make_family_member_in("gapi-kid9b", "gapi-kid9b", family.id)
-    _make_user("gapi-newmem8b", "gapi-newmem8b")
-
-    created = client.post(
-        "/api/family/groups",
-        json={
-            "name": "Family",
-            "alias": "gapi-fam8b",
-            "memberUids": ["gapi-admin8b", "gapi-kid9b"],
-        },
-        headers=admin_headers,
-    )
-    assert created.status_code == 201, created.text
-
-    resp = client.post(
-        "/api/conversations/gapi-fam8b/members",
-        json={"uid": "gapi-newmem8b"},
-        headers=admin_headers,
-    )
-    assert resp.status_code == 200, resp.text
-
-    edge = allow_store.get_edge("gapi-newmem8b", "gapi-admin8b")
-    assert edge is not None
-    assert edge.message is True
-    assert edge.locate is False
 
 
 def test_add_member_pushes_book_to_new_pager_member(client: TestClient):

@@ -355,7 +355,9 @@ def test_other_collisions_abort(tmp_path, src_db):
     assert not rep.ok
 
 
-def test_message_order_and_group_copies_survive(tmp_path, src_db):
+def test_seq_block_keeps_message_order_and_group_copies_and_creates_meta_on_an_empty_target(
+    tmp_path, src_db
+):
     dst = make_store(
         "sqlite",
         tmp_path,
@@ -368,9 +370,7 @@ def test_message_order_and_group_copies_survive(tmp_path, src_db):
     assert seq == {"m1": 101, "m2": 102, "m3": 102}  # old 5 < 6 == 6; sharing kept
     assert got["settings/meta"]["seqCounter"] == 102
 
-
-def test_seq_block_on_an_empty_target_creates_meta(tmp_path, src_db):
-    dst = make_store("sqlite", tmp_path, "d")
+    dst = make_store("sqlite", tmp_path, "d2")
     familyexport.apply_import(dst, bundle(src_db), HOME, RecordingAuth())
     got = dump(dst)
     assert got["settings/meta"]["seqCounter"] == 2 and got["messages/m1"]["seq"] == 1

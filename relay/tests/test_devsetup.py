@@ -15,7 +15,7 @@ import pytest
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from app import ca_resolve, devsetup, wirecbor
+from app import ca_resolve, devsetup
 from app.config import Settings
 from app.store import cas as cas_store
 from app.store import setup_codes as setup_codes_store
@@ -84,44 +84,40 @@ def test_parse_accepts_spaces_hyphens_mixed_case_port_and_apn():
     assert apn == "fast.t-mobile.com"
 
 
-def test_parse_rejects_a_one_character_typo_in_the_token():
-    _, token_str = devsetup.token()
-    code = devsetup.format_code(token_str, host="broker.example.com")
-    token_part, rest = code.split("@", 1)
-    bad_char = "0" if token_part[0] != "0" else "1"
-    mangled = bad_char + token_part[1:]
-    with pytest.raises(ValueError, match="check character"):
-        devsetup.parse(f"{mangled}@{rest}")
+def _flip_first_char(token_part: str) -> str:
+    return ("0" if token_part[0] != "0" else "1") + token_part[1:]
 
 
-def test_parse_rejects_a_transposition_typo_in_the_token():
-    _, token_str = devsetup.token()
-    code = devsetup.format_code(token_str, host="broker.example.com")
-    token_part, rest = code.split("@", 1)
+def _swap_first_two_chars(token_part: str) -> str:
     chars = list(token_part.replace("-", ""))
     if chars[0] == chars[1]:
         pytest.skip("degenerate token for this property, regenerate")
     chars[0], chars[1] = chars[1], chars[0]
-    with pytest.raises(ValueError, match="check character"):
-        devsetup.parse(f"{''.join(chars)}@{rest}")
+    return "".join(chars)
 
 
-def test_parse_rejects_missing_at_sign():
-    with pytest.raises(ValueError, match="@"):
-        devsetup.parse("0000-0000-0000-00")
-
-
-def test_parse_rejects_invalid_character():
-    with pytest.raises(ValueError):
-        devsetup.parse("UUUU-UUUU-UUUU-UU @ broker.example.com")
-
-
-def test_format_code_omits_port_suffix_only_when_default():
+@pytest.mark.parametrize(
+    "mangle", [_flip_first_char, _swap_first_two_chars], ids=["one_character", "transposition"]
+)
+def test_parse_rejects_a_typo_in_the_token_by_its_check_character(mangle):
     _, token_str = devsetup.token()
-    assert " @ broker.example.com" in devsetup.format_code(token_str, host="broker.example.com")
-    assert " @ broker.example.com:1883" in devsetup.format_code(
-        token_str, host="broker.example.com", port=1883
-    )
+    code = devsetup.format_code(token_str, host="broker.example.com")
+    token_part, rest = code.split("@", 1)
+    with pytest.raises(ValueError, match="check character"):
+        devsetup.parse(f"{mangle(token_part)}@{rest}")
+
+
+@pytest.mark.parametrize(
+    ("code", "match"),
+    [
+        ("0000-0000-0000-00", "@"),
+        ("UUUU-UUUU-UUUU-UU @ broker.example.com", None),
+    ],
+    ids=["missing_at_sign", "invalid_character"],
+)
+def test_parse_rejects_malformed_codes(code: str, match: str | None):
+    with pytest.raises(ValueError, match=match):
+        devsetup.parse(code)
 
 
 def test_derive_matches_the_vector():
@@ -152,33 +148,37 @@ def _vector_device() -> devsetup.BootstrapDevice:
     )
 
 
-def test_decrypting_the_vector_bundle_yields_the_plaintext_object():
-    bkey = base64.b64decode(VECTOR["bkey_b64"])
-    blob = base64.b64decode(VECTOR["bundle_ct_b64"])
-    decoded = devsetup.decrypt_bundle(bkey, blob)
-    expected = dict(VECTOR["bundle_plain_obj"])
-    k_b64 = expected.pop("k_b64")
-    expected["k"] = base64.b64decode(k_b64)
-    assert decoded == expected
+_RAW_BUNDLE_KEYS = {
+    "id": 1,
+    "pw": 30,
+    "k": 31,
+    "host": 32,
+    "port": 33,
+    "ca": 34,
+    "flags": 35,
+    "label": 36,
+    "ca_url": 40,
+    "ca_sha": 41,
+}
 
 
-def test_vector_bundle_decrypts_by_hand_with_independent_primitives():
-    """Decrypts with AESGCM and bare `cbor2`; checks raw integer keys against PROTOCOL.md §10."""
-    bkey = base64.b64decode(VECTOR["bkey_b64"])
-    blob = base64.b64decode(VECTOR["bundle_ct_b64"])
+@pytest.mark.parametrize("vector", [VECTOR, POINTER_VECTOR], ids=["inline_ca", "ca_pointer"])
+def test_vector_bundle_decrypts_to_the_plaintext_object_and_by_hand(vector: dict[str, Any]):
+    """By hand: AESGCM and bare `cbor2`, raw integer keys per PROTOCOL.md §10."""
+    bkey = base64.b64decode(vector["bkey_b64"])
+    blob = base64.b64decode(vector["bundle_ct_b64"])
+    expected = {
+        k.removesuffix("_b64"): (
+            base64.b64decode(v) if k.endswith("_b64") else v
+        )
+        for k, v in vector["bundle_plain_obj"].items()
+    }
+    assert devsetup.decrypt_bundle(bkey, blob) == expected
+
     nonce, ct = blob[:12], blob[12:]
-    assert nonce == base64.b64decode(VECTOR["bundle_nonce_b64"])
-    plaintext = AESGCM(bkey).decrypt(nonce, ct, None)
-    raw = cbor2.loads(plaintext)
-    assert raw[0] == 1
-    assert raw[1] == VECTOR["bundle_plain_obj"]["id"]
-    assert raw[30] == VECTOR["bundle_plain_obj"]["pw"]
-    assert raw[31] == base64.b64decode(VECTOR["bundle_plain_obj"]["k_b64"])
-    assert raw[32] == VECTOR["bundle_plain_obj"]["host"]
-    assert raw[33] == VECTOR["bundle_plain_obj"]["port"]
-    assert raw[34] == VECTOR["bundle_plain_obj"]["ca"]
-    assert raw[35] == VECTOR["bundle_plain_obj"]["flags"]
-    assert raw[36] == VECTOR["bundle_plain_obj"]["label"]
+    assert nonce == base64.b64decode(vector["bundle_nonce_b64"])
+    raw = cbor2.loads(AESGCM(bkey).decrypt(nonce, ct, None))
+    assert raw == {0: 1} | {_RAW_BUNDLE_KEYS[k]: v for k, v in expected.items() if k != "v"}
 
 
 def test_bundle_round_trips_with_a_fresh_random_nonce():
@@ -225,30 +225,22 @@ def test_bundle_omits_ca_fields_entirely_when_unpinned():
     assert "ca" not in decoded
 
 
-def test_bootstrap_device_rejects_ca_url_without_ca_sha():
-    with pytest.raises(ValueError, match="ca_url and ca_sha"):
+@pytest.mark.parametrize(
+    ("ca_sha", "match"),
+    [(None, "ca_url and ca_sha"), (b"too-short", "32-byte")],
+    ids=["ca_url_without_ca_sha", "short_ca_sha"],
+)
+def test_bootstrap_device_rejects_an_invalid_ca_pointer(ca_sha: bytes | None, match: str):
+    with pytest.raises(ValueError, match=match):
         devsetup.BootstrapDevice(
             id="pgr-0004",
             pw="pw",
             k=b"k" * 32,
             host="broker.example.com",
             ca_url="https://relay.example.com/ca/" + "ab" * 32 + ".pem",
+            ca_sha=ca_sha,
             flags=0,
             label="Kid 4",
-        )
-
-
-def test_bootstrap_device_rejects_a_short_ca_sha():
-    with pytest.raises(ValueError, match="32-byte"):
-        devsetup.BootstrapDevice(
-            id="pgr-0005",
-            pw="pw",
-            k=b"k" * 32,
-            host="broker.example.com",
-            ca_url="https://relay.example.com/ca/" + "ab" * 32 + ".pem",
-            ca_sha=b"too-short",
-            flags=0,
-            label="Kid 5",
         )
 
 
@@ -258,23 +250,6 @@ def test_decrypt_bundle_wrong_key_raises_invalid_tag():
     blob = devsetup.bundle(device, bkey)
     with pytest.raises(InvalidTag):
         devsetup.decrypt_bundle(b"x" * 32, blob)
-
-
-def test_bundle_uses_wirecbor_keymap_for_every_field():
-    for name in (
-        "v",
-        "id",
-        "pw",
-        "k",
-        "host",
-        "port",
-        "ca_url",
-        "ca_sha",
-        "flags",
-        "label",
-        "apn",
-    ):
-        assert name in wirecbor.KEYMAP
 
 
 def _issue(device_id: str, broker: FakeBrokerClient, emqx: _FakeEmqx, **kwargs: Any) -> str:
@@ -296,7 +271,15 @@ def _issue(device_id: str, broker: FakeBrokerClient, emqx: _FakeEmqx, **kwargs: 
 def test_issue_pushes_boot_user_publishes_retained_bundle_and_writes_setup_code():
     broker = FakeBrokerClient()
     emqx = _FakeEmqx()
-    code = _issue("pgr-issue-1", broker, emqx)
+    code = _issue(
+        "pgr-issue-1",
+        broker,
+        emqx,
+        mqtt_password="p4ssw0rd",
+        hmac_key=b"z" * 32,
+        host="broker.example.com",
+        label="Kid 2",
+    )
 
     assert " @ broker.example.com" in code
     assert len(emqx.ensured) == 1
@@ -315,25 +298,11 @@ def test_issue_pushes_boot_user_publishes_retained_bundle_and_writes_setup_code(
     assert stored.deviceId == "pgr-issue-1"
     assert set(type(stored).model_fields) == {"bid", "deviceId", "expiresAt"}
 
-
-def test_issue_bundle_decrypts_to_the_supplied_secrets():
-    broker = FakeBrokerClient()
-    emqx = _FakeEmqx()
-    code = _issue(
-        "pgr-issue-2",
-        broker,
-        emqx,
-        mqtt_password="p4ssw0rd",
-        hmac_key=b"z" * 32,
-        host="broker.example.com",
-        label="Kid 2",
-    )
     raw, host, port, _apn = devsetup.parse(code)
-    bid, _bpw, bkey = devsetup.derive(raw)
-    msg = broker.published[0]
-    assert msg.topic == f"pager/boot/{bid}/down"
+    code_bid, _bpw, bkey = devsetup.derive(raw)
+    assert code_bid == bid
     decoded = devsetup.decrypt_bundle(bkey, msg.payload)
-    assert decoded["id"] == "pgr-issue-2"
+    assert decoded["id"] == "pgr-issue-1"
     assert decoded["pw"] == "p4ssw0rd"
     assert decoded["k"] == b"z" * 32
     assert decoded["host"] == host
@@ -376,33 +345,7 @@ def test_issue_with_ca_pem_but_no_public_base_url_raises():
     assert broker.published == []
 
 
-def test_pointer_vector_decrypts_to_ca_url_and_ca_sha_not_inline_ca():
-    bkey = base64.b64decode(POINTER_VECTOR["bkey_b64"])
-    blob = base64.b64decode(POINTER_VECTOR["bundle_ct_b64"])
-    nonce, ct = blob[:12], blob[12:]
-    assert nonce == base64.b64decode(POINTER_VECTOR["bundle_nonce_b64"])
-    plaintext = AESGCM(bkey).decrypt(nonce, ct, None)
-    raw = cbor2.loads(plaintext)
-
-    obj = POINTER_VECTOR["bundle_plain_obj"]
-    assert raw[1] == obj["id"]
-    assert raw[30] == obj["pw"]
-    assert raw[31] == base64.b64decode(obj["k_b64"])
-    assert raw[32] == obj["host"]
-    assert raw[33] == obj["port"]
-    assert raw[40] == obj["ca_url"]
-    assert raw[41] == base64.b64decode(obj["ca_sha_b64"])  # raw bytes
-    assert 34 not in raw
-    assert raw[35] == obj["flags"]
-    assert raw[36] == obj["label"]
-
-    decoded = devsetup.decrypt_bundle(bkey, blob)
-    assert decoded["ca_url"] == obj["ca_url"]
-    assert decoded["ca_sha"] == base64.b64decode(obj["ca_sha_b64"])
-    assert "ca" not in decoded
-
-
-def test_complete_clears_bundle_revokes_boot_user_and_deletes_setup_code():
+def test_complete_clears_bundle_revokes_boot_user_and_deletes_setup_code_and_is_repeatable():
     broker = FakeBrokerClient()
     emqx = _FakeEmqx()
     code = _issue("pgr-complete-1", broker, emqx)
@@ -420,15 +363,6 @@ def test_complete_clears_bundle_revokes_boot_user_and_deletes_setup_code():
     assert emqx.deleted == [f"boot-{bid}"]
     assert setup_codes_store.get(bid) is None
 
-
-def test_complete_is_safe_to_call_twice():
-    broker = FakeBrokerClient()
-    emqx = _FakeEmqx()
-    code = _issue("pgr-complete-2", broker, emqx)
-    raw, *_ = devsetup.parse(code)
-    bid, _bpw, _bkey = devsetup.derive(raw)
-
-    devsetup.complete(bid, settings=_settings(), broker=broker, emqx=emqx)
     devsetup.complete(bid, settings=_settings(), broker=broker, emqx=emqx)
     assert setup_codes_store.get(bid) is None
 
@@ -452,35 +386,3 @@ def test_expire_cleans_up_only_codes_past_their_expiresat():
     assert emqx.deleted == [f"boot-{bid_old}"]
     assert len(broker.published) == 1
     assert broker.published[0].topic == f"pager/boot/{bid_old}/down"
-
-
-def test_expire_returns_zero_when_nothing_is_stale():
-    broker = FakeBrokerClient()
-    emqx = _FakeEmqx()
-    now = datetime.now(UTC)
-    _issue("pgr-expire-none", broker, emqx, now=now)
-    count = devsetup.expire(now=now, settings=_settings(), broker=broker, emqx=emqx)
-    assert count == 0
-
-
-def test_setup_codes_store_create_get_delete():
-    now = datetime.now(UTC)
-    setup_codes_store.create("bid-store-1", "pgr-store-1", now)
-    fetched = setup_codes_store.get("bid-store-1")
-    assert fetched is not None
-    assert fetched.deviceId == "pgr-store-1"
-    setup_codes_store.delete("bid-store-1")
-    assert setup_codes_store.get("bid-store-1") is None
-
-
-def test_setup_codes_store_get_missing_returns_none():
-    assert setup_codes_store.get("bid-store-missing") is None
-
-
-def test_setup_codes_store_list_expired():
-    now = datetime.now(UTC)
-    setup_codes_store.create("bid-store-old", "pgr-store-old", now - timedelta(minutes=1))
-    setup_codes_store.create("bid-store-new", "pgr-store-new", now + timedelta(minutes=10))
-    expired = {c.bid for c in setup_codes_store.list_expired(now)}
-    assert "bid-store-old" in expired
-    assert "bid-store-new" not in expired

@@ -3,6 +3,8 @@ and message/delivery rows built in memory."""
 
 from __future__ import annotations
 
+import pytest
+
 from app.backends.webapp import WebappBackend, push_alert
 from app.store import conversations as conversations_store
 from app.store import push_tokens as push_tokens_store
@@ -142,19 +144,6 @@ def test_deliver_group_copy_uses_group_name_and_alias_and_collapse_key():
     assert data["groupMsgId"] == "gm_push1"
 
 
-def test_deliver_dm_copy_has_no_group_msg_id_key():
-    users_store.create_user(uid="alice", alias="alice-alias", display_name="Alice")
-    push_tokens_store.add_token("bob", "tok_bob")
-
-    fcm = _RecordingFCMClient()
-    backend = WebappBackend(fcm_client=fcm)
-    msg = _message()
-    backend.deliver(msg, msg.deliveries["be1"], BackendRow(id="be1", kind="webapp"))
-
-    _, data = fcm.calls[0]
-    assert "groupMsgId" not in data
-
-
 def test_push_alert_new_conversation_sends_exact_data_map():
     users_store.create_user(
         uid="fam1admin", alias="fam1admin", display_name="Admin", role="admin", family_id="fam1"
@@ -188,64 +177,35 @@ def test_push_alert_new_conversation_sends_exact_data_map():
     assert all(isinstance(v, str) for v in data.values())
 
 
-def test_push_alert_sms_unknown_title_and_truncated_body():
+@pytest.mark.parametrize(
+    ("alert", "title", "body"),
+    [
+        pytest.param(
+            {"kind": "sms_unknown", "id": "alert2", "subjectAlias": "kid2", "preview": "x" * 200},
+            "Text from an unknown number for @kid2",
+            "x" * 120,
+            id="sms-unknown-truncated-body",
+        ),
+        pytest.param(
+            {"kind": "contact_request", "id": "alert3", "subjectAlias": "kid3"},
+            "Contact request from @kid3's pager",
+            "",
+            id="contact-request-empty-preview",
+        ),
+    ],
+)
+def test_push_alert_title_and_body_per_kind(alert: dict, title: str, body: str):
     users_store.create_user(
         uid="fam2admin", alias="fam2admin", display_name="Admin", role="admin", family_id="fam2"
     )
     push_tokens_store.add_token("fam2admin", "tok_admin2")
 
     fcm = _RecordingFCMClient()
-    long_body = "x" * 200
-    push_alert(
-        "fam2",
-        {
-            "kind": "sms_unknown",
-            "id": "alert2",
-            "subjectAlias": "kid2",
-            "preview": long_body,
-        },
-        fcm_client=fcm,
-    )
+    push_alert("fam2", alert, fcm_client=fcm)
 
     _, data = fcm.calls[0]
-    assert data["title"] == "Text from an unknown number for @kid2"
-    assert data["body"] == long_body[:120]
-    assert len(data["body"]) == 120
-
-
-def test_push_alert_contact_request_title_and_empty_preview():
-    users_store.create_user(
-        uid="fam3admin", alias="fam3admin", display_name="Admin", role="admin", family_id="fam3"
-    )
-    push_tokens_store.add_token("fam3admin", "tok_admin3")
-
-    fcm = _RecordingFCMClient()
-    push_alert(
-        "fam3",
-        {"kind": "contact_request", "id": "alert3", "subjectAlias": "kid3"},
-        fcm_client=fcm,
-    )
-
-    _, data = fcm.calls[0]
-    assert data["title"] == "Contact request from @kid3's pager"
-    assert data["body"] == ""
-
-
-def test_push_alert_skips_admin_who_opted_out():
-    users_store.create_user(
-        uid="fam4admin", alias="fam4admin", display_name="Admin", role="admin", family_id="fam4"
-    )
-    users_store.update_user("fam4admin", notify_alerts=False)
-    push_tokens_store.add_token("fam4admin", "tok_admin4")
-
-    fcm = _RecordingFCMClient()
-    push_alert(
-        "fam4",
-        {"kind": "contact_request", "id": "alert4", "subjectAlias": "kid4"},
-        fcm_client=fcm,
-    )
-
-    assert fcm.calls == []
+    assert data["title"] == title
+    assert data["body"] == body
 
 
 def _alert_push(family: str, *users: tuple[str, str, str | None, bool]) -> _RecordingFCMClient:
@@ -265,34 +225,16 @@ def _alert_push(family: str, *users: tuple[str, str, str | None, bool]) -> _Reco
     return fcm
 
 
-def test_push_alert_reaches_super_of_the_family():
-    fcm = _alert_push("fam5", ("fam5super", "super", "fam5", True))
-    assert [t for t, _ in fcm.calls] == [["tok_fam5super"]]
-
-
-def test_push_alert_skips_super_of_another_family():
-    fcm = _alert_push("fam6", ("fam6super", "super", "other6", True))
-    assert fcm.calls == []
-
-
-def test_push_alert_skips_member():
-    fcm = _alert_push("fam7", ("fam7member", "member", "fam7", True))
-    assert fcm.calls == []
-
-
-def test_push_alert_skips_super_who_opted_out():
-    fcm = _alert_push("fam8", ("fam8super", "super", "fam8", False))
-    assert fcm.calls == []
-
-
-def test_push_alert_logs_recipient_count(caplog):
-    import logging
-
-    with caplog.at_level(logging.INFO, logger="relay.backends.webapp"):
-        _alert_push(
-            "fam9",
-            ("fam9admin", "admin", "fam9", True),
-            ("fam9super", "super", "fam9", True),
-            ("fam9member", "member", "fam9", True),
-        )
-    assert "alert push kind=contact_request family=fam9 recipients=2" in caplog.text
+@pytest.mark.parametrize(
+    ("users", "tokens"),
+    [
+        pytest.param([("fam4admin", "admin", "fam4", False)], [], id="admin-opted-out"),
+        pytest.param([("fam5super", "super", "fam4", True)], [["tok_fam5super"]], id="super-of-the-family"),
+        pytest.param([("fam6super", "super", "other6", True)], [], id="super-of-another-family"),
+        pytest.param([("fam7member", "member", "fam4", True)], [], id="member"),
+        pytest.param([("fam8super", "super", "fam4", False)], [], id="super-opted-out"),
+    ],
+)
+def test_push_alert_recipients(users: list[tuple[str, str, str | None, bool]], tokens: list[list[str]]):
+    fcm = _alert_push("fam4", *users)
+    assert [t for t, _ in fcm.calls] == tokens

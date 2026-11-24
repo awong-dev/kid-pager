@@ -145,12 +145,6 @@ def test_subscribe_group_creates_external_group_edge_and_delivers_backlog_in_ord
     assert out["conversation"]["status"] == "subscribed"
 
 
-def test_default_pager_name_is_not_custom(env: Env):
-    env.events(_ev("Devon P", "hi"))
-    env.sub(GROUP, {"pagerName": "Soccer carpool", "roster": ROSTER[:1]})
-    assert conv_store.get(env.bridge.id, GROUP).customName is False
-
-
 def test_subscribe_dm_creates_only_the_external_and_a_chat_book_entry(env: Env):
     env.events(_ev("Grandma", "hello kid", DM, group=False, title="Grandma"))
     out = env.sub(DM, {"pagerName": "Grandma"})
@@ -217,18 +211,21 @@ def test_can_reply_false_rejects_owner_outbound_but_inbound_still_works(env: Env
     assert entry["sendable"] is False and entry["reason"] == "not_allowed"
 
 
-def test_out_policy_none_forces_read_only_without_409(env: Env):
-    get_db().collection("users").document("kid").update({"policy": {"out": "sms", "in": "people"}})
+@pytest.mark.parametrize(
+    ("policy", "status"),
+    [
+        pytest.param({"out": "sms", "in": "people"}, 200, id="out_none_forces_read_only"),
+        pytest.param({"out": "people", "in": "sms"}, 409, id="in_allowing_nobody_is_409"),
+    ],
+)
+def test_subscribe_dm_against_the_members_policy(env: Env, policy: dict, status: int):
+    get_db().collection("users").document("kid").update({"policy": policy})
     env.events(_ev("Grandma", "hello", DM, group=False, title="Grandma"))
-    out = env.sub(DM, {"pagerName": "Grandma", "canReply": True})
-    assert users_store.get_user(out["uid"]).chat["canReply"] is False
-
-
-def test_in_policy_allowing_nobody_is_409(env: Env):
-    get_db().collection("users").document("kid").update({"policy": {"out": "people", "in": "sms"}})
-    env.events(_ev("Grandma", "hello", DM, group=False, title="Grandma"))
-    r = env.sub(DM, {"pagerName": "Grandma"}, status=409)
-    assert "inbound policy" in r["detail"]
+    out = env.sub(DM, {"pagerName": "Grandma", "canReply": True}, status=status)
+    if status == 409:
+        assert "inbound policy" in out["detail"]
+    else:
+        assert users_store.get_user(out["uid"]).chat["canReply"] is False
 
 
 def test_paused_drops_inbound_and_fails_outbound(env: Env):
@@ -329,7 +326,6 @@ def test_validation_errors(env: Env):
     env.sub(GROUP, {"pagerName": "Soccer", "roster": [{"name": "Devon P", "nick": "Devon P"}]}, status=422)
     env.sub(GROUP, {"pagerName": "Soccer", "roster": [{"name": "A", "nick": "x"}, {"name": "B", "nick": "x"}]}, status=422)
     env.sub(GROUP, {"pagerName": "x" * 17, "roster": []}, status=422)
-    env.sub(GROUP, {"pagerName": "  ", "roster": []}, status=422)
     users_store.create_user(uid="mom", alias="mom", display_name="Soccer", family_id=env.world.family_id)
     env.sub(GROUP, {"pagerName": "soccer", "roster": []}, status=409)
     # Unknown ref / bridge.

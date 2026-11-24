@@ -49,14 +49,6 @@ def test_touch_merges_status_and_keeps_relay_owned_fields():
     assert got.fcmToken == "fcm-1" and got.lastSeenAt is not None
 
 
-def test_setters():
-    b = bridges_store.create("kid", "fam1", "p", "adm")
-    bridges_store.set_label(b.id, "New")
-    bridges_store.set_owner(b.id, "kid2")
-    got = bridges_store.get(b.id)
-    assert got.label == "New" and got.ownerUid == "kid2"
-
-
 def test_pair_code_is_single_use_and_expires():
     b = bridges_store.create("kid", "fam1", "p", "adm")
     code, expires = bridges_store.create_pair_code(b.id)

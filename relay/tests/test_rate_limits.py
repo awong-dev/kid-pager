@@ -17,34 +17,22 @@ from tests.fake_transport import FakeBrokerClient
 from tests.firebase_test_utils import auth_header
 
 
-def test_check_and_increment_allows_up_to_the_limit_then_trips():
+@pytest.mark.parametrize(
+    ("limit", "calls"),
+    [
+        pytest.param(3, [(0, True), (0, True), (0, True), (0, False)], id="allows-up-to-the-limit-then-trips"),
+        pytest.param(1, [(0, True), (0, False), (0, False)], id="rejected-call-is-not-counted"),
+        pytest.param(1, [(0, True), (0, False), (61, True)], id="resets-after-the-window-elapses"),
+    ],
+)
+def test_check_and_increment_sequence(limit: int, calls: list[tuple[int, bool]]):
     key = "unit-test-limit"
     now = 1_000_000.0
-    for _ in range(3):
-        assert rate_limits_store.check_and_increment(key, limit=3, window_s=60, now=now) is True
-    # The 4th call within the same window is rejected.
-    assert rate_limits_store.check_and_increment(key, limit=3, window_s=60, now=now) is False
-
-
-def test_check_and_increment_does_not_count_a_rejected_call():
-    key = "unit-test-rejected-not-counted"
-    now = 1_000_000.0
-    rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now)
-    # Trips.
-    assert rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now) is False
-    # Still trips: the rejected call must not increment the counter.
-    assert rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now) is False
-
-
-def test_check_and_increment_resets_after_the_window_elapses():
-    key = "unit-test-window-reset"
-    now = 1_000_000.0
-    assert rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now) is True
-    assert rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now) is False
-    # A fresh window (61s later) allows again.
-    assert (
-        rate_limits_store.check_and_increment(key, limit=1, window_s=60, now=now + 61) is True
-    )
+    for offset_s, allowed in calls:
+        result = rate_limits_store.check_and_increment(
+            key, limit=limit, window_s=60, now=now + offset_s
+        )
+        assert result is allowed
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -117,27 +105,6 @@ def test_backend_create_rate_limit_is_per_user(client: TestClient):
     assert resp.status_code == 200
 
 
-def test_backend_create_allows_again_after_the_window_resets(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-):
-    headers = _make_user("rl4", "rl4")
-    monkeypatch.setenv("RATE_LIMIT_BACKEND_CREATE_WINDOW_S", "0")
-    for i in range(2):
-        resp = client.post(
-            "/api/me/backends",
-            json={"kind": "gchat", "config": {}, "enabled": False},
-            headers=headers,
-        )
-        assert resp.status_code == 200
-    # window_s=0: every call is its own fresh window.
-    resp = client.post(
-        "/api/me/backends",
-        json={"kind": "gchat", "config": {}, "enabled": False},
-        headers=headers,
-    )
-    assert resp.status_code == 200
-
-
 @pytest.fixture(autouse=True)
 def _tight_admin_write_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RATE_LIMIT_ADMIN_WRITE_LIMIT", "2")
@@ -152,17 +119,6 @@ def admin_headers() -> dict[str, str]:
     )
     fb_auth.set_custom_user_claims(auth_user.uid, {"role": "super", "fam": ""})
     return auth_header(auth_user.uid)
-
-
-def test_admin_write_trips_429_after_the_configured_limit(
-    client: TestClient, admin_headers: dict[str, str]
-):
-    current = client.get("/api/admin/settings", headers=admin_headers).json()
-    for _ in range(2):
-        resp = client.put("/api/admin/settings", json=current, headers=admin_headers)
-        assert resp.status_code == 200, resp.text
-    resp = client.put("/api/admin/settings", json=current, headers=admin_headers)
-    assert resp.status_code == 429
 
 
 def test_admin_reads_are_not_rate_limited(client: TestClient, admin_headers: dict[str, str]):

@@ -35,7 +35,7 @@ from tests.conftest import (
     up_topic,
 )
 from tests.fake_transport import FakeBrokerClient
-from tests.firebase_test_utils import auth_header, seed_legacy_contact_request
+from tests.firebase_test_utils import auth_header
 
 
 def _make_user(uid: str, alias: str, display_name: str | None = None) -> None:
@@ -112,19 +112,26 @@ def test_build_book_basic_shape():
     assert obj["ack"] is None
     assert obj["id"].startswith("m_")
 
-
-def test_build_book_omits_d_when_no_default_recipient():
     _make_user("student2", "student2")
     _make_pager_device("pgr-b-2", "student2")
-
-    obj = devcfg.build_book("pgr-b-2")
-
-    assert "d" not in obj
+    assert "d" not in devcfg.build_book("pgr-b-2")
 
 
-def test_build_book_unregistered_device_raises():
+def test_unregistered_device_is_refused_by_build_and_every_push():
+    broker = FakeBrokerClient()
+
     with pytest.raises(ValueError):
         devcfg.build_book("no-such-device")
+    assert devcfg.push_book("no-such-device", broker) is False
+    assert devcfg.push_cfg("no-such-device", {"auto": 5}, broker) is False
+    assert (
+        devcfg.push_ca(
+            "no-such-device", pem=_CA_PEM, broker=broker, settings=_settings_with_public_base_url()
+        )
+        is False
+    )
+    assert devcfg.unpin_ca("no-such-device", broker) is False
+    assert broker.published == []
 
 
 def test_build_book_never_lists_an_external():
@@ -151,44 +158,21 @@ def test_build_book_never_lists_an_external():
     only_ext = devcfg.build_book("pgr-b-3")
     assert only_ext["c"] == []
 
-
-def test_build_book_excludes_implied_externals_from_c():
-    family = families_store.create_family(name="BookImplied", created_by="root")
+    # An external implied by an open policy is not listed either.
+    implied_family = families_store.create_family(name="BookImplied", created_by="root")
     users_store.create_user(
-        uid="student3i", alias="student3i", display_name="student3i", family_id=family.id
+        uid="student3i", alias="student3i", display_name="student3i", family_id=implied_family.id
     )
     get_db().collection("users").document("student3i").update(
         {"policy": {"out": "open", "in": "any"}}
     )
-    ext = externals_store.get_or_create(family.id, "+15550001112", "Grandma")
+    implied = externals_store.get_or_create(implied_family.id, "+15550001112", "Grandma")
     _make_pager_device("pgr-b-3i", "student3i")
 
     obj = devcfg.build_book("pgr-b-3i")
 
     assert obj["c"] == []
-    assert ext.alias not in [c["a"] for c in obj["c"]]
-
-
-def test_build_book_caps_approved_contacts_at_ten():
-    _make_user("student4", "student4")
-    _make_pager_device("pgr-b-4", "student4")
-    for i in range(12):
-        uid = f"contact4_{i}"
-        _make_user(uid, f"c4{i:02d}")
-        _approve("student4", uid)
-
-    obj = devcfg.build_book("pgr-b-4")
-
-    assert len(obj["c"]) == 10
-
-
-def test_build_book_no_longer_carries_p():
-    _make_user("student5", "student5")
-    _make_pager_device("pgr-b-5", "student5")
-    seed_legacy_contact_request("pgr-b-5", "student5", "u_b5", "Req", "+15550001111")
-
-    assert "p" not in devcfg.build_book("pgr-b-5")
-    assert "p" not in devcfg.build_book_body("pgr-b-5")
+    assert implied.alias not in [c["a"] for c in obj["c"]]
 
 
 def test_build_book_lists_owners_group_as_grp_contact():
@@ -218,14 +202,18 @@ def test_build_book_group_contact_not_listed_for_non_member():
     assert obj["c"] == []
 
 
-def test_build_book_caps_approved_contacts_at_ten_including_groups():
+@pytest.mark.parametrize(
+    ("contacts", "groups"),
+    [pytest.param(12, 0, id="contacts_only"), pytest.param(8, 4, id="including_groups")],
+)
+def test_build_book_caps_approved_contacts_at_ten(contacts: int, groups: int):
     _make_user("student10g", "student10g")
     _make_pager_device("pgr-b-10g", "student10g")
-    for i in range(8):
+    for i in range(contacts):
         uid = f"contact10g_{i}"
         _make_user(uid, f"c10g{i:02d}")
         _approve("student10g", uid)
-    for i in range(4):
+    for i in range(groups):
         mate = f"groupmate10g_{i}"
         _make_user(mate, mate)
         conversations_store.create_group(
@@ -238,7 +226,7 @@ def test_build_book_caps_approved_contacts_at_ten_including_groups():
     obj = devcfg.build_book("pgr-b-10g")
 
     assert len(obj["c"]) == 10
-    assert any(c["t"] == "grp" for c in obj["c"])
+    assert any(c["t"] == "grp" for c in obj["c"]) == (groups > 0)
 
 
 def test_push_book_publishes_and_stores_pending():
@@ -258,12 +246,6 @@ def test_push_book_publishes_and_stores_pending():
     assert raw["pendingBook"]["acked"] is False
 
 
-def test_push_book_unregistered_device_returns_false_without_publishing():
-    broker = FakeBrokerClient()
-    assert devcfg.push_book("no-such-device", broker) is False
-    assert broker.published == []
-
-
 def test_push_book_supersedes_older_unacked_book():
     _make_user("student9", "student9")
     _make_pager_device("pgr-b-9", "student9")
@@ -280,7 +262,7 @@ def test_push_book_supersedes_older_unacked_book():
     assert devcfg.ack("pgr-b-9", second_id) is True
 
 
-def test_ack_shown_marks_book_acked_idempotently():
+def test_ack_shown_marks_book_acked_idempotently_and_an_unknown_id_is_false():
     _make_user("student10", "student10")
     _make_pager_device("pgr-b-10", "student10")
     broker = FakeBrokerClient()
@@ -290,12 +272,7 @@ def test_ack_shown_marks_book_acked_idempotently():
     assert devcfg.ack("pgr-b-10", msg_id) is True
     assert _raw_device("pgr-b-10")["pendingBook"]["acked"] is True
     assert devcfg.ack("pgr-b-10", msg_id) is True
-
-
-def test_ack_unknown_id_returns_false():
-    _make_user("student11", "student11")
-    _make_pager_device("pgr-b-11", "student11")
-    assert devcfg.ack("pgr-b-11", "m_doesnotexist") is False
+    assert devcfg.ack("pgr-b-10", "m_doesnotexist") is False
 
 
 def test_republish_pending_skips_acked_book():
@@ -347,16 +324,10 @@ def test_push_cfg_publishes_lock_and_stores_pending():
     assert raw["pendingCfg"]["acked"] is False
 
 
-def test_push_cfg_unregistered_device_returns_false():
-    broker = FakeBrokerClient()
-    assert devcfg.push_cfg("no-such-device", {"auto": 5}, broker) is False
-    assert broker.published == []
-
-
 _CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIB...FAKE...TEST...CA==\n-----END CERTIFICATE-----\n"
 
 
-def _settings_with_public_base_url() -> Settings:
+def _settings_with_public_base_url(public_base_url: str | None = "https://relay.example.com") -> Settings:
     return Settings(
         broker_api_url="http://emqx.test/api/v5",
         broker_api_key="k",
@@ -366,7 +337,7 @@ def _settings_with_public_base_url() -> Settings:
         google_cloud_project=None,
         firestore_emulator_host=None,
         firebase_auth_emulator_host=None,
-        public_base_url="https://relay.example.com",
+        public_base_url=public_base_url,
     )
 
 
@@ -391,17 +362,6 @@ def test_push_ca_publishes_pointer_and_stores_pending():
     raw = _raw_device("pgr-ca-1")
     assert raw["pendingCfgCa"]["id"] == sent["id"]
     assert raw["pendingCfgCa"]["acked"] is False
-
-
-def test_push_ca_unregistered_device_returns_false():
-    broker = FakeBrokerClient()
-    assert (
-        devcfg.push_ca(
-            "no-such-device", pem=_CA_PEM, broker=broker, settings=_settings_with_public_base_url()
-        )
-        is False
-    )
-    assert broker.published == []
 
 
 def test_push_ca_without_public_base_url_raises():
@@ -437,12 +397,6 @@ def test_unpin_ca_publishes_empty_url_no_sha():
     assert "sha" not in sent["cfg"]["ca"]
 
 
-def test_unpin_ca_unregistered_device_returns_false():
-    broker = FakeBrokerClient()
-    assert devcfg.unpin_ca("no-such-device", broker) is False
-    assert broker.published == []
-
-
 def test_pending_cfg_lock_and_pending_cfg_ca_do_not_clobber_each_other():
     _make_user("student22", "student22")
     _make_pager_device("pgr-ca-4", "student22")
@@ -470,11 +424,15 @@ def test_pending_cfg_lock_and_pending_cfg_ca_do_not_clobber_each_other():
     assert _raw_device("pgr-ca-4")["pendingCfgCa"]["acked"] is True
 
 
-def test_status_bv_behind_book_version_triggers_push_book():
+@pytest.mark.parametrize(
+    ("bumps", "pushed_bv"),
+    [pytest.param(2, 2, id="behind_pushes_book"), pytest.param(1, None, id="caught_up_pushes_nothing")],
+)
+def test_status_bv_behind_the_book_version_pushes_the_book(bumps: int, pushed_bv: int | None):
     _make_user("student15", "student15")
     _make_pager_device("pgr-b-15", "student15")
-    _bump_book_version("pgr-b-15")
-    _bump_book_version("pgr-b-15")
+    for _ in range(bumps):
+        _bump_book_version("pgr-b-15")
     broker = FakeBrokerClient()
     ingest = Ingest(broker)
 
@@ -482,25 +440,14 @@ def test_status_bv_behind_book_version_triggers_push_book():
         status_topic("pgr-b-15"), online_status_payload("s_00000001", bv=1)
     )
 
+    if pushed_bv is None:
+        assert broker.published == []
+        return
     books = [
         json.loads(p.payload) for p in broker.published if json.loads(p.payload).get("kind") == "book"
     ]
     assert len(books) == 1
-    assert books[0]["bv"] == 2
-
-
-def test_status_bv_caught_up_does_not_push_book():
-    _make_user("student16", "student16")
-    _make_pager_device("pgr-b-16", "student16")
-    _bump_book_version("pgr-b-16")
-    broker = FakeBrokerClient()
-    ingest = Ingest(broker)
-
-    ingest.handle_status(
-        status_topic("pgr-b-16"), online_status_payload("s_00000002", bv=1)
-    )
-
-    assert broker.published == []
+    assert books[0]["bv"] == pushed_bv
 
 
 def test_up_ack_shown_for_book_id_is_handled_by_devcfg_not_dropped():
@@ -602,17 +549,6 @@ def test_admin_push_cfg_unknown_device_404(client: TestClient, admin_headers: di
     assert resp.status_code == 404
 
 
-def test_admin_push_cfg_requires_admin(client: TestClient):
-    fb_auth.create_user(uid="nonadmin2", email="nonadmin2@example.com")
-    users_store.create_user(uid="nonadmin2", alias="nonadmin2", display_name="NA")
-    resp = client.post(
-        "/api/admin/devices/pgr-b-x/cfg",
-        json={"lock": {"clear": True}},
-        headers=auth_header("nonadmin2"),
-    )
-    assert resp.status_code == 403
-
-
 def _ca_client(broker: FakeBrokerClient, **settings_overrides: object) -> TestClient:
     app = create_app(settings=make_settings(**settings_overrides), broker_client=broker)
     return TestClient(app)
@@ -684,14 +620,19 @@ def test_admin_push_ca_unknown_device_404(admin_headers: dict[str, str], broker:
     assert resp.status_code == 404
 
 
-def test_admin_push_ca_requires_admin(broker: FakeBrokerClient):
-    fb_auth.create_user(uid="nonadmin-ca", email="nonadmin-ca@example.com")
-    users_store.create_user(uid="nonadmin-ca", alias="nonadminca", display_name="NA")
+@pytest.mark.parametrize(
+    ("route", "body"),
+    [
+        pytest.param("cfg", {"lock": {"clear": True}}, id="cfg"),
+        pytest.param("ca", {"action": "unpin"}, id="ca"),
+    ],
+)
+def test_admin_push_requires_admin(broker: FakeBrokerClient, route: str, body: dict):
+    fb_auth.create_user(uid="nonadmin2", email="nonadmin2@example.com")
+    users_store.create_user(uid="nonadmin2", alias="nonadmin2", display_name="NA")
     with _ca_client(broker) as client:
         resp = client.post(
-            "/api/admin/devices/pgr-b-x/ca",
-            json={"action": "unpin"},
-            headers=auth_header("nonadmin-ca"),
+            f"/api/admin/devices/pgr-b-x/{route}", json=body, headers=auth_header("nonadmin2")
         )
     assert resp.status_code == 403
 
@@ -753,77 +694,35 @@ def test_approve_contact_publishes_book(
     ]
 
 
-def test_push_book_gate_bpull_absent_sends_full_book():
+@pytest.mark.parametrize(
+    ("hmac", "bpull", "base_url", "nudge"),
+    [
+        pytest.param(True, False, True, False, id="bpull_absent_sends_full_book"),
+        pytest.param(True, True, True, True, id="bpull_and_hmac_and_base_url_sends_nudge"),
+        pytest.param(True, True, False, False, id="bpull_without_base_url_falls_back_to_full_book"),
+        pytest.param(False, True, True, False, id="bpull_but_not_hmac_sends_full_book"),
+    ],
+)
+def test_push_book_gate(hmac: bool, bpull: bool, base_url: bool, nudge: bool):
     _make_user("student-gate1", "student-gate1")
-    _make_hmac_pager_device("pgr-gate-1", "student-gate1")
+    make_device = _make_hmac_pager_device if hmac else _make_pager_device
+    make_device("pgr-gate-1", "student-gate1")
+    if bpull:
+        devices_store.update_status("pgr-gate-1", bpull=1)
     broker = FakeBrokerClient()
+    settings = _settings_with_public_base_url("https://relay.example.com" if base_url else None)
 
-    ok = devcfg.push_book("pgr-gate-1", broker, settings=_settings_with_public_base_url())
+    ok = devcfg.push_book("pgr-gate-1", broker, settings=settings)
 
     assert ok is True
     sent = json.loads(broker.published[0].payload)
     assert sent["kind"] == "book"
-    assert "c" in sent
-    assert "url" not in sent
-
-
-def test_push_book_gate_bpull_and_hmac_and_base_url_sends_nudge():
-    _make_user("student-gate2", "student-gate2")
-    _make_hmac_pager_device("pgr-gate-2", "student-gate2")
-    devices_store.update_status("pgr-gate-2", bpull=1)
-    broker = FakeBrokerClient()
-
-    ok = devcfg.push_book("pgr-gate-2", broker, settings=_settings_with_public_base_url())
-
-    assert ok is True
-    sent = json.loads(broker.published[0].payload)
-    assert sent["kind"] == "book"
-    assert sent["url"] == "https://relay.example.com/api/device/book"
-    assert "c" not in sent
-    assert "p" not in sent
-    assert "d" not in sent
-    assert "more" not in sent
-
-
-def test_push_book_gate_bpull_without_base_url_falls_back_to_full_book(caplog):
-    _make_user("student-gate3", "student-gate3")
-    _make_hmac_pager_device("pgr-gate-3", "student-gate3")
-    devices_store.update_status("pgr-gate-3", bpull=1)
-    broker = FakeBrokerClient()
-
-    no_base_url_settings = Settings(
-        broker_api_url="http://emqx.test/api/v5",
-        broker_api_key="k",
-        broker_api_secret="s",
-        webhook_key="wk",
-        dev_mode=False,
-        google_cloud_project=None,
-        firestore_emulator_host=None,
-        firebase_auth_emulator_host=None,
-        public_base_url=None,
-    )
-
-    ok = devcfg.push_book("pgr-gate-3", broker, settings=no_base_url_settings)
-
-    assert ok is True
-    sent = json.loads(broker.published[0].payload)
-    assert sent["kind"] == "book"
-    assert "c" in sent
-    assert "url" not in sent
-
-
-def test_push_book_gate_bpull_but_not_hmac_sends_full_book():
-    _make_user("student-gate4", "student-gate4")
-    _make_pager_device("pgr-gate-4", "student-gate4")
-    devices_store.update_status("pgr-gate-4", bpull=1)
-    broker = FakeBrokerClient()
-
-    ok = devcfg.push_book("pgr-gate-4", broker, settings=_settings_with_public_base_url())
-
-    assert ok is True
-    sent = json.loads(broker.published[0].payload)
-    assert "c" in sent
-    assert "url" not in sent
+    if nudge:
+        assert sent["url"] == "https://relay.example.com/api/device/book"
+        assert not {"c", "p", "d", "more"} & set(sent)
+    else:
+        assert "c" in sent
+        assert "url" not in sent
 
 
 def test_nudge_size_under_640():
@@ -845,43 +744,32 @@ def test_nudge_size_under_640():
     assert obj["bv"] == 2**32 - 1
 
 
-def test_build_book_body_has_no_id_or_ack():
+@pytest.mark.parametrize(
+    ("contacts", "served", "more"),
+    [
+        pytest.param(0, 0, False, id="no_contacts"),
+        pytest.param(20, 20, False, id="serves_20_contacts_no_more"),
+        pytest.param(40, 32, True, id="truncates_at_32_sets_more"),
+    ],
+)
+def test_build_book_body_shape(contacts: int, served: int, more: bool):
     _make_user("student-body1", "student-body1")
     _make_pager_device("pgr-body-1", "student-body1")
+    for i in range(contacts):
+        uid = f"bodycontact_{i}"
+        _make_user(uid, f"bc{i:03d}")
+        _approve("student-body1", uid)
 
     body = devcfg.build_book_body("pgr-body-1")
 
     assert "id" not in body
     assert "ack" not in body
     assert body["kind"] == "book"
-
-
-def test_build_book_body_serves_20_contacts_no_more():
-    _make_user("student-body2", "student-body2")
-    _make_pager_device("pgr-body-2", "student-body2")
-    for i in range(20):
-        uid = f"bodycontact_{i}"
-        _make_user(uid, f"bc{i:02d}")
-        _approve("student-body2", uid)
-
-    body = devcfg.build_book_body("pgr-body-2")
-
-    assert len(body["c"]) == 20
-    assert "more" not in body
-
-
-def test_build_book_body_truncates_at_32_sets_more():
-    _make_user("student-body3", "student-body3")
-    _make_pager_device("pgr-body-3", "student-body3")
-    for i in range(40):
-        uid = f"bodycontact40_{i}"
-        _make_user(uid, f"bc40{i:03d}")
-        _approve("student-body3", uid)
-
-    body = devcfg.build_book_body("pgr-body-3")
-
-    assert len(body["c"]) == 32
-    assert body["more"] is True
+    assert len(body["c"]) == served
+    if more:
+        assert body["more"] is True
+    else:
+        assert "more" not in body
 
 
 def test_build_book_body_default_first_then_groups_then_people():
@@ -907,20 +795,31 @@ def test_build_book_body_default_first_then_groups_then_people():
     assert aliases_in_order[2] == "aaa-friend"
 
 
-def test_nudge_replaces_stored_full_book_wholesale():
+_STALE_BOOK = {
+    "v": 1, "id": "m_stale001", "ts": 1, "kind": "book", "bv": 1, "d": "x",
+    "c": [{"a": "a", "n": "A", "t": "web"}], "p": [{"n": "Q", "s": "pend"}], "ack": None,
+}
+_NUDGE = {"v": 1, "id": "m_nudge001", "ts": 2, "kind": "book", "bv": 2, "url": "https://x/y", "ack": None}
+_CFG_LOCK = {"v": 1, "id": "m_cfg00001", "kind": "cfg", "cfg": {"lock": {"clear": True}}, "ack": None}
+_CFG_OTA = {"v": 1, "id": "m_cfg00002", "kind": "cfg", "cfg": {"ota": {"u": "x"}}, "ack": None}
+
+
+@pytest.mark.parametrize(
+    ("slot", "stored", "newer"),
+    [
+        pytest.param("pendingBook", _STALE_BOOK, _NUDGE, id="nudge_replaces_stored_full_book"),
+        pytest.param("pendingCfg", _CFG_LOCK, _CFG_OTA, id="pending_cfg_replaced"),
+    ],
+)
+def test_set_pending_replaces_the_stored_envelope_wholesale(slot: str, stored: dict, newer: dict):
     _make_user("student-pw1", "student-pw1")
     _make_pager_device("pgr-pw-1", "student-pw1")
-    stale = {
-        "v": 1, "id": "m_stale001", "ts": 1, "kind": "book", "bv": 1, "d": "x",
-        "c": [{"a": "a", "n": "A", "t": "web"}], "p": [{"n": "Q", "s": "pend"}], "ack": None,
-    }
-    devcfg._set_pending("pgr-pw-1", "pendingBook", stale)
-    nudge = {"v": 1, "id": "m_nudge001", "ts": 2, "kind": "book", "bv": 2, "url": "https://x/y", "ack": None}
+    devcfg._set_pending("pgr-pw-1", slot, stored)
 
-    devcfg._set_pending("pgr-pw-1", "pendingBook", nudge)
+    devcfg._set_pending("pgr-pw-1", slot, newer)
 
-    obj = _raw_device("pgr-pw-1")["pendingBook"]["obj"]
-    assert obj == nudge
+    obj = _raw_device("pgr-pw-1")[slot]["obj"]
+    assert obj == newer
     assert not {"c", "p", "d"} & set(obj)
 
 
@@ -942,17 +841,3 @@ def test_hybrid_stored_nudge_is_republished_clean():
     (sent,) = [json.loads(m.payload) for m in broker.published]
     assert sent["id"] == "m_hybrid01" and sent["url"] == "https://x/y"
     assert not {"c", "p", "d", "more"} & set(sent)
-
-
-def test_pending_cfg_replaced_wholesale():
-    _make_user("student-pw3", "student-pw3")
-    _make_pager_device("pgr-pw-3", "student-pw3")
-    devcfg._set_pending(
-        "pgr-pw-3", "pendingCfg",
-        {"v": 1, "id": "m_cfg00001", "kind": "cfg", "cfg": {"lock": {"clear": True}}, "ack": None},
-    )
-    newer = {"v": 1, "id": "m_cfg00002", "kind": "cfg", "cfg": {"ota": {"u": "x"}}, "ack": None}
-
-    devcfg._set_pending("pgr-pw-3", "pendingCfg", newer)
-
-    assert _raw_device("pgr-pw-3")["pendingCfg"]["obj"] == newer

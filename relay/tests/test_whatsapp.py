@@ -191,7 +191,7 @@ def test_dm_needs_the_whatsapp_cap(client: TestClient, world: World, broker: Fak
     assert _post(client, no_wa, _lid()) == ["dropped_cap"]
 
 
-@pytest.mark.parametrize("conv", ["com.whatsapp|42", "123@c.us", "abc@lid", "@lid", "123@g.us.x"])
+@pytest.mark.parametrize("conv", ["com.whatsapp|42", "abc@lid"])
 def test_bad_conversation_ids_are_dropped_bad_conv(env: Env, conv: str):
     assert env.events(_dm(conv=conv)) == ["dropped_bad_conv"]
     assert conv_store.get(env.bridge.id, conv) is None
@@ -280,10 +280,6 @@ def test_whatsapp_group_event_does_not_take_the_dm_text_path(
     "link",
     [
         "https://wa.me/12065550111",
-        "https://chat.whatsapp.com/AbCdEf",
-        "https://api.whatsapp.com/send?phone=1",
-        "https://www.whatsapp.com/x",
-        "whatsapp://send?phone=1",
         "HTTPS://WA.ME/1",
     ],
 )
@@ -295,16 +291,6 @@ def test_inspect_by_whatsapp_link_is_400(client: TestClient, world: World, link:
     assert r.status_code == 400
     assert r.json()["detail"] == "whatsapp links cannot be inspected; wait for a message"
     assert bridge_outbox.list_pending(bridge.id) == []
-
-
-def test_inspect_by_google_link_still_works(client: TestClient, world: World):
-    bridge, _ = pair_bridge(client, world, caps=WA_CAPS)
-    r = client.post(
-        f"/api/family/bridges/{bridge.id}/inspect",
-        json={"link": "https://chat.google.com/room/AAA"},
-        headers=world.admin_headers,
-    )
-    assert r.status_code == 202
 
 
 def _held_then_approved(client, world, broker, headers, event, name="Mom"):

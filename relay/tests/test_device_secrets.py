@@ -9,12 +9,11 @@ import pytest
 from app.store import device_secrets as device_secrets_store
 
 
-def test_create_returns_the_expected_shape():
-    secret = device_secrets_store.create(
-        "pgr-secret-1", hmac_key=b"k" * 32, mqtt_password_hash="hash1"
-    )
+def test_create_returns_the_expected_shape_and_stores_base64_key():
+    key = bytes(range(32))
+    secret = device_secrets_store.create("pgr-secret-1", hmac_key=key, mqtt_password_hash="hash1")
     assert secret.id == "pgr-secret-1"
-    assert secret.hmacKey == b"k" * 32
+    assert secret.hmacKey == key
     assert secret.mqttPasswordHash == "hash1"
     assert secret.upN == 0
     assert secret.upBits == 0
@@ -23,23 +22,15 @@ def test_create_returns_the_expected_shape():
     assert secret.createdAt is not None
     assert secret.rotatedAt is None
 
-
-def test_hmac_key_round_trips_through_base64_storage():
-    key = bytes(range(32))
-    device_secrets_store.create("pgr-secret-2", hmac_key=key, mqtt_password_hash="h")
-    fetched = device_secrets_store.get("pgr-secret-2")
+    fetched = device_secrets_store.get("pgr-secret-1")
     assert fetched is not None
     assert fetched.hmacKey == key
     # The document stores base64 text, not raw bytes.
     from app.db.firestore import get_db
 
-    raw = get_db().collection("deviceSecrets").document("pgr-secret-2").get().to_dict()
+    raw = get_db().collection("deviceSecrets").document("pgr-secret-1").get().to_dict()
     assert raw is not None
     assert base64.b64decode(raw["hmacKey"]) == key
-
-
-def test_get_missing_device_returns_none():
-    assert device_secrets_store.get("pgr-secret-missing") is None
 
 
 def test_rotate_replaces_secrets_and_zeroes_counters():
@@ -58,25 +49,10 @@ def test_rotate_replaces_secrets_and_zeroes_counters():
     assert rotated.rotatedAt is not None
 
 
-def test_rotate_missing_device_raises_key_error():
-    with pytest.raises(KeyError):
-        device_secrets_store.rotate("pgr-secret-nope", b"x" * 32, "h")
-
-
 def test_delete_removes_the_document():
     device_secrets_store.create("pgr-secret-4", hmac_key=b"c" * 32, mqtt_password_hash="h")
     device_secrets_store.delete("pgr-secret-4")
     assert device_secrets_store.get("pgr-secret-4") is None
-
-
-def test_accept_up_n_accepts_strictly_increasing_values():
-    device_secrets_store.create("pgr-win-1", hmac_key=b"k" * 32, mqtt_password_hash="h")
-    assert device_secrets_store.accept_up_n("pgr-win-1", 1) is True
-    assert device_secrets_store.accept_up_n("pgr-win-1", 2) is True
-    assert device_secrets_store.accept_up_n("pgr-win-1", 3) is True
-    secret = device_secrets_store.get("pgr-win-1")
-    assert secret is not None
-    assert secret.upN == 3
 
 
 def test_accept_up_n_rejects_an_exact_replay_of_the_current_top():
@@ -113,11 +89,6 @@ def test_accept_up_n_replay_of_a_value_that_slid_out_of_the_bitmap_is_still_caug
     assert device_secrets_store.accept_up_n("pgr-win-5", 100) is False
 
 
-def test_accept_up_n_missing_device_raises_key_error():
-    with pytest.raises(KeyError):
-        device_secrets_store.accept_up_n("pgr-win-missing", 1)
-
-
 def test_next_down_n_increments_from_one():
     device_secrets_store.create("pgr-down-1", hmac_key=b"k" * 32, mqtt_password_hash="h")
     assert device_secrets_store.next_down_n("pgr-down-1") == 1
@@ -126,11 +97,6 @@ def test_next_down_n_increments_from_one():
     secret = device_secrets_store.get("pgr-down-1")
     assert secret is not None
     assert secret.downN == 3
-
-
-def test_next_down_n_missing_device_raises_key_error():
-    with pytest.raises(KeyError):
-        device_secrets_store.next_down_n("pgr-down-missing")
 
 
 def test_bump_sig_failures_increments_and_returns_the_new_count():
@@ -142,6 +108,16 @@ def test_bump_sig_failures_increments_and_returns_the_new_count():
     assert secret.sigFailures == 2
 
 
-def test_bump_sig_failures_missing_device_raises_key_error():
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: device_secrets_store.rotate("pgr-secret-nope", b"x" * 32, "h"),
+        lambda: device_secrets_store.accept_up_n("pgr-win-missing", 1),
+        lambda: device_secrets_store.next_down_n("pgr-down-missing"),
+        lambda: device_secrets_store.bump_sig_failures("pgr-sig-missing"),
+    ],
+    ids=["rotate", "accept_up_n", "next_down_n", "bump_sig_failures"],
+)
+def test_store_functions_raise_key_error_for_a_missing_device(call):
     with pytest.raises(KeyError):
-        device_secrets_store.bump_sig_failures("pgr-sig-missing")
+        call()

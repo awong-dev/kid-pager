@@ -3,6 +3,8 @@ transition."""
 
 from __future__ import annotations
 
+import pytest
+
 from app import deliveries
 from app.store import messages as messages_store
 
@@ -27,21 +29,26 @@ def _state(msg_id: str) -> str:
     return msg.deliveries["b1"].state
 
 
-def test_mark_sent_only_once():
+@pytest.mark.parametrize(
+    ("first", "second", "state", "error"),
+    [
+        pytest.param("mark_sent", "mark_failed", "sent", None, id="sent_first"),
+        pytest.param("mark_failed", "mark_sent", "failed", "sms_timeout", id="failed_first"),
+    ],
+)
+def test_a_delivery_leaves_queued_only_once(first: str, second: str, state: str, error: str | None):
     msg_id = _msg()
-    assert deliveries.mark_sent(msg_id, "b1") is True
-    assert deliveries.mark_sent(msg_id, "b1") is False
-    assert deliveries.mark_failed(msg_id, "b1", error="late") is False
-    assert _state(msg_id) == "sent"
 
+    def call(name: str, error: str) -> bool:
+        kwargs = {"error": error} if name == "mark_failed" else {}
+        return getattr(deliveries, name)(msg_id, "b1", **kwargs)
 
-def test_mark_failed_only_once_and_stores_error():
-    msg_id = _msg()
-    assert deliveries.mark_failed(msg_id, "b1", error="sms_timeout") is True
-    assert deliveries.mark_failed(msg_id, "b1", error="other") is False
-    assert deliveries.mark_sent(msg_id, "b1") is False
+    assert call(first, "sms_timeout") is True
+    assert call(first, "other") is False
+    assert call(second, "late") is False
+    assert _state(msg_id) == state
     msg = messages_store.get_message(msg_id)
-    assert msg is not None and msg.deliveries["b1"].error == "sms_timeout"
+    assert msg is not None and msg.deliveries["b1"].error == error
 
 
 def test_unknown_message_or_delivery_is_false():

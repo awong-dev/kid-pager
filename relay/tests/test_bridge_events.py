@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.db.firestore import get_db
@@ -130,15 +131,6 @@ def test_a_siblings_sim_text_leaves_the_first_members_via_alone(
     assert _sms_config(ext.uid)["via"] == {"kid": "gvoice", "sis": "sms"}
 
 
-def test_group_event_is_dropped(client: TestClient, world: World, broker: FakeBrokerClient):
-    _kid_setup(world, broker)
-    _, headers = pair_bridge(client, world)
-    ev = _ev()
-    ev["conversation"]["isGroup"] = True
-    assert _post(client, headers, ev) == ["dropped_group"]
-    assert _inbox() == []
-
-
 def test_drop_outcomes(client: TestClient, world: World, broker: FakeBrokerClient):
     _kid_setup(world, broker)
     _, headers = pair_bridge(client, world)  # SIM only: no gvoice cap
@@ -149,6 +141,10 @@ def test_drop_outcomes(client: TestClient, world: World, broker: FakeBrokerClien
     assert _post(client, headers, _ev("gvoice")) == ["dropped_cap"]
     inspect = _ev(kind="inspect")
     assert _post(client, headers, inspect) == ["dropped_unsupported"]
+    group = _ev()
+    group["conversation"]["isGroup"] = True
+    assert _post(client, headers, group) == ["dropped_group"]
+    assert _inbox() == []
     users_store.update_user("kid", disabled=True)
     assert _post(client, headers, _ev()) == ["dropped_owner"]
 
@@ -227,10 +223,6 @@ def test_validation_bounds_are_422(client: TestClient, world: World):
     bad_id = _ev()
     bad_id["id"] = "has space"
     assert client.post("/bridge/events", json={"events": [bad_id]}, headers=headers).status_code == 422
-    long_conv = _ev(conv="é" * 300)
-    assert client.post("/bridge/events", json={"events": [long_conv]}, headers=headers).status_code == 422
-    too_many = [_ev(text="") for _ in range(51)]
-    assert client.post("/bridge/events", json={"events": too_many}, headers=headers).status_code == 422
     assert client.post("/bridge/events", json={"events": [_ev()]}).status_code == 401
 
 
@@ -310,27 +302,21 @@ def test_member_signin_phone_policy_refused_not_held(
     assert _inbox() == []
 
 
-def test_other_family_member_phone_is_unknown(
-    client: TestClient, world: World, broker: FakeBrokerClient
+@pytest.mark.parametrize("ineligible", ["other-family", "disabled"])
+def test_ineligible_member_phone_is_unknown(
+    client: TestClient, world: World, broker: FakeBrokerClient, ineligible: str
 ):
     from app.store import families as families_store
 
     _kid_setup(world, broker)
-    other = families_store.create_family(name="G", created_by="root")
-    users_store.create_user(
-        uid="far", alias="far", display_name="Far", family_id=other.id, phone=SIS_PHONE
-    )
-    _, headers = pair_bridge(client, world)
-    assert _post(client, headers, _ev(phone=SIS_PHONE)) == ["held"]
-    assert len(_alerts(world, "sms_unknown")) == 1
-
-
-def test_disabled_member_phone_is_unknown(
-    client: TestClient, world: World, broker: FakeBrokerClient
-):
-    _kid_setup(world, broker)
-    _sis(world)
-    users_store.update_user("sis", disabled=True)
+    if ineligible == "other-family":
+        other = families_store.create_family(name="G", created_by="root")
+        users_store.create_user(
+            uid="far", alias="far", display_name="Far", family_id=other.id, phone=SIS_PHONE
+        )
+    else:
+        _sis(world)
+        users_store.update_user("sis", disabled=True)
     _, headers = pair_bridge(client, world)
     assert _post(client, headers, _ev(phone=SIS_PHONE)) == ["held"]
     assert len(_alerts(world, "sms_unknown")) == 1

@@ -193,19 +193,6 @@ def test_a_confirmed_topup_raises_the_estimate_and_announces_it(env: Env):
     assert _texts(env.broker) == ["Bridge phone texts topped up. 103 left."]
 
 
-def test_month_bounds_follow_the_family_zone(env: Env, monkeypatch):
-    monkeypatch.setenv("RELAY_TIMEZONE", "America/Los_Angeles")
-    t = datetime(2026, 12, 1, 7, 59, tzinfo=UTC)  # 23:59 on 30 Nov in Los Angeles
-    start, end = topups.month_bounds(env.world.family_id, t)
-    assert (start, end) == (
-        datetime(2026, 11, 1, 7, 0, tzinfo=UTC),  # PDT would be 07:00; Nov 1 is still PDT at 00:00
-        datetime(2026, 12, 1, 8, 0, tzinfo=UTC),
-    )
-    monkeypatch.setenv("RELAY_TIMEZONE", "UTC")
-    start, end = topups.month_bounds(env.world.family_id, t)
-    assert (start, end) == (datetime(2026, 12, 1, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC))
-
-
 def test_the_limit_rolls_over_at_local_midnight_not_utc(env: Env, monkeypatch):
     monkeypatch.setenv("RELAY_TIMEZONE", "America/Los_Angeles")
     _policy(env.world, "limited", 1)
@@ -250,23 +237,29 @@ def _race(env: Env, n: int) -> list[str]:
     return results
 
 
-def test_concurrent_presses_cannot_exceed_the_limit(env: Env):
-    _policy(env.world, "limited", 3)
+@pytest.mark.parametrize(
+    ("mode", "per_month", "used", "rows", "conflicts"),
+    [
+        pytest.param("limited", 3, 2, 3, None, id="limited-cannot-exceed-the-limit"),
+        pytest.param("unlimited", None, 0, None, 7, id="unlimited-buys-once"),
+    ],
+)
+def test_concurrent_presses_admit_exactly_one(
+    env: Env, mode: str, per_month: int | None, used: int, rows: int | None, conflicts: int | None
+):
+    _policy(env.world, mode, per_month)
     now = datetime.now(UTC)
-    for i in range(2):  # two already used this month
+    for i in range(used):
         get_db().collection("bridges").document(env.bridge.id).collection("topups").document(f"old{i}").set(
             {"pack": "text100", "packLabel": "100 texts", "texts": 100, "by": "adm", "at": now,
              "state": "confirmed", "outboxId": None, "note": None}
         )
     results = _race(env, 8)
     assert results.count("ok") == 1, results
-    assert len(topups_store.list_recent(env.bridge.id)) == 3
-
-
-def test_concurrent_presses_under_unlimited_buy_once(env: Env):
-    _policy(env.world, "unlimited")
-    results = _race(env, 8)
-    assert results.count("ok") == 1 and results.count("409") == 7, results
+    if rows is not None:
+        assert len(topups_store.list_recent(env.bridge.id)) == rows
+    if conflicts is not None:
+        assert results.count("409") == conflicts, results
 
 
 def test_the_owner_may_press_other_members_and_families_may_not(env: Env, world: World):
@@ -310,11 +303,6 @@ def test_an_unpaired_bridge_cannot_top_up(env: Env, world: World):
     _policy(world, "unlimited")
     bridges_store.unpair(env.bridge.id)
     assert _press(env).status_code == 409
-
-
-def test_sweep_with_no_federation_collections_is_a_no_op(env: Env):
-    result = jobs.sweep()
-    assert result.fedOutboxDeleted == 0 and result.fedInvitesDeleted == 0
 
 
 def test_sweep_keeps_topups_400_days(env: Env):

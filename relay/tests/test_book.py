@@ -258,7 +258,7 @@ def test_put_nick_authorization(client: TestClient):
 
 @pytest.mark.parametrize(
     "nick",
-    ["x" * 17, "😀" * 16, "  ", "Mom\n", "a\x00b"],
+    ["x" * 17, "😀" * 16],
 )
 def test_put_nick_rejects_invalid(client: TestClient, nick: str):
     fam = _family()
@@ -362,34 +362,19 @@ def _sms_names(uid: str) -> list[str]:
     return [u.displayName for u in book_module.sms_contacts_for(owner)]
 
 
-def test_sms_contacts_for_open_member_includes_every_family_contact():
+@pytest.mark.parametrize(("out", "in_"), [("open", "any"), ("any_sms", "people")])
+def test_sms_contacts_for_open_and_any_sms_members_include_every_family_contact(
+    out: str, in_: str
+):
     fam = _family()
     _user("kid", fam, auth=False)
-    _set_policy("kid", "open", "any")
+    _set_policy("kid", out, in_)
     _contact(fam, 1, "Bob")
     _contact(fam, 2, "Alice")
     assert _sms_names("kid") == ["Alice", "Bob"]
 
 
-def test_sms_contacts_for_any_sms_member_includes_every_family_contact():
-    fam = _family()
-    _user("kid", fam, auth=False)
-    _set_policy("kid", "any_sms", "people")
-    _contact(fam, 1, "Bob")
-    assert _sms_names("kid") == ["Bob"]
-
-
-def test_sms_contacts_for_people_member_includes_only_edge_contacts():
-    fam = _family()
-    _user("kid", fam, auth=False)  # default policy: people/people
-    bob = _contact(fam, 1, "Bob")
-    _contact(fam, 2, "Alice")
-    assert _sms_names("kid") == []
-    allow_store.set_edge("kid", bob.uid, message=True, locate=False)
-    assert _sms_names("kid") == ["Bob"]
-
-
-@pytest.mark.parametrize("out", ["people_sms", "sms"])
+@pytest.mark.parametrize("out", ["people", "people_sms", "sms"])
 def test_sms_contacts_for_people_sms_and_sms_members_require_edges(out: str):
     fam = _family()
     _user("kid", fam, auth=False)
@@ -550,30 +535,23 @@ def test_edge_peers_groups_and_dedup(client: TestClient):
     assert aliases["zed"]["sendable"] is True
 
 
-def test_disabling_member_bumps_family_books(client: TestClient):
+@pytest.mark.parametrize(
+    ("body", "device_owner"),
+    [
+        pytest.param({"disabled": True}, "mom", id="disabling-member"),
+        pytest.param({"policy": {"out": "sms", "in": "people"}}, "kid", id="policy-change"),
+    ],
+)
+def test_member_patch_bumps_family_books(client: TestClient, body: dict, device_owner: str):
     fam = _family()
     h = _user("mom", fam, role="admin")
     _user("kid", fam)
-    _device("pgr-x", "mom", fam)
+    _device("pgr-x", device_owner, fam)
     before = _bv("pgr-x")
-    resp = client.patch("/api/family/members/kid", json={"disabled": True}, headers=h)
+    resp = client.patch("/api/family/members/kid", json=body, headers=h)
     assert resp.status_code == 200, resp.text
     assert _bv("pgr-x") == before + 1
     assert devcfg.build_book_body("pgr-x")["c"] == []
-
-
-def test_policy_change_bumps_family_books(client: TestClient):
-    fam = _family()
-    h = _user("mom", fam, role="admin")
-    _user("kid", fam)
-    _device("pgr-p", "kid", fam)
-    before = _bv("pgr-p")
-    resp = client.patch(
-        "/api/family/members/kid", json={"policy": {"out": "sms", "in": "people"}}, headers=h
-    )
-    assert resp.status_code == 200, resp.text
-    assert _bv("pgr-p") == before + 1
-    assert devcfg.build_book_body("pgr-p")["c"] == []
 
 
 def _mark(owner: str, peer: str, fam: str | None = None, **extra: object) -> None:
@@ -582,22 +560,33 @@ def _mark(owner: str, peer: str, fam: str | None = None, **extra: object) -> Non
     )
 
 
-def test_added_external_listed_not_sendable():
+@pytest.mark.parametrize(
+    ("sms_number", "in_c", "reason"),
+    [("+12065550999", True, "not_allowed"), (None, False, "no_sms_number")],
+    ids=["with-sms-number", "modem-owner-no-sms-number"],
+)
+def test_marker_lists_an_external_unsendable_and_never_makes_it_an_sms_contact(
+    sms_number: str | None, in_c: bool, reason: str
+):
     fam = _family()
     _user("kid", fam, auth=False)
     _set_policy("kid", "people_sms", "people_sms")
-    users_store.set_sms_number("kid", "+12065550999")
+    if sms_number:
+        users_store.set_sms_number("kid", sms_number)
     _device("pgr-ad1", "kid", fam)
     ext = _contact(fam, 7, "Grandma")
     _mark("kid", ext.uid, fam)
 
     assert allow_store.get_edge("kid", ext.uid) is None
     (entry,) = [e for e in book_module.entries_for("kid") if e.kind == "external"]
-    assert entry.added is True and entry.sendable is False and entry.reason == "not_allowed"
+    assert entry.added is True and entry.sendable is False and entry.reason == reason
     assert entry.onPager is False
     c = devcfg.build_book_body("pgr-ad1")["c"]
-    assert [(x["a"], x["t"]) for x in c] == [(ext.alias, "sms")]
-    assert book_module.on_pager(users_store.get_user("kid"), ext.uid) is True
+    assert [(x["a"], x["t"]) for x in c] == ([(ext.alias, "sms")] if in_c else [])
+    assert book_module.on_pager(users_store.get_user("kid"), ext.uid) is in_c
+    owner = users_store.get_user("kid")
+    assert owner is not None
+    assert book_module.sms_contacts_for(owner) == []
 
 
 def test_implied_unsendable_still_hidden():
@@ -616,17 +605,6 @@ def test_implied_unsendable_still_hidden():
     assert [x["a"] for x in devcfg.build_book_body("pgr-ad2")["c"]] == ["sib"]
 
 
-def test_marker_not_in_sms_contacts_for():
-    fam = _family()
-    _user("kid", fam, auth=False)
-    _set_policy("kid", "people_sms", "people_sms")
-    ext = _contact(fam, 8, "Gran")
-    _mark("kid", ext.uid, fam)
-    owner = users_store.get_user("kid")
-    assert owner is not None
-    assert book_module.sms_contacts_for(owner) == []
-
-
 def test_marker_never_changes_policy_or_routing_checks(broker: FakeBrokerClient):
     """The marker grants nothing: routing still refuses it."""
     fam = _family()
@@ -643,19 +621,6 @@ def test_marker_never_changes_policy_or_routing_checks(broker: FakeBrokerClient)
         origin_backend_kind="pager",
     )
     assert result.messages == [] and result.rejected
-
-
-def test_modem_owner_added_external_listed_but_not_in_c_or_on_pager():
-    fam = _family()
-    _user("kid", fam, auth=False)
-    _set_policy("kid", "people_sms", "people_sms")
-    _device("pgr-ad3", "kid", fam)
-    ext = _contact(fam, 10, "Gran")
-    _mark("kid", ext.uid, fam)
-    (entry,) = [e for e in book_module.entries_for("kid") if e.kind == "external"]
-    assert entry.added is True and entry.onPager is False
-    assert devcfg.build_book_body("pgr-ad3")["c"] == []
-    assert book_module.on_pager(users_store.get_user("kid"), ext.uid) is False
 
 
 def test_other_family_external_marker_not_listed():

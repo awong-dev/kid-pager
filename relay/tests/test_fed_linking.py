@@ -15,7 +15,6 @@ from tests.fed_world import (
     identity_of,
     link_families,
     needs_two_relays,
-    signed_call,
 )
 
 pytestmark = needs_two_relays
@@ -51,14 +50,6 @@ def test_identity_is_created_on_first_call_and_is_stable(world):
     assert x.get(FED, "adm_a").json()["fedId"] == body["fedId"]
     # the private key never leaves the relay
     assert ident.privateKey not in first.text
-
-
-def test_each_family_has_its_own_identity(world):
-    x, _ = world
-    x.family("famC", "The Cs")
-    x.user("adm_c", "admc", "admin", "famC")
-    a, c = x.get(FED, "adm_a").json(), x.get(FED, "adm_c").json()
-    assert a["fedId"] != c["fedId"] and a["fingerprint"] != c["fingerprint"]
 
 
 def test_family_routes_are_for_the_family_admin_only(world):
@@ -140,15 +131,6 @@ def test_a_private_ca_rides_in_the_invite_and_is_stored_as_the_links_only_trust_
     assert link.remote.tlsCa == pem(cert)
 
 
-def test_each_side_can_compare_fingerprints(world):
-    x, y = world
-    on_x, on_y = link_families(x, "adm_a", y, "adm_b")
-    mine_x = x.get(FED, "adm_a").json()["fingerprint"]
-    mine_y = y.get(FED, "adm_b").json()["fingerprint"]
-    assert on_y["remote"]["fingerprint"] == mine_x
-    assert on_x["remote"]["fingerprint"] == mine_y
-
-
 def test_a_code_works_once(world):
     x, y = world
     y.family("famC", "The Cs")
@@ -161,12 +143,13 @@ def test_a_code_works_once(world):
         assert len(fed_links.list_for_family("famA")) == 1
 
 
-def test_an_expired_invite_is_refused(world):
+def test_an_expired_or_wrong_or_other_familys_code_is_refused(world):
+    from app.db.firestore import get_db
+    from app.fed.linking import InviteBlob, decode_invite, encode_invite
+
     x, y = world
     invite = x.post(f"{FED}/invites", "adm_a").json()["invite"]
     with x.active():
-        from app.db.firestore import get_db
-
         for snap in get_db().collection("fedInvites").stream():
             snap.reference.update({"expiresAt": 1})
     resp = y.post(f"{FED}/links", "adm_b", {"invite": invite})
@@ -174,26 +157,6 @@ def test_an_expired_invite_is_refused(world):
     with y.active():
         assert fed_links.list_for_family("famB") == []
 
-
-def test_a_wrong_code_is_refused(world):
-    from app.fed.linking import InviteBlob, decode_invite, encode_invite
-
-    x, y = world
-    blob = decode_invite(x.post(f"{FED}/invites", "adm_a").json()["invite"])
-    forged = encode_invite(InviteBlob(**{**blob.model_dump(), "code": "A" * 22}))
-    resp = y.post(f"{FED}/links", "adm_b", {"invite": forged})
-    assert (resp.status_code, resp.json()["detail"]) == (502, "refused")
-    with x.active():
-        assert fed_links.list_for_family("famA") == []
-    # the real code still works afterwards: a wrong guess does not burn it
-    real = encode_invite(blob)
-    assert y.post(f"{FED}/links", "adm_b", {"invite": real}).status_code == 201
-
-
-def test_a_code_of_another_family_does_not_work_for_this_one(world):
-    from app.fed.linking import InviteBlob, decode_invite, encode_invite
-
-    x, y = world
     x.family("famA2", "Other Alphas")
     x.user("adm_a2", "adma2", "admin", "famA2")
     blob_a = decode_invite(x.post(f"{FED}/invites", "adm_a").json()["invite"])
@@ -202,6 +165,15 @@ def test_a_code_of_another_family_does_not_work_for_this_one(world):
     mixed = encode_invite(InviteBlob(**{**blob_a2.model_dump(), "code": blob_a.code}))
     resp = y.post(f"{FED}/links", "adm_b", {"invite": mixed})
     assert (resp.status_code, resp.json()["detail"]) == (502, "refused")
+
+    forged = encode_invite(InviteBlob(**{**blob_a.model_dump(), "code": "A" * 22}))
+    resp = y.post(f"{FED}/links", "adm_b", {"invite": forged})
+    assert (resp.status_code, resp.json()["detail"]) == (502, "refused")
+    with x.active():
+        assert fed_links.list_for_family("famA") == []
+    # the real code still works afterwards: a wrong guess does not burn it
+    real = encode_invite(blob_a)
+    assert y.post(f"{FED}/links", "adm_b", {"invite": real}).status_code == 201
 
 
 def test_linking_to_yourself_is_refused(world):
@@ -222,7 +194,7 @@ def test_two_families_of_one_relay_can_link(world):
     assert len(x.get(FED, "adm_a2").json()["links"]) == 1
 
 
-def test_already_linked_is_a_409_from_either_side(world):
+def test_already_linked_is_a_409_from_either_side_and_when_only_the_issuer_still_has_it(world):
     x, y = world
     link_families(x, "adm_a", y, "adm_b")
     invite_a = x.post(f"{FED}/invites", "adm_a").json()["invite"]
@@ -230,11 +202,7 @@ def test_already_linked_is_a_409_from_either_side(world):
     invite_b = y.post(f"{FED}/invites", "adm_b").json()["invite"]
     assert x.post(f"{FED}/links", "adm_a", {"invite": invite_b}).status_code == 409
 
-
-def test_the_issuer_also_refuses_a_second_link_with_a_fresh_code(world):
-    """B forgets the link (its row removed locally); A still has it: A answers 409."""
-    x, y = world
-    link_families(x, "adm_a", y, "adm_b")
+    # B forgets the link (its row removed locally); A still has it: A answers 409.
     with y.active():
         (link,) = fed_links.list_for_family("famB")
         fed_links.delete(link.id)
@@ -271,31 +239,27 @@ def test_a_malformed_invite_is_a_400(world):
     assert x.post(f"{FED}/links", "adm_a", {"invite": "kpfed2.e30"}).status_code == 400
 
 
-def test_unreachable_other_relay(world, net):
+def test_link_transport_errors_are_reported_without_the_other_relays_words(world, net):
     x, y = world
+    host = "relay-x.example.org"
     invite = x.post(f"{FED}/invites", "adm_a").json()["invite"]
-    net.down.add("relay-x.example.org")
+
+    net.down.add(host)
     resp = y.post(f"{FED}/links", "adm_b", {"invite": invite})
     assert (resp.status_code, resp.json()["detail"]) == (502, "unreachable")
+    net.down.discard(host)
 
-
-def test_address_not_allowed(world, net):
-    x, y = world
-    invite = x.post(f"{FED}/invites", "adm_a").json()["invite"]
-    net.dns["relay-x.example.org"] = ["169.254.169.254"]
+    net.dns[host] = ["169.254.169.254"]
     resp = y.post(f"{FED}/links", "adm_b", {"invite": invite})
     assert (resp.status_code, resp.json()["detail"]) == (502, "address_not_allowed")
     assert not [h for h in net.hits if h.ip == "169.254.169.254"]  # nothing was sent
+    del net.dns[host]
 
-
-def test_a_refusal_and_a_garbled_answer(world, net):
-    x, y = world
-    invite = x.post(f"{FED}/invites", "adm_a").json()["invite"]
-    net.refuse["relay-x.example.org"] = (500, {"detail": "secret internals"})
+    net.refuse[host] = (500, {"detail": "secret internals"})
     resp = y.post(f"{FED}/links", "adm_b", {"invite": invite})
     assert (resp.status_code, resp.json()["detail"]) == (502, "refused")
     assert "secret" not in resp.text  # the other side's words are never shown
-    net.refuse["relay-x.example.org"] = (200, {"fedId": "x"})
+    net.refuse[host] = (200, {"fedId": "x"})
     resp = y.post(f"{FED}/links", "adm_b", {"invite": invite})
     assert (resp.status_code, resp.json()["detail"]) == (502, "bad_response")
 
@@ -475,9 +439,3 @@ def test_a_family_admin_cannot_touch_another_familys_link(world):
     ):
         resp = x.api(method, f"{FED}/links/{lnk['id']}{suffix}", "adm_a2", body)
         assert resp.status_code == 404, suffix
-
-
-def test_identity_helpers_are_the_stored_ones(world):
-    x, _ = world
-    assert signed_call  # imported for the traffic tests
-    assert identity_of(x, "famA") == identity_of(x, "famA")

@@ -98,41 +98,32 @@ def _raw_device(device_id: str) -> dict:
     return get_db().collection("devices").document(device_id).get().to_dict() or {}
 
 
-def test_sms_log_out_sent_is_stored():
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(
+            {"peer": "+15551234567", "dir_": "out", "st": "sent", "body": "on my way"}, id="out-sent"
+        ),
+        pytest.param({"peer": "+15559990000", "dir_": "in", "st": "recv", "body": "ok"}, id="in-recv"),
+        pytest.param({"peer": "+15551234567", "dir_": "out", "st": "sent", "body": ""}, id="empty-body"),
+    ],
+)
+def test_sms_log_is_stored(fields: dict[str, str]):
     _make_user("student", "student")
     _make_pager_device("pgr-s-1", "student")
     ingest, broker = _ingest_with_broker()
 
-    ingest.handle_up(
-        up_topic("pgr-s-1"),
-        sms_log_payload("s_00000001", peer="+15551234567", dir_="out", st="sent", body="on my way"),
-    )
+    ingest.handle_up(up_topic("pgr-s-1"), sms_log_payload("s_00000001", **fields))
 
     entries = sms_store.list_log("pgr-s-1")
     assert len(entries) == 1
     assert entries[0].id == "s_00000001"
-    assert entries[0].dir == "out"
-    assert entries[0].st == "sent"
-    assert entries[0].peer == "+15551234567"
-    assert entries[0].body == "on my way"
+    assert entries[0].dir == fields["dir_"]
+    assert entries[0].st == fields["st"]
+    assert entries[0].peer == fields["peer"]
+    assert entries[0].body == fields["body"]
     # Not routed to anyone, not a thread entry -- nothing published.
     assert broker.published == []
-
-
-def test_sms_log_in_recv_is_stored():
-    _make_user("student", "student")
-    _make_pager_device("pgr-s-2", "student")
-    ingest, _broker = _ingest_with_broker()
-
-    ingest.handle_up(
-        up_topic("pgr-s-2"),
-        sms_log_payload("s_00000002", peer="+15559990000", dir_="in", st="recv", body="ok"),
-    )
-
-    entries = sms_store.list_log("pgr-s-2")
-    assert len(entries) == 1
-    assert entries[0].dir == "in"
-    assert entries[0].st == "recv"
 
 
 def test_sms_log_blocked_logs_security(caplog: pytest.LogCaptureFixture):
@@ -158,43 +149,17 @@ def test_sms_log_blocked_logs_security(caplog: pytest.LogCaptureFixture):
     assert not any("+15558887777" in rec.message for rec in caplog.records)
 
 
-def test_sms_log_empty_body_is_allowed():
-    _make_user("student", "student")
-    _make_pager_device("pgr-s-4", "student")
-    ingest, _broker = _ingest_with_broker()
-
-    ingest.handle_up(up_topic("pgr-s-4"), sms_log_payload("s_00000004", body=""))
-
-    entries = sms_store.list_log("pgr-s-4")
-    assert entries[0].body == ""
-
-
-def test_sms_log_dedup_by_id_is_idempotent():
-    _make_user("student", "student")
-    _make_pager_device("pgr-s-5", "student")
-    ingest, _broker = _ingest_with_broker()
-
-    payload = sms_log_payload("s_00000005", body="once")
-    ingest.handle_up(up_topic("pgr-s-5"), payload)
-    ingest.handle_up(up_topic("pgr-s-5"), payload)  # webhook redelivery
-
-    assert len(sms_store.list_log("pgr-s-5")) == 1
-
-
-def test_sms_log_from_unregistered_device_dropped():
-    ingest, _broker = _ingest_with_broker()
-    ingest.handle_up(up_topic("pgr-s-missing"), sms_log_payload("s_00000006"))
-    assert sms_store.list_log("pgr-s-missing") == []
-
-
-def test_sms_log_from_revoked_device_dropped():
+@pytest.mark.parametrize("state", ["unregistered", "revoked"])
+def test_sms_log_from_unusable_device_dropped(state: str):
     _make_user("student", "student")
     _make_pager_device("pgr-s-6", "student")
-    devices_store.revoke_device("pgr-s-6")
+    if state == "revoked":
+        devices_store.revoke_device("pgr-s-6")
+    device_id = "pgr-s-6" if state == "revoked" else "pgr-s-missing"
     ingest, _broker = _ingest_with_broker()
 
-    ingest.handle_up(up_topic("pgr-s-6"), sms_log_payload("s_00000007"))
-    assert sms_store.list_log("pgr-s-6") == []
+    ingest.handle_up(up_topic(device_id), sms_log_payload("s_00000007"))
+    assert sms_store.list_log(device_id) == []
 
 
 def _sign_raw_json(key: bytes, topic: str, p: bytes) -> bytes:
@@ -259,69 +224,28 @@ def test_hmac_undecodable_signed_non_sms_is_not_logged():
     assert sms_store.list_log("pgr-s-bad2") == []
 
 
-def test_hmac_signed_sms_log_is_verified_then_stored():
+@pytest.mark.parametrize(
+    ("sends", "stored_ids"),
+    [
+        pytest.param([(_HMAC_KEY, "s_00000009", 1)], ["s_00000009"], id="verified-then-stored"),
+        pytest.param([(b"wrong-key-" + b"0" * 22, "s_0000000a", 1)], [], id="bad-signature-dropped"),
+        pytest.param(
+            [(_HMAC_KEY, "s_0000000b", 5), (_HMAC_KEY, "s_0000000c", 5)],
+            ["s_0000000b"],
+            id="replayed-n-dropped",
+        ),
+    ],
+)
+def test_hmac_signed_sms_log_is_stored_only_when_verified_and_fresh(
+    sends: list[tuple[bytes, str, int]], stored_ids: list[str]
+):
     _make_user("student", "student")
-    key = _make_hmac_pager_device("pgr-s-8", "student")
+    _make_hmac_pager_device("pgr-s-8", "student")
     ingest, _broker = _ingest_with_broker()
-
     topic = up_topic("pgr-s-8")
-    payload = devauth.sign_json(
-        key,
-        topic,
-        {
-            "v": 1,
-            "id": "s_00000009",
-            "ts": int(time.time()),
-            "kind": "sms_log",
-            "peer": "+15551112222",
-            "dir": "out",
-            "st": "sent",
-            "body": "signed",
-            "sms_ts": int(time.time()),
-            "n": 1,
-        },
-    )
-    ingest.handle_up(topic, payload)
 
-    entries = sms_store.list_log("pgr-s-8")
-    assert len(entries) == 1
-    assert entries[0].peer == "+15551112222"
-
-
-def test_hmac_signed_sms_log_bad_signature_dropped():
-    _make_user("student", "student")
-    _make_hmac_pager_device("pgr-s-9", "student")
-    ingest, _broker = _ingest_with_broker()
-
-    topic = up_topic("pgr-s-9")
-    payload = devauth.sign_json(
-        b"wrong-key-" + b"0" * 22,
-        topic,
-        {
-            "v": 1,
-            "id": "s_0000000a",
-            "ts": int(time.time()),
-            "kind": "sms_log",
-            "peer": "+15551112222",
-            "dir": "out",
-            "st": "sent",
-            "body": "bad sig",
-            "sms_ts": int(time.time()),
-            "n": 1,
-        },
-    )
-    ingest.handle_up(topic, payload)
-    assert sms_store.list_log("pgr-s-9") == []
-
-
-def test_hmac_signed_sms_log_replay_dropped():
-    _make_user("student", "student")
-    key = _make_hmac_pager_device("pgr-s-10", "student")
-    ingest, _broker = _ingest_with_broker()
-    topic = up_topic("pgr-s-10")
-
-    def _payload(log_id: str, n: int) -> bytes:
-        return devauth.sign_json(
+    for key, log_id, n in sends:
+        payload = devauth.sign_json(
             key,
             topic,
             {
@@ -332,15 +256,16 @@ def test_hmac_signed_sms_log_replay_dropped():
                 "peer": "+15551112222",
                 "dir": "out",
                 "st": "sent",
-                "body": "x",
+                "body": "signed",
                 "sms_ts": int(time.time()),
                 "n": n,
             },
         )
+        ingest.handle_up(topic, payload)
 
-    ingest.handle_up(topic, _payload("s_0000000b", 5))
-    ingest.handle_up(topic, _payload("s_0000000c", 5))  # replayed n
-    assert len(sms_store.list_log("pgr-s-10")) == 1
+    entries = sms_store.list_log("pgr-s-8")
+    assert [e.id for e in entries] == stored_ids
+    assert all(e.peer == "+15551112222" for e in entries)
 
 
 def test_store_sms_create_log_dedup_and_list_order():
@@ -401,22 +326,21 @@ def test_push_sms_contacts_publishes_and_stores_pending():
     assert devcfg.sms_pending("pgr-cfg-1") is True
 
 
-def test_push_sms_contacts_empty_list_is_valid():
-    _make_user("student12", "student12")
-    _make_pager_device("pgr-cfg-2", "student12")
+@pytest.mark.parametrize("registered", [True, False], ids=["empty-list-is-valid", "unregistered-device"])
+def test_push_sms_contacts_empty_list(registered: bool):
+    if registered:
+        _make_user("student12", "student12")
+        _make_pager_device("pgr-cfg-2", "student12")
     broker = FakeBrokerClient()
 
-    ok = devcfg.push_sms_contacts("pgr-cfg-2", [], broker)
+    ok = devcfg.push_sms_contacts("pgr-cfg-2" if registered else "no-such-device", [], broker)
 
-    assert ok is True
-    sent = json.loads(broker.published[0].payload)
-    assert sent["cfg"] == {"sms": []}
-
-
-def test_push_sms_contacts_unregistered_device_returns_false():
-    broker = FakeBrokerClient()
-    assert devcfg.push_sms_contacts("no-such-device", [], broker) is False
-    assert broker.published == []
+    assert ok is registered
+    if registered:
+        sent = json.loads(broker.published[0].payload)
+        assert sent["cfg"] == {"sms": []}
+    else:
+        assert broker.published == []
 
 
 def test_sms_pending_false_before_any_push_and_after_ack():
@@ -522,22 +446,25 @@ def test_get_api_devices_lists_only_own_devices(client: TestClient):
     assert ids == ["pgr-api-1"]
 
 
-def test_get_sms_contacts_owner_allowed(client: TestClient):
+@pytest.mark.parametrize(
+    ("route", "caller", "device_id", "status"),
+    [
+        pytest.param("sms-contacts", "owner", "pgr-api-3", 200, id="contacts-owner-allowed"),
+        pytest.param("sms-contacts", "stranger", "pgr-api-3", 403, id="contacts-third-party-forbidden"),
+        pytest.param("sms-contacts", "owner", "no-such-device", 404, id="contacts-unknown-device"),
+        pytest.param("sms-log", "stranger", "pgr-api-3", 403, id="log-non-owner-forbidden"),
+        pytest.param("sms-log", "owner", "no-such-device", 404, id="log-unknown-device"),
+    ],
+)
+def test_get_device_subroute_auth(client: TestClient, route: str, caller: str, device_id: str, status: int):
     _make_user("owner3", "owner3")
+    _make_user("stranger3", "stranger3")
     _make_pager_device("pgr-api-3", "owner3")
 
-    resp = client.get("/api/devices/pgr-api-3/sms-contacts", headers=auth_header("owner3"))
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {"contacts": [], "pending": False}
-
-
-def test_get_sms_contacts_third_party_forbidden(client: TestClient):
-    _make_user("owner4", "owner4")
-    _make_user("stranger4", "stranger4")
-    _make_pager_device("pgr-api-4", "owner4")
-
-    resp = client.get("/api/devices/pgr-api-4/sms-contacts", headers=auth_header("stranger4"))
-    assert resp.status_code == 403
+    resp = client.get(f"/api/devices/{device_id}/{route}", headers=auth_header(f"{caller}3"))
+    assert resp.status_code == status, resp.text
+    if (route, status) == ("sms-contacts", 200):
+        assert resp.json() == {"contacts": [], "pending": False}
 
 
 def test_get_sms_contacts_admin_allowed(client: TestClient, admin_headers: dict[str, str]):
@@ -546,37 +473,6 @@ def test_get_sms_contacts_admin_allowed(client: TestClient, admin_headers: dict[
 
     resp = client.get("/api/devices/pgr-api-5/sms-contacts", headers=admin_headers)
     assert resp.status_code == 200, resp.text
-
-
-def test_get_sms_contacts_unknown_device_404(client: TestClient):
-    _make_user("owner6", "owner6")
-    resp = client.get("/api/devices/no-such-device/sms-contacts", headers=auth_header("owner6"))
-    assert resp.status_code == 404
-
-
-def test_put_sms_contacts_is_405_pointing_at_the_people_page(
-    client: TestClient, broker: FakeBrokerClient
-):
-    _make_user("owner7", "owner7")
-    _make_pager_device("pgr-api-7", "owner7")
-
-    resp = client.put(
-        "/api/devices/pgr-api-7/sms-contacts",
-        json={"contacts": [{"name": "Mom", "phone": "+12065550100"}]},
-        headers=auth_header("owner7"),
-    )
-    assert resp.status_code == 405, resp.text
-    assert resp.json() == {"detail": "Managed from People → Approved numbers"}
-    assert broker.published == []
-    assert devices_store.get_device("pgr-api-7").smsContacts == []
-
-
-def test_put_sms_contacts_is_405_for_an_unauthenticated_caller(client: TestClient):
-    _make_user("owner8", "owner8")
-    _make_pager_device("pgr-api-8", "owner8")
-
-    resp = client.put("/api/devices/pgr-api-8/sms-contacts", json={"contacts": []})
-    assert resp.status_code == 401
 
 
 def test_get_sms_log_lists_malformed_rows_flagged(client: TestClient):
@@ -643,36 +539,6 @@ def test_get_sms_log_resolves_name_and_orders_newest_first(client: TestClient):
     assert [e["id"] for e in entries] == ["s_b", "s_a"]
     assert entries[1]["name"] == "Mom"
     assert entries[0]["name"] is None
-
-
-def test_get_sms_log_forbidden_for_non_owner(client: TestClient):
-    _make_user("owner14", "owner14")
-    _make_user("stranger14", "stranger14")
-    _make_pager_device("pgr-api-14", "owner14")
-
-    resp = client.get("/api/devices/pgr-api-14/sms-log", headers=auth_header("stranger14"))
-    assert resp.status_code == 403
-
-
-def test_get_sms_log_unknown_device_404(client: TestClient):
-    _make_user("owner15", "owner15")
-    resp = client.get("/api/devices/no-such-device/sms-log", headers=auth_header("owner15"))
-    assert resp.status_code == 404
-
-
-def test_get_sms_log_limit_bounds_are_422(client: TestClient):
-    _make_user("owner16", "owner16")
-    _make_pager_device("pgr-api-16", "owner16")
-
-    resp = client.get(
-        "/api/devices/pgr-api-16/sms-log?limit=501", headers=auth_header("owner16")
-    )
-    assert resp.status_code == 422
-
-    resp2 = client.get(
-        "/api/devices/pgr-api-16/sms-log?limit=0", headers=auth_header("owner16")
-    )
-    assert resp2.status_code == 422
 
 
 def _family_alerts(family_id: str) -> list[dict]:

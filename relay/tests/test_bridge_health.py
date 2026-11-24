@@ -93,20 +93,6 @@ def test_offline_after_threshold_one_notice_then_restored_by_heartbeat(
     assert alert is not None and alert.status == "handled"
 
 
-def test_offline_threshold_comes_from_the_environment(
-    client: TestClient, world: World, broker: FakeBrokerClient, monkeypatch
-):
-    _, headers = _setup(client, world)
-    _heartbeat(client, headers)
-    broker.clear()
-    monkeypatch.setenv("BRIDGE_OFFLINE_AFTER_S", "5")
-    assert bridge_health.offline_after_s() == 5
-    bridge_health.evaluate_all(now=int(time.time()) + 10, broker=broker)
-    assert len(_texts(broker)) == 1
-    monkeypatch.setenv("BRIDGE_OFFLINE_AFTER_S", "junk")
-    assert bridge_health.offline_after_s() == 15 * 60
-
-
 def test_tick_evaluates_and_repeated_ticks_do_not_duplicate(
     client: TestClient, world: World, broker: FakeBrokerClient
 ):

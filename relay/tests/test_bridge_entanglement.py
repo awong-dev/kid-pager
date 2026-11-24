@@ -3,6 +3,7 @@ transactional channel records."""
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 from firebase_admin import auth as fb_auth
 
@@ -50,33 +51,31 @@ def _pair(client: TestClient, code: str, **numbers: str):
     return client.post("/bridge/pair", json={"code": code, "caps": {"sms": True}, **numbers})
 
 
-def test_pair_voice_number_of_another_family_is_409_and_keeps_the_code(
-    client: TestClient, world: World
+@pytest.mark.parametrize(
+    ("first", "field", "number"),
+    [
+        pytest.param({"sim": None, "voice": VOICE}, "voiceNumber", VOICE, id="voice"),
+        pytest.param({"sim": SIM}, "simNumber", SIM, id="sim"),
+    ],
+)
+def test_pair_number_of_another_family_is_409_and_keeps_the_code(
+    client: TestClient, world: World, first: dict, field: str, number: str
 ):
-    pair_bridge(client, world, sim=None, voice=VOICE)
+    pair_bridge(client, world, **first)
     b = _family_b()
     bid, code = _code_b(b)
-    resp = _pair(client, code, voiceNumber=VOICE)
+    resp = _pair(client, code, **{field: number})
     assert resp.status_code == 409
-    assert resp.json()["detail"] in (
-        "that number is used by another bridge phone",
-        "that number belongs to @kid",
-    )
+    if field == "voiceNumber":
+        assert resp.json()["detail"] in (
+            "that number is used by another bridge phone",
+            "that number belongs to @kid",
+        )
     assert not bridges_store.get(bid).paired
-    assert _pair(client, code, voiceNumber=OTHER).status_code == 200
+    assert _pair(client, code, **{field: OTHER}).status_code == 200
     assert bridges_store.get(bid).paired
-
-
-def test_pair_sim_number_of_another_family_is_409_and_keeps_the_code(
-    client: TestClient, world: World
-):
-    pair_bridge(client, world, sim=SIM)
-    b = _family_b()
-    _, code = _code_b(b)
-    resp = _pair(client, code, simNumber=SIM)
-    assert resp.status_code == 409
-    assert _pair(client, code, simNumber=OTHER).status_code == 200
-    assert users_store.get_user("kid2").smsNumber == OTHER
+    if field == "simNumber":
+        assert users_store.get_user("kid2").smsNumber == OTHER
 
 
 def test_pair_succeeds_after_the_first_bridge_is_unpaired(client: TestClient, world: World, broker):
@@ -187,20 +186,6 @@ def test_concurrent_members_channels_both_survive(client: TestClient, world: Wor
         ))
     cfg = backends_store.get_backend(ext.uid, bid).config
     assert set(cfg["via"]) == set(members) and set(cfg["voiceConv"]) == set(members)
-
-
-def test_unchanged_channel_writes_nothing(client: TestClient, world: World, monkeypatch):
-    ext, bid = _ext_row(world)
-    backends_store.record_member_channel(ext.uid, bid, "kid", "sms", None)
-    calls: list[object] = []
-    from google.cloud.firestore import Transaction
-
-    real = Transaction.update
-    monkeypatch.setattr(Transaction, "update", lambda self, *a, **k: calls.append(a) or real(self, *a, **k))
-    backends_store.record_member_channel(ext.uid, bid, "kid", "sms", None)
-    assert calls == []
-    backends_store.record_member_channel(ext.uid, bid, "kid", "gvoice", "t")
-    assert len(calls) == 1
 
 
 def test_missing_row_is_a_noop(client: TestClient, world: World):

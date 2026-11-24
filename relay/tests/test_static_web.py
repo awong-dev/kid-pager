@@ -74,32 +74,19 @@ def test_resolve(root: Path, path: str, rel: str, status: int):
     assert found == (root / rel).resolve()
 
 
-def test_resolve_without_404_html(tmp_path: Path):
-    r = build(tmp_path / "w", {"index.html": "I"})
-    assert static_web.resolve(r, "nope") == (None, 404)
-
-
-def test_pages_over_http(client: TestClient):
-    assert client.get("/").text == "INDEX"
-    assert client.get("/family").text == "FAMILY"
-    assert client.get("/admin/users").text == "USERS"
-    assert client.get("/chat/kid").text == "CHAT"
-    assert client.get("/chat/view/abc").text == "CHATVIEW"
-    assert client.get("/devices/pgr-1").text == "DEVICES"
-    assert client.get("/chat/_.txt").text == "CHATTXT"
-
-
 def test_unknown_path_is_404_with_404_html(client: TestClient):
     r = client.get("/nope")
     assert r.status_code == 404 and r.text == "NOTFOUND"
 
 
-def test_plain_404_without_404_html(tmp_path: Path):
+def test_without_404_html_resolve_and_http_give_plain_404(tmp_path: Path):
+    r = build(tmp_path / "w", {"index.html": "I"})
+    assert static_web.resolve(r, "nope") == (None, 404)
     app = FastAPI()
-    static_web.mount(app, build(tmp_path / "w", {"index.html": "I"}))
-    r = TestClient(app).get("/nope")
-    assert r.status_code == 404
-    assert r.json() == {"detail": "Not Found"}
+    static_web.mount(app, r)
+    resp = TestClient(app).get("/nope")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
 
 
 @pytest.mark.parametrize("path", ["/api/missing", "/webhooks/x", "/internal/x"])

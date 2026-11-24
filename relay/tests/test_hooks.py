@@ -41,7 +41,7 @@ def world():
     befriend("bob", "carol")
 
 
-def test_no_hooks_changes_nothing_and_reads_the_hook_store_once(
+def test_no_hooks_changes_nothing_and_the_hook_list_is_cached_for_thirty_seconds(
     world, routing: Routing, monkeypatch: pytest.MonkeyPatch
 ):
     reads: list[int] = []
@@ -60,11 +60,8 @@ def test_no_hooks_changes_nothing_and_reads_the_hook_store_once(
     stored = messages_store.get_message(r1.messages[0].id)
     assert stored is not None and stored.hooks == {}
 
-
-def test_cache_expires_after_thirty_seconds(world, monkeypatch: pytest.MonkeyPatch):
-    reads: list[int] = []
-    real = hooks_store.list_hooks
-    monkeypatch.setattr(hooks_store, "list_hooks", lambda: (reads.append(1), real())[1])
+    hooks_store.invalidate_cache()
+    reads.clear()
     hooks_store.enabled_cached(now=100.0)
     hooks_store.enabled_cached(now=129.0)
     assert len(reads) == 1
@@ -103,8 +100,9 @@ def test_allow_sends_signed_payload_and_message_goes_through(
     assert "phone" not in text and "deviceId" not in text and "smsNumber" not in text
 
 
-def test_context_is_oldest_first_and_limited(
-    world, routing: Routing, fake_hooks: FakeHooks
+@pytest.mark.parametrize("context", [3, 0])
+def test_context_is_oldest_first_and_limited_and_zero_sends_none(
+    world, routing: Routing, fake_hooks: FakeHooks, context: int
 ):
     for i in range(5):
         web_send(
@@ -113,20 +111,16 @@ def test_context_is_oldest_first_and_limited(
             "bob" if i % 2 == 0 else "alice",
             f"m{i}",
         )
-    add_hook(context=3)
+    add_hook(context=context)
     web_send(routing, "alice", "bob", "latest")
     ctx = fake_hooks.calls[-1].payload["context"]
+    if context == 0:
+        assert ctx == []
+        return
     assert [c["body"] for c in ctx] == ["m2", "m3", "m4"]
     assert [c["sender"] for c in ctx] == ["alice", "bob", "alice"]
     assert set(ctx[0]) == {"id", "ts", "sender", "senderUid", "body"}
     assert ctx[0]["senderUid"] == "alice"
-
-
-def test_context_zero_sends_none(world, routing: Routing, fake_hooks: FakeHooks):
-    web_send(routing, "alice", "bob", "earlier")
-    add_hook(context=0)
-    web_send(routing, "alice", "bob", "x")
-    assert fake_hooks.calls[-1].payload["context"] == []
 
 
 def test_block_stores_nothing_and_reports_hook_blocked(
@@ -173,20 +167,24 @@ def test_replace_stores_and_delivers_the_new_body(
     assert stored.hookRef == "w1"
 
 
-@pytest.mark.parametrize("bad", ["", "   \x01", "x" * 8193])
-def test_replace_with_bad_body_is_an_error(world, routing, fake_hooks, bad):
+@pytest.mark.parametrize(
+    "body, accepted",
+    [
+        pytest.param("", False, id="empty"),
+        pytest.param("   \x01", False, id="control_char"),
+        pytest.param("x" * 8193, False, id="over_8192"),
+        pytest.param("x" * 8192, True, id="at_8192"),
+    ],
+)
+def test_replace_body_bounds(world, routing, fake_hooks, body, accepted):
     h = add_hook()
-    fake_hooks.respond["h1.test"] = {"action": "replace", "body": bad}
+    fake_hooks.respond["h1.test"] = {"action": "replace", "body": body}
     r = web_send(routing, "alice", "bob", "orig")
-    assert [m.body for m in r.messages] == ["orig"]  # fail open
-    assert hooks_store.get(h.id).stats.errors == 1
-
-
-def test_replace_at_the_8192_byte_bound_is_accepted(world, routing, fake_hooks):
-    add_hook()
-    fake_hooks.respond["h1.test"] = {"action": "replace", "body": "x" * 8192}
-    r = web_send(routing, "alice", "bob", "orig")
-    assert "".join(m.body for m in r.messages) == "x" * 8192  # then split for the recipient
+    if accepted:
+        assert "".join(m.body for m in r.messages) == body  # then split for the recipient
+    else:
+        assert [m.body for m in r.messages] == ["orig"]  # fail open
+        assert hooks_store.get(h.id).stats.errors == 1
 
 
 def test_chain_runs_in_order_each_sees_previous_body(world, routing, fake_hooks):

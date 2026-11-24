@@ -108,16 +108,6 @@ def test_ensure_device_falls_back_to_put_on_conflict(monkeypatch: pytest.MonkeyP
     assert len(log.calls) == 3
 
 
-def test_ensure_device_reports_error_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def responder(method: str, url: str, json: dict[str, Any] | None) -> _FakeResponse:
-        return _FakeResponse(500, "boom")
-
-    _install_fake_httpx(monkeypatch, responder)
-    admin = EmqxAdmin(_settings(), manages_auth=True)
-
-    assert admin.ensure_device("pgr-0003", "pw", "pgr-0003") == "error"
-
-
 def test_ensure_boot_user_uses_boot_prefixed_username_and_topics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -183,54 +173,41 @@ def test_delete_user_treats_404_as_success(monkeypatch: pytest.MonkeyPatch) -> N
     assert admin.delete_user("ghost") == "ok"
 
 
-def test_delete_user_reports_error_on_unexpected_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def responder(method: str, url: str, json: dict[str, Any] | None) -> _FakeResponse:
-        return _FakeResponse(500, "boom")
-
-    _install_fake_httpx(monkeypatch, responder)
-    admin = EmqxAdmin(_settings(), manages_auth=True)
-
-    assert admin.delete_user("pgr-0001") == "error"
-
-
-def test_network_failure_is_reported_as_error_never_raises(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("failure", ["http_500", "network"])
+@pytest.mark.parametrize("op", ["ensure_device", "delete_user"])
+def test_broker_failure_is_reported_as_error_never_raises(
+    monkeypatch: pytest.MonkeyPatch, op: str, failure: str
 ) -> None:
     def fake_request(method, url, *, json=None, auth=None, timeout=None):
-        raise httpx.ConnectError("connection refused")
+        if failure == "network":
+            raise httpx.ConnectError("connection refused")
+        return _FakeResponse(500, "boom")
 
     monkeypatch.setattr(httpx, "request", fake_request)
     admin = EmqxAdmin(_settings(), manages_auth=True)
 
-    assert admin.ensure_device("pgr-0001", "pw", "pgr-0001") == "error"
-    assert admin.delete_user("pgr-0001") == "error"
+    if op == "ensure_device":
+        assert admin.ensure_device("pgr-0003", "pw", "pgr-0003") == "error"
+    else:
+        assert admin.delete_user("pgr-0001") == "error"
 
 
-def test_broker_manages_auth_false_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("via_env", [False, True], ids=["constructor_flag", "env_default"])
+def test_broker_manages_auth_false_is_a_noop(monkeypatch: pytest.MonkeyPatch, via_env: bool) -> None:
     def fake_request(*args, **kwargs):
         raise AssertionError("httpx.request must not be called when BROKER_MANAGES_AUTH=0")
 
     monkeypatch.setattr(httpx, "request", fake_request)
-    admin = EmqxAdmin(_settings(), manages_auth=False)
+    if via_env:
+        monkeypatch.setenv("BROKER_MANAGES_AUTH", "0")
+        admin = EmqxAdmin(_settings())
+    else:
+        admin = EmqxAdmin(_settings(), manages_auth=False)
 
     assert admin.ensure_device("pgr-0001", "pw", "pgr-0001") == "manual"
     assert admin.ensure_boot_user("bid123", "bpw") == "manual"
     assert admin.delete_user("pgr-0001") == "manual"
 
-
-def test_default_manages_auth_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BROKER_MANAGES_AUTH", "0")
-
-    def fake_request(*args, **kwargs):
-        raise AssertionError("httpx.request must not be called when BROKER_MANAGES_AUTH=0")
-
-    monkeypatch.setattr(httpx, "request", fake_request)
-    admin = EmqxAdmin(_settings())
-
-    assert admin.ensure_device("pgr-0001", "pw", "pgr-0001") == "manual"
-
-    monkeypatch.setenv("BROKER_MANAGES_AUTH", "1")
-    admin2 = EmqxAdmin(_settings())
-    assert admin2._manages_auth is True
+    if via_env:
+        monkeypatch.setenv("BROKER_MANAGES_AUTH", "1")
+        assert EmqxAdmin(_settings())._manages_auth is True

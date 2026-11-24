@@ -52,11 +52,6 @@ def test_provisional_balance_shapes(text: str, texts: int):
     assert C.parse(SENDER, text) == Balance(texts=texts)
 
 
-@pytest.mark.parametrize("text", PROVISIONAL_UNLIMITED)
-def test_provisional_unlimited(text: str):
-    assert C.parse(SENDER, text) == Balance(texts=None)
-
-
 @pytest.mark.parametrize(("text", "added", "balance"), PROVISIONAL_TOPUP_OK)
 def test_provisional_topup_ok(text: str, added: int | None, balance: int | None):
     assert C.parse(SENDER, text) == TopupOk(added=added, balance=balance)
@@ -68,9 +63,13 @@ def test_provisional_topup_failed(text: str):
     assert isinstance(ev, TopupFailed) and ev.reason
 
 
-@pytest.mark.parametrize("text", PROVISIONAL_LOW)
-def test_provisional_low(text: str):
-    assert C.parse(SENDER, text) == LowWarning(texts=None)
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [(t, Balance(texts=None)) for t in PROVISIONAL_UNLIMITED]
+    + [(t, LowWarning(texts=None)) for t in PROVISIONAL_LOW],
+)
+def test_provisional_unlimited_and_low_shapes(text: str, expected: Balance | LowWarning):
+    assert C.parse(SENDER, text) == expected
 
 
 @pytest.mark.parametrize("text", PROVISIONAL_UNKNOWN)

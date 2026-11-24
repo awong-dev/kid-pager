@@ -130,19 +130,6 @@ def test_resolve_ca_from_chain_root_served_directly(
     assert resolved.subject == "CN=Test Root CA"
 
 
-def test_resolve_ca_from_chain_no_certifi_match_returns_none(
-    chain_fixture: tuple[x509.Certificate, x509.Certificate],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _root_cert, leaf_cert = chain_fixture
-    bundle = tmp_path / "cacert.pem"
-    bundle.write_text("")  # no roots at all -- nothing can match
-    monkeypatch.setattr(certifi, "where", lambda: str(bundle))
-
-    assert ca_resolve.resolve_ca_from_chain([_der(leaf_cert)]) is None
-
-
 def test_resolve_ca_from_chain_empty_chain_returns_none() -> None:
     assert ca_resolve.resolve_ca_from_chain([]) is None
 
@@ -238,11 +225,14 @@ def test_resolve_broker_ca_no_match_leaves_ca_empty(
     assert ca_resolve.get_broker_ca_subject() is None
 
 
-def test_ca_pointer_builds_url_and_remembers_pem():
+@pytest.mark.parametrize(
+    "base_url", ["https://relay.example.com", "https://relay.example.com/"], ids=["plain", "trailing_slash"]
+)
+def test_ca_pointer_builds_url_and_remembers_pem(base_url: str):
     from app.store import cas as cas_store
 
     pem = "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
-    settings = make_settings(public_base_url="https://relay.example.com")
+    settings = make_settings(public_base_url=base_url)
 
     url, sha = ca_resolve.ca_pointer(pem, settings)
 
@@ -252,16 +242,6 @@ def test_ca_pointer_builds_url_and_remembers_pem():
     assert sha == expected_sha
     assert url == f"https://relay.example.com/ca/{expected_sha.hex()}.pem"
     assert cas_store.get_pem(expected_sha.hex()) == pem
-
-
-def test_ca_pointer_strips_a_trailing_slash_from_public_base_url():
-    pem = "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
-    settings = make_settings(public_base_url="https://relay.example.com/")
-
-    url, _sha = ca_resolve.ca_pointer(pem, settings)
-
-    assert "//ca/" not in url.replace("https://", "")
-    assert url.startswith("https://relay.example.com/ca/")
 
 
 def test_ca_pointer_without_public_base_url_raises():

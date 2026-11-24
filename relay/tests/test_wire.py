@@ -22,41 +22,110 @@ from app.wire import (
 )
 
 
-def test_ack_envelope_valid():
-    env = UpEnvelope.model_validate({"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown"})
-    assert env.is_ack
-    assert env.body is None
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown"},
+            {"is_ack": True, "body": None},
+            id="ack",
+        ),
+        pytest.param(
+            {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "student", "body": "ok", "ack": None},
+            {"is_ack": False, "body": "ok"},
+            id="content",
+        ),
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "prio": "high"},  # reserved, §11
+            {"is_ack": True},
+            id="unknown-fields-ignored",
+        ),
+        pytest.param(
+            {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "system", "body": "hi", "ack": None},
+            {"from_": "system"},
+            id="from-system",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "u_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "student",
+                "to": "mom",
+                "body": "ok coming",
+                "ack": None,
+            },
+            {"to": "mom"},
+            id="to-present",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "u_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "student",
+                "body": "ok coming",
+                "ack": None,
+            },
+            {"to": None},
+            id="to-absent",
+        ),
+    ],
+)
+def test_up_envelope_valid_shapes(payload: dict, expected: dict):
+    env = UpEnvelope.model_validate(payload)
+    for attr, value in expected.items():
+        assert getattr(env, attr) == value
 
 
-def test_content_envelope_valid():
-    env = UpEnvelope.model_validate(
-        {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "student", "body": "ok", "ack": None}
-    )
-    assert not env.is_ack
-    assert env.body == "ok"
-
-
-def test_ack_with_body_is_malformed():
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "body": "nope"},
+            id="ack-with-body",
+        ),
+        pytest.param(  # PROTOCOL.md §3.1: `to` is restricted to up content messages
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "to": "mom"},
+            id="ack-with-to",
+        ),
+        pytest.param(
+            {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "student", "ack": None},
+            id="content-without-body",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "u_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "student",
+                "body": "hi\x01there",
+                "ack": None,
+            },
+            id="body-with-control-char",
+        ),
+        pytest.param({"v": 1, "id": "BAD ID!", "ts": 1_700_000_000, "ack": "shown"}, id="invalid-id-format"),
+        pytest.param(
+            {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "Not Valid", "body": "hi", "ack": None},
+            id="invalid-from-alias",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "u_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "student",
+                "to": "Bad To!",
+                "body": "ok coming",
+                "ack": None,
+            },
+            id="invalid-to-alias",
+        ),
+    ],
+)
+def test_up_envelope_malformed_shapes_are_rejected(payload: dict):
     with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "body": "nope"}
-        )
-
-
-def test_ack_with_to_is_malformed():
-    """PROTOCOL.md §3.1: `to` is restricted to up content messages; an ack with `to` is
-    malformed."""
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "to": "mom"}
-        )
-
-
-def test_content_message_without_body_is_malformed():
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {"v": 1, "id": "u_aaaaaaaa", "ts": 1_700_000_000, "from": "student", "ack": None}
-        )
+        UpEnvelope.model_validate(payload)
 
 
 def _up_with_body(body: str) -> dict:
@@ -69,69 +138,6 @@ def test_content_message_body_cap_is_1024_utf8_bytes_with_no_codepoint_cap():
     for too_long in ("a" * 1025, "é" * 513):
         with pytest.raises(ValidationError):
             UpEnvelope.model_validate(_up_with_body(too_long))
-
-
-def test_status_mb_is_modelled_and_an_out_of_range_value_is_dropped():
-    assert StatusEnvelope.model_validate(_online_status(mb=1024)).mb == 1024
-    assert StatusEnvelope.model_validate(_online_status()).mb is None
-    for bad in (0, -1, 8193):
-        assert StatusEnvelope.model_validate(_online_status(mb=bad)).mb is None
-
-
-def test_status_mb_cbor_key_is_76():
-    from app import wirecbor
-
-    assert wirecbor.KEYMAP["mb"] == 76 and 52 not in wirecbor.KEYMAP.values()
-    raw = wirecbor.encode({"v": 1, "state": "online", "mb": 1024})
-    assert wirecbor.decode(raw)["mb"] == 1024
-
-
-def test_content_message_body_with_control_char_is_malformed():
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "u_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "from": "student",
-                "body": "hi\x01there",
-                "ack": None,
-            }
-        )
-
-
-def test_invalid_id_format_is_malformed():
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate({"v": 1, "id": "BAD ID!", "ts": 1_700_000_000, "ack": "shown"})
-
-
-def test_unknown_fields_are_ignored():
-    env = UpEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "m_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "ack": "shown",
-            "prio": "high",  # reserved future field, §11
-        }
-    )
-    assert env.is_ack
-
-
-def test_status_online_requires_mode_batt_ts():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate({"v": 1, "state": "online", "session": "s_aabbccdd"})
-
-
-def test_status_offline_only_needs_session():
-    env = StatusEnvelope.model_validate({"v": 1, "state": "offline", "session": "s_aabbccdd"})
-    assert env.state == "offline"
-
-
-def test_status_invalid_session_format_is_malformed():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate({"v": 1, "state": "offline", "session": "not-a-session"})
-# PROTOCOL.md §14.2: `n = (epoch << 20) | lo` with a 32-bit epoch, so `n` can exceed 2**32.
 
 
 def _online_status(**overrides: object) -> dict:
@@ -148,239 +154,183 @@ def _online_status(**overrides: object) -> dict:
     return base
 
 
-@pytest.mark.parametrize("n", [0, 2**32 - 1, 2**32, 2**32 + 1, 2**53 - 1])
-def test_n_up_to_2_53_minus_1_is_accepted_on_every_signed_kind(n):
-    assert UpEnvelope.model_validate(
-        {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "n": n}
-    ).n == n
-    assert StatusEnvelope.model_validate(_online_status(n=n)).n == n
-    assert (
-        LocEnvelope.model_validate(
+# PROTOCOL.md §14.2: `n = (epoch << 20) | lo` with a 32-bit epoch, so `n` can exceed 2**32.
+@pytest.mark.parametrize(
+    ("n", "accepted"),
+    [
+        (0, True),
+        (2**32 - 1, True),
+        (2**32, True),
+        (2**32 + 1, True),
+        (2**53 - 1, True),
+        (2**53, False),
+        (2**53 + 1, False),
+        (-1, False),
+    ],
+)
+def test_n_is_accepted_up_to_2_53_minus_1_and_rejected_beyond(n: int, accepted: bool):
+    cases = [
+        (UpEnvelope, {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "n": n}),
+        (StatusEnvelope, _online_status(n=n)),
+    ]
+    if accepted:
+        loc = {"v": 1, "id": "l_aaaaaaaa", "ts": 1_700_000_000, "loc": None, "req": None, "err": "no_fix", "n": n}
+        cases.append((LocEnvelope, loc))
+    for model, payload in cases:
+        if accepted:
+            assert model.model_validate(payload).n == n
+        else:
+            with pytest.raises(ValidationError):
+                model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid"),
+    [
+        pytest.param({"v": 1, "state": "online", "session": "s_aabbccdd"}, False, id="online-requires-mode-batt-ts"),
+        pytest.param({"v": 1, "state": "offline", "session": "s_aabbccdd"}, True, id="offline-only-needs-session"),
+        pytest.param({"v": 1, "state": "offline", "session": "not-a-session"}, False, id="invalid-session-format"),
+        pytest.param({k: v for k, v in _online_status().items() if k != "batt_mv"}, True, id="online-without-batt-mv"),
+        pytest.param({k: v for k, v in _online_status().items() if k != "mode"}, False, id="online-without-mode"),
+        pytest.param({k: v for k, v in _online_status().items() if k != "ts"}, False, id="online-without-ts"),
+    ],
+)
+def test_status_required_core_fields(payload: dict, valid: bool):
+    if not valid:
+        with pytest.raises(ValidationError):
+            StatusEnvelope.model_validate(payload)
+        return
+    env = StatusEnvelope.model_validate(payload)
+    assert env.state == payload["state"]
+    assert env.batt_mv == payload.get("batt_mv")
+
+
+_OPTIONAL_STATUS_FIELDS = (
+    "tls", "ca_fp", "loc_backoff_s", "sms_lost", "loc_move_s", "link", "rst", "stage", "abn", "stallcmd",
+    "mb", "car",
+)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected", "ignored"),
+    [
+        pytest.param(
             {
-                "v": 1,
-                "id": "l_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "loc": None,
-                "req": None,
-                "err": "no_fix",
-                "n": n,
-            }
-        ).n
-        == n
-    )
-
-
-@pytest.mark.parametrize("n", [2**53, 2**53 + 1, -1])
-def test_n_at_or_above_2_53_or_negative_is_rejected(n):
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "ack": "shown", "n": n}
-        )
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(n=n))
-# Unknown or new optional /status fields must never cause rejection; these are accepted.
-
-
-def test_status_accepts_tls_ca_fp_loc_backoff_s_sms_lost():
-    env = StatusEnvelope.model_validate(
-        _online_status(tls="broken", ca_fp="0123456789abcdef", loc_backoff_s=320, sms_lost=2)
-    )
-    assert env.tls == "broken"
-    assert env.ca_fp == "0123456789abcdef"
-    assert env.loc_backoff_s == 320
-    assert env.sms_lost == 2
-
-
-def test_status_tls_ca_fp_loc_backoff_s_sms_lost_are_optional():
-    env = StatusEnvelope.model_validate(_online_status())
-    assert env.tls is None
-    assert env.ca_fp is None
-    assert env.loc_backoff_s is None
-    assert env.sms_lost is None
-
-
-def test_status_rejects_bad_tls_value():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(tls="not-a-state"))
-
-
-def test_status_rejects_malformed_ca_fp():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(ca_fp="too-short"))
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(ca_fp="0123456789ABCDEF"))  # must be lowercase
-
-
-def test_status_rejects_negative_sms_lost():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(sms_lost=-1))
-# /status `loc_move_s`: the GNSS-while-moving interval.
-
-
-def test_status_accepts_loc_move_s():
-    env = StatusEnvelope.model_validate(_online_status(loc_move_s=3600))
-    assert env.loc_move_s == 3600
-
-
-def test_status_loc_move_s_is_optional():
-    assert StatusEnvelope.model_validate(_online_status()).loc_move_s is None
-
-
-def test_status_loc_move_s_bounds():
-    assert StatusEnvelope.model_validate(_online_status(loc_move_s=0)).loc_move_s == 0
-    assert StatusEnvelope.model_validate(_online_status(loc_move_s=86400)).loc_move_s == 86400
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(loc_move_s=-1))
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(loc_move_s=86401))
-# /status `link`: MQTT-session generation within a boot.
-
-
-def test_status_accepts_link():
-    env = StatusEnvelope.model_validate(_online_status(link=3))
-    assert env.link == 3
-
-
-def test_status_link_is_optional():
-    """Absent `link` validates and reports `env.link` as `None`, not `0`."""
-    env = StatusEnvelope.model_validate(_online_status())
-    assert env.link is None
-
-
-def test_status_rejects_negative_link():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(link=-1))
-
-
-def test_status_accepts_link_zero():
-    env = StatusEnvelope.model_validate(_online_status(link=0))
-    assert env.link == 0
-# /status key 52 `xport` is retired: old firmware may still send it; it is ignored, not rejected.
-
-
-def test_status_ignores_retired_xport():
-    env = StatusEnvelope.model_validate(_online_status(xport="wifi"))
-    assert not hasattr(env, "xport")
-# Crash diagnostics: /status `rst`/`stage`/`abn` (PROTOCOL.md §5.1).
-
-
-def test_status_accepts_rst_stage_abn():
-    env = StatusEnvelope.model_validate(_online_status(rst=4, stage=6, abn=2))
-    assert env.rst == 4
-    assert env.stage == 6
-    assert env.abn == 2
-
-
-def test_status_rst_stage_abn_are_optional():
-    env = StatusEnvelope.model_validate(_online_status())
-    assert env.rst is None
-    assert env.stage is None
-    assert env.abn is None
-
-
-@pytest.mark.parametrize("field", ["rst", "stage"])
-def test_status_rejects_rst_stage_out_of_range(field):
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(**{field: -1}))
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(**{field: 256}))
-
-
-def test_status_accepts_rst_stage_boundary_values():
-    assert StatusEnvelope.model_validate(_online_status(rst=0)).rst == 0
-    assert StatusEnvelope.model_validate(_online_status(rst=255)).rst == 255
-    assert StatusEnvelope.model_validate(_online_status(stage=0)).stage == 0
-    assert StatusEnvelope.model_validate(_online_status(stage=255)).stage == 255
-
-
-def test_status_rejects_abn_out_of_range():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(abn=-1))
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(abn=65536))
-
-
-def test_status_accepts_abn_boundary_values():
-    assert StatusEnvelope.model_validate(_online_status(abn=0)).abn == 0
-    assert StatusEnvelope.model_validate(_online_status(abn=65535)).abn == 65535
-
-
-def test_status_rst_stage_abn_round_trip_cbor():
-    """PROTOCOL.md §10: keys 53/54/55."""
-    obj = _online_status(rst=4, stage=6, abn=2)
-    assert wirecbor.KEYMAP["rst"] == 53
-    assert wirecbor.KEYMAP["stage"] == 54
-    assert wirecbor.KEYMAP["abn"] == 55
-    cbor_bytes = wirecbor.encode(obj)
-    decoded = wirecbor.decode(cbor_bytes)
-    assert decoded["rst"] == 4
-    assert decoded["stage"] == 6
-    assert decoded["abn"] == 2
-    env = StatusEnvelope.model_validate(decoded)
-    assert (env.rst, env.stage, env.abn) == (4, 6, 2)
-# Crash diagnostics: /status `stallcmd` (PROTOCOL.md §5.1).
-
-
-def test_status_accepts_stallcmd():
-    env = StatusEnvelope.model_validate(_online_status(stallcmd="AT+CEREG?"))
-    assert env.stallcmd == "AT+CEREG?"
-
-
-def test_status_stallcmd_is_optional():
-    env = StatusEnvelope.model_validate(_online_status())
-    assert env.stallcmd is None
-
-
-def test_status_accepts_stallcmd_boundary_length():
-    assert StatusEnvelope.model_validate(_online_status(stallcmd="")).stallcmd == ""
-    twenty_four = "A" * 24
-    assert StatusEnvelope.model_validate(_online_status(stallcmd=twenty_four)).stallcmd == twenty_four
-
-
-def test_status_rejects_stallcmd_over_length():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(stallcmd="A" * 25))
-
-
-def test_status_rejects_stallcmd_non_printable():
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(stallcmd="AT+CEREG\x00"))
-    with pytest.raises(ValidationError):
-        StatusEnvelope.model_validate(_online_status(stallcmd="AT+é"))
-
-
-def test_status_stallcmd_round_trip_cbor():
-    """PROTOCOL.md §10: key 59."""
-    obj = _online_status(stallcmd="AT+CEREG?")
-    assert wirecbor.KEYMAP["stallcmd"] == 59
-    cbor_bytes = wirecbor.encode(obj)
-    decoded = wirecbor.decode(cbor_bytes)
-    assert decoded["stallcmd"] == "AT+CEREG?"
-    env = StatusEnvelope.model_validate(decoded)
-    assert env.stallcmd == "AT+CEREG?"
-
-
-def test_status_still_ignores_a_genuinely_unknown_field():
-    env = StatusEnvelope.model_validate(_online_status(some_future_field="whatever"))
+                "tls": "broken",
+                "ca_fp": "0123456789abcdef",
+                "loc_backoff_s": 320,
+                "sms_lost": 2,
+                "loc_move_s": 3600,
+                "link": 3,
+                "rst": 4,
+                "stage": 6,
+                "abn": 2,
+                "stallcmd": "AT+CEREG?",
+            },
+            {
+                "tls": "broken",
+                "ca_fp": "0123456789abcdef",
+                "loc_backoff_s": 320,
+                "sms_lost": 2,
+                "loc_move_s": 3600,
+                "link": 3,
+                "rst": 4,
+                "stage": 6,
+                "abn": 2,
+                "stallcmd": "AT+CEREG?",
+            },
+            (),
+            id="full",
+        ),
+        pytest.param({}, dict.fromkeys(_OPTIONAL_STATUS_FIELDS), (), id="minimal-all-absent-as-none"),
+        pytest.param({"tls": "proxy"}, {"tls": "proxy"}, (), id="tls-proxy"),
+        pytest.param({"link": 0}, {"link": 0}, (), id="link-zero-is-not-none"),
+        pytest.param({"xport": "wifi"}, {}, ("xport",), id="retired-xport-ignored"),
+        pytest.param({"some_future_field": "whatever"}, {}, ("some_future_field",), id="unknown-field-ignored"),
+    ],
+)
+def test_status_optional_fields_are_accepted_or_absent(overrides: dict, expected: dict, ignored: tuple[str, ...]):
+    env = StatusEnvelope.model_validate(_online_status(**overrides))
     assert env.state == "online"
+    for attr, value in expected.items():
+        assert getattr(env, attr) == value
+    for name in ignored:
+        assert not hasattr(env, name)
 
 
-def test_parse_envelope_bytes_rejects_oversize():
-    huge = b'{"body":"' + b"x" * 1300 + b'"}'
-    assert parse_envelope_bytes(huge) is None
+@pytest.mark.parametrize(
+    ("field", "ok", "rejected", "dropped"),
+    [
+        pytest.param("mb", (1024,), (), (0, -1, 8193), id="mb"),
+        pytest.param("car", ("Soracom", "x" * 24), (), ("x" * 25,), id="car"),
+        pytest.param("tls", (), ("not-a-state",), (), id="tls"),
+        pytest.param("ca_fp", (), ("too-short", "0123456789ABCDEF"), (), id="ca_fp"),  # must be lowercase
+        pytest.param("sms_lost", (), (-1,), (), id="sms_lost"),
+        pytest.param("loc_move_s", (0, 86400), (-1, 86401), (), id="loc_move_s"),
+        pytest.param("link", (), (-1,), (), id="link"),
+        pytest.param("rst", (0, 255), (-1, 256), (), id="rst"),
+        pytest.param("stage", (0, 255), (-1, 256), (), id="stage"),
+        pytest.param("abn", (0, 65535), (-1, 65536), (), id="abn"),
+        pytest.param("stallcmd", ("", "A" * 24), ("A" * 25, "AT+CEREG\x00", "AT+é"), (), id="stallcmd"),
+        pytest.param("batt_mv", (0, 5203, 10000), (-1, 10001), (), id="batt_mv"),
+        pytest.param("temp_dc", (235, -400, 1250), (-401, 1251), (), id="temp_dc"),
+    ],
+)
+def test_status_field_bounds(field: str, ok: tuple, rejected: tuple, dropped: tuple):
+    """`ok` values are kept, `rejected` ones fail validation, `dropped` ones validate as absent."""
+    for value in ok:
+        assert getattr(StatusEnvelope.model_validate(_online_status(**{field: value})), field) == value
+    for value in rejected:
+        with pytest.raises(ValidationError):
+            StatusEnvelope.model_validate(_online_status(**{field: value}))
+    for value in dropped:
+        assert getattr(StatusEnvelope.model_validate(_online_status(**{field: value})), field) is None
 
 
-def test_parse_envelope_bytes_rejects_invalid_utf8():
-    assert parse_envelope_bytes(b"\xff\xfe") is None
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("tls", 39),
+        ("rst", 53),
+        ("stage", 54),
+        ("abn", 55),
+        ("stallcmd", 59),
+        ("why", 60),  # `/loc`; equal to firmware's key
+        ("loc_move_s", 61),  # `/status`
+        ("car", 70),
+        ("temp_dc", 71),
+        ("mb", 76),
+    ],
+)
+def test_cbor_keymap_pins(name: str, key: int):
+    """PROTOCOL.md §10."""
+    assert wirecbor.KEYMAP[name] == key
+    assert 52 not in wirecbor.KEYMAP.values()
+    assert len(set(wirecbor.KEYMAP.values())) == len(wirecbor.KEYMAP)
 
 
-def test_parse_envelope_bytes_rejects_non_object():
-    assert parse_envelope_bytes(b"[1,2,3]") is None
-    assert parse_envelope_bytes(b'"just a string"') is None
-
-
-def test_parse_envelope_bytes_accepts_valid_object():
-    assert parse_envelope_bytes(b'{"a":1}') == {"a": 1}
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mb": 1024},
+        {"rst": 4, "stage": 6, "abn": 2},
+        {"stallcmd": "AT+CEREG?"},
+        {"car": "Soracom", "tls": "proxy"},
+        {"temp_dc": -35},
+    ],
+    ids=["mb", "rst-stage-abn", "stallcmd", "car-tls", "temp_dc"],
+)
+def test_status_fields_round_trip_cbor(overrides: dict):
+    obj = _online_status(**overrides)
+    wire = wirecbor.translate_to_int(obj)
+    for name, value in overrides.items():
+        assert wire[wirecbor.KEYMAP[name]] == value
+    assert wirecbor.translate_to_names({wirecbor.KEYMAP[k]: v for k, v in overrides.items()}) == overrides
+    decoded = wirecbor.decode(wirecbor.encode(obj))
+    assert decoded == obj
+    env = StatusEnvelope.model_validate(decoded)
+    for name, value in overrides.items():
+        assert getattr(env, name) == value
 
 
 def test_resolve_ts_substitutes_for_zero():
@@ -393,110 +343,43 @@ def test_strip_control_chars():
 
 
 @pytest.mark.parametrize(
-    "alias",
+    ("raw", "expected"),
     [
-        "parent",
-        "student",
-        "mom",
-        "a",  # 1 char, minimum length
-        "a" * 16,  # 16 chars, maximum length
-        "user-1",
-        "user_1",
-        "u1_-a",
-        "0start",  # may start with a digit
+        pytest.param(b'{"body":"' + b"x" * 1300 + b'"}', None, id="oversize"),
+        pytest.param(b"\xff\xfe", None, id="invalid-utf8"),
+        pytest.param(b"[1,2,3]", None, id="array-not-object"),
+        pytest.param(b'"just a string"', None, id="string-not-object"),
+        pytest.param(b'{"a":1}', {"a": 1}, id="valid-object"),
     ],
 )
-def test_valid_alias_shapes(alias: str):
-    assert is_valid_alias(alias)
+def test_parse_envelope_bytes(raw: bytes, expected: dict | None):
+    assert parse_envelope_bytes(raw) == expected
 
 
 @pytest.mark.parametrize(
-    "alias",
+    ("alias", "valid"),
     [
-        "a" * 17,  # too long
-        "Parent",  # uppercase
-        "-leading-hyphen",
-        "_leading-underscore",
-        "",  # empty
-        "has space",
-        "hasüni",
+        ("parent", True),
+        ("student", True),
+        ("mom", True),
+        ("system", True),
+        ("a", True),  # 1 char, minimum length
+        ("a" * 16, True),  # 16 chars, maximum length
+        ("user-1", True),
+        ("user_1", True),
+        ("u1_-a", True),
+        ("0start", True),  # may start with a digit
+        ("a" * 17, False),  # too long
+        ("Parent", False),  # uppercase
+        ("-leading-hyphen", False),
+        ("_leading-underscore", False),
+        ("", False),  # empty
+        ("has space", False),
+        ("hasüni", False),
     ],
 )
-def test_invalid_alias_shapes(alias: str):
-    assert not is_valid_alias(alias)
-
-
-def test_from_system_is_a_valid_alias():
-    assert is_valid_alias("system")
-    env = UpEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "u_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "from": "system",
-            "body": "hi",
-            "ack": None,
-        }
-    )
-    assert env.from_ == "system"
-
-
-def test_up_from_invalid_alias_is_malformed():
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "u_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "from": "Not Valid",
-                "body": "hi",
-                "ack": None,
-            }
-        )
-
-
-def test_up_message_with_to_present():
-    env = UpEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "u_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "from": "student",
-            "to": "mom",
-            "body": "ok coming",
-            "ack": None,
-        }
-    )
-    assert env.to == "mom"
-
-
-def test_up_message_with_to_absent():
-    env = UpEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "u_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "from": "student",
-            "body": "ok coming",
-            "ack": None,
-        }
-    )
-    assert env.to is None
-
-
-def test_up_message_with_invalid_to_is_malformed():
-    with pytest.raises(ValidationError):
-        UpEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "u_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "from": "student",
-                "to": "Bad To!",
-                "body": "ok coming",
-                "ack": None,
-            }
-        )
+def test_alias_shapes(alias: str, valid: bool):
+    assert is_valid_alias(alias) is valid
 
 
 def test_up_worst_case_up_message_fits_640_byte_hard_limit():
@@ -524,31 +407,49 @@ def test_up_worst_case_up_message_fits_640_byte_hard_limit():
     assert env.body == body
 
 
-def test_down_envelope_default_kind_is_msg():
-    env = DownEnvelope.model_validate(
-        {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "parent", "body": "hi", "ack": None}
-    )
-    assert env.kind == "msg"
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "parent", "body": "hi", "ack": None},
+            {"kind": "msg"},
+            id="default-kind-is-msg",
+        ),
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "kind": "loc_req", "from": "mom", "ack": None},
+            {"kind": "loc_req", "body": None},
+            id="loc-req-has-no-body",
+        ),
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "mom", "body": "hi", "ack": None},
+            {"sndr": None},
+            id="sndr-absent",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "m_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "family",
+                "sndr": "mom",
+                "body": "hi",
+                "ack": None,
+            },
+            {"sndr": "mom", "from_": "family"},
+            id="sndr-on-group-msg",
+        ),
+    ],
+)
+def test_down_envelope_valid_shapes(payload: dict, expected: dict):
+    env = DownEnvelope.model_validate(payload)
+    for attr, value in expected.items():
+        assert getattr(env, attr) == value
 
 
-def test_down_envelope_loc_req_has_no_body():
-    env = DownEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "m_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "kind": "loc_req",
-            "from": "mom",
-            "ack": None,
-        }
-    )
-    assert env.kind == "loc_req"
-    assert env.body is None
-
-
-def test_down_envelope_loc_req_with_body_is_malformed():
-    with pytest.raises(ValidationError):
-        DownEnvelope.model_validate(
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
             {
                 "v": 1,
                 "id": "m_aaaaaaaa",
@@ -557,23 +458,42 @@ def test_down_envelope_loc_req_with_body_is_malformed():
                 "from": "mom",
                 "body": "should not be here",
                 "ack": None,
-            }
-        )
-
-
-def test_down_envelope_msg_without_body_is_malformed():
+            },
+            id="loc-req-with-body",
+        ),
+        pytest.param(
+            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "parent", "ack": None},
+            id="msg-without-body",
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "m_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "from": "family",
+                "sndr": "Bad Alias!",
+                "body": "hi",
+                "ack": None,
+            },
+            id="invalid-sndr-alias",
+        ),
+        pytest.param(  # PROTOCOL.md §4: `sndr` only appears on a `msg`
+            {
+                "v": 1,
+                "id": "m_aaaaaaaa",
+                "ts": 1_700_000_000,
+                "kind": "loc_req",
+                "from": "mom",
+                "sndr": "mom",
+                "ack": None,
+            },
+            id="sndr-on-loc-req",
+        ),
+    ],
+)
+def test_down_envelope_malformed_shapes_are_rejected(payload: dict):
     with pytest.raises(ValidationError):
-        DownEnvelope.model_validate(
-            {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "parent", "ack": None}
-        )
-
-
-def test_build_down_payload_default_kind_omits_kind_key():
-    raw = build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi")
-    obj = json.loads(raw)
-    assert "kind" not in obj
-    assert obj["body"] == "hi"
-    assert obj["ack"] is None
+        DownEnvelope.model_validate(payload)
 
 
 def test_build_down_payload_loc_req_has_no_body_key():
@@ -589,88 +509,17 @@ def test_build_down_payload_loc_req_has_no_body_key():
     DownEnvelope.model_validate(obj)
 
 
-def test_build_down_payload_msg_without_body_raises():
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({}, id="msg-without-body"),
+        pytest.param({"body": ""}, id="msg-with-empty-body"),
+        pytest.param({"kind": "loc_req", "sndr": "mom"}, id="sndr-on-loc-req"),
+    ],
+)
+def test_build_down_payload_raises(kwargs: dict):
     with pytest.raises(ValueError):
-        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000)
-
-
-def test_build_down_payload_msg_with_empty_body_raises():
-    with pytest.raises(ValueError):
-        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, body="")
-
-
-@pytest.mark.parametrize("kind", ["msg", "loc_req"])
-def test_build_down_payload_round_trips_or_raises(kind: str):
-    kwargs: dict[str, object] = {"msg_id": "m_aaaaaaaa", "ts": 1_700_000_000, "kind": kind}
-    if kind == "msg":
-        kwargs["body"] = "hello"
-    raw = build_down_payload(**kwargs)
-    env = DownEnvelope.model_validate(json.loads(raw))
-    assert env.kind == kind
-
-
-def test_build_down_payload_msg_no_body_raises_before_producing_bad_json():
-    with pytest.raises(ValueError):
-        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, kind="msg")
-
-
-def test_down_envelope_sndr_absent_is_valid_and_none():
-    env = DownEnvelope.model_validate(
-        {"v": 1, "id": "m_aaaaaaaa", "ts": 1_700_000_000, "from": "mom", "body": "hi", "ack": None}
-    )
-    assert env.sndr is None
-
-
-def test_down_envelope_sndr_present_on_group_msg():
-    env = DownEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "m_aaaaaaaa",
-            "ts": 1_700_000_000,
-            "from": "family",
-            "sndr": "mom",
-            "body": "hi",
-            "ack": None,
-        }
-    )
-    assert env.sndr == "mom"
-    assert env.from_ == "family"
-
-
-def test_down_envelope_invalid_sndr_alias_is_malformed():
-    with pytest.raises(ValidationError):
-        DownEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "m_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "from": "family",
-                "sndr": "Bad Alias!",
-                "body": "hi",
-                "ack": None,
-            }
-        )
-
-
-def test_down_envelope_sndr_on_loc_req_is_malformed():
-    """PROTOCOL.md §4: `sndr` only appears on a `msg`; a `loc_req` carrying it is malformed."""
-    with pytest.raises(ValidationError):
-        DownEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "m_aaaaaaaa",
-                "ts": 1_700_000_000,
-                "kind": "loc_req",
-                "from": "mom",
-                "sndr": "mom",
-                "ack": None,
-            }
-        )
-
-
-def test_build_down_payload_omits_sndr_by_default():
-    raw = build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, body="hi", from_="mom")
-    assert "sndr" not in json.loads(raw)
+        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, **kwargs)
 
 
 def test_build_down_payload_dm_bytes_byte_identical_regardless_of_sndr_support():
@@ -688,11 +537,6 @@ def test_build_down_payload_with_sndr_round_trips_and_orders_after_from():
     keys = list(obj.keys())
     assert keys.index("from") < keys.index("sndr") < keys.index("body")
     DownEnvelope.model_validate(obj)
-
-
-def test_build_down_payload_sndr_on_loc_req_raises():
-    with pytest.raises(ValueError):
-        build_down_payload(msg_id="m_aaaaaaaa", ts=1_700_000_000, kind="loc_req", sndr="mom")
 
 
 def test_group_down_page_carries_sndr_in_both_encodings():
@@ -756,14 +600,6 @@ def _base_loc(**overrides):
     return obj
 
 
-def test_loc_why_and_loc_move_s_keys_match_firmware():
-    """PROTOCOL.md §10: `why` = 60 (`/loc`), `loc_move_s` = 61 (`/status`); equal to firmware's
-    keys."""
-    assert wirecbor.KEYMAP["why"] == 60
-    assert wirecbor.KEYMAP["loc_move_s"] == 61
-    assert len(set(wirecbor.KEYMAP.values())) == len(wirecbor.KEYMAP)
-
-
 def test_signed_cell_only_loc_with_why_verifies_and_parses():
     key = b"k" * 32
     topic = "pager/pgr-1/loc"
@@ -783,24 +619,115 @@ def test_signed_cell_only_loc_with_why_verifies_and_parses():
     env = LocEnvelope.model_validate(decoded)
     assert env.loc is None and env.err == "no_fix" and env.req is None
     assert env.why == "still"
+
+
 # LocEnvelope.why: known values accepted, anything else stored as absent (PROTOCOL.md §13.2).
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        *[pytest.param({"why": w}, w, id=f"why-{w}") for w in ("still", "cell", "move", "gnss", "stop")],
+        *[
+            pytest.param({"why": w}, None, id=f"unknown-{w!r}")
+            for w in ("unknown", "GNSS", "", 7, 3.5, True, ["still"], {"why": "still"})
+        ],
+        pytest.param({}, None, id="absent"),
+    ],
+)
+def test_loc_envelope_why_known_values_only(overrides: dict, expected: str | None):
+    assert LocEnvelope.model_validate(_base_loc(**overrides)).why == expected
 
 
-@pytest.mark.parametrize("why", ["still", "cell", "move", "gnss", "stop"])
-def test_loc_envelope_accepts_each_why_value(why: str) -> None:
-    env = LocEnvelope.model_validate(_base_loc(why=why))
-    assert env.why == why
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(
+            _base_loc(),
+            {"req": None, "err": None, "loc.lat": pytest.approx(37.774929), "cached": False},
+            id="periodic-fix",
+        ),
+        pytest.param(
+            _base_loc(req="m_7f3a2b10", cached=True), {"req": "m_7f3a2b10", "cached": True}, id="on-demand-with-req"
+        ),
+        pytest.param(
+            {
+                "v": 1,
+                "id": "l_3c9a11f0",
+                "ts": 1_700_000_000,
+                "loc": None,
+                "req": "m_7f3a2b10",
+                "err": "no_fix",
+            },
+            {"loc": None, "err": "no_fix"},
+            id="no-fix-error",
+        ),
+        pytest.param(
+            {"v": 1, "id": "l_3c9a11f0", "ts": 1_700_000_000, "loc": None, "req": None, "err": "disabled"},
+            {"err": "disabled"},
+            id="disabled-error",
+        ),
+        pytest.param(
+            b'{"v":1,"id":"l_3c9a11f0","ts":1757700000,'
+            b'"loc":{"lat":37.774929,"lon":-122.419416,"acc":14,'
+            b'"fix_ts":1757699991,"src":"gnss"},'
+            b'"req":"m_7f3a2b10","cached":false}',
+            {"req": "m_7f3a2b10", "loc.src": "gnss"},
+            id="protocol-example",
+        ),
+    ],
+)
+def test_loc_envelope_valid_shapes(payload: dict | bytes, expected: dict):
+    if isinstance(payload, bytes):
+        assert len(payload) <= 640
+        payload = parse_envelope_bytes(payload)
+        assert payload is not None
+    env = LocEnvelope.model_validate(payload)
+    for path, value in expected.items():
+        got = env
+        for part in path.split("."):
+            got = getattr(got, part)
+        assert got == value
 
 
-@pytest.mark.parametrize("why", ["unknown", "GNSS", "", 7, 3.5, True, ["still"], {"why": "still"}])
-def test_loc_envelope_unknown_or_non_str_why_is_stored_as_absent(why: object) -> None:
-    """PROTOCOL.md §13.2: an unknown `why` value, including a non-str one, is stored as absent."""
-    env = LocEnvelope.model_validate(_base_loc(why=why))
-    assert env.why is None
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(_base_loc(err="no_fix"), id="both-loc-and-err"),
+        pytest.param(
+            {"v": 1, "id": "l_3c9a11f0", "ts": 1_700_000_000, "loc": None, "req": None}, id="neither-loc-nor-err"
+        ),
+        pytest.param({k: v for k, v in _base_loc().items() if k != "req"}, id="missing-req-key"),  # §13.2
+        pytest.param(  # §3.5's ts=0 substitution is for the envelope's `ts`, not `loc.fix_ts`
+            _base_loc(loc={**_base_loc()["loc"], "fix_ts": 0}), id="zero-fix-ts-with-real-loc"
+        ),
+    ],
+)
+def test_loc_envelope_malformed_shapes_are_rejected(payload: dict):
+    with pytest.raises(ValidationError):
+        LocEnvelope.model_validate(payload)
 
 
-def test_loc_envelope_why_absent_by_default():
-    assert LocEnvelope.model_validate(_base_loc()).why is None
+@pytest.mark.parametrize(
+    ("loc_overrides", "valid"),
+    [
+        ({"lat": 90.0001}, False),
+        ({"lat": -90.0001}, False),
+        ({"lon": 180.0001}, False),
+        ({"lon": -180.0001}, False),
+        ({"acc": -1}, False),
+        ({"lat": 90.0, "lon": -180.0, "acc": 0}, True),
+    ],
+)
+def test_loc_fix_bounds(loc_overrides: dict, valid: bool):
+    obj = _base_loc()
+    obj["loc"].update(loc_overrides)
+    if not valid:
+        with pytest.raises(ValidationError):
+            LocEnvelope.model_validate(obj)
+        return
+    env = LocEnvelope.model_validate(obj)
+    assert env.loc is not None
+    for name, value in loc_overrides.items():
+        assert getattr(env.loc, name) == value
 
 
 def test_loc_with_unknown_int_key_still_parses():
@@ -814,208 +741,64 @@ def test_loc_with_unknown_int_key_still_parses():
     assert LocEnvelope.model_validate(decoded).id == "l_3c9a11f0"
 
 
-def test_loc_envelope_valid_periodic_fix():
-    env = LocEnvelope.model_validate(_base_loc())
-    assert env.req is None
-    assert env.err is None
-    assert env.loc is not None
-    assert env.loc.lat == pytest.approx(37.774929)
-    assert env.cached is False
-
-
-def test_loc_envelope_valid_on_demand_answer_with_req():
-    env = LocEnvelope.model_validate(_base_loc(req="m_7f3a2b10", cached=True))
-    assert env.req == "m_7f3a2b10"
-    assert env.cached is True
-
-
-def test_loc_envelope_valid_no_fix_error_shape():
-    env = LocEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "l_3c9a11f0",
-            "ts": 1_700_000_000,
-            "loc": None,
-            "req": "m_7f3a2b10",
-            "err": "no_fix",
-        }
-    )
-    assert env.loc is None
-    assert env.err == "no_fix"
-
-
-def test_loc_envelope_valid_disabled_error_shape():
-    env = LocEnvelope.model_validate(
-        {
-            "v": 1,
-            "id": "l_3c9a11f0",
-            "ts": 1_700_000_000,
-            "loc": None,
-            "req": None,
-            "err": "disabled",
-        }
-    )
-    assert env.err == "disabled"
-
-
-def test_loc_envelope_both_loc_and_err_set_is_malformed():
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(_base_loc(err="no_fix"))
-
-
-def test_loc_envelope_neither_loc_nor_err_set_is_malformed():
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(
-            {
-                "v": 1,
-                "id": "l_3c9a11f0",
-                "ts": 1_700_000_000,
-                "loc": None,
-                "req": None,
-            }
-        )
-
-
-def test_loc_envelope_oversize_payload_rejected():
-    huge = json.dumps(_base_loc()).encode("utf-8") + b" " * 1300
-    assert parse_envelope_bytes(huge) is None
-
-
-def test_loc_envelope_missing_req_key_is_rejected():
-    """PROTOCOL.md §13.2: `req` is required (`id | null`); omitting it is rejected."""
-    obj = _base_loc()
-    del obj["req"]
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(obj)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"lat": 90.0001},
-        {"lat": -90.0001},
-    ],
-)
-def test_loc_fix_lat_out_of_range_is_malformed(overrides: dict):
-    obj = _base_loc()
-    obj["loc"].update(overrides)
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(obj)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"lon": 180.0001},
-        {"lon": -180.0001},
-    ],
-)
-def test_loc_fix_lon_out_of_range_is_malformed(overrides: dict):
-    obj = _base_loc()
-    obj["loc"].update(overrides)
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(obj)
-
-
-def test_loc_fix_negative_acc_is_malformed():
-    obj = _base_loc()
-    obj["loc"]["acc"] = -1
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(obj)
-
-
-def test_loc_fix_zero_fix_ts_with_real_loc_is_malformed():
-    """§3.5's ts=0 substitution convention is for the envelope's top-level
-    `ts`, not `loc.fix_ts`: a real fix with fix_ts=0 is nonsense."""
-    obj = _base_loc()
-    obj["loc"]["fix_ts"] = 0
-    with pytest.raises(ValidationError):
-        LocEnvelope.model_validate(obj)
-
-
-def test_loc_fix_valid_boundary_values_accepted():
-    obj = _base_loc()
-    obj["loc"].update({"lat": 90.0, "lon": -180.0, "acc": 0})
-    env = LocEnvelope.model_validate(obj)
-    assert env.loc is not None
-    assert env.loc.lat == 90.0
-    assert env.loc.lon == -180.0
-    assert env.loc.acc == 0
-
-
-def test_loc_envelope_example_from_protocol_round_trips():
-    raw = (
-        b'{"v":1,"id":"l_3c9a11f0","ts":1757700000,'
-        b'"loc":{"lat":37.774929,"lon":-122.419416,"acc":14,'
-        b'"fix_ts":1757699991,"src":"gnss"},'
-        b'"req":"m_7f3a2b10","cached":false}'
-    )
-    assert len(raw) <= 640
-    data = parse_envelope_bytes(raw)
-    assert data is not None
-    env = LocEnvelope.model_validate(data)
-    assert env.req == "m_7f3a2b10"
-    assert env.loc is not None
-    assert env.loc.src == "gnss"
-
-
 def _cell(**overrides) -> dict:
     obj = {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95}
     obj.update(overrides)
     return obj
 
 
-def test_cell_info_valid_full():
-    info = CellInfo.model_validate(_cell())
-    assert info.mcc == "310"
-    assert info.mnc == "410"
-    assert info.tac == 12345
-    assert info.ci == 87654321
-    assert info.rsrp == -95
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param(
+            {}, {"mcc": "310", "mnc": "410", "tac": 12345, "ci": 87654321, "rsrp": -95}, id="full"
+        ),
+        pytest.param({"rsrp": None}, {"rsrp": None}, id="without-rsrp"),
+        pytest.param({"mnc": "05"}, {"mnc": "05"}, id="two-digit-mnc-leading-zero-preserved"),
+    ],
+)
+def test_cell_info_valid_variants(overrides: dict, expected: dict):
+    info = CellInfo.model_validate(_cell(**overrides))
+    for attr, value in expected.items():
+        assert getattr(info, attr) == value
 
 
-def test_cell_info_valid_without_rsrp():
-    info = CellInfo.model_validate(_cell(rsrp=None))
-    assert info.rsrp is None
+_NOT_NONE = object()
 
 
-def test_cell_info_valid_two_digit_mnc_leading_zero_preserved():
-    info = CellInfo.model_validate(_cell(mnc="05"))
-    assert info.mnc == "05"
-
-
-def test_loc_envelope_no_fix_with_valid_cell():
-    """§13.2: "the pager sends `cell` whenever it answers without a GNSS
-    fix": `loc: null, err: "no_fix", cell: {...}`."""
-    obj = {
-        "v": 1,
-        "id": "l_3c9a11f0",
-        "ts": 1_700_000_000,
-        "loc": None,
-        "req": "m_7f3a2b10",
-        "err": "no_fix",
-        "cell": _cell(),
-    }
-    env = LocEnvelope.model_validate(obj)
-    assert env.loc is None
-    assert env.err == "no_fix"
-    assert env.cell is not None
-    assert env.cell.mcc == "310"
-    assert env.cell.ci == 87654321
-
-
-def test_loc_envelope_cell_absent_is_backward_compatible():
-    env = LocEnvelope.model_validate(_base_loc())
-    assert env.cell is None
-
-
-def test_loc_envelope_gnss_fix_wins_cell_is_only_recorded():
-    """PROTOCOL.md §13.2: a real `loc` and a `cell` validate together; no winner is picked."""
-    obj = _base_loc()
-    obj["cell"] = _cell()
-    env = LocEnvelope.model_validate(obj)
-    assert env.loc is not None
-    assert env.cell is not None
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(  # §13.2: the pager sends `cell` whenever it answers without a GNSS fix
+            {
+                "v": 1,
+                "id": "l_3c9a11f0",
+                "ts": 1_700_000_000,
+                "loc": None,
+                "req": "m_7f3a2b10",
+                "err": "no_fix",
+                "cell": _cell(),
+            },
+            {"loc": None, "err": "no_fix", "cell.mcc": "310", "cell.ci": 87654321},
+            id="no-fix-with-valid-cell",
+        ),
+        pytest.param(_base_loc(), {"cell": None}, id="cell-absent-is-backward-compatible"),
+        pytest.param(  # PROTOCOL.md §13.2: a real `loc` and a `cell` validate together
+            _base_loc(cell=_cell()), {"loc": _NOT_NONE, "cell": _NOT_NONE}, id="gnss-fix-and-cell-both-recorded"
+        ),
+        pytest.param(_base_loc(cell=None), {"cell": None}, id="cell-null-is-absent"),
+    ],
+)
+def test_loc_envelope_cell_present_or_absent(payload: dict, expected: dict):
+    env = LocEnvelope.model_validate(payload)
+    for path, value in expected.items():
+        got = env
+        for part in path.split("."):
+            got = getattr(got, part)
+        if value is _NOT_NONE:
+            assert got is not None
+        else:
+            assert got == value
 
 
 @pytest.mark.parametrize(
@@ -1048,13 +831,6 @@ def test_loc_envelope_malformed_cell_is_treated_as_absent(bad_cell):
     env = LocEnvelope.model_validate(obj)
     assert env.cell is None
     assert env.err == "no_fix"
-
-
-def test_loc_envelope_cell_null_is_absent():
-    obj = _base_loc()
-    obj["cell"] = None
-    env = LocEnvelope.model_validate(obj)
-    assert env.cell is None
 
 
 def test_ota_status_keys_on_the_cbor_wire():
@@ -1097,54 +873,3 @@ def test_status_bs_cbor_round_trip_and_unknown_subkey_dropped():
     env = StatusEnvelope.model_validate({**status, "bs": {"aw": "x"}})
     assert env.state == "online"
 
-
-def test_status_accepts_tls_proxy():
-    assert StatusEnvelope.model_validate(_online_status(tls="proxy")).tls == "proxy"
-
-
-def test_status_car_accepts_up_to_24_and_drops_the_rest():
-    assert StatusEnvelope.model_validate(_online_status(car="Soracom")).car == "Soracom"
-    assert StatusEnvelope.model_validate(_online_status(car="x" * 24)).car == "x" * 24
-    assert StatusEnvelope.model_validate(_online_status(car="x" * 25)).car is None
-    assert StatusEnvelope.model_validate(_online_status()).car is None
-
-
-def test_status_car_is_key_70_on_the_cbor_wire():
-    from app import wirecbor
-
-    assert wirecbor.KEYMAP["car"] == 70
-    names = wirecbor.translate_to_names({70: "Soracom", 39: "proxy"})
-    assert names == {"car": "Soracom", "tls": "proxy"}
-    env = StatusEnvelope.model_validate(_online_status(**names))
-    assert (env.car, env.tls) == ("Soracom", "proxy")
-
-
-def test_status_batt_mv_raw_range():
-    for ok in (0, 5203, 10000):
-        assert StatusEnvelope.model_validate(_online_status(batt_mv=ok)).batt_mv == ok
-    for bad in (-1, 10001):
-        with pytest.raises(ValidationError):
-            StatusEnvelope.model_validate(_online_status(batt_mv=bad))
-
-
-def test_online_status_without_batt_mv_accepted():
-    d = _online_status()
-    d.pop("batt_mv", None)
-    assert StatusEnvelope.model_validate(d).batt_mv is None
-    for req in ("mode", "ts"):
-        d2 = {k: v for k, v in d.items() if k != req}
-        with pytest.raises(ValidationError):
-            StatusEnvelope.model_validate(d2)
-
-
-def test_status_temp_dc_range_and_cbor_key_71():
-    for ok in (235, -400, 1250):
-        assert StatusEnvelope.model_validate(_online_status(temp_dc=ok)).temp_dc == ok
-    for bad in (-401, 1251):
-        with pytest.raises(ValidationError):
-            StatusEnvelope.model_validate(_online_status(temp_dc=bad))
-    assert wirecbor.KEYMAP["temp_dc"] == 71
-    status = {"v": 1, "state": "online", "mode": "sleep", "session": "s_00000001",
-              "ts": 1_700_000_000, "temp_dc": -35}
-    assert wirecbor.translate_to_int(status)[71] == -35
-    assert wirecbor.decode(wirecbor.encode(status)) == status

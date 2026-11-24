@@ -36,33 +36,30 @@ def hinted_client(broker: FakeBrokerClient, fcm: RecordingFCM):
         yield c
 
 
-def test_hint_absent_by_default(client: TestClient, world: World):
-    bridge, headers = pair_bridge(client, world)
-    hb = client.post("/bridge/heartbeat", json={"status": {}}, headers=headers)
-    assert hb.json() == {"pending": 0}
-
-
-def test_pair_response_has_no_hint_by_default(client: TestClient, world: World):
+@pytest.mark.parametrize(
+    ("fixture", "hint"),
+    [("client", None), ("hinted_client", 7)],
+    ids=["default-no-hint", "hint-set"],
+)
+def test_outbox_wait_hint_in_pair_and_heartbeat_only_when_set(
+    request: pytest.FixtureRequest, world: World, fixture: str, hint: int | None
+):
     from app.store import bridges as bridges_store
 
+    c = request.getfixturevalue(fixture)
     bridge = bridges_store.create("kid", world.family_id, "phone", "adm")
     code, _ = bridges_store.create_pair_code(bridge.id)
-    r = client.post("/bridge/pair", json={"code": code, "version": "1.0", "caps": {"sms": True}})
+    r = c.post("/bridge/pair", json={"code": code, "version": "1.0", "caps": {"sms": True}})
     assert r.status_code == 200
-    assert set(r.json()) == {"bridgeId", "token"}
-
-
-def test_hint_present_in_pair_and_heartbeat_when_set(hinted_client: TestClient, world: World):
-    from app.store import bridges as bridges_store
-
-    bridge = bridges_store.create("kid", world.family_id, "phone", "adm")
-    code, _ = bridges_store.create_pair_code(bridge.id)
-    r = hinted_client.post("/bridge/pair", json={"code": code, "version": "1.0", "caps": {"sms": True}})
-    assert r.status_code == 200
-    assert r.json()["outboxWaitS"] == 7
+    expected = {"pending": 0}
+    if hint:
+        assert r.json()["outboxWaitS"] == hint
+        expected["outboxWaitS"] = hint
+    else:
+        assert set(r.json()) == {"bridgeId", "token"}
     headers = {"Authorization": f"Bearer {r.json()['token']}"}
-    hb = hinted_client.post("/bridge/heartbeat", json={"status": {}}, headers=headers)
-    assert hb.json() == {"pending": 0, "outboxWaitS": 7}
+    hb = c.post("/bridge/heartbeat", json={"status": {}}, headers=headers)
+    assert hb.json() == expected
 
 
 def test_settings_clamp(monkeypatch):

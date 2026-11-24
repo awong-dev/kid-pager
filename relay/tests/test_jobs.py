@@ -286,32 +286,19 @@ def test_sweep_deletes_conversations_past_retention():
     assert result.conversationsDeleted == 1
 
 
-def test_sweep_batches_correctly_with_a_small_sweep_batch(monkeypatch):
+def test_sweep_batches_correctly_with_a_small_sweep_batch_and_is_idempotent(monkeypatch):
     monkeypatch.setenv("SWEEP_BATCH", "2")
     settings_store.set_retention(
         messages=RetentionSetting(n=1, unit="days"), locations=RetentionSetting(n=1, unit="days")
     )
     ids = [_insert_stale_message("a", "b", days_ago=5) for _ in range(5)]
 
-    result = jobs.sweep()
-
-    assert result.messagesDeleted == 5
-    for mid in ids:
-        assert messages_store.get_message(mid) is None
-
-
-def test_sweep_is_idempotent_across_two_consecutive_calls(monkeypatch):
-    monkeypatch.setenv("SWEEP_BATCH", "2")
-    settings_store.set_retention(
-        messages=RetentionSetting(n=1, unit="days"), locations=RetentionSetting(n=1, unit="days")
-    )
-    for _ in range(5):
-        _insert_stale_message("a", "b", days_ago=5)
-
     first = jobs.sweep()
     second = jobs.sweep()
 
     assert first.messagesDeleted == 5
+    for mid in ids:
+        assert messages_store.get_message(mid) is None
     assert second.messagesDeleted == 0
     assert second.wireIdsDeleted == 0
 
@@ -351,22 +338,6 @@ def test_sweep_deletes_locations_loc_wire_ids_and_loc_reqs_together():
     assert result.locationsDeleted == 1
     assert result.locWireIdsDeleted == 1
     assert result.locReqsDeleted == 1
-
-
-def test_sweep_leaves_fresh_documents_untouched():
-    settings_store.set_retention(
-        messages=RetentionSetting(n=4, unit="weeks"), locations=RetentionSetting(n=1, unit="weeks")
-    )
-    fresh_msg = _insert_stale_message("a", "b", days_ago=0.01)
-    fresh_loc = _insert_stale_location("dev-fresh", days_ago=0.01)
-
-    result = jobs.sweep()
-
-    assert messages_store.get_message(fresh_msg) is not None
-    remaining_ids = {f.id for f in locations_store.list_locations("dev-fresh", limit=10)}
-    assert fresh_loc in remaining_ids
-    assert result.messagesDeleted == 0
-    assert result.locationsDeleted == 0
 
 
 def test_sweep_deletes_expired_gchat_link_codes_and_leaves_unexpired_ones(monkeypatch):

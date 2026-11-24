@@ -143,33 +143,33 @@ def test_log_records_fixture_reframed_and_decoded():
     assert [{"path": p, "data": d} for p, d in entities] == EXPECTED
 
 
-def test_log_records_split_and_block_padding():
+def _split_payloads() -> list[bytes]:
     big = bytes(range(256)) * 274  # 70144 bytes: FIRST, MIDDLE..., LAST
     assert len(big) > 2 * 32768
     # leaves exactly 3 bytes at the end of block 0, which are padding
     filler = b"f" * (32768 - 7 - 3)
     # leaves exactly 7 bytes (a zero-length FIRST fragment follows)
     filler2 = b"g" * (32768 - 7 - 7)
-    payloads = [
-        b"a",
-        big,
-        filler,
-        b"after-pad",
-        b"x" * 40000,
-        filler2,
-        b"tail" * 10,
-        b"z",
-    ]
+    return [b"a", big, filler, b"after-pad", b"x" * 40000, filler2, b"tail" * 10, b"z"]
+
+
+@pytest.mark.parametrize(
+    ("payloads", "min_len", "padding"),
+    [
+        pytest.param(_split_payloads(), 3 * 32768, None, id="split_and_block_padding"),
+        # 5 bytes left in block 0
+        pytest.param([b"f" * (32768 - 7 - 5), b"next"], 0, (32768 - 5, 5), id="block_end_padding_layout"),
+    ],
+)
+def test_log_records_round_trip_across_block_padding(
+    payloads: list[bytes], min_len: int, padding: tuple[int, int] | None
+):
     data = write_log(payloads)
-    assert len(data) > 3 * 32768
+    assert len(data) > min_len
+    if padding is not None:
+        start, n = padding
+        assert data[start : start + n] == b"\x00" * n
     assert list(dbexport._log_records(data)) == payloads
-
-
-def test_log_records_block_end_padding_layout():
-    filler = b"f" * (32768 - 7 - 5)  # 5 bytes left in block 0
-    data = write_log([filler, b"next"])
-    assert data[32768 - 5 : 32768] == b"\x00" * 5
-    assert list(dbexport._log_records(data)) == [filler, b"next"]
 
 
 def test_log_records_flipped_byte_is_convert_error():
@@ -188,22 +188,27 @@ def test_crafted_entity_supported_value():
     assert (path, data) == ("things/t1", {"n": 5})
 
 
-def test_geo_point_group_rejected_naming_field():
-    geo = varint(5 << 3 | 3) + varint(6 << 3 | 1) + struct.pack("<d", 1.5)
-    geo += varint(7 << 3 | 1) + struct.pack("<d", 2.5) + varint(5 << 3 | 4)
-    with pytest.raises(dbexport.ConvertError, match="'where'"):
-        dbexport._entity(entity(prop("where", geo)))
-
-
-def test_geo_meaning_rejected_naming_field():
-    with pytest.raises(dbexport.ConvertError, match="'spot'"):
-        dbexport._entity(entity(prop("spot", b"", meaning=9)))
-
-
-def test_reference_value_rejected_naming_field():
-    ref = varint(12 << 3 | 3) + varint(12 << 3 | 4)
-    with pytest.raises(dbexport.ConvertError, match="'link'"):
-        dbexport._entity(entity(prop("link", ref)))
+@pytest.mark.parametrize(
+    ("field", "value", "meaning"),
+    [
+        pytest.param(
+            "where",
+            varint(5 << 3 | 3)
+            + varint(6 << 3 | 1)
+            + struct.pack("<d", 1.5)
+            + varint(7 << 3 | 1)
+            + struct.pack("<d", 2.5)
+            + varint(5 << 3 | 4),
+            None,
+            id="geo_point_group",
+        ),
+        pytest.param("spot", b"", 9, id="geo_meaning"),
+        pytest.param("link", varint(12 << 3 | 3) + varint(12 << 3 | 4), None, id="reference_value"),
+    ],
+)
+def test_unsupported_values_are_rejected_naming_the_field(field: str, value: bytes, meaning: int | None):
+    with pytest.raises(dbexport.ConvertError, match=f"'{field}'"):
+        dbexport._entity(entity(prop(field, value, meaning=meaning)))
 
 
 def test_unsupported_value_fails_whole_convert(tmp_path):

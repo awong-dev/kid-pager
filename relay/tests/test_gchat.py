@@ -66,48 +66,32 @@ def test_verify_chat_bearer_token_accepts_a_validly_signed_jwt():
     assert claims["aud"] == AUDIENCE
 
 
-def test_verify_chat_bearer_token_rejects_tampered_signature():
+def _tampered_signature() -> bytes:
     token = _sign()
     # Flip a character inside the signature segment, not the last one: the last base64 character
     # can carry unused padding bits and change nothing.
     header_b64, payload_b64, sig_b64 = token.decode("ascii").split(".")
     idx = 5
     tampered_char = "A" if sig_b64[idx] != "A" else "B"
-    tampered = f"{header_b64}.{payload_b64}.{sig_b64[:idx]}{tampered_char}{sig_b64[idx + 1:]}"
+    return f"{header_b64}.{payload_b64}.{sig_b64[:idx]}{tampered_char}{sig_b64[idx + 1:]}".encode("ascii")
+
+
+@pytest.mark.parametrize(
+    "make_token, audience",
+    [
+        pytest.param(_tampered_signature, AUDIENCE, id="tampered_signature"),
+        pytest.param(lambda: _sign(audience="some-other-project"), AUDIENCE, id="wrong_audience"),
+        pytest.param(lambda: _sign(issuer="someone-else@example.com"), AUDIENCE, id="wrong_issuer"),
+        # Verification tolerates 30 s of clock skew; expire well past it.
+        pytest.param(lambda: _sign(exp_offset=-120), AUDIENCE, id="expired"),
+        # signed by a key not in `CERTS`
+        pytest.param(lambda: _sign(key=_keypair()[0]), AUDIENCE, id="untrusted_key"),
+        pytest.param(_sign, "", id="blank_audience_config"),
+    ],
+)
+def test_verify_chat_bearer_token_rejects(make_token, audience):
     with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(tampered, audience=AUDIENCE, certs=CERTS)
-
-
-def test_verify_chat_bearer_token_rejects_wrong_audience():
-    token = _sign(audience="some-other-project")
-    with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(token, audience=AUDIENCE, certs=CERTS)
-
-
-def test_verify_chat_bearer_token_rejects_wrong_issuer():
-    token = _sign(issuer="someone-else@example.com")
-    with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(token, audience=AUDIENCE, certs=CERTS)
-
-
-def test_verify_chat_bearer_token_rejects_expired_token():
-    # Verification tolerates 30 s of clock skew; expire well past it.
-    token = _sign(exp_offset=-120)
-    with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(token, audience=AUDIENCE, certs=CERTS)
-
-
-def test_verify_chat_bearer_token_rejects_key_signed_by_untrusted_key():
-    other_priv, _ = _keypair()
-    token = _sign(key=other_priv)  # signed by a key not in `CERTS`
-    with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(token, audience=AUDIENCE, certs=CERTS)
-
-
-def test_verify_chat_bearer_token_rejects_blank_audience_config():
-    token = _sign()
-    with pytest.raises(ValueError):
-        gchat.verify_chat_bearer_token(token, audience="", certs=CERTS)
+        gchat.verify_chat_bearer_token(make_token(), audience=audience, certs=CERTS)
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -176,17 +160,15 @@ def _link_gchat(uid: str, alias: str) -> str:
     return backend.id
 
 
-def test_webhook_missing_bearer_is_401(client: TestClient):
-    resp = client.post("/webhooks/gchat", json=_chat_event("spaces/AAA", "hi"))
-    assert resp.status_code == 401
-
-
-def test_webhook_invalid_jwt_is_401(client: TestClient):
-    resp = client.post(
-        "/webhooks/gchat",
-        json=_chat_event("spaces/AAA", "hi"),
-        headers={"Authorization": "Bearer not-a-real-jwt"},
-    )
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({}, id="missing_bearer"),
+        pytest.param({"Authorization": "Bearer not-a-real-jwt"}, id="invalid_jwt"),
+    ],
+)
+def test_webhook_without_a_valid_bearer_is_401(client: TestClient, headers):
+    resp = client.post("/webhooks/gchat", json=_chat_event("spaces/AAA", "hi"), headers=headers)
     assert resp.status_code == 401
 
 

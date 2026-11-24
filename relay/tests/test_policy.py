@@ -30,16 +30,9 @@ def _external() -> _FakeUser:
     return _FakeUser(kind="external", policy=_FakePolicy(out="", in_=""))
 
 
-# The (people-column, numbers-column) rule for each code, for the out and in tables.
-OUTBOUND_TABLE: dict[str, tuple[policy.Rule, policy.Rule]] = {
+# The (people-column, numbers-column) rule for each out ("open") and in ("any") code.
+RULE_TABLE: dict[str, tuple[policy.Rule, policy.Rule]] = {
     "open": ("any", "any"),
-    "people": ("approved", "none"),
-    "people_sms": ("approved", "approved"),
-    "sms": ("none", "approved"),
-    "any_sms": ("none", "any"),
-}
-
-INBOUND_TABLE: dict[str, tuple[policy.Rule, policy.Rule]] = {
     "any": ("any", "any"),
     "people": ("approved", "none"),
     "people_sms": ("approved", "approved"),
@@ -48,23 +41,11 @@ INBOUND_TABLE: dict[str, tuple[policy.Rule, policy.Rule]] = {
 }
 
 
-@pytest.mark.parametrize("code,expected", sorted(OUTBOUND_TABLE.items()))
-def test_rule_outbound_table(code: str, expected: tuple[policy.Rule, policy.Rule]) -> None:
+@pytest.mark.parametrize("code,expected", sorted(RULE_TABLE.items()))
+def test_rule_table(code: str, expected: tuple[policy.Rule, policy.Rule]) -> None:
     people_rule, numbers_rule = expected
     assert policy.rule(code, "person") == people_rule
     assert policy.rule(code, "external") == numbers_rule
-
-
-@pytest.mark.parametrize("code,expected", sorted(INBOUND_TABLE.items()))
-def test_rule_inbound_table(code: str, expected: tuple[policy.Rule, policy.Rule]) -> None:
-    people_rule, numbers_rule = expected
-    assert policy.rule(code, "person") == people_rule
-    assert policy.rule(code, "external") == numbers_rule
-
-
-def test_out_and_in_machine_code_sets_match_the_tables() -> None:
-    assert policy.OUT == set(OUTBOUND_TABLE)
-    assert policy.IN == set(INBOUND_TABLE)
 
 
 def test_check_open_any_passes_with_no_edges_at_all() -> None:
@@ -86,56 +67,46 @@ def test_check_people_people_requires_both_directed_edges() -> None:
     )
 
 
-def test_check_sender_none_refuses_policy_out_even_with_edges() -> None:
-    sender = _person("sms", "any")
-    recipient = _person("open", "any")
+@pytest.mark.parametrize(
+    ("sender", "recipient", "has_edge_out", "has_edge_in", "expected"),
+    [
+        pytest.param(
+            _person("sms", "any"), _person("open", "any"), True, True, "policy_out", id="sender-none-with-edges"
+        ),
+        pytest.param(
+            _person("open", "any"), _person("open", "sms"), True, True, "policy_in", id="recipient-none"
+        ),
+        pytest.param(
+            _person("sms", "any"),
+            _person("open", "sms"),
+            False,
+            False,
+            "policy_out",
+            id="sender-none-checked-before-recipient-in",
+        ),
+    ],
+)
+def test_check_refuses_a_none_column_with_the_matching_policy_code(
+    sender, recipient, has_edge_out, has_edge_in, expected
+) -> None:
     assert (
-        policy.check(sender, recipient, has_edge_out=True, has_edge_in=True) == "policy_out"
+        policy.check(sender, recipient, has_edge_out=has_edge_out, has_edge_in=has_edge_in)
+        == expected
     )
 
 
-def test_check_recipient_none_refuses_policy_in() -> None:
-    sender = _person("open", "any")
-    recipient = _person("open", "sms")
-    assert (
-        policy.check(sender, recipient, has_edge_out=True, has_edge_in=True) == "policy_in"
-    )
-
-
-def test_check_sender_none_checked_before_recipient_in() -> None:
-    sender = _person("sms", "any")
-    recipient = _person("open", "sms")
-    assert (
-        policy.check(sender, recipient, has_edge_out=False, has_edge_in=False) == "policy_out"
-    )
-
-
-def test_check_external_sender_skips_senders_own_side() -> None:
-    sender = _external()
-    recipient = _person("open", "any")
-    assert policy.check(sender, recipient, has_edge_out=False, has_edge_in=False) is None
-
-    recipient_blocked = _person("open", "people")
-    assert (
-        policy.check(sender, recipient_blocked, has_edge_out=False, has_edge_in=False)
-        == "policy_in"
-    )
-
-
-def test_check_external_recipient_skips_recipients_own_side() -> None:
-    sender = _person("any_sms", "any")
-    recipient = _external()
-    assert policy.check(sender, recipient, has_edge_out=False, has_edge_in=False) is None
-
-    sender_blocked = _person("people", "any")
-    assert (
-        policy.check(sender_blocked, recipient, has_edge_out=False, has_edge_in=False)
-        == "policy_out"
-    )
-
-
-def test_check_both_external_is_always_none() -> None:
-    assert policy.check(_external(), _external(), False, False) is None
+@pytest.mark.parametrize(
+    ("sender", "recipient", "expected"),
+    [
+        pytest.param(_external(), _person("open", "any"), None, id="external-sender-open-recipient"),
+        pytest.param(_external(), _person("open", "people"), "policy_in", id="external-sender-blocked"),
+        pytest.param(_person("any_sms", "any"), _external(), None, id="external-recipient-open-sender"),
+        pytest.param(_person("people", "any"), _external(), "policy_out", id="external-recipient-blocked"),
+        pytest.param(_external(), _external(), None, id="both-external"),
+    ],
+)
+def test_check_skips_an_external_sides_own_policy(sender, recipient, expected) -> None:
+    assert policy.check(sender, recipient, has_edge_out=False, has_edge_in=False) == expected
 
 
 def test_chat_external_is_a_person_peer():

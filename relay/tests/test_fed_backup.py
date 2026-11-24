@@ -132,18 +132,6 @@ def test_an_encrypted_backup_and_the_http_route(world):
         ).status_code == 409
 
 
-def test_the_cli_backup_command(world, tmp_path, monkeypatch):
-    x, _y, _z, _alias = world
-    monkeypatch.setattr(familyexport, "_db", lambda: x.db)
-    out = tmp_path / "b.kpfam"
-    with x.active():
-        assert familyexport.main(["backup", "famA", "-o", str(out), "--no-passphrase"]) == 0
-        assert KpfamFile(out.open("rb"), None).manifest().kind == "backup"
-        # the live flag is gone from export
-        with pytest.raises(SystemExit):
-            familyexport.main(["export", "famA", "--live"])
-
-
 def test_restore_keeps_the_fed_id_makes_a_new_key_and_parks_every_link(restored):
     x, _y, z, _alias, result = restored
     ident = identity_of(x, "famA")
@@ -162,7 +150,7 @@ def test_restore_keeps_the_fed_id_makes_a_new_key_and_parks_every_link(restored)
         assert [u for u in users_store.list_users() if u.ownerFamilyId == "famA" and u.fed]
 
 
-def test_a_reauth_link_sends_nothing_and_accepts_nothing(restored, net):
+def test_a_reauth_link_sends_nothing_accepts_nothing_and_can_be_deleted(restored, net):
     x, y, z, alias, _ = restored
     # outbound: refused at the gate with its own reason, and the book says so
     sent = z.post(f"/api/conversations/{alias}/messages", "ann", {"body": "hi"})
@@ -186,6 +174,9 @@ def test_a_reauth_link_sends_nothing_and_accepts_nothing(restored, net):
         assert z.post(f"{FED}/links/{lnk['id']}/{action}", "adm_a").status_code == 409
     # the other relays' directory and contacts calls are refused too
     assert z.get(f"{FED}/links/{lnk['id']}/directory", "adm_a").status_code == 409
+    # an unwanted reauth link goes with the normal delete
+    assert z.delete(f"{FED}/links/{lnk['id']}", "adm_a").status_code == 200
+    assert z.get(FED, "adm_a").json()["links"] == []
 
 
 def reauth_invite(z) -> dict:
@@ -213,20 +204,16 @@ def test_the_reauth_invite_and_its_url(restored):
     assert y.post(f"{FED}/links/{lnk['id']}/reauth", "adm_b").status_code == 409
 
 
-def test_the_url_is_null_when_the_other_relay_has_no_web_base(world):
+def test_the_reauth_url_follows_the_other_relays_reported_web_base(world):
     x, y, z, _alias = world
+    assert y.raw("GET", "/fed/v1/info").json() == {"v": 2, "hooks": False, "web": WEB}
+    assert x.raw("GET", "/fed/v1/info").json()["web"] is None
     # restore on Z; its link points at Y, which has a web base: make Y's report null
     restore(z, backup_bytes(x))
     import dataclasses
 
     y.app.state.settings = dataclasses.replace(y.settings, web_base_url=None)
     assert reauth_invite(z)["url"] is None
-
-
-def test_info_reports_the_web_base(world):
-    x, y, _z, _alias = world
-    assert y.raw("GET", "/fed/v1/info").json() == {"v": 2, "hooks": False, "web": WEB}
-    assert x.raw("GET", "/fed/v1/info").json()["web"] is None
 
 
 def test_reauth_needs_the_other_admin_to_confirm_then_both_sides_are_active(restored, net):
@@ -277,7 +264,7 @@ def test_reauth_needs_the_other_admin_to_confirm_then_both_sides_are_active(rest
 
     # the original (still alive) family is visibly cut off: Y no longer accepts its key
     # (asserted above) and holds the restored family's key for the link
-def test_a_re_invite_without_a_link_is_refused(restored):
+def test_a_re_invite_without_a_link_or_with_a_stale_epoch_is_refused(restored):
     x, y, z, _alias, _ = restored
     out = reauth_invite(z)
     # famC on Y has no link to that family: a `re` invite is not a way to make one
@@ -289,9 +276,6 @@ def test_a_re_invite_without_a_link_is_refused(restored):
     inv = x.post(f"{FED}/invites", "adm_a").json()["invite"]
     assert y.post(f"{FED}/links", "adm_b", {"invite": inv}).status_code == 409
 
-
-def test_a_stale_reauth_invite_is_refused(restored):
-    x, y, z, _alias, _ = restored
     out = reauth_invite(z)
     with y.active():
         fed_links.update_remote(y_link(y, x), epoch=99)
@@ -366,13 +350,6 @@ def test_a_mismatched_signature_in_a_reauth_request_is_refused(restored):
     assert z.raw("POST", "/fed/v1/link", content=raw, headers=headers).status_code == 401
     with z.active():
         assert fed_links.list_for_family("famA")[0].state == "reauth"
-
-
-def test_an_unwanted_reauth_link_is_removed_with_the_normal_delete(restored):
-    _x, _y, z, _alias, _ = restored
-    (lnk,) = z.get(FED, "adm_a").json()["links"]
-    assert z.delete(f"{FED}/links/{lnk['id']}", "adm_a").status_code == 200
-    assert z.get(FED, "adm_a").json()["links"] == []
 
 
 def test_the_target_switches_still_decide(world):

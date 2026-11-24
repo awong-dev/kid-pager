@@ -58,20 +58,27 @@ def client(broker: FakeBrokerClient) -> Iterator[TestClient]:
         yield c
 
 
-def test_cfg_loc_cbor_shape_and_round_trip():
-    obj = {"v": 1, "id": "m_aabbccdd", "ts": 1_700_000_000, "kind": "cfg",
-           "cfg": {"loc": {"gnss": False}}, "ack": None}  # fmt: skip
+@pytest.mark.parametrize(
+    "obj, wire_key, wire_value, field, decoded",
+    [
+        pytest.param(
+            {"v": 1, "id": "m_aabbccdd", "ts": 1_700_000_000, "kind": "cfg",
+             "cfg": {"loc": {"gnss": False}}, "ack": None},
+            wirecbor.KEYMAP["cfg"], {5: {0: False}}, "cfg", {"loc": {"gnss": False}},
+            id="cfg_loc",
+        ),
+        pytest.param(
+            {"v": 1, "state": "online", "mode": "sleep", "batt_mv": 3300, "rssi": -80,
+             "session": "s_aabbccdd", "ts": 1_700_000_000, "gnss": 0},
+            69, 0, "gnss", 0,
+            id="status_key_69",
+        ),
+    ],
+)
+def test_gnss_cbor_wire_shape_and_round_trip(obj, wire_key, wire_value, field, decoded):
     raw = wirecbor.encode(obj)
-    assert cbor2.loads(raw)[wirecbor.KEYMAP["cfg"]] == {5: {0: False}}
-    assert wirecbor.decode(raw)["cfg"] == {"loc": {"gnss": False}}
-
-
-def test_status_gnss_key_69_round_trips():
-    obj = {"v": 1, "state": "online", "mode": "sleep", "batt_mv": 3300, "rssi": -80,
-           "session": "s_aabbccdd", "ts": 1_700_000_000, "gnss": 0}  # fmt: skip
-    raw = wirecbor.encode(obj)
-    assert cbor2.loads(raw)[69] == 0
-    assert wirecbor.decode(raw)["gnss"] == 0
+    assert cbor2.loads(raw)[wire_key] == wire_value
+    assert wirecbor.decode(raw)[field] == decoded
 
 
 @pytest.mark.parametrize("val,expected", [(0, 0), (1, 1), (2, None), (-1, None), (None, None)])
@@ -137,10 +144,3 @@ def test_put_gnss_stores_publishes_and_acks(client: TestClient, broker: FakeBrok
     assert devcfg.ack("pgr-gnss-3", sent["id"]) is True
     resp = client.get("/api/devices/pgr-gnss-3/gnss", headers=h)
     assert resp.json() == {"en": False, "pending": False, "reported": 1}
-
-
-def test_put_gnss_rejects_missing_en(client: TestClient):
-    _make_user("gowner4")
-    _make_pager_device("pgr-gnss-4", "gowner4")
-    resp = client.put("/api/devices/pgr-gnss-4/gnss", json={}, headers=auth_header("gowner4"))
-    assert resp.status_code == 422

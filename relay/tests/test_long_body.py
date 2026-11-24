@@ -140,25 +140,29 @@ def test_disabled_pager_backend_does_not_set_the_cap(world, routing):
     assert [m.body for m in web_send(routing, "alice", "kid", LONG).messages] == [LONG]
 
 
-def test_resent_wire_id_dedups_every_part(world, routing):
+@pytest.mark.parametrize(
+    ("wire_id", "lose_last_part", "resent_wire_ids"),
+    [
+        pytest.param("w7", False, [], id="resend-dedups-every-part"),
+        pytest.param("w8", True, ["w8~2"], id="resend-repairs-a-lost-part"),
+    ],
+)
+def test_resent_wire_id_dedups_parts_and_repairs_only_a_lost_one(
+    world, routing, wire_id, lose_last_part, resent_wire_ids
+):
     pager_for("kid", "pgr-1")
-    first = web_send(routing, "alice", "kid", "z" * 400, wire_id="w7")
-    again = web_send(routing, "alice", "kid", "z" * 400, wire_id="w7")
-    assert len(first.messages) == 3 and again.messages == []
-    assert len(_thread("alice", "kid")) == 3
+    first = web_send(routing, "alice", "kid", "z" * 400, wire_id=wire_id)
+    assert len(first.messages) == 3
+    if lose_last_part:
+        from app.db.firestore import get_db
 
-
-def test_partial_fanout_is_repaired_by_a_resend(world, routing):
-    pager_for("kid", "pgr-1")
-    full = web_send(routing, "alice", "kid", "z" * 400, wire_id="w8")
-    from app.db.firestore import get_db
-
-    # lose part 2 (as a crash between parts would)
-    lost = full.messages[2]
-    get_db().collection("messages").document(lost.id).delete()
-    get_db().collection("wireIds").document("w8~2_kid").delete()
-    again = web_send(routing, "alice", "kid", "z" * 400, wire_id="w8")
-    assert [m.wireId for m in again.messages] == ["w8~2"]
+        # lose part 2 (as a crash between parts would)
+        get_db().collection("messages").document(first.messages[2].id).delete()
+        get_db().collection("wireIds").document(f"{wire_id}~2_kid").delete()
+    again = web_send(routing, "alice", "kid", "z" * 400, wire_id=wire_id)
+    assert [m.wireId for m in again.messages] == resent_wire_ids
+    if not lose_last_part:
+        assert len(_thread("alice", "kid")) == 3
 
 
 def test_group_copies_use_the_smallest_cap_and_identical_parts(world, routing):

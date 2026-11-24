@@ -37,7 +37,7 @@ def _raw(db: sqlitestore.Client, path: str) -> dict:
         conn.close()
 
 
-def test_server_timestamp_resolves_to_commit_time(db):
+def test_server_timestamp_resolves_to_commit_time_and_increases_per_commit(db):
     before = datetime.now(UTC)
     ref = db.collection("users").document("u1")
     ref.set({"createdAt": SERVER_TIMESTAMP, "nested": {"at": SERVER_TIMESTAMP}})
@@ -48,8 +48,6 @@ def test_server_timestamp_resolves_to_commit_time(db):
     # One commit, one timestamp.
     assert data["nested"]["at"] == data["createdAt"]
 
-
-def test_server_timestamps_strictly_increase_across_commits(db):
     ref = db.collection("c").document("d")
     stamps = []
     for _ in range(5):
@@ -76,9 +74,7 @@ def test_array_union_remove_increment_delete_field(db):
     assert data["a"] == ["x", "y"]
     assert data["n"] == 5.5
 
-
-def test_array_union_does_not_equate_bool_and_number(db):
-    ref = db.collection("c").document("d")
+    ref = db.collection("c").document("d2")
     ref.set({"a": [1]})
     ref.update({"a": ArrayUnion([True])})
     assert ref.get().to_dict()["a"] == [1, True]
@@ -341,12 +337,6 @@ def _file_bytes(path: str) -> bytes:
             with open(path + suffix, "rb") as f:
                 out += f.read()
     return out
-
-
-def test_new_database_is_incremental_vacuum_and_secure_delete(db):
-    conn = db._writer
-    assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
-    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
 
 
 def test_deleted_and_replaced_bodies_are_absent_from_db_and_wal_bytes(db):

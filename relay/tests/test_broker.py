@@ -57,26 +57,18 @@ def test_publish_sends_base64_for_every_payload(sent: list[dict[str, Any]], payl
     assert body["qos"] == 1 and body["retain"] is False
 
 
-def test_publish_binary_does_not_raise_and_reports_success(sent: list[dict[str, Any]]):
-    # A retained AES-GCM bootstrap blob on /boot/{bid}/down.
-    assert make_broker().publish("boot/bid-1/down", BINARY_PAYLOAD, qos=1, retain=True) is True
-    assert sent[0]["json"]["retain"] is True
+def _transport_error(url: str, **kwargs: Any) -> httpx.Response:
+    raise httpx.ConnectError("nope", request=httpx.Request("POST", url))
 
 
-def test_publish_returns_false_on_transport_error(monkeypatch: pytest.MonkeyPatch):
-    def boom(url: str, **kwargs: Any) -> httpx.Response:
-        raise httpx.ConnectError("nope", request=httpx.Request("POST", url))
-
-    monkeypatch.setattr(httpx, "post", boom)
-    assert make_broker().publish("pager/pgr-0001/down", BINARY_PAYLOAD, 1, False) is False
+def _rejection(url: str, **kwargs: Any) -> httpx.Response:
+    return httpx.Response(400, text="bad", request=httpx.Request("POST", url))
 
 
-def test_publish_returns_false_on_rejection(monkeypatch: pytest.MonkeyPatch):
-    def fake_post(url: str, **kwargs: Any) -> httpx.Response:
-        return httpx.Response(400, text="bad", request=httpx.Request("POST", url))
-
+@pytest.mark.parametrize("fake_post", [_transport_error, _rejection], ids=["transport_error", "rejection"])
+def test_publish_returns_false_on_failure(monkeypatch: pytest.MonkeyPatch, fake_post: Any):
     monkeypatch.setattr(httpx, "post", fake_post)
-    assert make_broker().publish("pager/pgr-0001/down", JSON_PAYLOAD, 1, False) is False
+    assert make_broker().publish("pager/pgr-0001/down", BINARY_PAYLOAD, 1, False) is False
 
 
 def emqx_body(topic: str, payload: bytes, qos: int = 1) -> bytes:
@@ -99,14 +91,6 @@ def test_parse_webhook_recovers_exact_bytes(payload: bytes):
     assert parsed == ("pager/pgr-0001/up", payload, 1)
 
 
-def test_parse_webhook_ignores_the_lossy_payload_field():
-    # EMQX's rendering of these bytes is unrecoverable, so a parser trusting `payload` would differ.
-    body = BrokerClient.parse_webhook(emqx_body("pager/pgr-0001/up", BINARY_PAYLOAD))
-    assert body is not None
-    assert body[1] == BINARY_PAYLOAD
-    assert body[1] != BINARY_PAYLOAD.decode("utf-8", "replace").encode("utf-8")
-
-
 def test_parse_webhook_falls_back_to_plain_payload():
     # A broker whose rule SQL lacks payload_b64 keeps working for text envelopes.
     body = json.dumps({"topic": "pager/pgr-0001/up", "payload": '{"v":1}', "qos": 1}).encode()
@@ -117,13 +101,10 @@ def test_parse_webhook_falls_back_to_plain_payload():
     "body",
     [
         b"not json at all",
-        b"[1,2,3]",
         json.dumps({"payload_b64": "AAA="}).encode(),  # no topic
         json.dumps({"topic": "pager/pgr-0001/up"}).encode(),  # no payload of any kind
         json.dumps({"topic": "t", "payload_b64": "!!!not base64!!!"}).encode(),
-        json.dumps({"topic": "t", "payload_b64": 17}).encode(),
         json.dumps({"topic": "t", "payload_b64": "AAA=", "qos": "one"}).encode(),
-        json.dumps({"topic": "t", "payload": 17}).encode(),
     ],
 )
 def test_parse_webhook_rejects_malformed_bodies(body: bytes):

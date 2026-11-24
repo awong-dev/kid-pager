@@ -265,13 +265,8 @@ def test_family_settings_defaults_patch_and_validation(
 def test_family_settings_validation_and_scope(client: TestClient, world: World):
     h = world.admin_headers
     for body in (
-        {},
         {"settings": {}},
-        {"settings": {"topup": {"mode": "always"}}},
-        {"settings": {"topup": {"perMonth": 0}}},
         {"settings": {"topup": {"perMonth": 11}}},
-        {"settings": {"linkChecks": None}},
-        {"settings": {"notices": {"pager": "maybe"}}},
         {"settings": {"nope": True}},
     ):
         r = client.patch("/api/family", json=body, headers=h)

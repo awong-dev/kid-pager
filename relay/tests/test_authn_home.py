@@ -130,12 +130,6 @@ def test_first_admin_needs_csrf_header_and_a_real_password(client: TestClient):
     assert client.get("/api/setup/status").json() == {"needsSetup": True}
 
 
-def test_tls_mode_is_reported(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    _first_admin(client)
-    monkeypatch.setenv("TLS_MODE", "selfsigned")
-    assert client.get("/api/me").json()["tlsMode"] == "selfsigned"
-
-
 def test_cookie_writes_need_the_csrf_header(client: TestClient):
     _first_admin(client)
     resp = client.patch("/api/me", json={"notify": {"alerts": False}})

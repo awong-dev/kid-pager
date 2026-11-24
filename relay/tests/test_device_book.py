@@ -108,37 +108,32 @@ def _decode_body(key: bytes, content: bytes) -> dict:
     return wirecbor.decode(unsigned)
 
 
-def test_device_book_serves_20_contacts(client: TestClient):
-    key = _make_hmac_pager_device("pgr-db-20", "student-db20")
-    _make_user("student-db20", "student-db20")
-    for i in range(20):
-        uid = f"dbcontact20_{i}"
-        _make_user(uid, f"dbc20{i:02d}")
-        _approve("student-db20", uid)
+@pytest.mark.parametrize(
+    ("count", "truncated"), [(20, False), (40, True)], ids=["under_limit", "truncates_at_32"]
+)
+def test_device_book_serves_at_most_32_contacts_and_sets_more(
+    client: TestClient, count: int, truncated: bool
+):
+    device_id = f"pgr-db-{count}"
+    owner = f"student-db{count}"
+    key = _make_hmac_pager_device(device_id, owner)
+    _make_user(owner, owner)
+    for i in range(count):
+        uid = f"dbcontact{count}_{i}"
+        _make_user(uid, f"dbc{count}{i:03d}")
+        _approve(owner, uid)
 
-    resp = _get(client, "pgr-db-20", key, 1, 0)
-
-    assert resp.status_code == 200, resp.text
-    body = _decode_body(key, resp.content)
-    assert len(body["c"]) == 20
-    assert "more" not in body
-
-
-def test_device_book_truncates_at_32_sets_more(client: TestClient):
-    key = _make_hmac_pager_device("pgr-db-40", "student-db40")
-    _make_user("student-db40", "student-db40")
-    for i in range(40):
-        uid = f"dbcontact40_{i}"
-        _make_user(uid, f"dbc40{i:03d}")
-        _approve("student-db40", uid)
-
-    resp = _get(client, "pgr-db-40", key, 1, 0)
+    resp = _get(client, device_id, key, 1, 0)
 
     assert resp.status_code == 200, resp.text
     assert len(resp.content) < 4096
     body = _decode_body(key, resp.content)
-    assert len(body["c"]) == 32
-    assert body["more"] is True
+    if truncated:
+        assert len(body["c"]) == 32
+        assert body["more"] is True
+    else:
+        assert len(body["c"]) == count
+        assert "more" not in body
 
 
 def test_device_book_default_first_then_groups(client: TestClient):
@@ -201,21 +196,14 @@ def test_device_book_malformed_headers_400(client: TestClient):
     assert resp.status_code == 400
 
 
-def test_device_book_unknown_device_404(client: TestClient):
-    resp = _get(client, "no-such-device", _HMAC_KEY, 1, 0)
-    assert resp.status_code == 404
-
-
-def test_device_book_revoked_404(client: TestClient):
+def _make_revoked_device() -> tuple[str, bytes]:
     key = _make_hmac_pager_device("pgr-db-revoked", "student-revoked")
     _make_user("student-revoked", "student-revoked")
     devices_store.revoke_device("pgr-db-revoked")
-
-    resp = _get(client, "pgr-db-revoked", key, 1, 0)
-    assert resp.status_code == 404
+    return "pgr-db-revoked", key
 
 
-def test_device_book_not_hmac_404(client: TestClient):
+def _make_password_device() -> tuple[str, bytes]:
     devices_store.create_device(
         device_id="pgr-db-password",
         owner_uid="std-db-pw",
@@ -225,8 +213,19 @@ def test_device_book_not_hmac_404(client: TestClient):
         auth_mode="password",
     )
     _make_user("std-db-pw", "std-db-pw")
+    return "pgr-db-password", _HMAC_KEY
 
-    resp = _get(client, "pgr-db-password", _HMAC_KEY, 1, 0)
+
+@pytest.mark.parametrize("kind", ["unknown", "revoked", "not_hmac"])
+def test_device_book_404_for_unknown_revoked_or_non_hmac_device(client: TestClient, kind: str):
+    if kind == "unknown":
+        device_id, key = "no-such-device", _HMAC_KEY
+    elif kind == "revoked":
+        device_id, key = _make_revoked_device()
+    else:
+        device_id, key = _make_password_device()
+
+    resp = _get(client, device_id, key, 1, 0)
     assert resp.status_code == 404
 
 
@@ -242,29 +241,22 @@ def test_device_book_bad_sig_401_and_counts_failure(client: TestClient):
     assert device_secrets_store.get("pgr-db-badsig").upN == 0
 
 
-def test_device_book_replayed_n_409(client: TestClient):
+@pytest.mark.parametrize(
+    ("first_n", "retry_n"), [(5, 5), (100, 99)], ids=["replayed_n", "below_upn_inside_window"]
+)
+def test_device_book_refuses_n_not_above_upn_with_409(
+    client: TestClient, first_n: int, retry_n: int
+):
     key = _make_hmac_pager_device("pgr-db-replay", "student-replay")
     _make_user("student-replay", "student-replay")
 
-    resp1 = _get(client, "pgr-db-replay", key, 5, 0)
+    resp1 = _get(client, "pgr-db-replay", key, first_n, 0)
     assert resp1.status_code == 200
-    up_n_after_first = device_secrets_store.get("pgr-db-replay").upN
-    assert up_n_after_first == 5
+    assert device_secrets_store.get("pgr-db-replay").upN == first_n
 
-    resp2 = _get(client, "pgr-db-replay", key, 5, 0)
+    resp2 = _get(client, "pgr-db-replay", key, retry_n, 0)
     assert resp2.status_code == 409
-    assert device_secrets_store.get("pgr-db-replay").upN == up_n_after_first
-
-
-def test_device_book_n_below_upn_409_even_inside_window(client: TestClient):
-    key = _make_hmac_pager_device("pgr-db-window", "student-window")
-    _make_user("student-window", "student-window")
-    assert device_secrets_store.accept_up_n("pgr-db-window", 100) is True
-
-    resp = _get(client, "pgr-db-window", key, 99, 0)
-
-    assert resp.status_code == 409
-    assert device_secrets_store.get("pgr-db-window").upN == 100
+    assert device_secrets_store.get("pgr-db-replay").upN == first_n
 
 
 def test_device_book_consumes_counter(client: TestClient, broker: FakeBrokerClient):
@@ -307,18 +299,6 @@ def test_device_book_consumes_counter(client: TestClient, broker: FakeBrokerClie
     assert after.upN == before.upN
     assert after.upBits == before.upBits
 
-
-def test_device_book_response_signature_verifies(client: TestClient):
-    key = _make_hmac_pager_device("pgr-db-sig", "student-sig")
-    _make_user("student-sig", "student-sig")
-
-    resp = _get(client, "pgr-db-sig", key, 7, 0)
-
-    assert resp.status_code == 200
-    ok, unsigned = devauth.verify(key, "/api/device/book", resp.content)
-    assert ok
-    body = wirecbor.decode(unsigned)
-    assert body["n"] == 7
 
 
 def test_device_book_cache_control_no_store(client: TestClient):

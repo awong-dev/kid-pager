@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 
+import pytest
+
 from app.logging_config import JsonLogFormatter, request_id_var
 
 
@@ -32,34 +34,18 @@ def test_format_produces_valid_json_with_severity_message_timestamp():
     assert payload["logger"] == "relay.test"
 
 
-def test_format_maps_every_standard_level_to_its_cloud_logging_severity():
-    expected = {
-        logging.DEBUG: "DEBUG",
-        logging.INFO: "INFO",
-        logging.WARNING: "WARNING",
-        logging.ERROR: "ERROR",
-        logging.CRITICAL: "CRITICAL",
-    }
-    for level, severity in expected.items():
-        record = _make_record(level=level)
-        payload = json.loads(JsonLogFormatter().format(record))
-        assert payload["severity"] == severity
-
-
-def test_format_includes_request_id_when_set_in_context():
-    token = request_id_var.set("req-abc-123")
+@pytest.mark.parametrize("request_id", ["req-abc-123", None])
+def test_format_includes_request_id_only_when_set_in_context(request_id):
+    token = request_id_var.set(request_id) if request_id else None
     try:
-        record = _make_record()
-        payload = json.loads(JsonLogFormatter().format(record))
-        assert payload["requestId"] == "req-abc-123"
+        payload = json.loads(JsonLogFormatter().format(_make_record()))
     finally:
-        request_id_var.reset(token)
-
-
-def test_format_omits_request_id_when_not_set():
-    record = _make_record()
-    payload = json.loads(JsonLogFormatter().format(record))
-    assert "requestId" not in payload
+        if token is not None:
+            request_id_var.reset(token)
+    if request_id:
+        assert payload["requestId"] == request_id
+    else:
+        assert "requestId" not in payload
 
 
 def test_format_includes_exception_traceback_when_present():

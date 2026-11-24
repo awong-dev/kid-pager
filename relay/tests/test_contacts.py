@@ -196,52 +196,48 @@ def test_add_lost_race_on_the_row_is_a_dup_with_no_second_bump():
     assert _book_version("pgr-c-3b") == 1
 
 
-def test_add_existing_number_other_name_sets_nick():
+@pytest.mark.parametrize(
+    ("existing", "adds", "display_names"),
+    [
+        pytest.param(
+            [("+15551110000", "Gran")],
+            [("+15551110000", "Grandma")],
+            ["Gran"],
+            id="existing_number_other_name_sets_nick",
+        ),
+        pytest.param(
+            [("+15552220000", "Grandma")],
+            [("+15553330100", "Grandma")],
+            ["Grandma 0100"],
+            id="name_taken_suffixes_last4",
+        ),
+        pytest.param(
+            [("+15552220000", "Grandma"), ("+15554440100", "Grandma 0100")],
+            [("+15553440100", "Grandma"), ("+15557440100", "Grandma")],
+            ["Grandma 440100", "+15557440100"],
+            id="name_taken_falls_through_to_last6_then_e164",
+        ),
+    ],
+)
+def test_add_name_collisions_get_a_distinct_display_name_and_keep_the_requested_nick(
+    existing: list[tuple[str, str]], adds: list[tuple[str, str]], display_names: list[str]
+):
     family = _make_family("Add3")
     _kid(family.id, devices=("pgr-c-4",))
-    ext = externals_store.get_or_create(family.id, "+15551110000", "Gran")
+    for phone, name in existing:
+        externals_store.get_or_create(family.id, phone, name)
     ingest, broker = _ingest()
 
-    ingest.handle_up(up_topic("pgr-c-4"), contact_req_payload("u_c4", "Grandma", ph="+15551110000"))
+    for n, (phone, name) in enumerate(adds):
+        ingest.handle_up(up_topic("pgr-c-4"), contact_req_payload(f"u_c4{n}", name, ph=phone))
 
-    assert [u.uid for u in externals_store.list_family_contacts(family.id)] == [ext.uid]
-    marker = _marker("student", ext.uid)
-    assert marker is not None and marker["added"] is True and marker["nick"] == "Grandma"
-    assert externals_store.get_family_contact(family.id, "+15551110000").displayName == "Gran"
+    assert len(externals_store.list_family_contacts(family.id)) == len({p for p, _ in existing + adds})
+    for (phone, name), display_name in zip(adds, display_names, strict=True):
+        ext = externals_store.get_family_contact(family.id, phone)
+        assert ext is not None and ext.displayName == display_name
+        marker = _marker("student", ext.uid)
+        assert marker is not None and marker["nick"] == name and marker["added"] is True
     assert _system_bodies(broker) == []
-
-
-def test_add_name_taken_suffixes_last4():
-    family = _make_family("Add4")
-    _kid(family.id, devices=("pgr-c-5",))
-    externals_store.get_or_create(family.id, "+15552220000", "Grandma")
-    ingest, broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-5"), contact_req_payload("u_c5", "Grandma", ph="+15553330100"))
-
-    ext = externals_store.get_family_contact(family.id, "+15553330100")
-    assert ext is not None and ext.displayName == "Grandma 0100"
-    marker = _marker("student", ext.uid)
-    assert marker is not None and marker["nick"] == "Grandma" and marker["added"] is True
-    assert _system_bodies(broker) == []
-
-
-def test_add_name_taken_falls_through_to_last6_then_e164():
-    family = _make_family("Add4b")
-    _kid(family.id, devices=("pgr-c-5b",))
-    externals_store.get_or_create(family.id, "+15552220000", "Grandma")
-    externals_store.get_or_create(family.id, "+15554440100", "Grandma 0100")
-    ingest, _broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-5b"), contact_req_payload("u_c5b", "Grandma", ph="+15553440100"))
-    ext = externals_store.get_family_contact(family.id, "+15553440100")
-    assert ext is not None and ext.displayName == "Grandma 440100"
-    assert _marker("student", ext.uid)["nick"] == "Grandma"
-
-    ingest.handle_up(up_topic("pgr-c-5b"), contact_req_payload("u_c5c", "Grandma", ph="+15557440100"))
-    ext = externals_store.get_family_contact(family.id, "+15557440100")
-    assert ext is not None and ext.displayName == "+15557440100"
-    assert _marker("student", ext.uid)["nick"] == "Grandma"
 
 
 def test_add_alias_inbound_edge_marks():
@@ -347,78 +343,80 @@ def test_policy_hidden_sibling_not_in_book():
     assert _system_bodies(broker) == ["Sis: already in your book"]
 
 
-def test_same_family_alias_is_already_in_your_book_with_no_row():
+@pytest.mark.parametrize("via", ["same_family_alias", "phone_on_the_pager"])
+def test_an_add_already_in_your_book_replies_and_stores_no_row(via: str):
     family = _make_family("Add8")
     _kid(family.id, devices=("pgr-c-11",))
-    _make_user("sis", "sis", family_id=family.id)
+    if via == "same_family_alias":
+        _make_user("sis", "sis", family_id=family.id)
+        ph, name, peer = "sis", "X", "sis"
+    else:
+        ext = externals_store.get_or_create(family.id, "+12065550123", "Gma")
+        allow_store.set_edge("student", ext.uid, message=True, locate=False)
+        ph, name, peer = "2065550123", "Gma", ext.uid
     ingest, broker = _ingest()
 
-    ingest.handle_up(up_topic("pgr-c-11"), contact_req_payload("u_c11", "X", ph="sis"))
+    ingest.handle_up(up_topic("pgr-c-11"), contact_req_payload("u_c11", name, ph=ph))
 
     assert contacts_store.get_by_device_and_req("pgr-c-11", "u_c11") is None
-    assert _system_bodies(broker) == ["X: already in your book"]
-    assert _marker("student", "sis") is None
+    assert _system_bodies(broker) == [f"{name}: already in your book"]
+    assert _marker("student", peer) is None
 
 
-def test_phone_already_on_the_pager_is_in_your_book():
-    family = _make_family("Add9")
-    _kid(family.id, devices=("pgr-c-12",))
-    ext = externals_store.get_or_create(family.id, "+12065550123", "Gma")
-    allow_store.set_edge("student", ext.uid, message=True, locate=False)
-    ingest, broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-12"), contact_req_payload("u_c12", "Gma", ph="2065550123"))
-
-    assert contacts_store.get_by_device_and_req("pgr-c-12", "u_c12") is None
-    assert _system_bodies(broker) == ["Gma: already in your book"]
-
-
-def test_modem_owner_refused_add_alerts_and_replies():
+@pytest.mark.parametrize(
+    ("kid_kwargs", "bodies", "sms_phones", "alerts"),
+    [
+        pytest.param(
+            {"sms": False},
+            ["Gma: added; needs a parent's OK to text"],
+            [],
+            True,
+            id="refused_fixable_alerts_and_replies",
+        ),
+        pytest.param(
+            {"policy": ("people", "people"), "sms": False},
+            ["Gma: added; settings don't allow texting"],
+            [],
+            False,
+            id="unfixable_replies_without_alert",
+        ),
+        pytest.param(
+            {"policy": ("any_sms", "people"), "sms": False},
+            [],
+            ["+15557770001"],
+            False,
+            id="allowed_reaches_cfg_sms",
+        ),
+    ],
+)
+def test_modem_owner_add_is_gated_by_cfg_sms(
+    kid_kwargs: dict, bodies: list[str], sms_phones: list[str], alerts: bool
+):
     """A modem owner's `cfg.sms` is the gate; a fixable refusal raises the alert and the number
     stays off `cfg.sms`."""
     family = _make_family("Add10")
-    _kid(family.id, sms=False, devices=("pgr-c-13",))
+    _kid(family.id, devices=("pgr-c-13",), **kid_kwargs)
     ingest, broker = _ingest()
 
     ingest.handle_up(up_topic("pgr-c-13"), contact_req_payload("u_c13", "Gma", ph="+15557770001"))
 
+    assert _system_bodies(broker) == bodies
+    assert [c.phone for c in devices_store.get_device("pgr-c-13").smsContacts] == sms_phones
+    if not alerts:
+        assert alerts_store.list_alerts(family.id, "all") == []
+        return
     ext = externals_store.get_family_contact(family.id, "+15557770001")
     assert ext is not None
-    assert _system_bodies(broker) == ["Gma: added; needs a parent's OK to text"]
     (alert,) = alerts_store.list_alerts(family.id, "all")
     assert alert.id == f"cr_student_{ext.uid}" and alert.kind == "contact_request"
     assert (alert.subjectUid, alert.peerUid, alert.peerPhone) == ("student", ext.uid, ext.phone)
     assert alert.contactRequestKey is None
-    assert devices_store.get_device("pgr-c-13").smsContacts == []
     assert _marker("student", ext.uid)["added"] is True
 
     # A second add of another number to the same alert id is a different alert;
     # the same peer again does not duplicate.
     ingest.handle_up(up_topic("pgr-c-13"), contact_req_payload("u_c13b", "Gma", ph="+15557770001"))
     assert len(alerts_store.list_alerts(family.id, "all")) == 1
-
-
-def test_modem_owner_unfixable_add_replies_without_alert():
-    family = _make_family("Add11")
-    _kid(family.id, policy=("people", "people"), sms=False, devices=("pgr-c-14",))
-    ingest, broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-14"), contact_req_payload("u_c14", "Gma", ph="+15557770002"))
-
-    assert _system_bodies(broker) == ["Gma: added; settings don't allow texting"]
-    assert alerts_store.list_alerts(family.id, "all") == []
-    assert devices_store.get_device("pgr-c-14").smsContacts == []
-
-
-def test_modem_owner_allowed_add_reaches_cfg_sms():
-    family = _make_family("Add12")
-    _kid(family.id, policy=("any_sms", "people"), sms=False, devices=("pgr-c-15",))
-    ingest, broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-15"), contact_req_payload("u_c15", "Gma", ph="+15557770003"))
-
-    assert _system_bodies(broker) == []
-    assert [c.phone for c in devices_store.get_device("pgr-c-15").smsContacts] == ["+15557770003"]
 
 
 def test_rejection_no_bump():
@@ -471,20 +469,16 @@ def test_added_marker_grants_nothing():
     assert allow_store.get_edge("student", ext.uid) is None
 
 
-def test_contact_req_from_unregistered_device_dropped():
-    ingest, broker = _ingest()
-    ingest.handle_up(up_topic("pgr-c-missing"), contact_req_payload("u_c7", "Nobody"))
-    assert contacts_store.get_by_device_and_req("pgr-c-missing", "u_c7") is None
-    assert broker.published == []
-
-
-def test_contact_req_from_revoked_device_dropped():
-    _make_user("student", "student")
-    _make_pager_device("pgr-c-8r", "student")
-    devices_store.revoke_device("pgr-c-8r")
+@pytest.mark.parametrize("revoked", [False, True], ids=["unregistered", "revoked"])
+def test_contact_req_from_an_unusable_device_is_dropped(revoked: bool):
+    if revoked:
+        _make_user("student", "student")
+        _make_pager_device("pgr-c-8r", "student")
+        devices_store.revoke_device("pgr-c-8r")
     ingest, broker = _ingest()
 
     ingest.handle_up(up_topic("pgr-c-8r"), contact_req_payload("u_c8", "Nope"))
+
     assert contacts_store.get_by_device_and_req("pgr-c-8r", "u_c8") is None
     assert broker.published == []
 
@@ -496,18 +490,6 @@ def test_contact_req_name_too_long_is_dropped_as_malformed():
 
     ingest.handle_up(up_topic("pgr-c-9m"), contact_req_payload("u_c9", "N" * 17))
     assert contacts_store.get_by_device_and_req("pgr-c-9m", "u_c9") is None
-
-
-def test_contact_req_bad_ph_format_is_rejected_with_a_reply():
-    """A bad `ph` is answered, not silently malformed-dropped."""
-    family = _make_family("Bad1")
-    _kid(family.id, devices=("pgr-c-10b",))
-    ingest, broker = _ingest()
-
-    ingest.handle_up(up_topic("pgr-c-10b"), contact_req_payload("u_c10", "Bad Phone", ph="+abc"))
-    req = contacts_store.get_by_device_and_req("pgr-c-10b", "u_c10")
-    assert req is not None and req.status == "rejected" and req.reason == "bad_number"
-    assert _system_bodies(broker) == ["Bad Phone: number must be 10 digits or start with +"]
 
 
 def test_hmac_signed_contact_req_is_verified_then_stored():

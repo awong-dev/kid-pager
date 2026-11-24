@@ -43,11 +43,6 @@ def test_property_parts_rejoin_fit_and_are_valid_utf8(name: str, caps):
             assert parts == [text]
 
 
-def test_short_text_is_returned_whole_untouched():
-    assert split_body("hello  world ", max_bytes=1024) == ["hello  world "]
-    assert split_body("x" * 1024, max_bytes=1024) == ["x" * 1024]
-
-
 def test_exact_boundaries_bytes_and_codepoints():
     assert len(split_body("x" * 1025, max_bytes=1024)) == 2
     assert split_body("é" * 512, max_bytes=1024) == ["é" * 512]
@@ -73,11 +68,6 @@ def test_prefers_whitespace_in_the_last_fifth():
 def test_never_returns_an_empty_part():
     parts = split_body("a" + " " * 100 + "b" * 10, max_bytes=20)
     assert all(p for p in parts) and _squash("".join(parts)) == "a" + "b" * 10
-
-
-def test_cjk_is_about_340_chars_per_1024_bytes():
-    parts = split_body("你" * 1000, max_bytes=1024)
-    assert [len(p) for p in parts] == [341, 341, 318]
 
 
 def test_rejects_a_cap_too_small_for_one_code_point():

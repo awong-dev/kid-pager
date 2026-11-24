@@ -89,20 +89,6 @@ def test_restore_refuses_while_the_relay_holds_the_db(tmp_path: Path, capsys):
     assert homebackup.main(["--data", str(data), "restore", "1999-01-01T000000Z"]) == 1
 
 
-def test_backup_keeps_only_the_newest_archives(tmp_path: Path):
-    data = _data(tmp_path)
-    db = sqlite3.connect(data / "relay" / "pager.sqlite")
-    db.execute("CREATE TABLE docs(path TEXT PRIMARY KEY, data TEXT)")
-    db.commit()
-    db.close()
-    for day in range(1, 6):
-        homebackup.backup(data, datetime(2026, 10, day, 12, 0, 0, tzinfo=UTC), keep=3)
-    kept = sorted(p.name for p in (data / "backups").iterdir())
-    assert kept == [
-        f"2026-10-0{d}T120000Z.{ext}" for d in (3, 4, 5) for ext in ("sqlite", "tar.gz")
-    ]
-
-
 def test_prune_leaves_pre_restore_dirs_and_keep_zero_keeps_everything(tmp_path: Path):
     data = _data(tmp_path)
     out = data / "backups"

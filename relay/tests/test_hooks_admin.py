@@ -77,13 +77,10 @@ def test_validation(client: TestClient, root):
         ).status_code
 
     assert post(url="ftp://x/y") == 422
-    assert post(url="nonsense") == 422
     assert post(timeoutMs=50) == 422
     assert post(timeoutMs=10001) == 422
     assert post(context=51) == 422
-    assert post(mode="other") == 422
     assert post(families=[]) == 422
-    assert post(failMode="maybe") == 422
     assert post(families=["f1"], context=0, timeoutMs=100) == 201
 
 

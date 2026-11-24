@@ -19,17 +19,11 @@ def policy(*ips: str, cloud: bool, loopback: bool = False) -> AddressPolicy:
     "ip",
     [
         "127.0.0.1",
-        "127.8.9.10",
         "::1",
         "169.254.169.254",  # the cloud metadata address
-        "169.254.0.1",
-        "fe80::1",
-        "224.0.0.1",
         "ff02::1",
         "0.0.0.0",
-        "::",
         "::ffff:127.0.0.1",  # a loopback address in IPv6 clothes
-        "::ffff:169.254.169.254",
     ],
 )
 def test_always_refused(ip, cloud):

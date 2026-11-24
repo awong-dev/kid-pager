@@ -74,15 +74,6 @@ def test_create_validates_owner(client: TestClient, world: World):
     assert r.status_code in (401, 403)
 
 
-def test_list_is_scoped_to_the_family(client: TestClient, world: World):
-    _create(client, world)
-    other = families_store.create_family(name="G", created_by="root")
-    fb_auth.create_user(uid="adm2", email="adm2@example.com")
-    users_store.create_user(uid="adm2", alias="adm2", display_name="a2", role="admin", family_id=other.id)
-    fb_auth.set_custom_user_claims("adm2", {"role": "admin", "fam": other.id})
-    assert client.get("/api/family/bridges", headers=auth_header("adm2")).json() == []
-
-
 def test_new_code_only_while_unpaired(client: TestClient, world: World):
     b = _create(client, world).json()["bridge"]
     r = client.post(f"/api/family/bridges/{b['id']}/code", headers=world.admin_headers)
@@ -205,13 +196,14 @@ def test_unpair_fails_pending_outbox_and_its_delivery_and_clears_the_number(
     assert client.delete(f"/api/family/bridges/{bridge.id}", headers=world.admin_headers).status_code == 200
 
 
-def test_other_familys_bridge_is_404_everywhere(client: TestClient, world: World):
+def test_other_familys_bridge_is_unlisted_and_404_everywhere(client: TestClient, world: World):
     bridge, _ = pair_bridge(client, world)
     other = families_store.create_family(name="G", created_by="root")
     fb_auth.create_user(uid="adm2", email="adm2@example.com")
     users_store.create_user(uid="adm2", alias="adm2", display_name="a2", role="admin", family_id=other.id)
     fb_auth.set_custom_user_claims("adm2", {"role": "admin", "fam": other.id})
     h = auth_header("adm2")
+    assert client.get("/api/family/bridges", headers=h).json() == []
     base = f"/api/family/bridges/{bridge.id}"
     assert client.patch(base, json={"label": "x"}, headers=h).status_code == 404
     assert client.delete(base, headers=h).status_code == 404

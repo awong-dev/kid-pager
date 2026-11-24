@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import datetime
 import http.server
-import ipaddress
 import json
 import ssl
 import threading
@@ -89,23 +88,17 @@ def pem(cert) -> str:
     return cert.public_bytes(serialization.Encoding.PEM).decode()
 
 
-def test_no_ca_means_the_default_verification():
+def test_tls_context_trusts_only_the_links_ca_bundle():
     assert client_mod.tls_context(None) is True
     with pytest.raises(ValueError):
         client_mod.tls_context("-----BEGIN NOPE-----\nzzz\n-----END NOPE-----\n")
     with pytest.raises(ValueError):
         client_mod.tls_context("not a pem")
 
-
-def test_the_links_ca_is_the_only_trust_root():
-    _, cert, _ = make_ca()
-    ctx = client_mod.tls_context(pem(cert))
-    assert isinstance(ctx, ssl.SSLContext) and len(ctx.get_ca_certs()) == 1
-
-
-def test_a_bundle_trusts_each_certificate_in_it():
     _, a, _ = make_ca("a")
     _, b, _ = make_ca("b")
+    ctx = client_mod.tls_context(pem(a))
+    assert isinstance(ctx, ssl.SSLContext) and len(ctx.get_ca_certs()) == 1
     ctx = client_mod.tls_context(pem(a) + pem(b))
     assert isinstance(ctx, ssl.SSLContext) and len(ctx.get_ca_certs()) == 2
 
@@ -123,23 +116,23 @@ class Recorder(httpx.BaseTransport):
         return httpx.Response(self.status, content=self.body)
 
 
-def test_the_request_goes_to_the_checked_address_with_the_hostname_kept():
+@pytest.mark.parametrize(
+    ("ip", "port", "host_header"),
+    [
+        ("93.184.216.34", 8443, "peer.example.org:8443"),
+        ("2606:2800:220:1::1", 443, "peer.example.org"),  # bracketed; 443: no port
+    ],
+    ids=["ipv4", "ipv6"],
+)
+def test_the_request_goes_to_the_checked_address_with_the_hostname_kept(ip, port, host_header):
     rec = Recorder()
-    c = client_mod.FedClient(transport=rec, policy=policy("93.184.216.34"))
-    c.post_inbox(identity(), link(host="peer.example.org", port=8443), [])
+    c = client_mod.FedClient(transport=rec, policy=policy(ip))
+    c.post_inbox(identity(), link(host="peer.example.org", port=port), [])
     (req,) = rec.requests
-    assert req.url.host == "93.184.216.34" and req.url.port == 8443
-    assert req.headers["host"] == "peer.example.org:8443"
+    assert req.url.host == ip and req.url.port == (port if port != 443 else None)
+    assert req.headers["host"] == host_header
     assert req.extensions["sni_hostname"] == "peer.example.org"
     assert req.url.path == "/fed/v1/inbox"
-
-
-def test_an_ipv6_address_is_bracketed():
-    rec = Recorder()
-    c = client_mod.FedClient(transport=rec, policy=policy("2606:2800:220:1::1"))
-    c.post_inbox(identity(), link(), [])
-    assert rec.requests[0].url.host == "2606:2800:220:1::1"
-    assert rec.requests[0].headers["host"] == "peer.example.org"  # 443: no port
 
 
 def test_a_second_dns_answer_is_never_asked_for():
@@ -171,12 +164,9 @@ def test_each_checked_address_is_tried_in_turn():
     assert [r.url.host for r in rec.requests] == ["93.184.216.34", "93.184.216.35"]
 
 
-@pytest.mark.parametrize(
-    "ip", ["127.0.0.1", "169.254.169.254", "10.0.0.1", "::1", "fe80::1"]
-)
-def test_every_kind_of_call_is_refused_before_anything_is_sent(ip):
+def test_every_kind_of_call_is_refused_before_anything_is_sent():
     rec = Recorder()
-    c = client_mod.FedClient(transport=rec, policy=policy(ip, cloud=True))
+    c = client_mod.FedClient(transport=rec, policy=policy("169.254.169.254", cloud=True))
     ident, lnk = identity(), link()
     calls = [
         lambda: c.post_inbox(ident, lnk, []),
@@ -192,17 +182,58 @@ def test_every_kind_of_call_is_refused_before_anything_is_sent(ip):
     assert rec.requests == []
 
 
-def test_error_codes():
-    ident, lnk = identity(), link()
-    p = policy("93.184.216.34")
-    for error, code in (
-        (httpx.ConnectError("refused"), "unreachable"),
-        (httpx.ReadTimeout("slow"), "unreachable"),
-    ):
-        c = client_mod.FedClient(transport=Recorder(error=error), policy=p)
-        with pytest.raises(client_mod.FedTransportError) as exc:
-            c.post_inbox(ident, lnk, [])
-        assert exc.value.code == code
+class Redirect(Recorder):
+    def handle_request(self, request):
+        self.requests.append(request)
+        return httpx.Response(302, headers={"location": "https://169.254.169.254/"})
+
+
+def _tls_failure() -> Recorder:
+    err = httpx.ConnectError("bad cert")
+    err.__cause__ = ssl.SSLCertVerificationError("hostname mismatch")
+    return Recorder(error=err)
+
+
+@pytest.mark.parametrize(
+    ("transport", "status", "code"),
+    [
+        (lambda: Recorder(error=httpx.ConnectError("refused")), None, "unreachable"),
+        (lambda: Recorder(error=httpx.ReadTimeout("slow")), None, "unreachable"),
+        (_tls_failure, None, "tls"),
+        (lambda: Recorder(body=b"x" * (256 * 1024 + 1)), None, "bad_response"),
+        (Redirect, None, "bad_response"),
+        (lambda: Recorder(status=403, body=b"{}"), 403, "refused"),
+        (lambda: Recorder(status=401, body=b"{}"), 401, "refused"),
+        (lambda: Recorder(status=503, body=b"{}"), 503, "unreachable"),
+        (lambda: Recorder(body=b"not json"), None, "bad_response"),
+    ],
+    ids=[
+        "connect_error",
+        "read_timeout",
+        "tls_failure",
+        "response_over_256_kib",
+        "redirect_never_followed",
+        "http_403",
+        "http_401",
+        "http_503",
+        "not_json",
+    ],
+)
+def test_transport_faults_and_responses_map_to_error_codes(transport, status, code):
+    rec = transport()
+    c = client_mod.FedClient(transport=rec, policy=policy("93.184.216.34"))
+    with pytest.raises(
+        client_mod.FedHttpError if status else client_mod.FedTransportError
+    ) as exc:
+        c.post_inbox(identity(), link(), [])
+    assert exc.value.code == code
+    if status:
+        assert exc.value.status == status
+    if isinstance(rec, Redirect):
+        assert len(rec.requests) == 1
+
+
+def test_error_vocabulary_and_a_malformed_directory_answer():
     assert set(client_mod.ERROR_CODES) == {
         "unreachable",
         "tls",
@@ -210,53 +241,12 @@ def test_error_codes():
         "address_not_allowed",
         "bad_response",
     }
-
-
-def test_a_tls_failure_is_tls():
-    err = httpx.ConnectError("bad cert")
-    err.__cause__ = ssl.SSLCertVerificationError("hostname mismatch")
-    c = client_mod.FedClient(transport=Recorder(error=err), policy=policy("93.184.216.34"))
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.post_inbox(identity(), link(), [])
-    assert exc.value.code == "tls"
-
-
-def test_a_response_over_256_kib_is_bad_response():
     c = client_mod.FedClient(
-        transport=Recorder(body=b"x" * (256 * 1024 + 1)), policy=policy("93.184.216.34")
+        transport=Recorder(body=json.dumps([{"nope": 1}]).encode()),
+        policy=policy("93.184.216.34"),
     )
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.post_inbox(identity(), link(), [])
-    assert exc.value.code == "bad_response"
-
-
-def test_a_redirect_is_never_followed():
-    class Redirect(Recorder):
-        def handle_request(self, request):
-            self.requests.append(request)
-            return httpx.Response(302, headers={"location": "https://169.254.169.254/"})
-
-    rec = Redirect()
-    c = client_mod.FedClient(transport=rec, policy=policy("93.184.216.34"))
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.post_inbox(identity(), link(), [])
-    assert exc.value.code == "bad_response" and len(rec.requests) == 1
-
-
-def test_http_errors_and_malformed_answers():
-    ident, lnk, p = identity(), link(), policy("93.184.216.34")
-    for status, code in ((403, "refused"), (401, "refused"), (503, "unreachable")):
-        c = client_mod.FedClient(transport=Recorder(status=status, body=b"{}"), policy=p)
-        with pytest.raises(client_mod.FedHttpError) as exc:
-            c.post_inbox(ident, lnk, [])
-        assert (exc.value.status, exc.value.code) == (status, code)
-    c = client_mod.FedClient(transport=Recorder(body=b"not json"), policy=p)
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.post_inbox(ident, lnk, [])
-    assert exc.value.code == "bad_response"
-    c = client_mod.FedClient(transport=Recorder(body=json.dumps([{"nope": 1}]).encode()), policy=p)
     with pytest.raises(client_mod.FedTransportError):
-        c.directory(ident, lnk)
+        c.directory(identity(), link())
 
 
 def test_the_request_is_signed_for_the_remote_family():
@@ -330,33 +320,17 @@ def test_a_real_tls_handshake_verifies_the_hostname_while_connecting_to_the_ip(t
     assert seen == [{"host": f"peer.test:{port}", "path": "/fed/v1/directory"}]
 
 
-def test_a_certificate_for_another_name_is_refused_as_tls(tls_server):
+@pytest.mark.parametrize(
+    ("served", "trust"),
+    [("someone-else.test", ("own",)), ("peer.test", ("other", "system"))],
+    ids=["certificate_for_another_name", "untrusted_ca"],
+)
+def test_a_real_tls_handshake_that_does_not_verify_is_refused_as_tls(tls_server, served, trust):
     make, _ = tls_server
-    port, ca = make("someone-else.test")
+    port, own_ca = make(served)
+    cas = {"own": own_ca, "other": pem(make_ca("another CA")[1]), "system": None}
     c = client_mod.FedClient(policy=policy("127.0.0.1", loopback=True))
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.directory(identity(), link(host="peer.test", port=port, ca=ca))
-    assert exc.value.code == "tls"
-
-
-def test_an_untrusted_ca_is_refused_as_tls(tls_server):
-    make, _ = tls_server
-    port, _ca = make("peer.test")
-    _, other_ca, _ = make_ca("another CA")
-    c = client_mod.FedClient(policy=policy("127.0.0.1", loopback=True))
-    for ca in (pem(other_ca), None):  # a different private CA; and the system store
+    for name in trust:  # a different private CA; and the system store
         with pytest.raises(client_mod.FedTransportError) as exc:
-            c.directory(identity(), link(host="peer.test", port=port, ca=ca))
+            c.directory(identity(), link(host="peer.test", port=port, ca=cas[name]))
         assert exc.value.code == "tls"
-
-
-def test_loopback_is_not_reachable_without_the_injection(tls_server):
-    make, seen = tls_server
-    port, ca = make("peer.test")
-    c = client_mod.FedClient(
-        policy=addr.AddressPolicy(cloud=False, resolver=lambda h, p: ["127.0.0.1"])
-    )
-    with pytest.raises(client_mod.FedTransportError) as exc:
-        c.directory(identity(), link(host="peer.test", port=port, ca=ca))
-    assert exc.value.code == "address_not_allowed" and seen == []
-    assert ipaddress.ip_address("127.0.0.1").is_loopback

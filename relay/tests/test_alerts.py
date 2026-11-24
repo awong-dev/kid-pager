@@ -232,6 +232,9 @@ def test_approve_sms_unknown_creates_external_edge_and_rederives_sms_contacts(
     _make_member("kid1", "kid1", family.id)
     _set_policy("kid1", out="people", in_="people_sms")
     _make_pager_device("pgr-kid1", "kid1")
+    _make_member("sib1", "sib1", family.id)
+    _set_policy("sib1", out="open", in_="people")
+    _make_pager_device("pgr-sib1", "sib1")
 
     alert_id = alerts_module.sms_unknown(family.id, "+19995551234", "kid1", "hi there")
     alert = alerts_store.get(family.id, alert_id)
@@ -254,26 +257,8 @@ def test_approve_sms_unknown_creates_external_edge_and_rederives_sms_contacts(
     assert list(get_db().collection("messages").stream()) == []
     device = devices_store.get_device("pgr-kid1")
     assert [(c.name, c.phone) for c in device.smsContacts] == [("Aunt Sue", "+19995551234")]
-
-
-def test_approve_sms_unknown_rederives_whole_family(client: TestClient):
-    family = _make_family("WholeFam")
-    headers = _make_family_admin("admin1b", "admin1b", family.id)
-    _make_member("kid1b", "kid1b", family.id)
-    _make_member("sib1b", "sib1b", family.id)
-    _set_policy("sib1b", out="open", in_="people")
-    _make_pager_device("pgr-kid1b", "kid1b")
-    _make_pager_device("pgr-sib1b", "sib1b")
-
-    alert_id = alerts_module.sms_unknown(family.id, "+19995551235", "kid1b", "hello")
-    resp = client.post(
-        f"/api/family/alerts/{alert_id}/approve", json={"name": "Aunt Sue"}, headers=headers
-    )
-    assert resp.status_code == 200, resp.text
-
-    assert [c.name for c in devices_store.get_device("pgr-kid1b").smsContacts] == ["Aunt Sue"]
     # The open sibling holds it by implied approval, with no edge.
-    assert [c.name for c in devices_store.get_device("pgr-sib1b").smsContacts] == ["Aunt Sue"]
+    assert [c.name for c in devices_store.get_device("pgr-sib1").smsContacts] == ["Aunt Sue"]
 
 
 def test_approve_sms_unknown_taken_name_is_409(client: TestClient):

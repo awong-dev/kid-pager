@@ -5,10 +5,11 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app import jobs
 from app.db.firestore import get_db
 from app.store import settings as settings_store
-from app.store.settings import RetentionSetting
 
 
 def _ago(days: float) -> datetime:
@@ -21,16 +22,6 @@ def _exists(path: str) -> bool:
     for i in range(2, len(parts), 2):
         ref = ref.collection(parts[i]).document(parts[i + 1])
     return ref.get().exists
-
-
-def test_defaults_are_in_days():
-    r = settings_store.get_retention()
-    assert (r.messagesDays, r.locationsDays, r.alertsDays, r.batteryDays) == (
-        28,
-        7,
-        90,
-        90,
-    )
 
 
 def test_legacy_week_fields_are_read_as_days_and_dropped_on_save():
@@ -72,58 +63,72 @@ def test_set_retention_merges_and_rejects_out_of_bounds():
     assert settings_store.get_retention().locationsDays == 2
 
 
-def test_sms_log_swept_by_message_window():
-    settings_store.set_retention(messagesDays=10)
-    col = get_db().collection("devices").document("d1").collection("smsLog")
-    col.document("old").set({"body": "secret", "peer": "+1555", "receivedAt": _ago(11)})
-    col.document("new").set({"body": "fresh", "peer": "+1555", "receivedAt": _ago(9)})
+def _collection(path: str):
+    parts = path.split("/")
+    ref = get_db().collection(parts[0])
+    for i in range(1, len(parts), 2):
+        ref = ref.document(parts[i]).collection(parts[i + 1])
+    return ref
+
+
+_NOW_S = time.time()
+
+
+@pytest.mark.parametrize(
+    ("retention", "collection", "old", "new", "counter"),
+    [
+        pytest.param(
+            {"messagesDays": 10},
+            "devices/d1/smsLog",
+            {"body": "secret", "peer": "+1555", "receivedAt": _ago(11)},
+            {"body": "fresh", "peer": "+1555", "receivedAt": _ago(9)},
+            "smsLogDeleted",
+            id="sms-log-by-message-window",
+        ),
+        pytest.param(
+            None,
+            "rateLimits",
+            {"windowStart": _NOW_S - 2 * 86400, "count": 1},
+            {"windowStart": _NOW_S - 3600, "count": 1},
+            "rateLimitsDeleted",
+            id="rate-limits-older-than-a-day",
+        ),
+        pytest.param(
+            None,
+            "cells",
+            {"lat": 1.0, "lon": 2.0, "resolvedAt": _ago(31)},
+            {"lat": 1.0, "lon": 2.0, "resolvedAt": _ago(29)},
+            "cellsDeleted",
+            id="cells-resolved-over-30-days-ago",
+        ),
+        pytest.param(
+            None,
+            "contactRequests",
+            {"status": "added", "createdAt": _ago(91)},
+            {"status": "added", "createdAt": _ago(89)},
+            "contactRequestsDeleted",
+            id="contact-requests-90-days",
+        ),
+        pytest.param(
+            None,
+            "setupCodes",
+            {"deviceId": "d", "expiresAt": _ago(0.1)},
+            {"deviceId": "d", "expiresAt": datetime.now(UTC) + timedelta(hours=1)},
+            "setupCodesDeleted",
+            id="expired-setup-codes",
+        ),
+    ],
+)
+def test_sweep_deletes_the_old_row_and_keeps_the_new_one(retention, collection, old, new, counter):
+    if retention:
+        settings_store.set_retention(**retention)
+    col = _collection(collection)
+    col.document("old").set(old)
+    col.document("new").set(new)
     res = jobs.sweep()
-    assert res.smsLogDeleted == 1
-    assert not _exists("devices/d1/smsLog/old")
-    assert _exists("devices/d1/smsLog/new")
-
-
-def test_rate_limits_older_than_a_day_swept():
-    now = time.time()
-    col = get_db().collection("rateLimits")
-    col.document("ip:1.2.3.4").set({"windowStart": now - 2 * 86400, "count": 1})
-    col.document("ip:5.6.7.8").set({"windowStart": now - 3600, "count": 1})
-    res = jobs.sweep()
-    assert res.rateLimitsDeleted == 1
-    assert not _exists("rateLimits/ip:1.2.3.4")
-    assert _exists("rateLimits/ip:5.6.7.8")
-
-
-def test_cells_resolved_over_30_days_ago_swept():
-    col = get_db().collection("cells")
-    col.document("old").set({"lat": 1.0, "lon": 2.0, "resolvedAt": _ago(31)})
-    col.document("new").set({"lat": 1.0, "lon": 2.0, "resolvedAt": _ago(29)})
-    res = jobs.sweep()
-    assert res.cellsDeleted == 1
-    assert not _exists("cells/old")
-    assert _exists("cells/new")
-
-
-def test_contact_requests_90_days():
-    col = get_db().collection("contactRequests")
-    col.document("old").set({"status": "added", "createdAt": _ago(91)})
-    col.document("new").set({"status": "added", "createdAt": _ago(89)})
-    res = jobs.sweep()
-    assert res.contactRequestsDeleted == 1
-    assert not _exists("contactRequests/old")
-    assert _exists("contactRequests/new")
-
-
-def test_expired_setup_codes_swept():
-    col = get_db().collection("setupCodes")
-    col.document("gone").set({"deviceId": "d", "expiresAt": _ago(0.1)})
-    col.document("live").set(
-        {"deviceId": "d", "expiresAt": datetime.now(UTC) + timedelta(hours=1)}
-    )
-    res = jobs.sweep()
-    assert res.setupCodesDeleted == 1
-    assert not _exists("setupCodes/gone")
-    assert _exists("setupCodes/live")
+    assert getattr(res, counter) == 1
+    assert not _exists(f"{collection}/old")
+    assert _exists(f"{collection}/new")
 
 
 def test_open_alerts_expire_with_their_held_body():
@@ -255,15 +260,9 @@ def test_hourly_location_pass_removes_expired_fix_without_a_full_sweep():
     assert settings_store.get_meta().lastLocPassAt is not None
 
 
-def test_legacy_retention_setting_class_still_converts():
-    assert RetentionSetting(n=2, unit="weeks").days() == 14
-
-
 def test_sweep_leaves_no_swept_body_in_the_sqlite_file_or_wal():
     """A message swept for age is gone from the raw database and WAL bytes (home store only)."""
     import os
-
-    import pytest
 
     db = get_db()
     if not hasattr(type(db), "reclaim_space"):

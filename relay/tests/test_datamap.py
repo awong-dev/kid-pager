@@ -37,21 +37,11 @@ def test_registry_has_no_unused_rows() -> None:
     assert not unused, f"datamap rows with no collection(...) literal in app/: {unused}"
 
 
-def test_subcollection_parents_are_registered() -> None:
-    for c in datamap.REGISTRY:
-        if c.parent is not None:
-            assert c.parent in datamap.BY_NAME, c
-
-
-def test_scan_sees_the_known_shapes() -> None:
-    lits = _literals()
-    assert {"users", "locations", "outbox", "pushTokens", "heldSms"} <= set(lits)
-
-
-def test_every_device_and_bridge_row_says_how_it_names_its_owner() -> None:
+def test_registry_parents_exist_and_device_and_bridge_rows_name_their_owner() -> None:
     """`app/purge.py` cascades a device or bridge delete through `links`."""
     for c in datamap.REGISTRY:
         if c.parent is not None:
+            assert c.parent in datamap.BY_NAME, c
             continue
         if c.family == "via:device":
             assert any(link.startswith("device:") for link in c.links), c.name

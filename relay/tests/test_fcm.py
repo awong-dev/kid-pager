@@ -8,6 +8,7 @@ import pytest
 from firebase_admin import messaging
 
 from app.backends.fcm import FirebaseFCMClient
+from app.backends.webapp import NullFCMClient
 from app.store import push_tokens as push_tokens_store
 
 
@@ -55,7 +56,12 @@ def test_send_data_success_sends_one_multicast_with_webpush_headers(
     assert message.webpush.headers == {"Urgency": "high", "TTL": "14400"}
 
 
-def test_unregistered_token_is_deleted_others_kept(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "exc",
+    [messaging.UnregisteredError("gone"), messaging.SenderIdMismatchError("wrong sender")],
+    ids=["unregistered", "sender_id_mismatch"],
+)
+def test_dead_token_is_deleted_others_kept(monkeypatch: pytest.MonkeyPatch, exc: Exception):
     push_tokens_store.add_token("alice", "tok_good")
     push_tokens_store.add_token("alice", "tok_dead")
     push_tokens_store.add_token("bob", "tok_other_user")
@@ -64,7 +70,7 @@ def test_unregistered_token_is_deleted_others_kept(monkeypatch: pytest.MonkeyPat
         responses = []
         for token in message.tokens:
             if token == "tok_dead":
-                responses.append(_fail(messaging.UnregisteredError("gone")))
+                responses.append(_fail(exc))
             else:
                 responses.append(_ok(token))
         return _FakeBatchResponse(responses)
@@ -76,22 +82,6 @@ def test_unregistered_token_is_deleted_others_kept(monkeypatch: pytest.MonkeyPat
 
     assert push_tokens_store.list_tokens("alice") == ["tok_good"]
     assert push_tokens_store.list_tokens("bob") == ["tok_other_user"]
-
-
-def test_sender_id_mismatch_token_is_also_deleted(monkeypatch: pytest.MonkeyPatch):
-    push_tokens_store.add_token("carol", "tok_mismatch")
-
-    def _responder(message: messaging.MulticastMessage) -> _FakeBatchResponse:
-        return _FakeBatchResponse(
-            [_fail(messaging.SenderIdMismatchError("wrong sender")) for _ in message.tokens]
-        )
-
-    _capture_multicast(monkeypatch, _responder)
-
-    client = FirebaseFCMClient()
-    client.send_data(["tok_mismatch"], {"id": "m1"})
-
-    assert push_tokens_store.list_tokens("carol") == []
 
 
 def test_transient_error_keeps_the_token(
@@ -130,10 +120,13 @@ def test_chunks_at_500_tokens(monkeypatch: pytest.MonkeyPatch):
     assert calls[0].tokens + calls[1].tokens == tokens
 
 
-def test_push_backend_null_constructs_the_null_client():
+@pytest.mark.parametrize(
+    ("push_backend", "client_class"),
+    [("null", NullFCMClient), ("fcm", FirebaseFCMClient)],
+)
+def test_push_backend_setting_constructs_the_matching_client(push_backend: str, client_class):
     from fastapi.testclient import TestClient
 
-    from app.backends.webapp import NullFCMClient
     from app.config import Settings
     from app.main import create_app
     from tests.fake_transport import FakeBrokerClient
@@ -147,34 +140,9 @@ def test_push_backend_null_constructs_the_null_client():
         google_cloud_project=None,
         firestore_emulator_host=None,
         firebase_auth_emulator_host=None,
-        push_backend="null",
+        push_backend=push_backend,
     )
     app = create_app(settings=settings, broker_client=FakeBrokerClient())
     with TestClient(app) as client:
         webapp_backend = client.app.state.backend_registry["webapp"]
-        assert isinstance(webapp_backend._fcm, NullFCMClient)
-
-
-def test_push_backend_fcm_constructs_the_real_client():
-    from fastapi.testclient import TestClient
-
-    from app.backends.fcm import FirebaseFCMClient
-    from app.config import Settings
-    from app.main import create_app
-    from tests.fake_transport import FakeBrokerClient
-
-    settings = Settings(
-        broker_api_url="http://unused.invalid/api/v5",
-        broker_api_key=None,
-        broker_api_secret=None,
-        webhook_key="test-webhook-key",
-        dev_mode=False,
-        google_cloud_project=None,
-        firestore_emulator_host=None,
-        firebase_auth_emulator_host=None,
-        push_backend="fcm",
-    )
-    app = create_app(settings=settings, broker_client=FakeBrokerClient())
-    with TestClient(app) as client:
-        webapp_backend = client.app.state.backend_registry["webapp"]
-        assert isinstance(webapp_backend._fcm, FirebaseFCMClient)
+        assert isinstance(webapp_backend._fcm, client_class)

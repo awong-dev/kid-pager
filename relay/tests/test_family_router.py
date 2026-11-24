@@ -244,20 +244,24 @@ def test_patch_member_404_for_uid_outside_family(client: TestClient):
     assert resp.status_code == 404
 
 
-def test_member_role_cannot_reach_family_routes(client: TestClient):
+@pytest.mark.parametrize(
+    ("caller", "query"),
+    [("member", "none"), ("admin", "other")],
+    ids=["member_role", "admin_naming_another_family"],
+)
+def test_family_members_route_is_403_outside_the_callers_scope(
+    client: TestClient, caller: str, query: str
+):
     family = _make_family("G")
-    member_headers = _make_member("fam6-member", "fam6-member", family.id)
+    other = _make_family("I")
+    headers = {
+        "member": lambda: _make_member("scope-caller", "scope-caller", family.id),
+        "admin": lambda: _make_family_admin("scope-caller", "scope-caller", family.id),
+    }[caller]()
+    suffix = {"none": "", "other": f"?family={other.id}"}[query]
 
-    resp = client.get("/api/family/members", headers=member_headers)
-    assert resp.status_code == 403
+    resp = client.get(f"/api/family/members{suffix}", headers=headers)
 
-
-def test_admin_naming_another_family_is_403(client: TestClient):
-    family_a = _make_family("H")
-    family_b = _make_family("I")
-    admin_a = _make_family_admin("fam7-admin-a", "fam7-admin-a", family_a.id)
-
-    resp = client.get(f"/api/family/members?family={family_b.id}", headers=admin_a)
     assert resp.status_code == 403
 
 
@@ -502,7 +506,7 @@ def test_directory_super_sees_family_edges_only_with_family_param(client: TestCl
     assert "fam19-ext" in {e["uid"] for e in resp_with.json()["entries"]}
 
 
-def test_externals_get_or_create_is_idempotent_by_phone():
+def test_externals_get_or_create_is_idempotent_by_phone_and_defaults_to_region_us():
     a = externals_store.get_or_create("famA", "+1 555 222 3333", "Pizza Place")
     b = externals_store.get_or_create("famA", "5552223333", "Pizza Place (again)")
     assert a.uid == b.uid
@@ -520,8 +524,6 @@ def test_externals_get_or_create_is_idempotent_by_phone():
     assert kinds == ["sms"]
     assert list(get_db().collection("phoneIndex").stream()) == []
 
-
-def test_externals_get_or_create_default_region_us():
     ext = externals_store.get_or_create("famA", "2065550100", "Local")
     assert ext.phone == "+12065550100"
 
@@ -605,49 +607,36 @@ def test_approved_put_locate_refused_cross_family(client: TestClient):
     assert allow_store.get_edge("fam22-kid-a", "fam22-kid-b") is None
 
 
-def test_put_approved_contacts_unknown_uid_is_404_and_writes_nothing(client: TestClient):
-    family = _make_family("AppU")
-    admin = _make_family_admin("fam22u-admin", "fam22u-admin", family.id)
-    _make_member("fam22u-kid", "fam22u-kid", family.id)
-    mom = _create_contact(client, admin, "+12065550100", "Mom")
-
-    resp = _put_contacts(
-        client, admin, "fam22u-kid", [{"uid": mom["uid"]}, {"uid": "x_does_not_exist"}]
-    )
-    assert resp.status_code == 404, resp.text
-    assert resp.json()["detail"] == "no such contact: x_does_not_exist"
-    # Validation happens before any write: not even the valid one landed.
-    assert allow_store.get_edge("fam22u-kid", mom["uid"]) is None
-
-
-def test_put_approved_contacts_other_family_uid_is_404(client: TestClient):
+@pytest.mark.parametrize(
+    ("bad", "with_valid_contact"),
+    [("unknown", True), ("other_family", False), ("person", False)],
+    ids=["unknown_uid_writes_nothing", "other_family_uid", "person_uid"],
+)
+def test_put_approved_contacts_bad_uid_is_404_and_writes_nothing(
+    client: TestClient, bad: str, with_valid_contact: bool
+):
     fam_a = _make_family("AppOA")
     fam_b = _make_family("AppOB")
     admin_a = _make_family_admin("fam22o-admin-a", "fam22o-admin-a", fam_a.id)
     admin_b = _make_family_admin("fam22o-admin-b", "fam22o-admin-b", fam_b.id)
     _make_member("fam22o-kid-a", "fam22o-kid-a", fam_a.id)
+    mom = _create_contact(client, admin_a, "+12065550100", "Mom")
     theirs = _create_contact(client, admin_b, "+12065550100", "Theirs")
+    bad_uid = {
+        "unknown": "x_does_not_exist",
+        "other_family": theirs["uid"],
+        "person": "fam22o-admin-a",
+    }[bad]
+    uids = ([mom["uid"]] if with_valid_contact else []) + [bad_uid]
 
-    resp = _put_contacts(client, admin_a, "fam22o-kid-a", [{"uid": theirs["uid"]}])
+    resp = _put_contacts(client, admin_a, "fam22o-kid-a", [{"uid": u} for u in uids])
+
     assert resp.status_code == 404, resp.text
-    assert allow_store.get_edge("fam22o-kid-a", theirs["uid"]) is None
-    # A person's uid is not a contact either.
-    resp = _put_contacts(client, admin_a, "fam22o-kid-a", [{"uid": "fam22o-admin-a"}])
-    assert resp.status_code == 404, resp.text
-
-
-def test_put_approved_numbers_field_is_422(client: TestClient):
-    family = _make_family("AppN")
-    admin = _make_family_admin("fam22n-admin", "fam22n-admin", family.id)
-    _make_member("fam22n-kid", "fam22n-kid", family.id)
-
-    resp = client.put(
-        "/api/family/members/fam22n-kid/approved",
-        json={"people": [], "numbers": [{"phone": "+12065550100", "name": "Mom"}]},
-        headers=admin,
-    )
-    assert resp.status_code == 422, resp.text
-    assert externals_store.list_family_contacts(family.id) == []
+    if bad == "unknown":
+        assert resp.json()["detail"] == "no such contact: x_does_not_exist"
+    # Validation happens before any write: not even the valid one landed.
+    for uid in uids:
+        assert allow_store.get_edge("fam22o-kid-a", uid) is None
 
 
 def test_put_approved_never_creates_an_external(client: TestClient):
@@ -731,18 +720,28 @@ def _get_approved(client: TestClient, headers: dict[str, str], member: str) -> d
     return resp.json()
 
 
-def test_approved_put_unlisted_person_edge_is_removed(client: TestClient):
-    family = _make_family("AppR1")
-    admin = _make_family_admin("fam23-admin", "fam23-admin", family.id)
-    _make_member("fam23-kid", "fam23-kid", family.id)
-    _make_member("fam23-sib1", "fam23-sib1", family.id)
-    _make_member("fam23-sib2", "fam23-sib2", family.id)
+def test_approved_put_diffs_person_edges_and_leaves_peer_reverse_edge_alone(client: TestClient):
+    fam_a = _make_family("AppR1")
+    fam_b = _make_family("AppR5B")
+    admin = _make_family_admin("fam23-admin", "fam23-admin", fam_a.id)
+    _make_member("fam23-kid", "fam23-kid", fam_a.id)
+    _make_member("fam23-sib1", "fam23-sib1", fam_a.id)
+    _make_member("fam23-sib2", "fam23-sib2", fam_a.id)
+    _make_member("fam23-far", "fam23-far", fam_b.id)
+    allow_store.set_edge("fam23-sib1", "fam23-kid", message=True, locate=False)
+    allow_store.set_edge("fam23-kid", "fam23-far", message=True, locate=False)
 
     resp = _put_people(
-        client, admin, "fam23-kid", [_person("fam23-sib1"), _person("fam23-sib2")]
+        client,
+        admin,
+        "fam23-kid",
+        [_person("fam23-sib1"), _person("fam23-sib2"), _person("fam23-far")],
     )
     assert resp.status_code == 200, resp.text
     assert allow_store.get_edge("fam23-kid", "fam23-sib2") is not None
+    assert allow_store.get_edge("fam23-kid", "fam23-far") is not None
+    listed = {p["alias"] for p in _get_approved(client, admin, "fam23-kid")["people"]}
+    assert listed == {"fam23-sib1", "fam23-sib2", "fam23-far"}
 
     resp = _put_people(client, admin, "fam23-kid", [_person("fam23-sib1")])
     assert resp.status_code == 200, resp.text
@@ -750,21 +749,12 @@ def test_approved_put_unlisted_person_edge_is_removed(client: TestClient):
         "fam23-sib1"
     ]
     assert allow_store.get_edge("fam23-kid", "fam23-sib2") is None
+    assert allow_store.get_edge("fam23-kid", "fam23-far") is None
 
-
-def test_approved_put_check_one_uncheck_other_in_one_save(client: TestClient):
-    family = _make_family("AppR2")
-    admin = _make_family_admin("fam24-admin", "fam24-admin", family.id)
-    _make_member("fam24-kid", "fam24-kid", family.id)
-    _make_member("fam24-sib1", "fam24-sib1", family.id)
-    _make_member("fam24-sib2", "fam24-sib2", family.id)
-    assert _put_people(client, admin, "fam24-kid", [_person("fam24-sib1")]).status_code == 200
-
-    resp = _put_people(client, admin, "fam24-kid", [_person("fam24-sib2")])
+    resp = _put_people(client, admin, "fam23-kid", [])
     assert resp.status_code == 200, resp.text
-    assert [p["alias"] for p in resp.json()["people"]] == ["fam24-sib2"]
-    assert resp.json() == _get_approved(client, admin, "fam24-kid")
-    assert allow_store.get_edge("fam24-kid", "fam24-sib1") is None
+    assert allow_store.get_edge("fam23-kid", "fam23-sib1") is None
+    assert allow_store.get_edge("fam23-sib1", "fam23-kid") is not None
 
 
 def test_approved_put_removing_person_bumps_book(
@@ -784,42 +774,6 @@ def test_approved_put_removing_person_bumps_book(
     assert devcfg.get_book_version("pgr-fam25-1") == before + 1
     pushes = [json.loads(m.payload) for m in broker.published]
     assert any(d["kind"] == "book" for d in pushes)
-
-
-def test_approved_put_leaves_peer_reverse_edge_alone(client: TestClient):
-    family = _make_family("AppR4")
-    admin = _make_family_admin("fam26-admin", "fam26-admin", family.id)
-    _make_member("fam26-kid", "fam26-kid", family.id)
-    _make_member("fam26-sib1", "fam26-sib1", family.id)
-    allow_store.set_edge("fam26-sib1", "fam26-kid", message=True, locate=False)
-    assert _put_people(client, admin, "fam26-kid", [_person("fam26-sib1")]).status_code == 200
-
-    resp = _put_people(client, admin, "fam26-kid", [])
-    assert resp.status_code == 200, resp.text
-    assert allow_store.get_edge("fam26-kid", "fam26-sib1") is None
-    assert allow_store.get_edge("fam26-sib1", "fam26-kid") is not None
-
-
-def test_approved_put_cross_family_person_edge_kept_if_listed_else_deleted(
-    client: TestClient,
-):
-    fam_a = _make_family("AppR5A")
-    fam_b = _make_family("AppR5B")
-    admin_a = _make_family_admin("fam27-admin-a", "fam27-admin-a", fam_a.id)
-    _make_member("fam27-kid-a", "fam27-kid-a", fam_a.id)
-    _make_member("fam27-kid-b", "fam27-kid-b", fam_b.id)
-    allow_store.set_edge("fam27-kid-a", "fam27-kid-b", message=True, locate=False)
-
-    resp = _put_people(client, admin_a, "fam27-kid-a", [_person("fam27-kid-b")])
-    assert resp.status_code == 200, resp.text
-    assert allow_store.get_edge("fam27-kid-a", "fam27-kid-b") is not None
-    assert [p["alias"] for p in _get_approved(client, admin_a, "fam27-kid-a")["people"]] == [
-        "fam27-kid-b"
-    ]
-
-    resp = _put_people(client, admin_a, "fam27-kid-a", [])
-    assert resp.status_code == 200, resp.text
-    assert allow_store.get_edge("fam27-kid-a", "fam27-kid-b") is None
 
 
 def test_family_contacts_lists_only_family_externals_create_and_rename(
@@ -896,7 +850,9 @@ def test_create_contact_pushes_cfg_sms_to_open_members_only(
     assert _sms_pushes(broker, "pgr-fam23a-kid")[-1]["cfg"]["sms"] == []
 
 
-def test_create_contact_duplicate_name_is_409(client: TestClient):
+def test_create_contact_name_collision_is_409_exactly_and_after_truncation_and_case(
+    client: TestClient,
+):
     family = _make_family("Dup")
     admin = _make_family_admin("fam23b-admin", "fam23b-admin", family.id)
     _create_contact(client, admin, "+12065550100", "Grandma")
@@ -913,20 +869,16 @@ def test_create_contact_duplicate_name_is_409(client: TestClient):
     other_admin = _make_family_admin("fam23b-other", "fam23b-other", other.id)
     _create_contact(client, other_admin, "+12065550102", "Grandma")
 
-
-def test_create_contact_name_collision_after_truncation_and_case_is_409(client: TestClient):
-    family = _make_family("Trunc")
-    admin = _make_family_admin("fam23c-admin", "fam23c-admin", family.id)
     # The pager shows 16 code points and matches by name: these two are the
     # same name on the device.
-    _create_contact(client, admin, "+12065550100", "Grandma Josephine Smith")
+    _create_contact(client, admin, "+12065550103", "Grandma Josephine Smith")
     resp = client.post(
         "/api/family/contacts",
-        json={"phone": "+12065550101", "name": "GRANDMA JOSEPHINE Jones"},
+        json={"phone": "+12065550104", "name": "GRANDMA JOSEPHINE Jones"},
         headers=admin,
     )
     assert resp.status_code == 409, resp.text
-    assert len(externals_store.list_family_contacts(family.id)) == 1
+    assert len(externals_store.list_family_contacts(family.id)) == 2
 
 
 def test_create_contact_same_number_twice_is_idempotent_and_keeps_name(client: TestClient):
@@ -944,10 +896,10 @@ def test_create_contact_same_number_twice_is_idempotent_and_keeps_name(client: T
     _create_contact(client, admin, "+12065550101", "Nana")
 
 
-def test_rename_contact_to_taken_name_is_409(client: TestClient):
+def test_rename_contact_to_taken_name_is_409_and_frees_the_old_name(client: TestClient):
     family = _make_family("RenTaken")
     admin = _make_family_admin("fam23e-admin", "fam23e-admin", family.id)
-    _create_contact(client, admin, "+12065550100", "Grandma")
+    gma = _create_contact(client, admin, "+12065550100", "Grandma")
     pizza = _create_contact(client, admin, "+12065550101", "Pizza")
 
     resp = client.patch(
@@ -962,16 +914,11 @@ def test_rename_contact_to_taken_name_is_409(client: TestClient):
     assert resp.status_code == 200, resp.text
     assert resp.json()["displayName"] == "PIZZA"
 
-
-def test_rename_contact_frees_old_name_for_reuse(client: TestClient):
-    family = _make_family("RenFree")
-    admin = _make_family_admin("fam23f-admin", "fam23f-admin", family.id)
-    gma = _create_contact(client, admin, "+12065550100", "Grandma")
     resp = client.patch(
         f"/api/family/contacts/{gma['uid']}", json={"name": "Nana"}, headers=admin
     )
     assert resp.status_code == 200, resp.text
-    _create_contact(client, admin, "+12065550101", "Grandma")
+    _create_contact(client, admin, "+12065550102", "Grandma")
 
 
 def test_rename_contact_repushes_cfg_sms_to_explicit_and_implied_holders(
@@ -1117,48 +1064,32 @@ def test_implied_cfg_sms_caps_at_eight_name_sorted(client: TestClient):
     assert names == [f"c{i}" for i in range(8)]
 
 
-def test_send_message_to_unknown_phone_number_is_404_and_creates_nothing(
-    client: TestClient,
+@pytest.mark.parametrize(
+    ("out_policy", "number"),
+    [("open", "+12065550500"), ("people_sms", "+12065550600")],
+    ids=["open_policy_unknown_number", "people_sms_unapproved_number"],
+)
+def test_send_message_to_unapproved_phone_number_is_404_and_creates_nothing(
+    client: TestClient, out_policy: str, number: str
 ):
     family = _make_family("Msg1")
     admin_headers = _make_family_admin("fam24-admin", "fam24-admin", family.id)
     member_headers = _make_member("fam24-kid", "fam24-kid", family.id)
     resp = client.patch(
         "/api/family/members/fam24-kid",
-        json={"policy": {"out": "open", "in": "people"}},
+        json={"policy": {"out": out_policy, "in": "people"}},
         headers=admin_headers,
     )
     assert resp.status_code == 200, resp.text
 
     resp = client.post(
-        "/api/conversations/+12065550500/messages",
+        f"/api/conversations/{number}/messages",
         json={"body": "hi"},
         headers=member_headers,
     )
     assert resp.status_code == 404, resp.text
     assert externals_store.list_family_contacts(family.id) == []
-    assert externals_store.get_family_contact(family.id, "+12065550500") is None
-
-
-def test_send_message_to_unapproved_phone_number_is_404_without_any_number_policy(
-    client: TestClient,
-):
-    family = _make_family("Msg2")
-    admin_headers = _make_family_admin("fam25-admin", "fam25-admin", family.id)
-    member_headers = _make_member("fam25-kid", "fam25-kid", family.id)
-    resp = client.patch(
-        "/api/family/members/fam25-kid",
-        json={"policy": {"out": "people_sms", "in": "people"}},
-        headers=admin_headers,
-    )
-    assert resp.status_code == 200, resp.text
-
-    resp = client.post(
-        "/api/conversations/+12065550600/messages",
-        json={"body": "hi"},
-        headers=member_headers,
-    )
-    assert resp.status_code == 404, resp.text
+    assert externals_store.get_family_contact(family.id, number) is None
 
 
 def test_create_member_normalises_phone_and_rejects_garbage(client: TestClient):
@@ -1275,25 +1206,6 @@ def test_two_families_approving_one_number_get_their_own_names_and_sms_contacts(
     assert resp.status_code == 200, resp.text
     assert [c.name for c in devices_store.get_device("pgr-fam33-a").smsContacts] == ["Nana"]
     assert [c.name for c in devices_store.get_device("pgr-fam33-b").smsContacts] == ["Gran Jo"]
-
-
-def test_two_families_keep_separate_contacts_for_one_number():
-    fam_a = families_store.create_family(name="A", created_by="s")
-    fam_b = families_store.create_family(name="B", created_by="s")
-    a = externals_store.get_or_create(fam_a.id, "+12065550100", "Grandma")
-    b = externals_store.get_or_create(fam_b.id, "206-555-0100", "Gran Jo")
-    assert a.uid != b.uid and a.alias != b.alias
-    assert (a.displayName, b.displayName) == ("Grandma", "Gran Jo")
-    assert (a.phone, b.phone) == ("+12065550100", "+12065550100")
-    assert externals_store.get_family_contact(fam_a.id, "+12065550100").uid == a.uid
-    assert externals_store.get_family_contact(fam_b.id, "+12065550100").uid == b.uid
-    assert [u.uid for u in externals_store.list_family_contacts(fam_a.id)] == [a.uid]
-
-    db = get_db()
-    for uid in (a.uid, b.uid):
-        kinds = [s.to_dict()["kind"] for s in db.collection("users").document(uid).collection("backends").stream()]
-        assert kinds == ["sms"]
-    assert list(db.collection("phoneIndex").stream()) == []
 
 
 def test_approve_open_sms_unknown_alert_creates_the_contact_and_rederives(client: TestClient):
@@ -1469,10 +1381,15 @@ def _raise_alert(family_id: str, ext_uid: str) -> str:
     return f"cr_kid1_{ext_uid}"
 
 
-def test_approve_added_writes_edge_and_bumps(client: TestClient, broker: FakeBrokerClient):
+@pytest.mark.parametrize("had_locate_edge", [False, True], ids=["no_edge", "existing_locate_kept"])
+def test_approve_added_writes_edge_and_bumps(
+    client: TestClient, broker: FakeBrokerClient, had_locate_edge: bool
+):
     from app.routing import Routing
 
     family, admin, ext_uid = _added_setup(client)
+    if had_locate_edge:
+        allow_store.set_edge("kid1", ext_uid, message=False, locate=True)
     alert_id = _raise_alert(family.id, ext_uid)
     bv = devcfg.get_book_version("pgr-add-1")
     peer = users_store.get_user(ext_uid)
@@ -1488,7 +1405,7 @@ def test_approve_added_writes_edge_and_bumps(client: TestClient, broker: FakeBro
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "handled"
     edge = allow_store.get_edge("kid1", ext_uid)
-    assert edge is not None and edge.message is True and edge.locate is False
+    assert edge is not None and edge.message is True and edge.locate is had_locate_edge
     # (the relay-number owner's `rederive_sms_contacts` bumps once more)
     assert devcfg.get_book_version("pgr-add-1") > bv
     assert any(json.loads(m.payload).get("kind") == "book" for m in broker.published)
@@ -1498,18 +1415,6 @@ def test_approve_added_writes_edge_and_bumps(client: TestClient, broker: FakeBro
         origin_backend_kind="pager",
     )
     assert sent.rejected == []
-
-
-def test_approve_keeps_existing_locate(client: TestClient):
-    family, admin, ext_uid = _added_setup(client)
-    allow_store.set_edge("kid1", ext_uid, message=False, locate=True)
-    alert_id = _raise_alert(family.id, ext_uid)
-
-    resp = client.post(f"/api/family/alerts/{alert_id}/approve", json={}, headers=admin)
-
-    assert resp.status_code == 200, resp.text
-    edge = allow_store.get_edge("kid1", ext_uid)
-    assert edge is not None and edge.message is True and edge.locate is True
 
 
 def test_approve_legacy_409(client: TestClient):
@@ -1562,11 +1467,15 @@ def test_book_entries_carry_added(client: TestClient):
     assert entry["added"] is True and entry["sendable"] is False
 
 
-def test_remove_added_keeps_nick(client: TestClient, broker: FakeBrokerClient):
+@pytest.mark.parametrize("nick", ["Gran", None], ids=["keeps_nick", "deletes_the_doc"])
+def test_remove_added_clears_the_marker_and_keeps_a_nick(
+    client: TestClient, broker: FakeBrokerClient, nick: str | None
+):
     family, admin, ext_uid = _added_setup(client)
-    get_db().collection("users").document("kid1").collection("book").document(ext_uid).update(
-        {"nick": "Gran"}
-    )
+    if nick:
+        get_db().collection("users").document("kid1").collection("book").document(ext_uid).update(
+            {"nick": nick}
+        )
     bv = devcfg.get_book_version("pgr-add-1")
     broker.clear()
 
@@ -1574,22 +1483,16 @@ def test_remove_added_keeps_nick(client: TestClient, broker: FakeBrokerClient):
 
     assert resp.status_code == 200, resp.text
     marker = _marker("kid1", ext_uid)
-    assert marker is not None and marker["nick"] == "Gran" and "added" not in marker
+    if nick:
+        assert marker is not None and marker["nick"] == nick and "added" not in marker
+    else:
+        assert marker is None
     assert devcfg.get_book_version("pgr-add-1") == bv + 1
     assert any(json.loads(m.payload).get("kind") == "book" for m in broker.published)
     assert ext_uid not in [e["uid"] for e in resp.json()["entries"]]
     # Edges and the family contact are untouched; a second remove is a 404.
     assert externals_store.get_family_contact(family.id, "+12065550100") is not None
     assert client.delete(f"/api/book/kid1/added/{ext_uid}", headers=admin).status_code == 404
-
-
-def test_remove_added_without_nick_deletes_the_doc(client: TestClient):
-    _family, admin, ext_uid = _added_setup(client)
-
-    resp = client.delete(f"/api/book/kid1/added/{ext_uid}", headers=admin)
-
-    assert resp.status_code == 200, resp.text
-    assert _marker("kid1", ext_uid) is None
 
 
 def test_remove_added_other_family_404(client: TestClient):

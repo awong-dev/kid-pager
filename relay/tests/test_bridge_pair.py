@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import jobs
@@ -124,18 +125,20 @@ def test_sms_number_taken_is_409_and_user_untouched(client: TestClient, world: W
     assert users_store.get_user("sis").smsNumber == SIM
 
 
-def test_voice_only_pair_uses_the_voice_number(client: TestClient, world: World):
-    bridge, _ = pair_bridge(client, world, sim=None, voice=VOICE)
-    assert bridge.simNumber is None and bridge.voiceNumber == VOICE
-    assert bridge.caps.gvoice and not bridge.caps.sms
-    assert users_store.get_user("kid").smsNumber == VOICE
-    assert bridges_store.get_by_sms_number(VOICE).id == bridge.id
-
-
-def test_sim_wins_over_voice_when_both_present(client: TestClient, world: World):
-    bridge, _ = pair_bridge(client, world, sim=SIM, voice=VOICE)
-    assert users_store.get_user("kid").smsNumber == SIM
-    assert bridge.caps.sms and bridge.caps.gvoice
+@pytest.mark.parametrize(
+    ("sim", "voice"),
+    [(None, VOICE), (SIM, VOICE)],
+    ids=["voice-only", "sim-wins-over-voice"],
+)
+def test_pair_owner_number_is_the_sim_else_the_voice_number(
+    client: TestClient, world: World, sim: str | None, voice: str
+):
+    bridge, _ = pair_bridge(client, world, sim=sim, voice=voice)
+    number = sim or voice
+    assert bridge.simNumber == sim and bridge.voiceNumber == voice
+    assert bridge.caps.gvoice and bridge.caps.sms is (sim is not None)
+    assert users_store.get_user("kid").smsNumber == number
+    assert bridges_store.get_by_sms_number(number).id == bridge.id
 
 
 def test_pair_rate_limit_is_global_across_forwarded_ips(client: TestClient, world: World):

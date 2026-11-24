@@ -26,24 +26,30 @@ def plan(tmp_path, src_db, opts, auth=None):
     return familyexport.plan_import(dst, bundle(src_db), opts, auth or RecordingAuth())
 
 
-def test_parse_grammar():
-    text = """
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            """
 # comment
 moma,Mom@Example.com
 @kida = -
 supa   sup@example.com
   bo=   -
-"""
-    assert parse_email_list(text) == {
-        "moma": "Mom@Example.com",
-        "kida": "-",
-        "supa": "sup@example.com",
-        "bo": "-",
-    }
-
-
-def test_parse_skips_unfilled_template_lines():
-    assert parse_email_list("moma,\nkida,-\n") == {"kida": "-"}
+""",
+            {
+                "moma": "Mom@Example.com",
+                "kida": "-",
+                "supa": "sup@example.com",
+                "bo": "-",
+            },
+        ),
+        ("moma,\nkida,-\n", {"kida": "-"}),
+    ],
+    ids=["grammar", "skips_unfilled_template_lines"],
+)
+def test_parse_email_list_accepts(text, expected):
+    assert parse_email_list(text) == expected
 
 
 @pytest.mark.parametrize(
@@ -98,7 +104,7 @@ def test_missing_answers_refuse(tmp_path, src_db):
     assert not dump(dst)
 
 
-def test_dash_is_accepted_and_report_lists_every_person(tmp_path, src_db):
+def test_plan_report_lists_every_person_with_their_sign_in_answer(tmp_path, src_db):
     rep = plan(tmp_path, src_db, cloud(moma="Mom@Example.com", kida="-"))
     assert rep.ok, rep.errors
     assert [p.alias for p in rep.people] == ["kida", "moma", "supa"]
@@ -119,14 +125,10 @@ def test_dash_is_accepted_and_report_lists_every_person(tmp_path, src_db):
     )
     assert rep.emailsMissing == rep.emailsTaken == rep.emailsInvalid == []
 
-
-def test_unanswered_person_has_null_sign_in(tmp_path, src_db):
     rep = plan(tmp_path, src_db, cloud(moma="mom@example.com"))
     kid = next(p for p in rep.people if p.alias == "kida")
     assert kid.signIn is None and kid.email is None
 
-
-def test_override_of_prefill(tmp_path, src_db):
     rep = plan(tmp_path, src_db, cloud(moma="mom@example.com", kida="-", supa="-"))
     sup = next(p for p in rep.people if p.alias == "supa")
     assert rep.ok and sup.signIn is False and sup.email is None
@@ -137,8 +139,6 @@ def test_override_of_prefill(tmp_path, src_db):
     )
     assert next(p for p in rep.people if p.alias == "supa").email == "other@example.com"
 
-
-def test_target_alias_and_role_in_report(tmp_path, src_db):
     opts = ImportOptions(
         target_kind="cloud",
         emails={"moma": "mom@example.com", "kida": "-"},
@@ -171,31 +171,31 @@ def test_home_target_refuses_emails(tmp_path, src_db):
     assert not rep.ok and "cloud target only" in " ".join(rep.errors)
 
 
-def test_no_admin_with_email_refuses(tmp_path, src_db):
-    rep = plan(tmp_path, src_db, cloud(moma="-", kida="kid@example.com", supa="-"))
-    assert not rep.ok and any("at least one admin" in e for e in rep.errors)
-
-
-def test_duplicate_email(tmp_path, src_db):
-    rep = plan(
-        tmp_path, src_db, cloud(moma="same@example.com", kida="SAME@example.com")
-    )
-    assert not rep.ok and rep.emailsTaken == ["kida", "moma"]
-
-
-def test_invalid_email(tmp_path, src_db):
-    rep = plan(tmp_path, src_db, cloud(moma="mom@example.com", kida="nope"))
-    assert not rep.ok and rep.emailsInvalid == ["kida"]
-
-
-def test_unknown_alias_and_external(tmp_path, src_db):
-    rep = plan(
-        tmp_path,
-        src_db,
-        cloud(moma="mom@example.com", kida="-", ghost="g@example.com", xexta="-"),
-    )
-    assert not rep.ok
-    assert sum("no such person" in e for e in rep.errors) == 2
+@pytest.mark.parametrize(
+    "emails,refused",
+    [
+        (
+            {"moma": "-", "kida": "kid@example.com", "supa": "-"},
+            lambda rep: any("at least one admin" in e for e in rep.errors),
+        ),
+        (
+            {"moma": "same@example.com", "kida": "SAME@example.com"},
+            lambda rep: rep.emailsTaken == ["kida", "moma"],
+        ),
+        (
+            {"moma": "mom@example.com", "kida": "nope"},
+            lambda rep: rep.emailsInvalid == ["kida"],
+        ),
+        (
+            {"moma": "mom@example.com", "kida": "-", "ghost": "g@example.com", "xexta": "-"},
+            lambda rep: sum("no such person" in e for e in rep.errors) == 2,
+        ),
+    ],
+    ids=["no_admin_with_email", "duplicate_email", "invalid_email", "unknown_alias_and_external"],
+)
+def test_plan_refuses_bad_email_answers(tmp_path, src_db, emails, refused):
+    rep = plan(tmp_path, src_db, cloud(**emails))
+    assert not rep.ok and refused(rep)
 
 
 def test_taken_by_another_uid_refuses_same_uid_ok(tmp_path, src_db):
@@ -223,9 +223,7 @@ def test_apply_creates_accounts_for_every_email_and_lists_dash_people(tmp_path, 
     assert got[f"users/{w.MOM}"]["email"] == "mom@example.com"
     assert "email" not in got[f"users/{w.KID}"]
 
-
-def test_dash_overrides_a_prefilled_email_on_the_doc(tmp_path, src_db):
-    dst = make_store("sqlite", tmp_path, "d")
+    dst = make_store("sqlite", tmp_path, "d2")
     familyexport.apply_import(
         dst,
         bundle(src_db),

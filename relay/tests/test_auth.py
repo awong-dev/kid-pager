@@ -47,13 +47,11 @@ def client() -> Iterator[TestClient]:
         yield c
 
 
-def test_no_bearer_token_is_401(client: TestClient):
-    resp = client.get("/api/admin/users")
-    assert resp.status_code == 401
-
-
-def test_garbage_bearer_token_is_401(client: TestClient):
-    resp = client.get("/api/admin/users", headers={"Authorization": "Bearer not-a-real-token"})
+@pytest.mark.parametrize(
+    "headers", [{}, {"Authorization": "Bearer not-a-real-token"}], ids=["no-token", "garbage-token"]
+)
+def test_missing_or_garbage_bearer_token_is_401(client: TestClient, headers: dict[str, str]):
+    resp = client.get("/api/admin/users", headers=headers)
     assert resp.status_code == 401
 
 
@@ -115,17 +113,15 @@ def test_principal_for_defaults_a_claimless_token_to_member_no_family():
     assert principal == Principal(uid="u1", role="member", family_id=None)
 
 
-def test_require_family_admin_rejects_a_member():
-    authed = _authed(uid="mem1", role="member", family_id="famA")
+@pytest.mark.parametrize(
+    ("role", "family"),
+    [("member", None), ("admin", "famB")],
+    ids=["member", "admin-naming-another-family"],
+)
+def test_require_family_admin_refuses_with_403(role: str, family: str | None):
+    authed = _authed(uid="usr1", role=role, family_id="famA")
     with pytest.raises(HTTPException) as exc_info:
-        require_family_admin(authed, family=None, x_family=None)
-    assert exc_info.value.status_code == 403
-
-
-def test_require_family_admin_admin_naming_another_family_is_403():
-    authed = _authed(uid="admA", role="admin", family_id="famA")
-    with pytest.raises(HTTPException) as exc_info:
-        require_family_admin(authed, family="famB", x_family=None)
+        require_family_admin(authed, family=family, x_family=None)
     assert exc_info.value.status_code == 403
 
 
@@ -143,17 +139,18 @@ def test_require_family_admin_super_without_family_is_400():
     assert exc_info.value.status_code == 400
 
 
-def test_require_family_admin_super_with_family_query_is_ok():
+@pytest.mark.parametrize(
+    ("family", "x_family", "expected"),
+    [("famB", None, "famB"), (None, "famC", "famC")],
+    ids=["query", "x-family-header"],
+)
+def test_require_family_admin_super_selects_the_family(
+    family: str | None, x_family: str | None, expected: str
+):
     authed = _authed(uid="sup1", role="super", family_id=None)
-    principal, family_id = require_family_admin(authed, family="famB", x_family=None)
-    assert family_id == "famB"
+    principal, family_id = require_family_admin(authed, family=family, x_family=x_family)
+    assert family_id == expected
     assert principal.role == "super"
-
-
-def test_require_family_admin_super_with_x_family_header_is_ok():
-    authed = _authed(uid="sup1", role="super", family_id=None)
-    _principal, family_id = require_family_admin(authed, family=None, x_family="famC")
-    assert family_id == "famC"
 
 
 def test_require_super_rejects_family_admin():
@@ -172,12 +169,6 @@ def test_require_super_rejects_bare_legacy_admin_claim():
     with pytest.raises(HTTPException) as exc_info:
         require_super(authed)
     assert exc_info.value.status_code == 403
-
-
-def test_require_super_accepts_super():
-    authed = _authed(uid="sup1", role="super", family_id="default")
-    result = require_super(authed)
-    assert result.uid == "sup1"
 
 
 def test_disabled_user_is_403(client: TestClient):
@@ -216,11 +207,11 @@ def test_dev_token_mint_by_alias(client: TestClient):
     assert "token" in data
 
 
-def test_dev_token_unknown_alias_is_404(client: TestClient):
-    resp = client.post("/api/dev/token", json={"alias": "ghost-alias"})
-    assert resp.status_code == 404
-
-
-def test_dev_token_requires_uid_or_alias(client: TestClient):
-    resp = client.post("/api/dev/token", json={})
-    assert resp.status_code == 422
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [({"alias": "ghost-alias"}, 404), ({}, 422)],
+    ids=["unknown-alias", "no-uid-or-alias"],
+)
+def test_dev_token_error_statuses(client: TestClient, body: dict, status: int):
+    resp = client.post("/api/dev/token", json=body)
+    assert resp.status_code == status

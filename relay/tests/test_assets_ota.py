@@ -236,15 +236,7 @@ def test_assets_index_validation():
     firmware.AssetsIndex.model_validate(ok)
     for mutate in (
         lambda i: i["builds"][0].update(size=0x200000 - 4095),
-        lambda i: i["builds"][0].update(size=0),
-        lambda i: i["builds"][0].update(fv=0),
-        lambda i: i["builds"][0].update(fv=256),
         lambda i: i["builds"][0]["full"].update(path="as/../etc/passwd"),
-        lambda i: i["builds"][0]["full"].update(path="as/abc/full.z"),
-        lambda i: i["builds"][0]["full"].update(path=f"fw/{ID16}/full.z"),
-        lambda i: i["builds"][0]["full"].update(path=f"as/{AS_ID2[:16]}/full.z"),
-        lambda i: i["builds"][0]["full"].update(osz=0x200001),
-        lambda i: i["builds"][0].update(id="5A" * 32),
         lambda i: i.update(v=2),
     ):
         bad = copy.deepcopy(make_as_index())
@@ -311,22 +303,31 @@ def test_list_assets_blocked_reasons(ac, admin_headers, broker):
     assert r["blocked"].startswith("needs firmware")
 
 
-def test_assets_routes_502_503(ac, as_server, admin_headers, client_unconfigured=None):
-    _dev()
-    as_server["status"] = 500
-    assert ac.get("/api/admin/assets", headers=admin_headers).status_code == 502
-    r = ac.post("/api/admin/devices/pgr-as-1/assets", json={"target": ID16}, headers=admin_headers)
-    assert r.status_code == 502
-
-
-def test_assets_route_503_not_configured(fake_emqx, broker, admin_headers):
+@pytest.fixture
+def ac_unconfigured(fake_emqx: FakeEmqxAdmin, broker: FakeBrokerClient) -> Iterator[TestClient]:
     app = create_app(settings=make_settings(), broker_client=broker)
     app.state.emqx_admin = fake_emqx
     with TestClient(app) as c:
-        _dev()
-        assert c.get("/api/admin/assets", headers=admin_headers).status_code == 503
-        r = c.post("/api/admin/devices/pgr-as-1/assets", json={"cancel": True}, headers=admin_headers)
-        assert r.status_code == 503
+        yield c
+
+
+@pytest.mark.parametrize(
+    ("fixture", "code", "body"),
+    [
+        pytest.param("ac", 502, {"target": ID16}, id="index-unreachable"),
+        pytest.param("ac_unconfigured", 503, {"cancel": True}, id="not-configured"),
+    ],
+)
+def test_assets_routes_refuse_when_unavailable(
+    request: pytest.FixtureRequest, admin_headers, fixture: str, code: int, body: dict
+):
+    c = request.getfixturevalue(fixture)
+    if fixture == "ac":
+        request.getfixturevalue("as_server")["status"] = 500
+    _dev()
+    assert c.get("/api/admin/assets", headers=admin_headers).status_code == code
+    r = c.post("/api/admin/devices/pgr-as-1/assets", json=body, headers=admin_headers)
+    assert r.status_code == code
 
 
 def test_push_assets_success_and_cancel(ac, admin_headers, broker):

@@ -58,22 +58,13 @@ def test_put_decodes_wire_values_and_get_encodes_them(client: TestClient):
     assert body["data"] == {"at": {"$ts": TS_US}, "blob": {"$b64": "AQID"}, "n": 3}
 
 
-def test_get_missing_doc(client: TestClient):
-    body = client.get(f"{BASE}/doc", params={"path": "devdbt/nope"}).json()
-    assert body["exists"] is False and body["data"] is None
-
-
-def test_patch_merges(client: TestClient):
+def test_patch_merges_and_put_replaces(client: TestClient):
     put(client, "devdbt/d1", {"a": 1, "b": 2})
     assert client.patch(
         f"{BASE}/doc", json={"path": "devdbt/d1", "data": {"b": 5, "c": 6}}
     ).json() == {"ok": True}
     data = client.get(f"{BASE}/doc", params={"path": "devdbt/d1"}).json()["data"]
     assert data == {"a": 1, "b": 5, "c": 6}
-
-
-def test_put_replaces(client: TestClient):
-    put(client, "devdbt/d1", {"a": 1})
     put(client, "devdbt/d1", {"b": 2})
     assert client.get(f"{BASE}/doc", params={"path": "devdbt/d1"}).json()["data"] == {
         "b": 2
@@ -91,30 +82,34 @@ def test_delete_removes(client: TestClient):
     )
 
 
-def test_list_by_parent(client: TestClient):
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        pytest.param(
+            {"parent": "devices/d1/locations"},
+            {"devices/d1/locations/l1": {"v": 1}, "devices/d1/locations/l2": {"v": 2}},
+            id="by_parent",
+        ),
+        pytest.param(
+            {"group": "locations"},
+            {
+                "devices/d1/locations/l1": {"v": 1},
+                "devices/d1/locations/l2": {"v": 2},
+                "devices/d2/locations/l3": {"v": 3},
+            },
+            id="by_group_spans_parents",
+        ),
+    ],
+)
+def test_list_by_parent_or_group(client: TestClient, params: dict, expected: dict):
     put(client, "devices/d1/locations/l1", {"v": 1})
     put(client, "devices/d1/locations/l2", {"v": 2})
     put(client, "devices/d2/locations/l3", {"v": 3})
     put(client, "devices/d1", {"name": "x"})
-    docs = client.get(f"{BASE}/list", params={"parent": "devices/d1/locations"}).json()[
-        "docs"
-    ]
-    assert sorted(d["path"] for d in docs) == [
-        "devices/d1/locations/l1",
-        "devices/d1/locations/l2",
-    ]
-    by_id = {d["id"]: d["data"] for d in docs}
-    assert by_id == {"l1": {"v": 1}, "l2": {"v": 2}}
-
-
-def test_list_by_group_spans_parents(client: TestClient):
-    put(client, "devices/d1/locations/l1", {"v": 1})
-    put(client, "devices/d2/locations/l3", {"v": 3})
-    docs = client.get(f"{BASE}/list", params={"group": "locations"}).json()["docs"]
-    assert sorted(d["path"] for d in docs) == [
-        "devices/d1/locations/l1",
-        "devices/d2/locations/l3",
-    ]
+    docs = client.get(f"{BASE}/list", params=params).json()["docs"]
+    assert {d["path"]: d["data"] for d in docs} == expected
+    assert len(docs) == len(expected)
+    assert {d["id"] for d in docs} == {path.rsplit("/", 1)[1] for path in expected}
 
 
 def test_bad_paths_are_400(client: TestClient):

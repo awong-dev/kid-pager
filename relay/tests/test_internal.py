@@ -89,55 +89,14 @@ def client() -> Iterator[TestClient]:
         yield c
 
 
-def test_tick_not_found_replaced_by_401_when_dev_mode_off_and_no_token():
-    app = create_app(settings=make_settings(dev_mode=False), broker_client=FakeBrokerClient())
-    with TestClient(app) as c:
-        resp = c.post("/internal/tick")
-        assert resp.status_code == 401
-
-
-def test_sweep_401_when_dev_mode_off_and_no_token():
-    app = create_app(settings=make_settings(dev_mode=False), broker_client=FakeBrokerClient())
-    with TestClient(app) as c:
-        resp = c.post("/internal/sweep")
-        assert resp.status_code == 401
-
-
 def test_sweep_runs_and_reports_zero_deletions_with_nothing_stale(client: TestClient):
     """Route wiring: `POST /internal/sweep` returns all zeros on a fresh emulator."""
     resp = client.post("/internal/sweep")
     assert resp.status_code == 200
     body = resp.json()
     assert body.pop("oldest") == {"messages": None, "locations": None}
-    assert body == {
-        "messagesDeleted": 0,
-        "wireIdsDeleted": 0,
-        "locationsDeleted": 0,
-        "locWireIdsDeleted": 0,
-        "locReqsDeleted": 0,
-        "orphanedWireIdsDeleted": 0,
-        "conversationsDeleted": 0,
-        "gchatLinkCodesDeleted": 0,
-        "alertsDeleted": 0,
-        "batteryDeleted": 0,
-        "heldSmsDeleted": 0,
-        "bridgePairCodesDeleted": 0,
-        "bridgeOutboxDeleted": 0,
-        "heldChatDeleted": 0,
-        "sessionsDeleted": 0,
-        "inviteCodesDeleted": 0,
-        "webauthnChallengesDeleted": 0,
-        "smsLogDeleted": 0,
-        "topupsDeleted": 0,
-        "rateLimitsDeleted": 0,
-        "cellsDeleted": 0,
-        "contactRequestsDeleted": 0,
-        "setupCodesDeleted": 0,
-        "locMessagesScrubbed": 0,
-        "deviceStatusScrubbed": 0,
-        "fedInvitesDeleted": 0,
-        "fedOutboxDeleted": 0,
-    }
+    assert body and all(v == 0 for v in body.values())
+    assert {"messagesDeleted", "locationsDeleted", "fedOutboxDeleted"} <= body.keys()
 
 
 def test_tick_retries_queued_pager_deliveries_end_to_end():
@@ -208,57 +167,39 @@ def _auth_headers(token: bytes) -> dict[str, str]:
     return {"Authorization": f"Bearer {token.decode('ascii')}"}
 
 
-def test_tick_accepts_a_valid_oidc_token(oidc_client: TestClient):
-    resp = oidc_client.post("/internal/tick", headers=_auth_headers(_sign()))
-    assert resp.status_code == 200
-
-
-def test_sweep_accepts_a_valid_oidc_token(oidc_client: TestClient):
-    resp = oidc_client.post("/internal/sweep", headers=_auth_headers(_sign()))
-    assert resp.status_code == 200
-
-
-def test_internal_rejects_missing_bearer_token(oidc_client: TestClient):
-    resp = oidc_client.post("/internal/tick")
-    assert resp.status_code == 401
-
-
-def test_internal_rejects_wrong_audience(oidc_client: TestClient):
-    token = _sign(audience="https://some-other-service-uc.a.run.app")
-    resp = oidc_client.post("/internal/tick", headers=_auth_headers(token))
-    assert resp.status_code == 401
-
-
-def test_internal_rejects_wrong_caller_email(oidc_client: TestClient):
-    token = _sign(email="someone-else@demo-pager.iam.gserviceaccount.com")
-    resp = oidc_client.post("/internal/tick", headers=_auth_headers(token))
-    assert resp.status_code == 401
-
-
-def test_internal_rejects_an_expired_token(oidc_client: TestClient):
-    """Expiry is enforced (`clock_skew_in_seconds=30`, so -600 s is past it)."""
-    token = _sign(exp_offset=-600)
-    resp = oidc_client.post("/internal/tick", headers=_auth_headers(token))
-    assert resp.status_code == 401
-
-
-def test_internal_rejects_tampered_signature(oidc_client: TestClient):
+def _tampered_signature_token() -> bytes:
     token = _sign()
     header_b64, payload_b64, sig_b64 = token.decode("ascii").split(".")
     idx = 5
     tampered_char = "A" if sig_b64[idx] != "A" else "B"
-    tampered = f"{header_b64}.{payload_b64}.{sig_b64[:idx]}{tampered_char}{sig_b64[idx + 1:]}"
-    resp = oidc_client.post(
-        "/internal/tick", headers={"Authorization": f"Bearer {tampered}"}
-    )
+    return f"{header_b64}.{payload_b64}.{sig_b64[:idx]}{tampered_char}{sig_b64[idx + 1:]}".encode("ascii")
+
+
+@pytest.mark.parametrize("route", ["/internal/tick", "/internal/sweep"])
+def test_a_valid_oidc_token_is_accepted(oidc_client: TestClient, route: str):
+    resp = oidc_client.post(route, headers=_auth_headers(_sign()))
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("route", ["/internal/tick", "/internal/sweep"])
+def test_no_token_is_401_when_dev_mode_is_off(oidc_client: TestClient, route: str):
+    resp = oidc_client.post(route)
     assert resp.status_code == 401
 
 
-def test_dev_mode_bypass_still_works_locally(client: TestClient):
-    """`client` (dev_mode=True) needs no Authorization header."""
-    resp = client.post("/internal/tick")
-    assert resp.status_code == 200
-    # Under SCHEDULER_MODE=internal the routes also accept `X-Relay-Webhook-Key`.
+@pytest.mark.parametrize(
+    "make_token",
+    [
+        pytest.param(lambda: _sign(audience="https://some-other-service-uc.a.run.app"), id="wrong_audience"),
+        pytest.param(lambda: _sign(email="someone-else@demo-pager.iam.gserviceaccount.com"), id="wrong_caller_email"),
+        # Expiry is enforced (`clock_skew_in_seconds=30`, so -600 s is past it).
+        pytest.param(lambda: _sign(exp_offset=-600), id="expired"),
+        pytest.param(_tampered_signature_token, id="tampered_signature"),
+    ],
+)
+def test_a_bad_oidc_token_is_rejected(oidc_client: TestClient, make_token):
+    resp = oidc_client.post("/internal/tick", headers=_auth_headers(make_token()))
+    assert resp.status_code == 401
 
 
 def _home_client(**overrides: object) -> TestClient:

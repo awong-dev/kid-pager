@@ -15,7 +15,7 @@ sys.modules["soracom_beam"] = sb
 _spec.loader.exec_module(sb)
 
 
-def test_build_calls_without_group_id():
+def test_build_calls_with_or_without_group_id():
     calls = sb.build_calls("pager-beam", "295050000000001", sb.DEFAULT_DESTINATION)
     assert [(c.method, c.path) for c in calls] == [
         ("GET", "/groups"),
@@ -30,8 +30,6 @@ def test_build_calls_without_group_id():
     assert value["useClientCredentials"] is True and value["version"] == "201912"
     assert value["destination"].startswith("mqtts://broker.example.com:8883")
 
-
-def test_build_calls_with_known_group_id_skips_lookup():
     calls = sb.build_calls("g", "1", "mqtts://h:8883", group_id="grp-1")
     assert [(c.method, c.path) for c in calls] == [
         ("PUT", "/groups/grp-1/configuration/SoracomBeam"),
