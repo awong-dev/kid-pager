@@ -2077,8 +2077,12 @@ def scenario_receipts() -> None:
     sim = bridge_sim.BridgeSimClient(BRIDGE_SIM_URL)
 
     kid, device = _bridge_member(admin, family_id, "rkid", "pgr-e2e-rcp")
-    _pair_sim(admin, sim, family_id, kid["uid"], "Receipt phone")
-    gran = admin.family_create_contact(family_id, "+15550003333", "ReceiptGran")
+    # The sim keeps the last scenario's numbers across `/_reset`, and those belong to its member.
+    _pair_sim(
+        admin, sim, family_id, kid["uid"], "Receipt phone",
+        simNumber="+15550010001", voiceNumber=None,
+    )
+    gran = admin.family_create_contact(family_id, "+15550010002", "ReceiptGran")
     admin.family_put_approved(family_id, kid["uid"], contacts=[{"uid": gran["uid"]}])
     alias = Oracle().user(gran["uid"]).alias
 
@@ -2137,7 +2141,10 @@ def scenario_bridge_health() -> None:
     sim = bridge_sim.BridgeSimClient(BRIDGE_SIM_URL)
 
     kid, device = _bridge_member(admin, family_id, "hkid", "pgr-e2e-hlt")
-    bridge = _pair_sim(admin, sim, family_id, kid["uid"], "Health phone")
+    bridge = _pair_sim(
+        admin, sim, family_id, kid["uid"], "Health phone",
+        simNumber="+15550010003", voiceNumber=None,  # not the previous scenario's number
+    )
     bridge_id = bridge["id"]
     gran = admin.family_create_contact(family_id, "+15550004444", "HealthGran")
     admin.family_put_approved(family_id, kid["uid"], contacts=[{"uid": gran["uid"]}])
