@@ -13,6 +13,7 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import Logo from "@/components/Logo";
 import { useNavigate } from "@/lib/router";
 import { AUTH_BACKEND } from "@/lib/auth";
 import {
@@ -103,6 +104,9 @@ function HomeSetup() {
   return (
     <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", p: 2 }}>
       <Paper elevation={2} sx={{ p: { xs: 2, sm: 4 }, maxWidth: 420, width: "100%" }}>
+        <Box sx={{ display: "flex", justifyContent: "center", mb: 1 }}>
+          <Logo size={72} />
+        </Box>
         <Typography variant="h5" gutterBottom>
           Set up Pager
         </Typography>

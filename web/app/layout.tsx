@@ -9,8 +9,9 @@ export const metadata: Metadata = {
   description: "School pickup pager -- web app",
   manifest: "/manifest.webmanifest",
   icons: {
-    icon: "/icons/icon-192.png",
-    apple: "/icons/icon-192.png",
+    // explicit: declaring `apple` here suppresses the automatic link for app/icon.svg
+    icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
+    apple: "/icons/apple-touch-icon.png",
   },
 };
 
