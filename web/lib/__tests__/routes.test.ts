@@ -19,7 +19,7 @@ describe("API paths", () => {
   });
   it("relay rewrites come before the catch-all, which is last", () => {
     const last = rewrites[rewrites.length - 1]!;
-    expect(last).toEqual({ source: "!/_next/**", destination: "/index.html" });
+    expect(last).toEqual({ source: "**", destination: "/index.html" });
     expect(rewrites.slice(0, -1).every((r) => r.run)).toBe(true);
   });
   it("matches prefixes on segment boundaries", () => {
