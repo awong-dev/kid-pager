@@ -1446,8 +1446,6 @@ def scenario_address_book() -> None:
     device.inbox.clear()
     req_id = device.publish_contact_req("Grandma", "+15550001111")
 
-    from app.store import externals as externals_store
-
     wait_until(
         lambda: any(
             e.data.get("from") == "system" and e.data.get("body") == "Grandma: added; needs a parent's OK to text"
@@ -1458,7 +1456,8 @@ def scenario_address_book() -> None:
     )
     row = oracle.contact_request(issued_id("pgr-e2e-book"), req_id)
     assert row is not None and row.status == "added", row
-    contact_uid, contact_alias = externals_store.contact_ids(family_id, "+15550001111")
+    grandma = next(c for c in admin.family_list_contacts(family_id) if c["phone"] == "+15550001111")
+    contact_uid, contact_alias = grandma["uid"], grandma["alias"]
     expected_alert_id = f"cr_{abstudent['uid']}_{contact_uid}"
 
     def _pending_alert() -> dict | None:
