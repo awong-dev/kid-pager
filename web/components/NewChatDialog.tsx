@@ -149,7 +149,7 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
         {bookEmpty && (
           <Alert severity="info" sx={{ mb: 1 }}>
             Your address book is empty. Ask a family admin to approve people for you.{" "}
-            <Link href="/settings/book">Address book</Link>
+            <Link href="/account/book">My address book</Link>
           </Alert>
         )}
         <Autocomplete<ChatOption, false, false, boolean>

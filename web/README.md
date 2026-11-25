@@ -130,14 +130,28 @@ menu in one place.
   conversations" (read-only, collapsed behind Show all past 8 rows). Each section has its own reads,
   skeleton and error. Threads and `/location` get a back arrow to Messages in the phone top bar;
   `/location` keeps the bottom bar and has a "Messages" link on desktop.
-- Family tabs: People & contacts, Address books, Pagers, Settings. `/family/people` is one page of
+- Family tabs: People & contacts, Permissions, Pagers, Settings. `/family/people` is one page of
   chat targets in three `SectionBlock`s (`#members`, `#contacts` = Outside contacts incl. other
   families, `#groups`), each with its own load/error state; `useScrollToAnchor` scrolls to the
-  fragment once they have content (the router does not). Group chats there is a per-member summary
-  linking to the detail screen `/family/chat?uid=` (stays under the People & contacts tab, with a back
-  link). `/family/settings` holds the family name and switches plus Message history (retention is
-  server-wide and superadmin-only to change; a family admin sees it read-only). The member drawer's
-  Policy and Approved parts are `components/MemberPolicyParts.tsx`, ready for the Permissions page.
+  fragment once they have content (the router does not). The member drawer holds only the profile and
+  a link to the person's permissions. Group chats there is a per-member summary linking to the detail
+  screen `/family/chat?uid=` (stays under the People & contacts tab, with a back link).
+  `/family/settings` holds the family name and switches plus Message history (retention is
+  server-wide and superadmin-only to change; a family admin sees it read-only).
+- `/family/permissions` gathers every control that decides who may talk to whom. A member list shows
+  each person's rules in words and how many are approved; the selection is `?who=<alias>` (read with
+  `useSearch()` from `lib/router`, so Back and reload work; helpers in `screens/family/permissionsModel.ts`).
+  A person's detail (`PersonPermissions`) is, in order: Messaging rules (`PolicyPicker`), Approved people
+  and contacts (`ApprovedEditor`, with the per-person Locate switch), On their pager
+  (`components/MemberAddressBook.tsx`, the same body as `/account/book`), Group chats (link to
+  `/family/chat?uid=`) and Who can see their location (read-only, from everyone's approved lists).
+  Each editor keeps its own Save; the detail is keyed by uid so unsaved edits never move to another
+  person. md and up: list left, detail right; phones: the list, or the detail with an "All people"
+  link (CSS only). There is no family-wide default policy: the relay gives a new member People/People
+  and a new admin Open/Anyone (`relay/app/store/users.py`), stated on the page under Defaults. A
+  closing list links to Outside contacts, linked families, Alerts and (super) the allow-list.
+- `/account/book` ("My address book", everyone, own book only) is in the account menu; `/settings/book`
+  redirects to it.
 - The phone/desktop split is CSS only, so the static export never flashes the wrong layout.
 - `screens/home/Home.tsx`: the launcher. Its cards are data in `screens/home/cards.ts`; each shows one
   live status line, reading only what the viewer's role may read (see `relay/firestore.rules`).

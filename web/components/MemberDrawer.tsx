@@ -1,13 +1,12 @@
 "use client";
 
-/** Row-click drawer on `/family/people`: Profile, Policy, Group chats and Approved. Profile is this
- * file's `MemberProfileForm`; Policy and Approved are `MemberPolicyParts` (the Permissions page
- * lifts them out of here); the drawer only keeps the saved outbound policy that links the two. */
+/** Row-click drawer on `/family/people`: the person's profile (name, role, enabled) and a link to
+ * their rules on `/family/permissions`. Messaging rules, the approved list, the address book and
+ * group chats live there, not here. */
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
-import Divider from "@mui/material/Divider";
 import Drawer from "@mui/material/Drawer";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import MenuItem from "@mui/material/MenuItem";
@@ -17,9 +16,9 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import { Link } from "@/lib/router";
-import { MemberApprovedPart, MemberPolicyPart } from "@/components/MemberPolicyParts";
 import { ApiError, api } from "@/lib/api";
 import { familyQuery } from "@/lib/family-context";
+import { permissionsHref } from "@/screens/family/permissionsModel";
 import type { Role, UserDoc } from "@/lib/types";
 
 export interface MemberDrawerMember extends UserDoc {
@@ -37,9 +36,6 @@ function MemberProfileForm({
   const [displayName, setDisplayName] = useState(member.displayName);
   const [role, setRole] = useState<Role>(member.role);
   const [disabled, setDisabled] = useState(member.disabled);
-  // The saved outbound policy (not the unsaved radio), so the Approved hint
-  // matches what the relay applies.
-  const [savedOut, setSavedOut] = useState(member.policy.out);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   async function save() {
@@ -101,16 +97,13 @@ function MemberProfileForm({
         Save
       </Button>
 
-      <MemberPolicyPart member={member} onSaved={(p) => setSavedOut(p.out)} />
-
-      <Divider />
-
-      <Typography variant="subtitle2">Group chats</Typography>
-      <Button component={Link} href={`/family/chat?uid=${encodeURIComponent(member.uid)}`} variant="outlined">
-        Group chats…
+      <Typography variant="subtitle2">Permissions</Typography>
+      <Typography variant="body2" color="text.secondary">
+        Who they can message, who can message them, their approved list, address book and group chats.
+      </Typography>
+      <Button component={Link} href={permissionsHref(member.alias)} variant="outlined">
+        Permissions
       </Button>
-
-      <MemberApprovedPart member={member} policyOut={savedOut} />
     </>
   );
 }

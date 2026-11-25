@@ -30,6 +30,7 @@ import { familyDevicesQuery } from "@/lib/live/queries";
 import { inboundLabel, outboundLabel } from "@/lib/policy";
 import type { DeviceDoc } from "@/lib/types";
 import { responsiveTableSx } from "@/lib/tableSx";
+import { permissionsHref } from "./permissionsModel";
 import { AddPersonDialog, InviteDialog, type InviteCode, SignInEmailDialog } from "./MemberDialogs";
 import type { FamilyMembers, MemberRow } from "./useFamilyMembers";
 
@@ -85,7 +86,7 @@ export default function MembersSection({ members, loading, error: loadError }: F
     <SectionBlock
       id="members"
       title="Family members"
-      description="The people in your family: who has a pager and whether they can sign in. Tap a person for their settings."
+      description="The people in your family: who has a pager and whether they can sign in. Tap a person to edit their profile; their messaging rules are under Permissions."
       action={
         <Button variant="contained" onClick={() => setCreateOpen(true)}>
           Add person
@@ -106,7 +107,7 @@ export default function MembersSection({ members, loading, error: loadError }: F
                 <TableCell>Role</TableCell>
                 <TableCell>Sign-in</TableCell>
                 <TableCell>Pagers</TableCell>
-                <TableCell>Policy</TableCell>
+                <TableCell>Rules</TableCell>
                 <TableCell>Enabled</TableCell>
                 {AUTH_BACKEND === "home" && <TableCell />}
               </TableRow>
@@ -154,11 +155,14 @@ export default function MembersSection({ members, loading, error: loadError }: F
                       ))}
                     </Stack>
                   </TableCell>
-                  <TableCell>
+                  <TableCell onClick={(e) => e.stopPropagation()}>
                     <Chip
+                      component={Link}
+                      href={permissionsHref(m.alias)}
+                      clickable
                       size="small"
                       variant="outlined"
-                      label={`Out: ${outboundLabel(m.policy.out)} · In: ${inboundLabel(m.policy.in)}`}
+                      label={`Can message ${outboundLabel(m.policy.out)} · Messaged by ${inboundLabel(m.policy.in)}`}
                     />
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>

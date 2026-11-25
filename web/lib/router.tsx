@@ -42,6 +42,15 @@ export function usePathname(): string | null {
   return useSyncExternalStore(subscribe, getClientSnapshot, getServerSnapshot);
 }
 
+const getSearchSnapshot = (): string => window.location.search;
+const getServerSearch = (): string => "";
+
+/** Current query string (with its leading `?`, or `""`). Unlike `usePathname` it re-renders on a
+ * `?query`-only navigation, and on Back/Forward, so a screen can keep its selection in the URL. */
+export function useSearch(): string {
+  return useSyncExternalStore(subscribe, getSearchSnapshot, getServerSearch);
+}
+
 const ParamsContext = createContext<Params>({});
 
 /** Provides the matched route's `:param` values (decoded) to its screen. */

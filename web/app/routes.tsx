@@ -38,9 +38,9 @@ export const AUTHENTICATED: readonly AuthRoute[] = [
   { path: "/devices/:id",           role: "member", screen: () => import("@/screens/devices/Device") },
   { path: "/location",              role: "member", screen: () => import("@/screens/location/Location") },
   { path: "/account/apps",          role: "member", screen: () => import("@/screens/account/Backends") },
+  { path: "/account/book",          role: "member", screen: () => import("@/screens/account/Book") },
   { path: "/account/notifications", role: "member", screen: () => import("@/screens/account/Notifications") },
   { path: "/account/pagers",        role: "member", screen: () => import("@/screens/account/Pagers") },
-  { path: "/settings/book",         role: "member", screen: () => import("@/screens/settings/Book") },
 
   // --- admin: family admin or super ---------------------------------------------------------
   { path: "/chat/view/:key",        role: "admin",  screen: () => import("@/screens/chat/MonitorThread") },
@@ -48,6 +48,7 @@ export const AUTHENTICATED: readonly AuthRoute[] = [
   { path: "/family/chat",           role: "admin",  screen: () => import("@/screens/family/Chat") },
   { path: "/family/devices",        role: "admin",  screen: () => import("@/screens/family/Devices") },
   { path: "/family/people",         role: "admin",  screen: () => import("@/screens/family/People") },
+  { path: "/family/permissions",    role: "admin",  screen: () => import("@/screens/family/Permissions") },
   { path: "/family/settings",       role: "admin",  screen: () => import("@/screens/family/Settings") },
 
   // --- super: superadmin only ---------------------------------------------------------------
@@ -69,6 +70,7 @@ export type RedirectRoute = { from: string; to: string };
 export const REDIRECTS: readonly RedirectRoute[] = [
   { from: "/family/alerts",         to: "/alerts" },
   { from: "/settings/backends",     to: "/account/apps" },
+  { from: "/settings/book",         to: "/account/book" },
   { from: "/settings/devices",      to: "/account/pagers" },
   { from: "/settings/notifications", to: "/account/notifications" },
   { from: "/family/contacts",       to: "/family/people#contacts" },

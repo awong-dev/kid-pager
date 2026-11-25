@@ -34,16 +34,18 @@ describe("sectionOf", () => {
     expect(isThreadPath("/chat/a/b/c")).toBe(false);
   });
   it("Family has four tabs; group chats and settings highlight their own place", () => {
-    expect(labels(admin, "/family/people")).toEqual(["People & contacts", "Address books", "Pagers", "Settings"]);
+    expect(labels(admin, "/family/people")).toEqual(["People & contacts", "Permissions", "Pagers", "Settings"]);
     expect(sectionOf("/family/chat", admin)).toMatchObject({ section: { id: "family" }, activeTab: { label: "People & contacts" } });
     expect(sectionOf("/family/settings", admin).activeTab?.label).toBe("Settings");
-    expect(sectionOf("/settings/book", admin)).toMatchObject({
+    expect(sectionOf("/family/permissions", admin)).toMatchObject({
       section: { id: "family" },
-      activeTab: { href: "/settings/book" },
+      activeTab: { href: "/family/permissions" },
     });
+    // the address book is an account page now, in no section
+    expect(sectionOf("/account/book", admin).section).toBeNull();
   });
   it("a viewer is only placed in sections they may use", () => {
-    expect(sectionOf("/settings/book", member).section).toBeNull(); // members reach it from the account menu
+    expect(sectionOf("/account/book", member).section).toBeNull(); // everyone reaches it from the account menu
     expect(sectionOf("/family/people", member).section).toBeNull();
     expect(sectionOf("/admin/users", admin).section).toBeNull();
     expect(sectionOf("/admin/users", sup).section?.id).toBe("system");

@@ -85,7 +85,7 @@ const navHrefs: { where: string; href: string }[] = [
     ...s.tabs.map((t) => ({ where: `${s.id} tab`, href: t.href })),
   ]),
   ...CARDS.map((c) => ({ where: `card ${c.id}`, href: c.href })),
-  ...["/account/notifications", "/account/apps", "/account/pagers", "/settings/book"].map((href) => ({
+  ...["/account/notifications", "/account/apps", "/account/pagers", "/account/book"].map((href) => ({
     where: "account menu",
     href,
   })),
@@ -98,6 +98,7 @@ describe("redirects", () => {
     expect(resolveRoute("/admin/settings")).toEqual({ kind: "redirect", to: "/family/settings" });
     expect(resolveRoute("/family/history")).toEqual({ kind: "redirect", to: "/family/settings" });
     expect(resolveRoute("/family/contacts")).toEqual({ kind: "redirect", to: "/family/people#contacts" });
+    expect(resolveRoute("/settings/book")).toEqual({ kind: "redirect", to: "/account/book" });
   });
   it("every target is a listed route that is at least as strict as the old path was", () => {
     // The old roles: alerts/retention were admin-only, the rest member.
@@ -109,6 +110,7 @@ describe("redirects", () => {
       "/settings/backends": RANK.member,
       "/settings/devices": RANK.member,
       "/settings/notifications": RANK.member,
+      "/settings/book": RANK.member,
     };
     expect(Object.keys(was).sort()).toEqual(REDIRECTS.map((r) => r.from).sort());
     for (const r of REDIRECTS) expect(roleOf(r.to.replace(/#.*/, "")), r.to).toBeGreaterThanOrEqual(was[r.from]!);
@@ -132,7 +134,11 @@ describe("navigation", () => {
     }
   });
   it("the new family pages are admin routes and the retired ones are gone from the table", () => {
-    for (const p of ["/family/people", "/family/settings", "/family/chat"]) expect(roleOf(p), p).toBe(RANK.admin);
+    for (const p of ["/family/people", "/family/permissions", "/family/settings", "/family/chat"]) {
+      expect(roleOf(p), p).toBe(RANK.admin);
+    }
+    expect(roleOf("/account/book")).toBe(RANK.member);
+    expect(AUTHENTICATED.map((r) => r.path)).not.toContain("/settings/book");
     const paths = AUTHENTICATED.map((r) => r.path);
     expect(paths).not.toContain("/family/contacts");
     expect(paths).not.toContain("/family/history");

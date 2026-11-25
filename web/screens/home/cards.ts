@@ -4,10 +4,10 @@
 import type { DeviceDoc } from "@/lib/types";
 
 export type CardId =
-  | "messages" | "alerts" | "people" | "pagers" | "settings" | "system" | "myPager" | "notifications";
+  | "messages" | "alerts" | "people" | "permissions" | "pagers" | "settings" | "system" | "myPager" | "notifications";
 
 export type IconKey =
-  | "forum" | "alerts" | "groups" | "remote" | "settings" | "admin" | "notifications";
+  | "forum" | "alerts" | "groups" | "verified" | "remote" | "settings" | "admin" | "notifications";
 
 /** Who sees a card: `everyone`, `admin` (family admin or super), `super`, or `members`
  * (signed in but NOT an admin). */
@@ -32,6 +32,8 @@ export const CARDS: readonly HomeCard[] = [
     description: "Requests waiting for your OK." },
   { id: "people", title: "People & contacts", href: "/family/people", icon: "groups", audience: "admin", needsFamily: true,
     description: "Everyone your pagers can message." },
+  { id: "permissions", title: "Permissions", href: "/family/permissions", icon: "verified", audience: "admin",
+    description: "Who can message whom." },
   { id: "pagers", title: "Pagers", href: "/family/devices", icon: "remote", audience: "admin", needsFamily: true,
     description: "Set up and look after your family's pagers." },
   { id: "settings", title: "Family settings", href: "/family/settings", icon: "settings", audience: "admin",

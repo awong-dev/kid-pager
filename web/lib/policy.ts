@@ -15,29 +15,29 @@ export const OUTBOUND_POLICIES: PolicyOption[] = [
   {
     code: "open",
     label: "Open",
-    description: "Message any person or any number. Admins are alerted when a new conversation starts.",
+    description: "Message any person or any phone number. Admins are alerted when a new conversation starts.",
   },
-  { code: "people", label: "People", description: "Only approved people, no numbers." },
-  { code: "people_sms", label: "People + Numbers", description: "Approved people and approved numbers." },
-  { code: "sms", label: "Numbers", description: "Only approved numbers, no people." },
-  { code: "any_sms", label: "Any number", description: "No people, but any phone number." },
+  { code: "people", label: "People", description: "Only approved people (your family counts as approved), no phone numbers." },
+  { code: "people_sms", label: "People + phone numbers", description: "Approved people and approved phone numbers." },
+  { code: "sms", label: "Phone numbers", description: "Only approved phone numbers, no people." },
+  { code: "any_sms", label: "Any phone number", description: "No people, but any phone number." },
 ];
 
 // `users.policy.in`: who may reach a member. An unknown number is held and raises an alert;
 // approving it needs a policy whose numbers column is not "none".
 export const INBOUND_POLICIES: PolicyOption[] = [
-  { code: "any", label: "Anyone", description: "Any person or any approved number may reach them." },
-  { code: "people", label: "People", description: "Only approved people may reach them." },
+  { code: "any", label: "Anyone", description: "Any person or any approved phone number may reach them." },
+  { code: "people", label: "People", description: "Only approved people (your family counts as approved) may reach them." },
   {
     code: "people_sms",
-    label: "People + Numbers",
-    description: "Approved people and approved numbers may reach them.",
+    label: "People + phone numbers",
+    description: "Approved people and approved phone numbers may reach them.",
   },
-  { code: "sms", label: "Numbers", description: "Only approved numbers may reach them, no people." },
+  { code: "sms", label: "Phone numbers", description: "Only approved phone numbers may reach them, no people." },
   {
     code: "any_sms",
-    label: "Any number",
-    description: "No people; approved numbers reach them and unknown numbers are held for your approval.",
+    label: "Any phone number",
+    description: "No people; approved phone numbers reach them and unknown numbers are held for your approval.",
   },
 ];
 

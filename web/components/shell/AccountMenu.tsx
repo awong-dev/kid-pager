@@ -22,7 +22,7 @@ export function initialsOf(name: string): string {
 
 /** Avatar button + the account menu (the only menu in the shell). */
 export default function AccountMenu() {
-  const { me, isFamilyAdmin, signOutUser } = useAuth();
+  const { me, signOutUser } = useAuth();
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const close = () => setAnchor(null);
   if (!me) return null;
@@ -59,11 +59,9 @@ export default function AccountMenu() {
         <MenuItem component={Link} href="/account/pagers" onClick={close}>
           My pagers
         </MenuItem>
-        {!isFamilyAdmin && (
-          <MenuItem component={Link} href="/settings/book" onClick={close}>
-            Address book
-          </MenuItem>
-        )}
+        <MenuItem component={Link} href="/account/book" onClick={close}>
+          My address book
+        </MenuItem>
         <Divider />
         <MenuItem
           onClick={() => {

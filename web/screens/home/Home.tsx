@@ -17,6 +17,7 @@ import NotificationsActiveOutlinedIcon from "@mui/icons-material/NotificationsAc
 import NotificationsNoneOutlinedIcon from "@mui/icons-material/NotificationsNoneOutlined";
 import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import SettingsRemoteOutlinedIcon from "@mui/icons-material/SettingsRemoteOutlined";
+import VerifiedUserOutlinedIcon from "@mui/icons-material/VerifiedUserOutlined";
 import Skeleton from "@mui/material/Skeleton";
 import Typography from "@mui/material/Typography";
 import { alpha } from "@mui/material/styles";
@@ -49,6 +50,7 @@ const ICONS: Record<IconKey, ReactNode> = {
   forum: <ForumOutlinedIcon fontSize="medium" />,
   alerts: <NotificationsActiveOutlinedIcon fontSize="medium" />,
   groups: <GroupsOutlinedIcon fontSize="medium" />,
+  verified: <VerifiedUserOutlinedIcon fontSize="medium" />,
   remote: <SettingsRemoteOutlinedIcon fontSize="medium" />,
   settings: <SettingsOutlinedIcon fontSize="medium" />,
   admin: <AdminPanelSettingsOutlinedIcon fontSize="medium" />,

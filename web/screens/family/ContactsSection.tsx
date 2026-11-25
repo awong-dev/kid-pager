@@ -24,11 +24,13 @@ import FedLinksSection from "@/components/FedLinksSection";
 import SectionBlock from "@/components/SectionBlock";
 import { ApiError, api } from "@/lib/api";
 import type { BookResponse } from "@/lib/book";
+import { Link } from "@/lib/router";
 import { useDirectory } from "@/lib/directory";
 import { fedRemoteHost, fedRemoteName, getFamilyFed, type FedLink, type FedRef } from "@/lib/federation";
 import { familyQuery, useFamily } from "@/lib/family-context";
 import type { FamilyDoc } from "@/lib/types";
 import { responsiveTableSx } from "@/lib/tableSx";
+import { permissionsHref } from "./permissionsModel";
 import { AddContactDialog, DeleteContactDialog, RenameContactDialog } from "./ContactDialogs";
 import LinkedPeople from "./LinkedPeople";
 import type { FamilyMembers } from "./useFamilyMembers";
@@ -138,6 +140,11 @@ export default function ContactsSection({
     const entry = byUid(uid);
     return entry ? `@${entry.alias}` : uid;
   };
+  /** Props that turn a person chip into a link to their permissions, when the person is known. */
+  const toPerson = (uid: string) => {
+    const entry = byUid(uid);
+    return entry ? { component: Link, href: permissionsHref(entry.alias), clickable: true } : {};
+  };
   const people = members.filter((m) => m.kind === "person" && !m.disabled);
   const closeDialog = () => setDialog(null);
   const done = () => void loadContacts();
@@ -161,9 +168,9 @@ export default function ContactsSection({
       }
     >
       <Typography variant="body2" color="text.secondary">
-        Contacts are texted by the pager&apos;s own SMS. Approve a contact for a member (open the person under Family
-        members, then Approved) to put it on their pager. Members with an SMS number text contacts through the relay;
-        others use the pager&apos;s own SIM.
+        Contacts are texted by the pager&apos;s own SMS. Approve a contact for a member (open them under{" "}
+        <Link href="/family/permissions">Permissions</Link>, then Approved people and contacts) to put it on
+        their pager. Members with an SMS number text contacts through the relay; others use the pager&apos;s own SIM.
       </Typography>
       {error && <Alert severity="error">{error}</Alert>}
       {loadError && <Alert severity="error">{loadError}</Alert>}
@@ -229,15 +236,22 @@ export default function ContactsSection({
                   <TableCell>
                     <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
                       {(c.approvedFor ?? []).map((uid) => (
-                        <Chip key={uid} size="small" label={labelFor(uid)} />
+                        <Chip key={uid} size="small" label={labelFor(uid)} {...toPerson(uid)} />
                       ))}
                       {(c.impliedFor ?? []).map((uid) => (
-                        <Tooltip key={`i-${uid}`} title="On their pager because their policy is Open">
-                          <Chip size="small" variant="outlined" label={`${labelFor(uid)} (policy)`} />
+                        <Tooltip key={`i-${uid}`} title="On their pager because their messaging rule is Open">
+                          <Chip size="small" variant="outlined" label={`${labelFor(uid)} (policy)`} {...toPerson(uid)} />
                         </Tooltip>
                       ))}
                       {(addedBy[c.uid] ?? []).map((uid) => (
-                        <Chip key={`a-${uid}`} size="small" color="info" variant="outlined" label={`added by ${labelFor(uid)}`} />
+                        <Chip
+                          key={`a-${uid}`}
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                          label={`added by ${labelFor(uid)}`}
+                          {...toPerson(uid)}
+                        />
                       ))}
                     </Stack>
                   </TableCell>

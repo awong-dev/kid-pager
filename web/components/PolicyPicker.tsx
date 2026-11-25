@@ -1,6 +1,7 @@
 "use client";
 
-/** Outbound/Inbound radio pickers for a member's conversation policy, with its own Save. */
+/** "Who they can message" / "Who can message them" radio pickers for a member's conversation
+ * policy (`policy.out` / `policy.in`), with its own Save. */
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -52,7 +53,7 @@ export default function PolicyPicker({
       {error && <Alert severity="error">{error}</Alert>}
 
       <FormControl>
-        <FormLabel>Outbound</FormLabel>
+        <FormLabel>Who they can message</FormLabel>
         <RadioGroup value={out} onChange={(e) => setOut(e.target.value)}>
           {OUTBOUND_POLICIES.filter((o) => !o.hidden || o.code === out).map((o) => (
             <FormControlLabel
@@ -73,7 +74,7 @@ export default function PolicyPicker({
       </FormControl>
 
       <FormControl>
-        <FormLabel>Inbound</FormLabel>
+        <FormLabel>Who can message them</FormLabel>
         <RadioGroup value={inbound} onChange={(e) => setInbound(e.target.value)}>
           {INBOUND_POLICIES.filter((o) => !o.hidden || o.code === inbound).map((o) => (
             <FormControlLabel
@@ -94,8 +95,8 @@ export default function PolicyPicker({
       </FormControl>
 
       <Typography variant="body2" color="text.secondary">
-        Contacts: Open puts every family contact on the member&apos;s pager; otherwise only the contacts
-        approved for them (Approved → Contacts). The relay itself never sends SMS.
+        Outside contacts: Open puts every family contact on the member&apos;s pager; otherwise only the
+        contacts approved for them (see Approved people and contacts). The relay itself never sends SMS.
       </Typography>
 
       <Button variant="contained" onClick={() => void save()} disabled={busy} sx={{ alignSelf: "flex-start" }}>

@@ -53,12 +53,12 @@ export const SECTIONS: readonly Section[] = [
   },
   {
     id: "family", label: "Family", href: "/family/people", access: "admin",
-    prefixes: ["/family", "/settings/book"],
+    prefixes: ["/family"],
     tabs: [
-      { href: "/family/people",   label: "People & contacts", also: ["/family/chat"] },
-      { href: "/settings/book",   label: "Address books" },
-      { href: "/family/devices",  label: "Pagers" },
-      { href: "/family/settings", label: "Settings" },
+      { href: "/family/people",      label: "People & contacts", also: ["/family/chat"] },
+      { href: "/family/permissions", label: "Permissions" },
+      { href: "/family/devices",     label: "Pagers" },
+      { href: "/family/settings",    label: "Settings" },
     ],
   },
   {
