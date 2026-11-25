@@ -4,7 +4,7 @@ import sharp from "sharp";
 
 const svg = readFileSync(new URL("../public/logo.svg", import.meta.url));
 const out = (p) => new URL(`../public/icons/${p}`, import.meta.url).pathname;
-const BG = "#fbf1d8";
+const BG = "#fff4d6";
 
 async function plain(size, file) {
   await sharp(svg, { density: (72 * size) / 128 * 2 }).resize(size, size).png().toFile(out(file));

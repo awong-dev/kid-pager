@@ -17,8 +17,8 @@ const DEFAULT_MAP_HEIGHT_PX = 200;
 // Used only to pick a zoom level, not for layout.
 const VIEWPORT_PX_ESTIMATE = 260;
 
-const PRECISE_COLOR = "#2f5d8a"; // theme.ts primary.main
-const TRAIL_COLOR = "#8a5d2f"; // theme.ts secondary.main, doubles as the "coarse" colour
+const PRECISE_COLOR = "#0b3c6f"; // theme.ts primary.main
+const TRAIL_COLOR = "#e07b00"; // theme.ts secondary.main, doubles as the "coarse" colour
 
 export interface LocationMapTrailPoint {
   lat: number;
