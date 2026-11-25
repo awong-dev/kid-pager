@@ -124,6 +124,12 @@ menu in one place.
 - Phones: a slim top bar plus a fixed bottom navigation (Home, Messages, Alerts, Family, System; a
   plain member gets Home, Messages, My pager). Chat threads hide the bottom bar and show a back arrow;
   `lib/layout.ts` (`CHROME`, `threadHeightSx`) sizes a thread to fill the rest of the viewport.
+- `/chat` is the Messages dashboard (`screens/chat/Messages.tsx`), no tabs: Conversations, "Where they
+  are" (a card per pager the viewer can see: name, online, newest fix, Locate now; links to
+  `/location?who=<alias>`, the map and timeline detail screen) and, for admins, "All family
+  conversations" (read-only, collapsed behind Show all past 8 rows). Each section has its own reads,
+  skeleton and error. Threads and `/location` get a back arrow to Messages in the phone top bar;
+  `/location` keeps the bottom bar and has a "Messages" link on desktop.
 - The phone/desktop split is CSS only, so the static export never flashes the wrong layout.
 - `screens/home/Home.tsx`: the launcher. Its cards are data in `screens/home/cards.ts`; each shows one
   live status line, reading only what the viewer's role may read (see `relay/firestore.rules`).
@@ -318,10 +324,10 @@ incognito window) to act as two different people at once where noted.
     only the family; adding a person appears live; creating a device shows the setup code and the
     device appears in the table with the right owner; as a member, `/chat` peers resolve by alias
     without any `localStorage` key.
-19. **Family tab and read-only monitor thread**: as family admin, Family tab shows a
+19. **Audit list and read-only monitor thread**: as family admin, "All family conversations" on `/chat` shows a
     member's DM with a user in another family and the member's SMS conversation; opening one shows
     messages read-only; as the other family's admin the same DM appears and the SMS one does not;
-    as a member, no Family tab; DM rows never show `uid:xxxx`.
+    as a member, no such section; DM rows never show `uid:xxxx`.
 20. **Group-handling fixes**: a group message while on another page notifies with the group
     name and opens the group; a group with more than one page of messages offers Load older; a
     family admin creates a group from family members.

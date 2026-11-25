@@ -11,8 +11,6 @@ export type Access = "member" | "admin" | "super";
 export interface Viewer {
   isFamilyAdmin: boolean;
   isSuper: boolean;
-  /** Admin, or owns/may locate a device: the Location tab's rule. */
-  showLocation: boolean;
 }
 
 export interface Tab {
@@ -20,8 +18,6 @@ export interface Tab {
   label: string;
   /** Hidden unless the viewer passes this; default member. */
   access?: Access;
-  /** Shown only when `Viewer.showLocation`. */
-  needsLocation?: boolean;
 }
 
 export interface Section {
@@ -43,11 +39,10 @@ export const MY_PAGER = { id: "pager", label: "My pager", href: "/account/pagers
 export const SECTIONS: readonly Section[] = [
   {
     id: "messages", label: "Messages", href: "/chat", access: "member",
+    // One dashboard (`/chat`) holds conversations, locations and the admin audit list, so no tabs;
+    // `/location` is its detail screen and stays highlighted here.
     prefixes: ["/chat", "/location"],
-    tabs: [
-      { href: "/chat",            label: "Chats" },
-      { href: "/location",        label: "Location", needsLocation: true },
-    ],
+    tabs: [],
   },
   {
     id: "alerts", label: "Alerts", href: "/alerts", access: "admin",
@@ -87,6 +82,21 @@ export function isThreadPath(pathname: string): boolean {
   return THREAD_PATTERNS.some((p) => matchPattern(p, pathname) !== null);
 }
 
+/** Screens reached from the Messages dashboard get a way back to it: a back arrow in the phone
+ * top bar (and, on `/location`, a link on desktop). Threads also hide the bottom bar; `/location`
+ * keeps it. */
+export const BACK_TO_MESSAGES: readonly { pattern: string; label: string }[] = [
+  { pattern: "/chat/:alias",     label: "Back to Messages" },
+  { pattern: "/chat/view/:key",  label: "Back to Messages" },
+  { pattern: "/location",        label: "Back to Messages" },
+];
+
+/** Where the phone bar's back arrow goes from `pathname`, or null when it shows none. */
+export function backTarget(pathname: string): { href: string; label: string } | null {
+  const hit = BACK_TO_MESSAGES.find((b) => matchPattern(b.pattern, pathname) !== null);
+  return hit ? { href: "/chat", label: hit.label } : null;
+}
+
 export function allows(access: Access, v: Pick<Viewer, "isFamilyAdmin" | "isSuper">): boolean {
   return access === "member" || (access === "admin" ? v.isFamilyAdmin : v.isSuper);
 }
@@ -104,7 +114,7 @@ export function visibleSections(v: Viewer): Section[] {
 
 /** The tabs of `section` this viewer sees. */
 export function visibleTabs(section: Section, v: Viewer): Tab[] {
-  return section.tabs.filter((t) => allows(t.access ?? "member", v) && (!t.needsLocation || v.showLocation));
+  return section.tabs.filter((t) => allows(t.access ?? "member", v));
 }
 
 /** Which section (and tab) a path is in for this viewer. `null` section: Home, the account pages,

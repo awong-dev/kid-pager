@@ -1,7 +1,8 @@
 "use client";
 
-/** `/location`: the people the viewer can locate, with a timeline and map for the selected one
- * (access is enforced server-side). A `?who=<alias>` deep link is read once. */
+/** `/location`: the detail screen behind the Messages dashboard's "Where they are" cards. Lists the
+ * people the viewer can locate, with a timeline and map for the selected one (access is enforced
+ * server-side). A `?who=<alias>` deep link (any listed person, the viewer included) is read once. */
 
 import dynamic from "next/dynamic";
 import { useMemo, useState } from "react";
@@ -16,20 +17,19 @@ import List from "@mui/material/List";
 import ListItemButton from "@mui/material/ListItemButton";
 import ListItemText from "@mui/material/ListItemText";
 import Skeleton from "@mui/material/Skeleton";
-import Snackbar from "@mui/material/Snackbar";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
-import LocationOnIcon from "@mui/icons-material/LocationOn";
 
+import LocateNowButton from "@/components/LocateNowButton";
 import LocationTimeline from "@/components/LocationTimeline";
 import { deviceName } from "@/lib/devices";
-import { ApiError, api } from "@/lib/api";
 import { locBackoffLabel } from "@/lib/deviceTrust";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useLive } from "@/lib/live";
+import { Link } from "@/lib/router";
 import { deviceLocationsQuery, retentionSettingsQuery } from "@/lib/live/queries";
 import { buildLocationTimeline, locationsDaysOf, type LocationFixRow } from "@/lib/location";
 import { useLocatableDevices, type LocatableDevice } from "@/lib/locatableDevices";
@@ -88,8 +88,6 @@ function LocationDetail({
   onBack: () => void;
 }) {
   const [manualFocusId, setManualFocusId] = useState<string | null>(null);
-  const [locateBusy, setLocateBusy] = useState(false);
-  const [snack, setSnack] = useState<string | null>(null);
 
   const { docs: fixDocs } = useLive<LocationFixDoc>(
     deviceLocationsQuery(device.id, LOCATIONS_QUERY_LIMIT)
@@ -120,27 +118,6 @@ function LocationDetail({
   );
 
   const backoffLabel = locBackoffLabel(device.status.locBackoffS);
-
-  async function handleLocate() {
-    if (!ownerAlias) return;
-    setLocateBusy(true);
-    try {
-      const resp = await api.post<{ requestId: string | null; cached: boolean }>(
-        `/conversations/${encodeURIComponent(ownerAlias)}/locate`
-      );
-      setSnack(
-        resp.cached
-          ? "Answered from a recent fix -- see the timeline."
-          : "Location requested -- watch the timeline for the reply."
-      );
-    } catch (err) {
-      setSnack(
-        err instanceof ApiError ? String(err.detail ?? "Location request failed.") : "Location request failed."
-      );
-    } finally {
-      setLocateBusy(false);
-    }
-  }
 
   const mapArea =
     entries.length === 0 ? (
@@ -175,15 +152,7 @@ function LocationDetail({
         <Stack spacing={0.25} sx={{ alignItems: "flex-end" }}>
           {/* hidden, not disabled, when `canLocate` is false */}
           {device.canLocate && (
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<LocationOnIcon />}
-              disabled={locateBusy || !ownerAlias}
-              onClick={() => void handleLocate()}
-            >
-              Locate now
-            </Button>
+            <LocateNowButton alias={ownerAlias} />
           )}
           {backoffLabel && (
             <Typography variant="caption" color="text.secondary">
@@ -212,8 +181,6 @@ function LocationDetail({
         </Box>
         <Box sx={{ flexGrow: 1, minWidth: 0, order: 1 }}>{mapArea}</Box>
       </Stack>
-
-      <Snackbar open={snack !== null} autoHideDuration={5000} onClose={() => setSnack(null)} message={snack} />
     </Stack>
   );
 }
@@ -235,8 +202,8 @@ function LocationInner() {
   const autoSelectedId = useMemo(() => {
     if (!initialWho) return null;
     // best effort: a non-admin's directory may not know the alias yet
-    return devices.find((d) => !d.isOwn && uidToAlias(d.ownerUid) === initialWho)?.id ?? null;
-  }, [initialWho, devices, uidToAlias]);
+    return devices.find((d) => (d.isOwn ? me?.alias : uidToAlias(d.ownerUid)) === initialWho)?.id ?? null;
+  }, [initialWho, devices, uidToAlias, me]);
   const selectedId = manualSelectedId !== undefined ? manualSelectedId : autoSelectedId;
 
   const selectedDevice = useMemo(
@@ -268,7 +235,15 @@ function LocationInner() {
 
   return (
     <Stack spacing={2}>
-      <Typography variant="h5">Location</Typography>
+      {/* phones have the back arrow in the top bar (`backTarget`) */}
+      <Box sx={{ display: { xs: "none", md: "block" } }}>
+        <Button component={Link} href="/chat" size="small" startIcon={<ArrowBackIcon />} sx={{ ml: -1 }}>
+          Messages
+        </Button>
+      </Box>
+      <Typography variant="h5" component="h1">
+        Location
+      </Typography>
 
       {!loaded && <CircularProgress />}
 

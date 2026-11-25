@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { initialsOf } from "../AccountMenu";
-import { type Viewer, bottomNavFor, isBottomItemActive, isThreadPath, sectionOf, visibleSections } from "../sections";
+import { type Viewer, backTarget, bottomNavFor, isBottomItemActive, isThreadPath, sectionOf, visibleSections } from "../sections";
 
-const member: Viewer = { isFamilyAdmin: false, isSuper: false, showLocation: false };
-const memberLoc: Viewer = { ...member, showLocation: true };
-const admin: Viewer = { isFamilyAdmin: true, isSuper: false, showLocation: true };
-const sup: Viewer = { isFamilyAdmin: true, isSuper: true, showLocation: true };
+const member: Viewer = { isFamilyAdmin: false, isSuper: false };
+const admin: Viewer = { isFamilyAdmin: true, isSuper: false };
+const sup: Viewer = { isFamilyAdmin: true, isSuper: true };
 
 const labels = (v: Viewer, path: string) => sectionOf(path, v).tabs.map((t) => t.label);
 
@@ -16,12 +15,14 @@ describe("sectionOf", () => {
       expect(sectionOf(p, sup).section, p).toBeNull();
     }
   });
-  it("Messages: Chats | Location, Location only when the viewer has devices", () => {
-    expect(sectionOf("/chat", memberLoc).section?.id).toBe("messages");
-    expect(labels(memberLoc, "/chat")).toEqual(["Chats", "Location"]);
-    expect(labels(member, "/chat")).toEqual([]); // a lone tab is not a row
-    expect(sectionOf("/location", memberLoc).activeTab?.href).toBe("/location");
-    expect(sectionOf("/chat", memberLoc).activeTab?.href).toBe("/chat");
+  it("Messages is one dashboard: no tab row, and /location stays highlighted as part of it", () => {
+    for (const v of [member, admin, sup]) {
+      for (const p of ["/chat", "/location"]) {
+        expect(sectionOf(p, v).section?.id, p).toBe("messages");
+        expect(sectionOf(p, v).tabs, p).toEqual([]);
+      }
+    }
+    expect(isBottomItemActive("messages", "/location", member)).toBe(true);
   });
   it("threads show no tab row but stay in Messages", () => {
     for (const p of ["/chat/bob", "/chat/view/k1"]) {
@@ -76,6 +77,19 @@ describe("navigation lists", () => {
     expect(isBottomItemActive("messages", "/chat/bob", sup)).toBe(true);
     expect(isBottomItemActive("pager", "/account/pagers", member)).toBe(true);
     expect(isBottomItemActive("family", "/account/pagers", admin)).toBe(false);
+  });
+});
+
+describe("backTarget", () => {
+  it("threads and /location go back to the Messages dashboard; the dashboard itself has no back", () => {
+    for (const p of ["/chat/bob", "/chat/view/k1", "/location"]) {
+      expect(backTarget(p), p).toEqual({ href: "/chat", label: "Back to Messages" });
+    }
+    for (const p of ["/chat", "/", "/alerts", "/family/people"]) expect(backTarget(p), p).toBeNull();
+  });
+  it("/location keeps the bottom bar; threads hide it", () => {
+    expect(isThreadPath("/location")).toBe(false);
+    expect(isThreadPath("/chat/bob")).toBe(true);
   });
 });
 

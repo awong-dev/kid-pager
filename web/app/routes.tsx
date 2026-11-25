@@ -33,7 +33,7 @@ export const PUBLIC: readonly PublicRoute[] = [
 export const AUTHENTICATED: readonly AuthRoute[] = [
   // --- member: any signed-in user -----------------------------------------------------------
   { path: "/",                      role: "member", screen: () => import("@/screens/home/Home") },
-  { path: "/chat",                  role: "member", screen: () => import("@/screens/chat/List") },
+  { path: "/chat",                  role: "member", screen: () => import("@/screens/chat/Messages") },
   { path: "/chat/:alias",           role: "member", screen: () => import("@/screens/chat/Thread") },
   { path: "/devices/:id",           role: "member", screen: () => import("@/screens/devices/Device") },
   { path: "/location",              role: "member", screen: () => import("@/screens/location/Location") },

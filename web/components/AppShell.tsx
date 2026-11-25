@@ -4,8 +4,8 @@
  * `components/shell/sections.ts`:
  * - md and up: one app bar with plain links (Messages, Alerts, Family, System) and the account
  *   menu; a section's sub-pages are a tab row under it.
- * - below md: a slim top bar and a fixed bottom navigation (hidden on chat threads, which get a
- *   back arrow instead).
+ * - below md: a slim top bar and a fixed bottom navigation (hidden on chat threads). Threads and
+ *   `/location` get a back arrow to Messages in the top bar.
  * The phone/desktop split is CSS (`display`), never JS, so the static export cannot flash the
  * wrong layout. */
 
@@ -39,9 +39,10 @@ import NotificationWatcher from "./NotificationWatcher";
 import Logo from "./Logo";
 import AccountMenu from "./shell/AccountMenu";
 import FamilySwitcher from "./shell/FamilySwitcher";
-import { ShellDataProvider, useOpenAlertCount, useShellDevices } from "./shell/ShellData";
+import { ShellDataProvider, useOpenAlertCount } from "./shell/ShellData";
 import {
   type Viewer,
+  backTarget,
   bottomNavFor,
   isBottomItemActive,
   isThreadPath,
@@ -122,12 +123,12 @@ function DesktopBar({ viewer, activeId }: { viewer: Viewer; activeId: string | n
   );
 }
 
-function PhoneBar({ thread }: { thread: boolean }) {
+function PhoneBar({ back }: { back: { href: string; label: string } | null }) {
   const { isSuper } = useAuth();
   return (
     <Toolbar sx={{ gap: 1, display: { xs: "flex", md: "none" }, minHeight: { xs: CHROME.appBar.xs } }}>
-      {thread && (
-        <IconButton color="inherit" edge="start" component={Link} href="/chat" aria-label="Back to chats">
+      {back && (
+        <IconButton color="inherit" edge="start" component={Link} href={back.href} aria-label={back.label}>
           <ArrowBackIcon />
         </IconButton>
       )}
@@ -208,10 +209,8 @@ function BottomBar({ viewer, pathname }: { viewer: Viewer; pathname: string }) {
 
 function Frame({ children }: { children: ReactNode }) {
   const { isFamilyAdmin, isSuper } = useAuth();
-  const { devices } = useShellDevices();
   const pathname = usePathname() ?? "";
-  // Nav visibility only, not the gate; a family admin always gets the Location tab.
-  const viewer: Viewer = { isFamilyAdmin, isSuper, showLocation: isFamilyAdmin || devices.length > 0 };
+  const viewer: Viewer = { isFamilyAdmin, isSuper };
   const thread = isThreadPath(pathname);
   const activeId = sectionOf(pathname, viewer).section?.id ?? null;
   // Phones: room for the fixed bottom bar (not on threads: the composer owns the bottom edge).
@@ -224,7 +223,7 @@ function Frame({ children }: { children: ReactNode }) {
       <NotificationWatcher />
       <AppBar position="static" color="primary" enableColorOnDark elevation={0}>
         <DesktopBar viewer={viewer} activeId={activeId} />
-        <PhoneBar thread={thread} />
+        <PhoneBar back={backTarget(pathname)} />
       </AppBar>
       <SectionTabs viewer={viewer} pathname={pathname} />
       <Container
