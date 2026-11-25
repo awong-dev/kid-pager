@@ -1,7 +1,9 @@
 "use client";
 
-/** `/family/history`: retention days per data class (bounds mirror `relay/app/store/settings.py`)
- * and the last sweep's `settings/meta.lastSweep`. */
+/** "Message history" on `/family/settings`: retention days per data class (bounds mirror
+ * `relay/app/store/settings.py`) and the last sweep's `settings/meta.lastSweep`. The retention API
+ * (`PUT /api/admin/settings`) is superadmin-only and server-wide, not per family, so a family admin
+ * sees the values read-only. */
 
 import { useEffect, useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -11,7 +13,9 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import SectionBlock from "@/components/SectionBlock";
 import { ApiError, api } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context";
 import { subscribeLive, useLive } from "@/lib/live";
 import { metaSettingsQuery, retentionSettingsQuery } from "@/lib/live/queries";
 import { locationsDaysOf } from "@/lib/location";
@@ -80,7 +84,8 @@ function LastRunPanel({ meta, locationsDays }: { meta: MetaSettingsDoc | undefin
   );
 }
 
-function AdminSettingsInner() {
+export default function RetentionSection() {
+  const { isSuper } = useAuth();
   const [values, setValues] = useState<Record<DayKey, number>>(DEFAULTS);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -110,8 +115,16 @@ function AdminSettingsInner() {
   }
 
   return (
-    <Stack spacing={3} sx={{ maxWidth: 480 }}>
-      <Typography variant="h5">Message history</Typography>
+    <SectionBlock
+      id="history"
+      title="Message history"
+      description="How long messages, locations, alerts and battery readings are kept before they are deleted."
+    >
+      <Alert severity={isSuper ? "info" : "warning"}>
+        {isSuper
+          ? "These limits apply to the whole server, not just one family."
+          : "These limits apply to the whole server, not just your family, so only the server administrator can change them."}
+      </Alert>
 
       {FIELDS.map((f) => (
         <Stack key={f.key} direction="row" spacing={2} sx={{ alignItems: "center" }}>
@@ -124,6 +137,7 @@ function AdminSettingsInner() {
             error={!Number.isInteger(values[f.key]) || values[f.key] < f.min || values[f.key] > f.max}
             helperText={`${f.min} to ${f.max}`}
             onChange={(e) => setValues({ ...values, [f.key]: e.target.value === "" ? NaN : Number(e.target.value) })}
+            disabled={!isSuper}
             sx={{ width: 120 }}
             slotProps={{ htmlInput: { min: f.min, max: f.max } }}
           />
@@ -140,13 +154,9 @@ function AdminSettingsInner() {
       {status && <Alert severity="success">{status}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
 
-      <Button variant="contained" disabled={saving || invalid} onClick={() => void save()} sx={{ alignSelf: "flex-start" }}>
+      <Button variant="contained" disabled={!isSuper || saving || invalid} onClick={() => void save()} sx={{ alignSelf: "flex-start" }}>
         {saving ? "Saving..." : "Save"}
       </Button>
-    </Stack>
+    </SectionBlock>
   );
-}
-
-export default function AdminSettingsPage() {
-  return <AdminSettingsInner />;
 }

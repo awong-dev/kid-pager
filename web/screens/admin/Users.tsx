@@ -275,7 +275,7 @@ function AdminUsersInner() {
               helperText={
                 <>
                   Used to sign in. Texts from this number to a family bridge phone count as this person. To text a number from a pager, add it under{" "}
-                  <Link href="/family/contacts">Contacts</Link>. Email or phone is required.
+                  <Link href="/family/people#contacts">People &amp; contacts</Link>. Email or phone is required.
                 </>
               }
               fullWidth

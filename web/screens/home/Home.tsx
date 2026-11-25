@@ -13,9 +13,9 @@ import CardActionArea from "@mui/material/CardActionArea";
 import Chip from "@mui/material/Chip";
 import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
 import GroupsOutlinedIcon from "@mui/icons-material/GroupsOutlined";
-import HistoryOutlinedIcon from "@mui/icons-material/HistoryOutlined";
 import NotificationsActiveOutlinedIcon from "@mui/icons-material/NotificationsActiveOutlined";
 import NotificationsNoneOutlinedIcon from "@mui/icons-material/NotificationsNoneOutlined";
+import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import SettingsRemoteOutlinedIcon from "@mui/icons-material/SettingsRemoteOutlined";
 import Skeleton from "@mui/material/Skeleton";
 import Typography from "@mui/material/Typography";
@@ -50,7 +50,7 @@ const ICONS: Record<IconKey, ReactNode> = {
   alerts: <NotificationsActiveOutlinedIcon fontSize="medium" />,
   groups: <GroupsOutlinedIcon fontSize="medium" />,
   remote: <SettingsRemoteOutlinedIcon fontSize="medium" />,
-  history: <HistoryOutlinedIcon fontSize="medium" />,
+  settings: <SettingsOutlinedIcon fontSize="medium" />,
   admin: <AdminPanelSettingsOutlinedIcon fontSize="medium" />,
   notifications: <NotificationsNoneOutlinedIcon fontSize="medium" />,
 };

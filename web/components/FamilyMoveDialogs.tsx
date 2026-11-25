@@ -592,7 +592,7 @@ function Checklist({ result }: { result: ImportResult }) {
       <Typography variant="subtitle2">Checklist</Typography>
       <Typography variant="body2">
         1. Pagers ({devices}): open{" "}
-        <Link href="/admin/devices">Admin &gt; Devices</Link>, press &quot;New setup code&quot; on each and type it on
+        <Link href="/admin/devices">System &gt; All devices</Link>, press &quot;New setup code&quot; on each and type it on
         the pager. Soracom Beam users also repoint the Beam group at this server.
       </Typography>
       {(result.devices ?? []).map((d) => (
@@ -636,7 +636,7 @@ function Checklist({ result }: { result: ImportResult }) {
         <Typography variant="body2">
           {result.accountsCreated.length > 0 ? "" : "4. "}No sign-in: {result.accountsPending.map((a) => `@${a}`).join(", ")}{" "}
           &mdash; you can add an email later from the person&apos;s page (
-          <Link href="/family/people">Family &gt; People</Link>).
+          <Link href="/family/people">Family &gt; People &amp; contacts</Link>).
         </Typography>
       )}
       {result.promoted && (

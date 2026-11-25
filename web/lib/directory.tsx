@@ -43,7 +43,7 @@ export interface GroupInfo {
   alias: string;
   name: string;
   uids: string[];
-  /** True for a group bridged to Google Chat: managed under Family -> Google Chat, no leave. */
+  /** True for a group bridged to Google Chat: managed under People & contacts -> Group chats, no leave. */
   bridged: boolean;
 }
 

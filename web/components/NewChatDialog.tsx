@@ -129,7 +129,7 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
     const trimmed = text.trim();
     if (!trimmed) return;
     if (parsePhoneDigits(trimmed) !== null) {
-      setNotice("Numbers are texted from the pager. Add one under Family → Contacts.");
+      setNotice("Numbers are texted from the pager. Add one under Family → People & contacts.");
       return;
     }
     go(trimmed.replace(/^@/, ""));

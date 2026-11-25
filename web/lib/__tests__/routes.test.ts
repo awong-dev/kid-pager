@@ -95,19 +95,23 @@ describe("redirects", () => {
   it("old paths redirect to their new home", () => {
     for (const r of REDIRECTS) expect(resolveRoute(r.from)).toEqual({ kind: "redirect", to: r.to });
     expect(resolveRoute("/family/alerts/")).toEqual({ kind: "redirect", to: "/alerts" });
-    expect(resolveRoute("/admin/settings")).toEqual({ kind: "redirect", to: "/family/history" });
+    expect(resolveRoute("/admin/settings")).toEqual({ kind: "redirect", to: "/family/settings" });
+    expect(resolveRoute("/family/history")).toEqual({ kind: "redirect", to: "/family/settings" });
+    expect(resolveRoute("/family/contacts")).toEqual({ kind: "redirect", to: "/family/people#contacts" });
   });
   it("every target is a listed route that is at least as strict as the old path was", () => {
     // The old roles: alerts/retention were admin-only, the rest member.
     const was: Record<string, number> = {
       "/family/alerts": RANK.admin,
       "/admin/settings": RANK.admin,
+      "/family/contacts": RANK.admin,
+      "/family/history": RANK.admin,
       "/settings/backends": RANK.member,
       "/settings/devices": RANK.member,
       "/settings/notifications": RANK.member,
     };
     expect(Object.keys(was).sort()).toEqual(REDIRECTS.map((r) => r.from).sort());
-    for (const r of REDIRECTS) expect(roleOf(r.to), r.to).toBeGreaterThanOrEqual(was[r.from]!);
+    for (const r of REDIRECTS) expect(roleOf(r.to.replace(/#.*/, "")), r.to).toBeGreaterThanOrEqual(was[r.from]!);
   });
   it("a source is never a route, a target, or another redirect's source twice", () => {
     const paths = AUTHENTICATED.map((r) => r.path);
@@ -126,6 +130,12 @@ describe("navigation", () => {
       expect(r.kind, `${where}: ${href}`).toBe("authenticated");
       expect(r.kind === "authenticated" && r.route, `${where}: ${href}`).toBeTruthy();
     }
+  });
+  it("the new family pages are admin routes and the retired ones are gone from the table", () => {
+    for (const p of ["/family/people", "/family/settings", "/family/chat"]) expect(roleOf(p), p).toBe(RANK.admin);
+    const paths = AUTHENTICATED.map((r) => r.path);
+    expect(paths).not.toContain("/family/contacts");
+    expect(paths).not.toContain("/family/history");
   });
   it("no nav href is a redirect source", () => {
     const sources = REDIRECTS.map((r) => r.from);

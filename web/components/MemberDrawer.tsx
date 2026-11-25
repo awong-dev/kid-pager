@@ -1,6 +1,8 @@
 "use client";
 
-/** Row-click drawer on `/family/people`: Profile, Policy and Approved sections. */
+/** Row-click drawer on `/family/people`: Profile, Policy, Group chats and Approved. Profile is this
+ * file's `MemberProfileForm`; Policy and Approved are `MemberPolicyParts` (the Permissions page
+ * lifts them out of here); the drawer only keeps the saved outbound policy that links the two. */
 
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -15,8 +17,7 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
 import { Link } from "@/lib/router";
-import ApprovedEditor from "@/components/ApprovedEditor";
-import PolicyPicker from "@/components/PolicyPicker";
+import { MemberApprovedPart, MemberPolicyPart } from "@/components/MemberPolicyParts";
 import { ApiError, api } from "@/lib/api";
 import { familyQuery } from "@/lib/family-context";
 import type { Role, UserDoc } from "@/lib/types";
@@ -89,7 +90,7 @@ function MemberProfileForm({
         </Typography>
         <Typography>{member.smsNumber ?? "none"}</Typography>
         <Typography variant="caption" color="text.secondary">
-          Set by the member&apos;s bridge phone (Family → Devices).
+          Set by the member&apos;s bridge phone (Pagers).
         </Typography>
       </div>
       <FormControlLabel
@@ -100,22 +101,16 @@ function MemberProfileForm({
         Save
       </Button>
 
-      <Divider />
-
-      <Typography variant="subtitle2">Policy</Typography>
-      <PolicyPicker uid={member.uid} policy={member.policy} onSaved={(p) => setSavedOut(p.out)} />
+      <MemberPolicyPart member={member} onSaved={(p) => setSavedOut(p.out)} />
 
       <Divider />
 
-      <Typography variant="subtitle2">Bridged chats</Typography>
+      <Typography variant="subtitle2">Group chats</Typography>
       <Button component={Link} href={`/family/chat?uid=${encodeURIComponent(member.uid)}`} variant="outlined">
-        Bridged chats…
+        Group chats…
       </Button>
 
-      <Divider />
-
-      <Typography variant="subtitle2">Approved</Typography>
-      <ApprovedEditor uid={member.uid} familyId={member.familyId} policyOut={savedOut} />
+      <MemberApprovedPart member={member} policyOut={savedOut} />
     </>
   );
 }

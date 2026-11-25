@@ -245,8 +245,8 @@ export default function ApprovedEditor({
         <Typography variant="caption" color="text.secondary">
           Click a chip to toggle Deny.
         </Typography>
-        <MuiLink component={Link} href="/family/contacts" variant="body2">
-          Add a contact under Family → Contacts
+        <MuiLink component={Link} href="/family/people#contacts" variant="body2">
+          Add a contact under People & contacts
         </MuiLink>
         <Typography variant="caption" color="text.secondary">
           The pager itself lists at most 8 contacts.

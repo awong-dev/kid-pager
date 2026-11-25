@@ -65,7 +65,7 @@ function DevicesInner() {
       {unavailable && (
         <Alert severity="info">
           This relay doesn&apos;t support listing your own devices yet. Ask an admin to open your
-          pager from Admin → Devices instead.
+          pager from Family → Pagers instead.
         </Alert>
       )}
       {error && <Alert severity="error">{error}</Alert>}

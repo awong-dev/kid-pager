@@ -1,7 +1,7 @@
 "use client";
 
 /** `/settings/book`: one person's address book (a family admin can pick any member) with per-owner
- * nicknames. Membership is edited under Family -> People. */
+ * nicknames. Membership is edited under Family -> People & contacts. */
 
 import { useMemo, useState } from "react";
 import Alert from "@mui/material/Alert";
@@ -254,7 +254,7 @@ function BookInner() {
 
       {isFamilyAdmin && (
         <Typography variant="body2">
-          Approved people and numbers are managed in <Link href="/family/people">Family → People</Link>.
+          Approved people and numbers are managed in <Link href="/family/people">Family → People &amp; contacts</Link>.
         </Typography>
       )}
 

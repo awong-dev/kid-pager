@@ -1,9 +1,12 @@
 "use client";
 
-/** `/family/chat?uid=`: a member's Chat / Voice conversations on their bridge phone (subscribe,
- * ignore, rename, pause, add by link). Polls `/api/family/members/{uid}/chat`. */
+/** `/family/chat?uid=`: "Group chats" detail for one member: their Chat / Voice conversations on
+ * their bridge phone (subscribe, ignore, rename, pause, add by link). Polls
+ * `/api/family/members/{uid}/chat`. Reached from the Group chats section of People & contacts
+ * (`/family/people#groups`), which it links back to. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import Alert from "@mui/material/Alert";
 import Autocomplete from "@mui/material/Autocomplete";
 import Button from "@mui/material/Button";
@@ -47,6 +50,7 @@ import {
 } from "@/lib/bridges";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";
+import { Link } from "@/lib/router";
 import { formatRelativeAge } from "@/lib/time";
 import type { BridgeConversationRow, ChatTabOut, RosterEntry } from "@/lib/types";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
@@ -129,7 +133,7 @@ function ChatInner() {
       }
       return t;
     } catch (e) {
-      if (alive.current) setError(errText(e, "Could not load bridged conversations"));
+      if (alive.current) setError(errText(e, "Could not load group chats"));
       return null;
     }
   }, [ownerUid]);
@@ -195,7 +199,7 @@ function ChatInner() {
       // The member's paired bridge phone (the tab response lists them; the first is asked).
       const mine = (tab?.bridges ?? []).filter((b) => b.paired);
       if (mine.length === 0) {
-        setLinkMsg({ severity: "warning", text: "This member has no paired bridge phone. Add one under Family -> Devices." });
+        setLinkMsg({ severity: "warning", text: "This member has no paired bridge phone. Add one under Family -> Pagers." });
         return;
       }
       await inspectLink(mine[0].id, url);
@@ -224,7 +228,14 @@ function ChatInner() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h5">Bridged chats</Typography>
+      <Stack spacing={1} sx={{ alignItems: "flex-start" }}>
+        <Button component={Link} href="/family/people#groups" size="small" startIcon={<ArrowBackIcon />}>
+          People &amp; contacts
+        </Button>
+        <Typography variant="h5" component="h1">
+          Group chats
+        </Typography>
+      </Stack>
 
       <Autocomplete
         options={owners}

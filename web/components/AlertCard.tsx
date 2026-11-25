@@ -513,8 +513,8 @@ export default function AlertCard({ alert }: { alert: AlertRow }) {
             </Button>
           )}
           {alert.kind === "fed_unknown" && (
-            <Button size="small" component={Link} href="/family/contacts">
-              Contacts
+            <Button size="small" component={Link} href="/family/people#contacts">
+              Outside contacts
             </Button>
           )}
           {(alert.kind === "fed_moved" || alert.kind === "fed_reauth") && (

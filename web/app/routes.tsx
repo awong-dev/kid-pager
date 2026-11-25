@@ -46,10 +46,9 @@ export const AUTHENTICATED: readonly AuthRoute[] = [
   { path: "/chat/view/:key",        role: "admin",  screen: () => import("@/screens/chat/MonitorThread") },
   { path: "/alerts",                role: "admin",  screen: () => import("@/screens/alerts/Alerts") },
   { path: "/family/chat",           role: "admin",  screen: () => import("@/screens/family/Chat") },
-  { path: "/family/contacts",       role: "admin",  screen: () => import("@/screens/family/Contacts") },
   { path: "/family/devices",        role: "admin",  screen: () => import("@/screens/family/Devices") },
-  { path: "/family/history",        role: "admin",  screen: () => import("@/screens/family/History") },
   { path: "/family/people",         role: "admin",  screen: () => import("@/screens/family/People") },
+  { path: "/family/settings",       role: "admin",  screen: () => import("@/screens/family/Settings") },
 
   // --- super: superadmin only ---------------------------------------------------------------
   { path: "/admin/allowlist",       role: "super",  screen: () => import("@/screens/admin/Allowlist") },
@@ -72,7 +71,9 @@ export const REDIRECTS: readonly RedirectRoute[] = [
   { from: "/settings/backends",     to: "/account/apps" },
   { from: "/settings/devices",      to: "/account/pagers" },
   { from: "/settings/notifications", to: "/account/notifications" },
-  { from: "/admin/settings",        to: "/family/history" },
+  { from: "/family/contacts",       to: "/family/people#contacts" },
+  { from: "/family/history",        to: "/family/settings" },
+  { from: "/admin/settings",        to: "/family/settings" },
 ];
 
 // ================================================================================================

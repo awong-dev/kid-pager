@@ -1,6 +1,6 @@
 "use client";
 
-/** People page "Other families": federation identity, link invites and the list of links. */
+/** "Other families" in the Outside contacts section of People & contacts: federation identity, link invites and the list of links. */
 
 import { useCallback, useEffect, useState } from "react";
 import Alert from "@mui/material/Alert";

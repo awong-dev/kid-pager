@@ -4,10 +4,10 @@
 import type { DeviceDoc } from "@/lib/types";
 
 export type CardId =
-  | "messages" | "alerts" | "people" | "pagers" | "history" | "system" | "myPager" | "notifications";
+  | "messages" | "alerts" | "people" | "pagers" | "settings" | "system" | "myPager" | "notifications";
 
 export type IconKey =
-  | "forum" | "alerts" | "groups" | "remote" | "history" | "admin" | "notifications";
+  | "forum" | "alerts" | "groups" | "remote" | "settings" | "admin" | "notifications";
 
 /** Who sees a card: `everyone`, `admin` (family admin or super), `super`, or `members`
  * (signed in but NOT an admin). */
@@ -30,12 +30,12 @@ export const CARDS: readonly HomeCard[] = [
     description: "Message your family's pagers and see where they are." },
   { id: "alerts", title: "Alerts", href: "/alerts", icon: "alerts", audience: "admin", needsFamily: true,
     description: "Requests waiting for your OK." },
-  { id: "people", title: "People", href: "/family/people", icon: "groups", audience: "admin", needsFamily: true,
-    description: "Everyone in your family and who they can message." },
+  { id: "people", title: "People & contacts", href: "/family/people", icon: "groups", audience: "admin", needsFamily: true,
+    description: "Everyone your pagers can message." },
   { id: "pagers", title: "Pagers", href: "/family/devices", icon: "remote", audience: "admin", needsFamily: true,
     description: "Set up and look after your family's pagers." },
-  { id: "history", title: "Message history", href: "/family/history", icon: "history", audience: "admin",
-    description: "How long messages and locations are kept." },
+  { id: "settings", title: "Family settings", href: "/family/settings", icon: "settings", audience: "admin",
+    description: "Your family's name, pager notices and how long history is kept." },
   { id: "system", title: "System", href: "/admin/families", icon: "admin", audience: "super",
     description: "Families, users and server settings." },
   { id: "myPager", title: "My pager", href: "/account/pagers", icon: "remote", audience: "members",

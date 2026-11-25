@@ -194,7 +194,7 @@ function FamilyDevicesInner() {
   return (
     <Stack spacing={2}>
       <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
-        <Typography variant="h5">Devices</Typography>
+        <Typography variant="h5">Pagers</Typography>
         <Button variant="contained" onClick={() => setCreateOpen(true)}>
           Add device
         </Button>

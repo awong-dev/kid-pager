@@ -33,15 +33,14 @@ describe("sectionOf", () => {
     expect(isThreadPath("/chat")).toBe(false);
     expect(isThreadPath("/chat/a/b/c")).toBe(false);
   });
-  it("Family has six tabs including Address books and Message history", () => {
-    expect(labels(admin, "/family/people")).toEqual([
-      "People", "Contacts", "Group chats", "Address books", "Pagers", "Message history",
-    ]);
+  it("Family has four tabs; group chats and settings highlight their own place", () => {
+    expect(labels(admin, "/family/people")).toEqual(["People & contacts", "Address books", "Pagers", "Settings"]);
+    expect(sectionOf("/family/chat", admin)).toMatchObject({ section: { id: "family" }, activeTab: { label: "People & contacts" } });
+    expect(sectionOf("/family/settings", admin).activeTab?.label).toBe("Settings");
     expect(sectionOf("/settings/book", admin)).toMatchObject({
       section: { id: "family" },
       activeTab: { href: "/settings/book" },
     });
-    expect(sectionOf("/family/history", admin).activeTab?.label).toBe("Message history");
   });
   it("a viewer is only placed in sections they may use", () => {
     expect(sectionOf("/settings/book", member).section).toBeNull(); // members reach it from the account menu

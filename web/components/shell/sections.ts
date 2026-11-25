@@ -18,6 +18,8 @@ export interface Tab {
   label: string;
   /** Hidden unless the viewer passes this; default member. */
   access?: Access;
+  /** Detail screens that highlight this tab though they are not under its `href`. */
+  also?: readonly string[];
 }
 
 export interface Section {
@@ -53,12 +55,10 @@ export const SECTIONS: readonly Section[] = [
     id: "family", label: "Family", href: "/family/people", access: "admin",
     prefixes: ["/family", "/settings/book"],
     tabs: [
-      { href: "/family/people",   label: "People" },
-      { href: "/family/contacts", label: "Contacts" },
-      { href: "/family/chat",     label: "Group chats" },
+      { href: "/family/people",   label: "People & contacts", also: ["/family/chat"] },
       { href: "/settings/book",   label: "Address books" },
       { href: "/family/devices",  label: "Pagers" },
-      { href: "/family/history",  label: "Message history" },
+      { href: "/family/settings", label: "Settings" },
     ],
   },
   {
@@ -130,7 +130,7 @@ export function sectionOf(
   const all = visibleTabs(section, v);
   // the longest matching tab href wins
   const activeTab =
-    all.filter((t) => under(pathname, t.href)).sort((a, b) => b.href.length - a.href.length)[0] ?? null;
+    all.filter((t) => under(pathname, t.href) || t.also?.some((a) => under(pathname, a))).sort((a, b) => b.href.length - a.href.length)[0] ?? null;
   const showRow = all.length >= 2 && !isThreadPath(pathname);
   return { section, tabs: showRow ? all : [], activeTab };
 }

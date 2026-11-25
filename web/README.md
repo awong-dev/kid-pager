@@ -97,7 +97,7 @@ the route table in `app/routes.tsx`, which has four blocks:
   super, `super`) and screen. The router wraps these once in `RequireAuth` + `AppShell`. An unknown
   path is authenticated too: guard first, then Not Found inside the shell. `/` is the Home launcher.
 - **REDIRECTS**: old path -> new path (`/family/alerts` -> `/alerts`, `/settings/{notifications,backends,devices}`
-  -> `/account/{notifications,apps,pagers}`, `/admin/settings` -> `/family/history`). `?query` and `#fragment`
+  -> `/account/{notifications,apps,pagers}`, `/admin/settings` and `/family/history` -> `/family/settings`, `/family/contacts` -> `/family/people#contacts`). `?query` and `#fragment`
   are kept. The relay still puts `/family/alerts` in push notifications; the redirect covers it.
 - **API** (`/api`, `/webhooks`, `/bridge`, from `lib/apiPaths.ts`): answered by the relay, never rendered here.
 
@@ -130,6 +130,14 @@ menu in one place.
   conversations" (read-only, collapsed behind Show all past 8 rows). Each section has its own reads,
   skeleton and error. Threads and `/location` get a back arrow to Messages in the phone top bar;
   `/location` keeps the bottom bar and has a "Messages" link on desktop.
+- Family tabs: People & contacts, Address books, Pagers, Settings. `/family/people` is one page of
+  chat targets in three `SectionBlock`s (`#members`, `#contacts` = Outside contacts incl. other
+  families, `#groups`), each with its own load/error state; `useScrollToAnchor` scrolls to the
+  fragment once they have content (the router does not). Group chats there is a per-member summary
+  linking to the detail screen `/family/chat?uid=` (stays under the People & contacts tab, with a back
+  link). `/family/settings` holds the family name and switches plus Message history (retention is
+  server-wide and superadmin-only to change; a family admin sees it read-only). The member drawer's
+  Policy and Approved parts are `components/MemberPolicyParts.tsx`, ready for the Permissions page.
 - The phone/desktop split is CSS only, so the static export never flashes the wrong layout.
 - `screens/home/Home.tsx`: the launcher. Its cards are data in `screens/home/cards.ts`; each shows one
   live status line, reading only what the viewer's role may read (see `relay/firestore.rules`).
@@ -302,7 +310,7 @@ incognito window) to act as two different people at once where noted.
 13. **Notifications**: `/settings/notifications` -> Enable notifications
     (grant the browser permission prompt) -> Send test notification -> a
     native OS notification should appear.
-14. **Retention settings**: `/admin/settings` -> change messages retention
+14. **Retention settings**: `/family/settings` -> change messages retention (as superadmin)
     to `2 weeks`, save, reload, confirm it persisted; read the weekly-sweep
     note.
 15. **Sign out**: confirm "Sign out" returns to `/login` and that navigating

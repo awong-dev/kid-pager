@@ -11,9 +11,9 @@ const ids = (v: { isFamilyAdmin: boolean; isSuper: boolean }) =>
 describe("home cards", () => {
   it("who sees what", () => {
     expect(ids({ isFamilyAdmin: false, isSuper: false })).toEqual(["messages", "myPager", "notifications"]);
-    expect(ids({ isFamilyAdmin: true, isSuper: false })).toEqual(["messages", "alerts", "people", "pagers", "history"]);
+    expect(ids({ isFamilyAdmin: true, isSuper: false })).toEqual(["messages", "alerts", "people", "pagers", "settings"]);
     expect(ids({ isFamilyAdmin: true, isSuper: true })).toEqual([
-      "messages", "alerts", "people", "pagers", "history", "system",
+      "messages", "alerts", "people", "pagers", "settings", "system",
     ]);
   });
   it("Messages is first and the only featured card", () => {
@@ -43,5 +43,14 @@ describe("status lines", () => {
     expect(myPagerStatus([dev("online")], seen, ago)).toBe("Online");
     expect(myPagerStatus([dev("offline")], seen, ago)).toBe("Last seen 1000ms ago");
     expect(myPagerStatus([dev("offline")], () => null, ago)).toBe("Offline");
+  });
+});
+
+describe("family cards", () => {
+  it("People & contacts and Family settings point at the merged pages", () => {
+    const by = (id: string) => CARDS.find((c) => c.id === id)!;
+    expect(by("people")).toMatchObject({ title: "People & contacts", href: "/family/people" });
+    expect(by("settings")).toMatchObject({ title: "Family settings", href: "/family/settings", icon: "settings" });
+    expect(CARDS.some((c) => c.href === "/family/history")).toBe(false);
   });
 });

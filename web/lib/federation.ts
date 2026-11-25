@@ -264,7 +264,7 @@ export function reportFederationLines(v: ReportFederation | undefined): { reauth
   return {
     reauth:
       v.reauth > 0
-        ? `${v.reauth} ${v.reauth === 1 ? "link" : "links"} to other families need re-authorizing: Family > Other families > Re-authorize`
+        ? `${v.reauth} ${v.reauth === 1 ? "link" : "links"} to other families need re-authorizing: Family > People & contacts > Other families > Re-authorize`
         : null,
     announcing: v.announcing > 0,
   };
