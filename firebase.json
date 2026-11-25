@@ -32,16 +32,8 @@
         }
       },
       {
-        "source": "/chat/view/**",
-        "destination": "/chat/view/_.html"
-      },
-      {
-        "source": "/chat/**",
-        "destination": "/chat/_.html"
-      },
-      {
-        "source": "/devices/**",
-        "destination": "/devices/_.html"
+        "source": "**",
+        "destination": "/index.html"
       }
     ],
     "headers": [

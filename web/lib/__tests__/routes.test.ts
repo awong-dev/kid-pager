@@ -6,18 +6,21 @@ import { API, AUTHENTICATED, PUBLIC, resolveRoute } from "../../app/routes";
 import { API_PATH_PREFIXES, isApiPath } from "../apiPaths";
 
 type Rewrite = { source: string; run?: unknown; destination?: string };
-const firebase = JSON.parse(readFileSync(join(__dirname, "../../firebase.json"), "utf8")) as {
-  hosting: { rewrites: Rewrite[] };
-};
-const rewrites = firebase.hosting.rewrites;
+// The repo-root file is what `firebase deploy` uses; web/firebase.json is the local preview.
+const configs = ["../../../firebase.json", "../../firebase.json"].map((rel) => ({
+  rel,
+  rewrites: (
+    JSON.parse(readFileSync(join(__dirname, rel), "utf8")) as { hosting: { rewrites: Rewrite[] } }
+  ).hosting.rewrites,
+}));
 
 describe("API paths", () => {
-  it("firebase.json relay rewrites list exactly lib/apiPaths.ts", () => {
+  it.each(configs)("$rel relay rewrites list exactly lib/apiPaths.ts", ({ rewrites }) => {
     const relay = rewrites.filter((r) => r.run).map((r) => r.source);
     expect(relay.sort()).toEqual(API_PATH_PREFIXES.map((p) => `${p}/**`).sort());
     expect([...API]).toEqual([...API_PATH_PREFIXES]);
   });
-  it("relay rewrites come before the catch-all, which is last", () => {
+  it.each(configs)("$rel relay rewrites come before the catch-all, which is last", ({ rewrites }) => {
     const last = rewrites[rewrites.length - 1]!;
     expect(last).toEqual({ source: "**", destination: "/index.html" });
     expect(rewrites.slice(0, -1).every((r) => r.run)).toBe(true);

@@ -1,7 +1,11 @@
 {
   "hosting": {
     "public": "out",
-    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
     "cleanUrls": true,
     "trailingSlash": false,
     "rewrites": [
@@ -20,6 +24,13 @@
         }
       },
       {
+        "source": "/bridge/**",
+        "run": {
+          "serviceId": "pager-relay",
+          "region": "us-central1"
+        }
+      },
+      {
         "source": "**",
         "destination": "/index.html"
       }
@@ -27,11 +38,21 @@
     "headers": [
       {
         "source": "/sw.js",
-        "headers": [{ "key": "Service-Worker-Allowed", "value": "/" }]
+        "headers": [
+          {
+            "key": "Service-Worker-Allowed",
+            "value": "/"
+          }
+        ]
       },
       {
         "source": "/firebase-messaging-sw.js",
-        "headers": [{ "key": "Service-Worker-Allowed", "value": "/" }]
+        "headers": [
+          {
+            "key": "Service-Worker-Allowed",
+            "value": "/"
+          }
+        ]
       }
     ]
   }

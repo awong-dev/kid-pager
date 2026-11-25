@@ -43,7 +43,7 @@ python3 tools/emqx_setup.py        # one-off per `docker compose up`, provisions
 npm run dev                        # http://localhost:3000
 ```
 
-`next.config.ts` rewrites the API prefixes (`lib/apiPaths.ts`: `/api`, `/webhooks`) to
+`next.config.ts` rewrites the API prefixes (`lib/apiPaths.ts`: `/api`, `/webhooks`, `/bridge`) to
 `http://localhost:8000` (the relay) in dev, and serves the one page for every other path. `lib/firebase.ts` connects to the
 Firestore/Auth emulators when `NEXT_PUBLIC_USE_EMULATORS=1` (the
 `.env.local.example` default).
@@ -96,7 +96,7 @@ the route table in `app/routes.tsx`, which has three blocks:
 - **AUTHENTICATED** (the default): each row names its `role` (`member`, `admin` = family admin or
   super, `super`) and screen. The router wraps these once in `RequireAuth` + `AppShell`. An unknown
   path is authenticated too: guard first, then Not Found inside the shell. `/` redirects to `/chat`.
-- **API** (`/api`, `/webhooks`, from `lib/apiPaths.ts`): answered by the relay, never rendered here.
+- **API** (`/api`, `/webhooks`, `/bridge`, from `lib/apiPaths.ts`): answered by the relay, never rendered here.
 
 Screens live in `screens/` (one default-exported component each, lazy-loaded so each is its own
 chunk). `:param` segments (`/chat/:alias`, `/chat/view/:key`, `/devices/:id`) are read with
@@ -104,7 +104,7 @@ chunk). `:param` segments (`/chat/:alias`, `/chat/view/:key`, `/devices/:id`) ar
 `lib/router`, not `next/link` or `next/navigation`. Navigation is `history.pushState`, so query
 strings and `#fragments` are kept as written.
 
-Serving: Hosting (`firebase.json`) sends `/api/**` and `/webhooks/**` to the relay and everything
+Serving: Hosting (the repo-root `firebase.json` deploys; `web/firebase.json` previews) sends the API prefixes to the relay and everything
 else without a file to `/index.html`; `next dev` does the same. `lib/__tests__/routes.test.ts`
 fails if `firebase.json` and `lib/apiPaths.ts` disagree, or if a route outside PUBLIC is unguarded.
 

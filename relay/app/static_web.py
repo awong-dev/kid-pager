@@ -14,7 +14,7 @@ WEB_ROOT = Path("/srv/web")
 # shell. Build assets are the exception, so a stale chunk URL fails instead of returning HTML.
 SHELL = "index.html"
 _ASSET_PREFIXES = ("_next/",)
-_RELAY_PREFIXES = ("api/", "webhooks/", "internal/")
+_RELAY_PREFIXES = ("api/", "webhooks/", "bridge/", "fed/", "hooks/", "internal/")
 _HEADERS = {
     "sw.js": {"Service-Worker-Allowed": "/"},
     "firebase-messaging-sw.js": {"Service-Worker-Allowed": "/"},

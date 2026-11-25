@@ -64,7 +64,7 @@ export const HOME_REDIRECT = { from: "/", to: "/chat" } as const;
 // API: answered by the relay, never by this app (Hosting and the dev server send them there).
 // The router never renders these; if one is reached client-side it does a full page load.
 // ================================================================================================
-export const API: readonly string[] = API_PATH_PREFIXES; // /api, /webhooks  (lib/apiPaths.ts)
+export const API: readonly string[] = API_PATH_PREFIXES; // /api, /webhooks, /bridge  (lib/apiPaths.ts)
 
 export type Resolved =
   | { kind: "redirect"; to: string }
