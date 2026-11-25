@@ -238,8 +238,16 @@ def restore_env_file() -> None:
 
 
 def _home_secrets() -> dict[str, str]:
+    try:
+        text = (HOME_DATA / "secrets.env").read_text()
+    except PermissionError:
+        # On Linux the file is root's, mode 0600; read it from inside a container.
+        text = compose(
+            "run", "--rm", "--no-deps", "--entrypoint", "cat", "init", "/data/secrets.env",
+            capture=True,
+        ).stdout
     values: dict[str, str] = {}
-    for line in (HOME_DATA / "secrets.env").read_text().splitlines():
+    for line in text.splitlines():
         key, sep, value = line.partition("=")
         if sep:
             values[key.strip()] = value.strip()
