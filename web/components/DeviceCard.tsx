@@ -3,7 +3,6 @@
 /** One pager device as a two-column card shared by `/family/devices` and `/admin/devices`.
  * Layout only: every action is a callback from the page. */
 
-import Link from "next/link";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
@@ -14,6 +13,7 @@ import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import { Link } from "@/lib/router";
 import DeviceTrustChip from "@/components/DeviceTrustChip";
 import EditDeviceLabelButton from "@/components/EditDeviceLabelDialog";
 import FirmwareChip from "@/components/FirmwareChip";

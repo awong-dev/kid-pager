@@ -16,16 +16,10 @@ from tests.test_healthz import make_settings
 FILES = {
     "index.html": "INDEX",
     "404.html": "NOTFOUND",
-    "family.html": "FAMILY",
-    "chat/_.html": "CHAT",
-    "chat/view/_.html": "CHATVIEW",
-    "devices/_.html": "DEVICES",
-    "chat/_.txt": "CHATTXT",
     "_next/static/x.js": "JS",
     "firebase-messaging-sw.js": "SW",
     "sw.js": "SW2",
     "manifest.webmanifest": "{}",
-    "admin/users.html": "USERS",
 }
 
 
@@ -58,14 +52,14 @@ def client(root: Path) -> TestClient:
     ("path", "rel", "status"),
     [
         ("", "index.html", 200),
-        ("family", "family.html", 200),
-        ("admin/users", "admin/users.html", 200),
-        ("chat/kid", "chat/_.html", 200),
-        ("chat/view/abc", "chat/view/_.html", 200),
-        ("devices/pgr-1", "devices/_.html", 200),
-        ("chat/_.txt", "chat/_.txt", 200),
+        ("login", "index.html", 200),
+        ("admin/users", "index.html", 200),
+        ("chat/kid", "index.html", 200),
+        ("chat/view/abc", "index.html", 200),
+        ("devices/pgr-1", "index.html", 200),
+        ("manifest.webmanifest", "manifest.webmanifest", 200),
         ("_next/static/x.js", "_next/static/x.js", 200),
-        ("nope", "404.html", 404),
+        ("_next/static/gone.js", "404.html", 404),
     ],
 )
 def test_resolve(root: Path, path: str, rel: str, status: int):
@@ -74,17 +68,19 @@ def test_resolve(root: Path, path: str, rel: str, status: int):
     assert found == (root / rel).resolve()
 
 
-def test_unknown_path_is_404_with_404_html(client: TestClient):
+def test_unknown_page_path_is_the_shell_and_a_missing_asset_is_404(client: TestClient):
     r = client.get("/nope")
+    assert r.status_code == 200 and r.text == "INDEX"
+    r = client.get("/_next/static/gone.js")
     assert r.status_code == 404 and r.text == "NOTFOUND"
 
 
 def test_without_404_html_resolve_and_http_give_plain_404(tmp_path: Path):
     r = build(tmp_path / "w", {"index.html": "I"})
-    assert static_web.resolve(r, "nope") == (None, 404)
+    assert static_web.resolve(r, "_next/nope") == (None, 404)
     app = FastAPI()
     static_web.mount(app, r)
-    resp = TestClient(app).get("/nope")
+    resp = TestClient(app).get("/_next/nope")
     assert resp.status_code == 404
     assert resp.json() == {"detail": "Not Found"}
 
@@ -110,9 +106,7 @@ def test_path_traversal_never_escapes(tmp_path: Path, path: str):
     static_web.mount(app, build(tmp_path / "web", {"index.html": "I"}))
     r = TestClient(app).get(path)
     assert "SECRET" not in r.text
-    assert r.status_code == 404
-    found, _ = static_web.resolve(tmp_path / "web", "../secret.txt")
-    assert found is None
+    assert static_web.resolve(tmp_path / "web", "../secret.txt") == (None, 404)
 
 
 def test_headers_and_content_types(client: TestClient):
@@ -131,7 +125,7 @@ def test_headers_and_content_types(client: TestClient):
 def test_head_works(client: TestClient):
     r = client.head("/family")
     assert r.status_code == 200 and r.text == ""
-    assert client.head("/nope").status_code == 404
+    assert client.head("/_next/nope").status_code == 404
 
 
 def test_create_app_mounts_only_when_web_root_exists(
@@ -146,5 +140,5 @@ def test_create_app_mounts_only_when_web_root_exists(
     monkeypatch.setattr(static_web, "WEB_ROOT", root)
     app = create_app(settings=make_settings(), broker_client=FakeBrokerClient())
     with TestClient(app) as c:
-        assert c.get("/family").text == "FAMILY"
+        assert c.get("/family").text == "INDEX"
         assert c.get("/healthz").status_code in (200, 503)

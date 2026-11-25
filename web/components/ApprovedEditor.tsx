@@ -4,7 +4,6 @@
  * saved by one replace-all `PUT`. Under outbound policy Open a picked contact is a deny. */
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
 import Alert from "@mui/material/Alert";
 import Autocomplete from "@mui/material/Autocomplete";
 import Button from "@mui/material/Button";
@@ -19,6 +18,7 @@ import TextField from "@mui/material/TextField";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 
+import { Link } from "@/lib/router";
 import { ApiError, api } from "@/lib/api";
 import { useDirectory } from "@/lib/directory";
 import { familyQuery } from "@/lib/family-context";

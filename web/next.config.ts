@@ -1,26 +1,20 @@
 import type { NextConfig } from "next";
 
-// `output: 'export'` applies only to a real build: under `next dev`, export's rule that every
-// dynamic param be pre-declared rejects `/chat/<alias>` (production rewrites it to one shell).
-// `rewrites()` is ignored by the export build; Hosting supplies them in production.
-const isDev = process.env.NODE_ENV === "development";
+import { API_PATH_PREFIXES } from "./lib/apiPaths";
+
+// Dev only: `rewrites()` is ignored by the export build; production gets the same two rules from
+// `firebase.json` (API prefixes to the relay, everything else to `/index.html`).
+const RELAY = "http://localhost:8000";
 
 const nextConfig: NextConfig = {
-  ...(isDev ? {} : { output: "export" as const }),
+  output: "export",
 
   async rewrites() {
     return {
-      // Dev stand-in for `firebase.json`'s Hosting rewrites. `beforeFiles` is required because
-      // `/chat/[alias]` is a real filesystem route.
-      beforeFiles: [
-        { source: "/chat/view/:key", destination: "/chat/view/_" },
-        { source: "/chat/:alias", destination: "/chat/_" },
-        { source: "/devices/:id", destination: "/devices/_" },
-      ],
-      afterFiles: [
-        { source: "/api/:path*", destination: "http://localhost:8000/api/:path*" },
-        { source: "/webhooks/:path*", destination: "http://localhost:8000/webhooks/:path*" },
-      ],
+      // API paths belong to the relay (the list is lib/apiPaths.ts).
+      beforeFiles: API_PATH_PREFIXES.map((p) => ({ source: `${p}/:path*`, destination: `${RELAY}${p}/:path*` })),
+      // Everything that is not a file or the page itself is a client route: serve the one page.
+      fallback: [{ source: "/:path*", destination: "/" }],
     };
   },
 };

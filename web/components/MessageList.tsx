@@ -2,7 +2,6 @@
 
 /** Message list pane for the chat thread and monitor routes; scroll state stays with the caller. */
 
-import Link from "next/link";
 import type { RefObject, UIEvent } from "react";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
@@ -11,6 +10,7 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import LocationOnIcon from "@mui/icons-material/LocationOn";
 
+import { Link } from "@/lib/router";
 import DeliveryChips from "@/components/DeliveryChips";
 import { useAuth } from "@/lib/auth-context";
 import SmsLogBubble from "@/components/SmsLogBubble";

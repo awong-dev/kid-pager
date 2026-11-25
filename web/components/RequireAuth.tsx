@@ -1,14 +1,14 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { type ReactNode, useEffect } from "react";
 import Box from "@mui/material/Box";
 import CircularProgress from "@mui/material/CircularProgress";
 
+import { useNavigate } from "@/lib/router";
 import { useAuth } from "@/lib/auth-context";
 import { stashReturnPath } from "@/lib/returnPath";
 
-function LoadingScreen() {
+export function LoadingScreen() {
   return (
     <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", height: "60vh" }}>
       <CircularProgress />
@@ -16,33 +16,25 @@ function LoadingScreen() {
   );
 }
 
-/** Client-side route guard (UX only; the relay and rules enforce access).
- * `requireRole: 'admin'` accepts a family admin or super; `'super'` accepts only super. */
-export default function RequireAuth({
-  children,
-  requireAdmin = false,
-  requireRole,
-}: {
-  children: ReactNode;
-  /** @deprecated use `requireRole="admin"` instead. */
-  requireAdmin?: boolean;
-  requireRole?: "admin" | "super";
-}) {
+export type Role = "member" | "admin" | "super";
+
+/** Client-side route guard (UX only; the relay and rules enforce access). Rendered once, by the
+ * router (`app/page.tsx`), around every authenticated screen.
+ * `role`: `member` = any signed-in user; `admin` = a family admin or super; `super` = super only. */
+export default function RequireAuth({ children, role }: { children: ReactNode; role: Role }) {
   const { status, isFamilyAdmin, isSuper, needsSetup } = useAuth();
-  const router = useRouter();
-  const effectiveRole = requireRole ?? (requireAdmin ? "admin" : undefined);
-  const allowed =
-    effectiveRole === undefined ? true : effectiveRole === "super" ? isSuper : isFamilyAdmin;
+  const navigate = useNavigate();
+  const allowed = role === "member" ? true : role === "super" ? isSuper : isFamilyAdmin;
 
   useEffect(() => {
     if (status === "signed-out" || status === "not-registered") {
       // Home backend with no users yet: first run. Keep the page asked for (and its #fragment).
       stashReturnPath(`${window.location.pathname}${window.location.search}${window.location.hash}`);
-      router.replace(needsSetup ? "/setup" : "/login");
+      navigate.replace(needsSetup ? "/setup" : "/login");
     } else if (status === "signed-in" && !allowed) {
-      router.replace("/chat");
+      navigate.replace("/chat");
     }
-  }, [status, allowed, router, needsSetup]);
+  }, [status, allowed, navigate, needsSetup]);
 
   if (status !== "signed-in" || !allowed) {
     return <LoadingScreen />;

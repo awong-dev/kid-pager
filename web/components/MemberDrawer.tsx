@@ -2,7 +2,6 @@
 
 /** Row-click drawer on `/family/people`: Profile, Policy and Approved sections. */
 
-import Link from "next/link";
 import { useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
@@ -15,6 +14,7 @@ import Switch from "@mui/material/Switch";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 
+import { Link } from "@/lib/router";
 import ApprovedEditor from "@/components/ApprovedEditor";
 import PolicyPicker from "@/components/PolicyPicker";
 import { ApiError, api } from "@/lib/api";

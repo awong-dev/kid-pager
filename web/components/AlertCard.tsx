@@ -4,7 +4,6 @@
 
 import { useState } from "react";
 import Collapse from "@mui/material/Collapse";
-import Link from "next/link";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
@@ -26,6 +25,7 @@ import SmsIcon from "@mui/icons-material/Sms";
 import SettingsInputAntennaIcon from "@mui/icons-material/SettingsInputAntenna";
 import PublicIcon from "@mui/icons-material/Public";
 
+import { Link } from "@/lib/router";
 import BridgeTopups from "@/components/BridgeTopups";
 import ChatSubscribeDialog from "@/components/ChatSubscribeDialog";
 import { formatPhoneDigits } from "@/components/NewChatDialog";

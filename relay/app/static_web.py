@@ -1,4 +1,4 @@
-"""Serves the web static export from the relay with Firebase Hosting's cleanUrls and rewrites."""
+"""Serves the web static export from the relay the way web/firebase.json does on Hosting."""
 
 from __future__ import annotations
 
@@ -10,12 +10,10 @@ from fastapi.responses import FileResponse, Response
 
 WEB_ROOT = Path("/srv/web")
 
-# Rewrites for non-relay paths, in order: a prefix and the file it maps to.
-REWRITES: tuple[tuple[str, str], ...] = (
-    ("chat/view/", "chat/view/_.html"),
-    ("chat/", "chat/_.html"),
-    ("devices/", "devices/_.html"),
-)
+# The web app is one client-routed page (web/app/page.tsx): any path that is not a file is the
+# shell. Build assets are the exception, so a stale chunk URL fails instead of returning HTML.
+SHELL = "index.html"
+_ASSET_PREFIXES = ("_next/",)
 _RELAY_PREFIXES = ("api/", "webhooks/", "internal/")
 _HEADERS = {
     "sw.js": {"Service-Worker-Allowed": "/"},
@@ -45,11 +43,10 @@ def resolve(root: Path, path: str) -> tuple[Path | None, int]:
     )
     if found is not None:
         return found, 200
-    for prefix, target in REWRITES:
-        if rel.startswith(prefix) and len(rel) > len(prefix):
-            hit = _file(root, target)
-            if hit is not None:
-                return hit, 200
+    if not rel.startswith(_ASSET_PREFIXES) and ".." not in rel.split("/"):
+        shell = _file(root, SHELL)
+        if shell is not None:
+            return shell, 200
     return _file(root, "404.html"), 404
 
 

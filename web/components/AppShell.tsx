@@ -1,7 +1,5 @@
 "use client";
 
-import Link from "next/link";
-import { usePathname } from "next/navigation";
 import { type ReactNode, useState } from "react";
 import AppBar from "@mui/material/AppBar";
 import Badge from "@mui/material/Badge";
@@ -27,6 +25,7 @@ import FamilyRestroomIcon from "@mui/icons-material/FamilyRestroom";
 import LocationOnIcon from "@mui/icons-material/LocationOn";
 import SettingsIcon from "@mui/icons-material/Settings";
 
+import { Link, usePathname } from "@/lib/router";
 import { useAuth } from "@/lib/auth-context";
 import { useFamily } from "@/lib/family-context";
 import { useLive } from "@/lib/live";

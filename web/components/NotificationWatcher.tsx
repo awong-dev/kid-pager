@@ -3,9 +3,9 @@
 /** Shows a browser notification for new messages (and, for admins, new open alerts) when the
  * tab is hidden or the thread is not open. Renders nothing. */
 
-import { usePathname } from "next/navigation";
 import { useEffect, useRef } from "react";
 
+import { usePathname } from "@/lib/router";
 import { useAuth } from "@/lib/auth-context";
 import { useDirectory } from "@/lib/directory";
 import { useFamily } from "@/lib/family-context";

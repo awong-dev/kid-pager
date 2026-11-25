@@ -3,8 +3,6 @@
 /** "New chat" dialog: search select over the address book; only navigates to `/chat/{alias}`. */
 
 import { useMemo, useState } from "react";
-import Link from "next/link";
-import { useRouter } from "next/navigation";
 import Alert from "@mui/material/Alert";
 import Autocomplete, { createFilterOptions } from "@mui/material/Autocomplete";
 import Button from "@mui/material/Button";
@@ -15,6 +13,7 @@ import DialogTitle from "@mui/material/DialogTitle";
 import TextField from "@mui/material/TextField";
 import PhoneIcon from "@mui/icons-material/Phone";
 
+import { Link, useNavigate } from "@/lib/router";
 import { useAuth } from "@/lib/auth-context";
 import { useLive } from "@/lib/live";
 import { userQuery } from "@/lib/live/queries";
@@ -69,7 +68,7 @@ interface NewChatDialogProps {
 
 export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   const fullScreen = useFullScreenDialog();
-  const router = useRouter();
+  const navigate = useNavigate();
   const { isFamilyAdmin, me } = useAuth();
   // Live, so an admin setting the number takes effect without a reload.
   const meUid = me?.uid;
@@ -121,7 +120,7 @@ export default function NewChatDialog({ open, onClose }: NewChatDialogProps) {
   function go(alias: string) {
     reset();
     onClose();
-    router.push(`/chat/${encodeURIComponent(alias)}`);
+    navigate.push(`/chat/${encodeURIComponent(alias)}`);
   }
 
   // Admin free text: an alias typed with or without its leading `@`

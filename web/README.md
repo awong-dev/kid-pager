@@ -1,7 +1,7 @@
 # Pager web app
 
-Next.js (App Router, `output: 'export'`) + MUI + the Firebase JS SDK. No SSR, no server actions, no middleware: every page
-is a client component; every read is a Firestore listener; every write is a
+Next.js (App Router, `output: 'export'`) + MUI + the Firebase JS SDK. No SSR, no server actions, no middleware: the
+app is one client-routed page (see Routing); every read is a Firestore listener; every write is a
 `fetch` to `/api/*` with `Authorization: Bearer <Firebase ID token>`
 (`lib/api.ts`). Never write to Firestore from the browser.
 
@@ -43,8 +43,8 @@ python3 tools/emqx_setup.py        # one-off per `docker compose up`, provisions
 npm run dev                        # http://localhost:3000
 ```
 
-`next.config.ts` rewrites `/api/**` and `/webhooks/**` to
-`http://localhost:8000` (the relay) in dev. `lib/firebase.ts` connects to the
+`next.config.ts` rewrites the API prefixes (`lib/apiPaths.ts`: `/api`, `/webhooks`) to
+`http://localhost:8000` (the relay) in dev, and serves the one page for every other path. `lib/firebase.ts` connects to the
 Firestore/Auth emulators when `NEXT_PUBLIC_USE_EMULATORS=1` (the
 `.env.local.example` default).
 
@@ -84,7 +84,29 @@ npm run lint       # eslint
 `next build` prints `Specified "rewrites" will not automatically work with
 "output: export"` -- expected and harmless. Production gets its rewrites
 from `web/firebase.json` (Firebase Hosting), not `next.config.ts`; the
-config's `rewrites()` only matters to `next dev`.
+config's `rewrites()` only matters to `next dev`. `out/` holds `index.html` (plus Next's
+`404.html`/`_not-found.html`); there is no per-route HTML.
+
+## Routing
+
+`app/page.tsx` is the only page: a client router (`lib/router.tsx`, History API, no dependency) over
+the route table in `app/routes.tsx`, which has three blocks:
+
+- **PUBLIC** (`/login`, `/setup`): no sign-in, no shell. A path is public only if listed here.
+- **AUTHENTICATED** (the default): each row names its `role` (`member`, `admin` = family admin or
+  super, `super`) and screen. The router wraps these once in `RequireAuth` + `AppShell`. An unknown
+  path is authenticated too: guard first, then Not Found inside the shell. `/` redirects to `/chat`.
+- **API** (`/api`, `/webhooks`, from `lib/apiPaths.ts`): answered by the relay, never rendered here.
+
+Screens live in `screens/` (one default-exported component each, lazy-loaded so each is its own
+chunk). `:param` segments (`/chat/:alias`, `/chat/view/:key`, `/devices/:id`) are read with
+`useParams()`; the most specific pattern wins. Use `Link` / `useNavigate()` / `usePathname()` from
+`lib/router`, not `next/link` or `next/navigation`. Navigation is `history.pushState`, so query
+strings and `#fragments` are kept as written.
+
+Serving: Hosting (`firebase.json`) sends `/api/**` and `/webhooks/**` to the relay and everything
+else without a file to `/index.html`; `next dev` does the same. `lib/__tests__/routes.test.ts`
+fails if `firebase.json` and `lib/apiPaths.ts` disagree, or if a route outside PUBLIC is unguarded.
 
 ## Sign-in backends
 
@@ -97,7 +119,7 @@ picked at build time by `NEXT_PUBLIC_BACKEND`:
 - `home` (`NEXT_PUBLIC_BACKEND=home npm run build`): relay sessions. The
   relay (`AUTH_BACKEND=home`) sets an `HttpOnly` `pager_session` cookie;
   `lib/api.ts` sends `credentials: "include"` and `X-Requested-With: pager`
-  on every call. `/login` renders `app/login/HomeLogin.tsx` (username +
+  on every call. `/login` renders `screens/login/HomeLogin.tsx` (username +
   password, "Sign in with a passkey", invite-code redeem); `/setup` is the
   first-run page that creates the first super admin while the relay has no
   users, and `RequireAuth` sends a signed-out visitor there. People and

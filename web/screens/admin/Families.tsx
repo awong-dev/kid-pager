@@ -1,0 +1,470 @@
+"use client";
+
+/** `/admin/families`: superadmin table of families with member/admin/device counts.
+ * Writes go through `/api/admin/families*`, `/api/admin/users/{uid}` and `/api/family/members`. */
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Alert from "@mui/material/Alert";
+import Autocomplete from "@mui/material/Autocomplete";
+import Button from "@mui/material/Button";
+import Chip from "@mui/material/Chip";
+import Dialog from "@mui/material/Dialog";
+import DialogActions from "@mui/material/DialogActions";
+import DialogContent from "@mui/material/DialogContent";
+import DialogTitle from "@mui/material/DialogTitle";
+import Divider from "@mui/material/Divider";
+import IconButton from "@mui/material/IconButton";
+import Stack from "@mui/material/Stack";
+import Switch from "@mui/material/Switch";
+import Table from "@mui/material/Table";
+import TableBody from "@mui/material/TableBody";
+import TableCell from "@mui/material/TableCell";
+import TableContainer from "@mui/material/TableContainer";
+import TableHead from "@mui/material/TableHead";
+import TableRow from "@mui/material/TableRow";
+import TextField from "@mui/material/TextField";
+import Typography from "@mui/material/Typography";
+import LaunchIcon from "@mui/icons-material/Launch";
+
+import { useNavigate } from "@/lib/router";
+import { BackupDialog, ExportDialog, ImportDialog } from "@/components/FamilyMoveDialogs";
+import { getFedState, setFedFamily, type FedState } from "@/lib/federation";
+import { useFamily } from "@/lib/family-context";
+import { ApiError, api } from "@/lib/api";
+import { useLive } from "@/lib/live";
+import { allDevicesQuery, allFamiliesQuery, allUsersQuery } from "@/lib/live/queries";
+import type { DeviceDoc, FamilyDoc, Role, UserDoc } from "@/lib/types";
+import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
+import { responsiveTableSx } from "@/lib/tableSx";
+
+interface FamilyRow extends FamilyDoc {
+  id: string;
+}
+
+interface UserRow extends UserDoc {
+  uid: string;
+}
+
+interface DeviceRow extends DeviceDoc {
+  id: string;
+}
+
+const emptyCreateForm = {
+  name: "",
+  adminAlias: "",
+  adminDisplayName: "",
+  adminEmail: "",
+  adminPhone: "",
+};
+
+function formatCreatedAt(f: FamilyRow): string {
+  return f.createdAt ? f.createdAt.toDate().toLocaleDateString() : "--";
+}
+
+function AdminFamiliesInner() {
+  const fullScreen = useFullScreenDialog();
+  const navigate = useNavigate();
+  const { setFamilyId } = useFamily();
+
+  const { docs: familyDocs } = useLive<FamilyDoc>(allFamiliesQuery());
+  const families = useMemo(() => {
+    const rows: FamilyRow[] = familyDocs.map((d) => ({ id: d.id, ...d.data }));
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    return rows;
+  }, [familyDocs]);
+  const { docs: userDocs } = useLive<UserDoc>(allUsersQuery());
+  const users = useMemo<UserRow[]>(() => userDocs.map((d) => ({ uid: d.id, ...d.data })), [userDocs]);
+  const { docs: deviceDocs } = useLive<DeviceDoc>(allDevicesQuery());
+  const devices = useMemo<DeviceRow[]>(() => deviceDocs.map((d) => ({ id: d.id, ...d.data })), [deviceDocs]);
+
+  const [error, setError] = useState<string | null>(null);
+
+  const [fed, setFed] = useState<FedState | null>(null);
+  const loadFed = useCallback(() => {
+    getFedState()
+      .then(setFed)
+      .catch(() => setFed(null));
+  }, []);
+  useEffect(() => {
+    const t = setTimeout(loadFed, 0);
+    return () => clearTimeout(t);
+  }, [loadFed]);
+  async function toggleFed(f: FamilyRow, on: boolean) {
+    setError(null);
+    try {
+      setFed(await setFedFamily(f.id, on));
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to change federation");
+    }
+  }
+
+  const [exportFor, setExportFor] = useState<FamilyRow | null>(null);
+  const [backupFor, setBackupFor] = useState<FamilyRow | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+
+  async function setFrozen(f: FamilyRow, frozen: boolean) {
+    setError(null);
+    try {
+      await api.post(`/admin/families/${encodeURIComponent(f.id)}/${frozen ? "freeze" : "unfreeze"}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to change freeze");
+    }
+  }
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createForm, setCreateForm] = useState(emptyCreateForm);
+  const [creating, setCreating] = useState(false);
+
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detailName, setDetailName] = useState("");
+  const [savingDetail, setSavingDetail] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<UserRow | null>(null);
+
+  const detail = families.find((f) => f.id === detailId) ?? null;
+
+  function openDetail(f: FamilyRow) {
+    setDetailId(f.id);
+    setDetailName(f.name);
+    setMoveTarget(null);
+    setError(null);
+  }
+
+  function closeDetail() {
+    setDetailId(null);
+  }
+
+  async function createFamily() {
+    setError(null);
+    setCreating(true);
+    try {
+      const created = await api.post<FamilyDoc & { id: string }>("/admin/families", {
+        name: createForm.name,
+      });
+      if (createForm.adminAlias.trim()) {
+        await api.post(`/family/members?family=${encodeURIComponent(created.id)}`, {
+          alias: createForm.adminAlias,
+          displayName: createForm.adminDisplayName || createForm.adminAlias,
+          email: createForm.adminEmail || undefined,
+          phone: createForm.adminPhone || undefined,
+          role: "admin",
+        });
+      }
+      setCreateOpen(false);
+      setCreateForm(emptyCreateForm);
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to create family");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function saveDetail() {
+    if (!detail) return;
+    setSavingDetail(true);
+    setError(null);
+    try {
+      await api.patch(`/admin/families/${detail.id}`, { name: detailName });
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to update family");
+    } finally {
+      setSavingDetail(false);
+    }
+  }
+
+  async function setRole(u: UserRow, role: Role) {
+    setError(null);
+    try {
+      await api.patch(`/admin/users/${u.uid}`, { role });
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to change role");
+    }
+  }
+
+  async function moveUserIn() {
+    if (!detail || !moveTarget) return;
+    setError(null);
+    try {
+      await api.patch(`/admin/users/${moveTarget.uid}`, { familyId: detail.id });
+      setMoveTarget(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? String(err.detail ?? err.message) : "Failed to move user");
+    }
+  }
+
+  function openAsFamily(f: FamilyRow) {
+    setFamilyId(f.id);
+    navigate.push("/family/people");
+  }
+
+  const countsByFamily = useMemo(() => {
+    const admins = new Map<string, UserRow[]>();
+    const members = new Map<string, number>();
+    for (const u of users) {
+      if (!u.familyId) continue;
+      members.set(u.familyId, (members.get(u.familyId) ?? 0) + 1);
+      if (u.role === "admin") {
+        const list = admins.get(u.familyId) ?? [];
+        list.push(u);
+        admins.set(u.familyId, list);
+      }
+    }
+    const deviceCounts = new Map<string, number>();
+    for (const d of devices) {
+      if (!d.familyId) continue;
+      deviceCounts.set(d.familyId, (deviceCounts.get(d.familyId) ?? 0) + 1);
+    }
+    return { admins, members, deviceCounts };
+  }, [users, devices]);
+
+  const detailMembers = detail ? users.filter((u) => u.familyId === detail.id) : [];
+  const moveCandidates = detail ? users.filter((u) => u.familyId !== detail.id && u.kind !== "external") : [];
+
+  const createValid = createForm.name.trim().length > 0;
+
+  return (
+    <Stack spacing={2}>
+      <Stack direction="row" sx={{ flexWrap: "wrap", justifyContent: "space-between", alignItems: "center" }}>
+        <Typography variant="h5">Families</Typography>
+        <Stack direction="row" spacing={1}>
+          <Button onClick={() => setImportOpen(true)}>Import</Button>
+          <Button variant="contained" onClick={() => setCreateOpen(true)}>
+            Create family
+          </Button>
+        </Stack>
+      </Stack>
+      {error && <Alert severity="error">{error}</Alert>}
+
+      <TableContainer sx={responsiveTableSx(fed ? [2, 6] : [2, 5])}>
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell>Name</TableCell>
+              <TableCell>Admins</TableCell>
+              <TableCell>Members</TableCell>
+              <TableCell>Devices</TableCell>
+              {fed && <TableCell>Federation</TableCell>}
+              <TableCell>Created</TableCell>
+              <TableCell />
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {families.map((f) => (
+              <TableRow key={f.id} hover sx={{ cursor: "pointer" }} onClick={() => openDetail(f)}>
+                <TableCell>
+                  {f.name} {f.frozen && <Chip size="small" color="info" label="Frozen" sx={{ ml: 0.5 }} />}
+                </TableCell>
+                <TableCell>
+                  <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
+                    {(countsByFamily.admins.get(f.id) ?? []).map((a) => (
+                      <Chip key={a.uid} size="small" label={`@${a.alias}`} />
+                    ))}
+                  </Stack>
+                </TableCell>
+                <TableCell>{countsByFamily.members.get(f.id) ?? 0}</TableCell>
+                <TableCell>{countsByFamily.deviceCounts.get(f.id) ?? 0}</TableCell>
+                {fed && (
+                  <TableCell onClick={(e) => e.stopPropagation()}>
+                    <Switch
+                      size="small"
+                      checked={fed.families.find((x) => x.id === f.id)?.enabled ?? false}
+                      onChange={(e) => void toggleFed(f, e.target.checked)}
+                      slotProps={{ input: { "aria-label": `Federation for ${f.name}` } }}
+                    />
+                  </TableCell>
+                )}
+                <TableCell>{formatCreatedAt(f)}</TableCell>
+                <TableCell>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void setFrozen(f, !f.frozen);
+                    }}
+                  >
+                    {f.frozen ? "Unfreeze" : "Freeze"}
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExportFor(f);
+                    }}
+                  >
+                    Export
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBackupFor(f);
+                    }}
+                  >
+                    Back up
+                  </Button>
+                  <IconButton
+                    size="small"
+                    aria-label="open as family"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openAsFamily(f);
+                    }}
+                  >
+                    <LaunchIcon fontSize="small" />
+                  </IconButton>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+
+      <ExportDialog
+        family={exportFor ? { id: exportFor.id, name: exportFor.name, frozen: !!exportFor.frozen } : null}
+        onClose={() => setExportFor(null)}
+      />
+      <BackupDialog family={backupFor ? { id: backupFor.id, name: backupFor.name } : null} onClose={() => setBackupFor(null)} />
+      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
+
+      <Dialog fullScreen={fullScreen} open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="xs">
+        <DialogTitle>Create family</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <TextField
+              label="Family name"
+              value={createForm.name}
+              onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
+              fullWidth
+              autoFocus
+            />
+            <Typography variant="caption" color="text.secondary">
+              Optionally create the first family admin now (leave the alias blank to skip and add
+              one later from the family detail).
+            </Typography>
+            <TextField
+              label="Admin alias"
+              value={createForm.adminAlias}
+              onChange={(e) => setCreateForm({ ...createForm, adminAlias: e.target.value })}
+              helperText="lowercase, e.g. mom"
+              fullWidth
+            />
+            <TextField
+              label="Admin display name"
+              value={createForm.adminDisplayName}
+              onChange={(e) => setCreateForm({ ...createForm, adminDisplayName: e.target.value })}
+              fullWidth
+            />
+            <TextField
+              label="Admin email"
+              value={createForm.adminEmail}
+              onChange={(e) => setCreateForm({ ...createForm, adminEmail: e.target.value })}
+              fullWidth
+            />
+            <TextField
+              label="Admin phone (+1XXXXXXXXXX)"
+              value={createForm.adminPhone}
+              onChange={(e) => setCreateForm({ ...createForm, adminPhone: e.target.value })}
+              helperText="email or phone is required if creating an admin"
+              fullWidth
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCreateOpen(false)}>Cancel</Button>
+          <Button onClick={() => void createFamily()} disabled={!createValid || creating}>
+            Create
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog fullScreen={fullScreen} open={detail !== null} onClose={closeDetail} fullWidth maxWidth="sm">
+        {detail && (
+          <>
+            <DialogTitle>{detail.name}</DialogTitle>
+            <DialogContent>
+              <Stack spacing={2} sx={{ mt: 1 }}>
+                <TextField
+                  label="Name"
+                  value={detailName}
+                  onChange={(e) => setDetailName(e.target.value)}
+                  fullWidth
+                />
+                <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => void saveDetail()}
+                    disabled={savingDetail}
+                  >
+                    Save
+                  </Button>
+                  <Button onClick={() => openAsFamily(detail)}>Open as family</Button>
+                </Stack>
+
+                <Divider />
+                <Typography variant="subtitle2">Members</Typography>
+                <TableContainer sx={responsiveTableSx([2])}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Alias</TableCell>
+                        <TableCell>Name</TableCell>
+                        <TableCell>Role</TableCell>
+                        <TableCell />
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {detailMembers.map((u) => (
+                        <TableRow key={u.uid}>
+                          <TableCell>@{u.alias}</TableCell>
+                          <TableCell>{u.displayName}</TableCell>
+                          <TableCell>
+                            <Chip size="small" label={u.role} color={u.role === "admin" ? "primary" : "default"} />
+                          </TableCell>
+                          <TableCell>
+                            {u.role === "member" && (
+                              <Button size="small" onClick={() => void setRole(u, "admin")}>
+                                Make admin
+                              </Button>
+                            )}
+                            {u.role === "admin" && (
+                              <Button size="small" onClick={() => void setRole(u, "member")}>
+                                Make member
+                              </Button>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+
+                <Divider />
+                <Typography variant="subtitle2">Move a user in</Typography>
+                <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                  <Autocomplete
+                    sx={{ flexGrow: 1 }}
+                    size="small"
+                    options={moveCandidates}
+                    getOptionLabel={(u) => `@${u.alias} (${u.displayName})`}
+                    value={moveTarget}
+                    onChange={(_e, value) => setMoveTarget(value)}
+                    renderInput={(params) => <TextField {...params} label="User" />}
+                  />
+                  <Button onClick={() => void moveUserIn()} disabled={!moveTarget}>
+                    Move in
+                  </Button>
+                </Stack>
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={closeDetail}>Close</Button>
+            </DialogActions>
+          </>
+        )}
+      </Dialog>
+    </Stack>
+  );
+}
+
+export default function AdminFamiliesPage() {
+  return <AdminFamiliesInner />;
+}

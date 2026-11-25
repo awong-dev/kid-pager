@@ -462,8 +462,8 @@ keys are optional lines in `pager.env`, as in the cloud `.env`.
 A Raspberry Pi 4 with 2 GB runs this with room. Only one image is ours, and the home image is the
 same image the cloud runs (same `Dockerfile`), so it is built and tested by the same CI on every
 push. The web static export is baked into the relay image at `/srv/web` and served by FastAPI with
-the three rewrites `web/firebase.json` has (`/chat/view/** → /chat/view/_.html`,
-`/chat/** → /chat/_.html`, `/devices/** → /devices/_.html`), so nginx needs no knowledge of the
+the same rule `web/firebase.json` has (any path that is not a file is `index.html`, the
+client-routed shell; `/_next/` assets are never rewritten), so nginx needs no knowledge of the
 app. Two web builds exist (`NEXT_PUBLIC_BACKEND=firebase|home`); the image carries the home one,
 Firebase Hosting carries the other.
 
