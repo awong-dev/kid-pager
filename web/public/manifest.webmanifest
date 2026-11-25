@@ -2,7 +2,7 @@
   "name": "Pager",
   "short_name": "Pager",
   "description": "School pickup pager -- web app",
-  "start_url": "/chat",
+  "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",
   "theme_color": "#2f5d8a",

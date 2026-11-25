@@ -25,7 +25,7 @@ export interface LocatableDevice extends DeviceDoc {
   canLocate: boolean;
 }
 
-export function useLocatableDevices(): { devices: LocatableDevice[]; loaded: boolean } {
+export function useLocatableDevices(): { devices: LocatableDevice[]; loaded: boolean; failed: boolean } {
   const { me, isFamilyAdmin, isSuper } = useAuth();
   const { familyId } = useFamily();
   const ready = Boolean(me && familyId);
@@ -67,5 +67,10 @@ export function useLocatableDevices(): { devices: LocatableDevice[]; loaded: boo
     return [...byId.values()];
   }, [own, granted, familyWide]);
 
-  return { devices, loaded: grantedLoaded && ownLoaded && (!isFamilyAdmin || familyLoaded) };
+  const failed = Boolean(grantedLive.error || ownLive.error || familyLive.error);
+  return {
+    devices,
+    loaded: grantedLoaded && ownLoaded && (!isFamilyAdmin || familyLoaded),
+    failed,
+  };
 }

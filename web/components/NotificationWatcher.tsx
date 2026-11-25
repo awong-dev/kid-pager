@@ -20,7 +20,7 @@ import {
 import { peerLabel } from "@/lib/names";
 import type { AlertDoc, ConversationDoc } from "@/lib/types";
 
-/** Alerts show the relay-provided `preview` and link to `/family/alerts`. */
+/** Alerts show the relay-provided `preview` and link to `/alerts`. */
 function showForegroundAlertNotification(preview: string): void {
   if (notificationPermission() !== "granted") return;
   const n = new Notification("New family alert", {
@@ -31,7 +31,7 @@ function showForegroundAlertNotification(preview: string): void {
   n.onclick = () => {
     window.focus();
     // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-    window.location.href = "/family/alerts";
+    window.location.href = "/alerts";
   };
 }
 
@@ -136,7 +136,7 @@ export default function NotificationWatcher() {
       docs.forEach((d) => {
         if (initialized && !seen.has(d.id)) {
           const data = d.data;
-          const onAlertsPage = pathnameRef.current?.startsWith("/family/alerts") ?? false;
+          const onAlertsPage = pathnameRef.current?.startsWith("/alerts") ?? false;
           if (document.visibilityState !== "visible" || !onAlertsPage) {
             showForegroundAlertNotification(data.preview);
           }

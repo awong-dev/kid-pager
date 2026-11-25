@@ -1,6 +1,6 @@
 "use client";
 
-/** `/admin/settings`: retention days per data class (bounds mirror `relay/app/store/settings.py`)
+/** `/family/history`: retention days per data class (bounds mirror `relay/app/store/settings.py`)
  * and the last sweep's `settings/meta.lastSweep`. */
 
 import { useEffect, useState } from "react";
@@ -111,7 +111,7 @@ function AdminSettingsInner() {
 
   return (
     <Stack spacing={3} sx={{ maxWidth: 480 }}>
-      <Typography variant="h5">Retention</Typography>
+      <Typography variant="h5">Message history</Typography>
 
       {FIELDS.map((f) => (
         <Stack key={f.key} direction="row" spacing={2} sx={{ alignItems: "center" }}>

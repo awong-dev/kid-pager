@@ -1,5 +1,5 @@
 /** Browser Notifications and push registration; permission is requested only from
- * `/settings/notifications`, never on load. */
+ * `/account/notifications`, never on load. */
 
 import { getToken } from "firebase/messaging";
 import { ApiError, api } from "./api";

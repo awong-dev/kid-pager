@@ -1,6 +1,6 @@
 "use client";
 
-/** `/settings/notifications`: browser push via `registerForPush()` (Web Push or FCM), test button,
+/** `/account/notifications`: browser push via `registerForPush()` (Web Push or FCM), test button,
  * and a family-admin "Family alerts" switch (`PATCH /api/me {notify: {alerts}}`). */
 
 import { useEffect, useState } from "react";

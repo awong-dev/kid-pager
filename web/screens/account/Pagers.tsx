@@ -1,6 +1,6 @@
 "use client";
 
-/** `/settings/devices`: the caller's own pagers (`GET /api/devices`), linking to `/devices/[id]`.
+/** `/account/pagers`: the caller's own pagers (`GET /api/devices`), linking to `/devices/[id]`.
  * If the listing 404s the page shows a plain explanation. */
 
 import { useEffect, useState } from "react";
@@ -60,7 +60,7 @@ function DevicesInner() {
 
   return (
     <Stack spacing={2}>
-      <Typography variant="h5">My devices</Typography>
+      <Typography variant="h5">My pagers</Typography>
 
       {unavailable && (
         <Alert severity="info">

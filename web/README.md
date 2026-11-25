@@ -90,12 +90,15 @@ config's `rewrites()` only matters to `next dev`. `out/` holds `index.html` (plu
 ## Routing
 
 `app/page.tsx` is the only page: a client router (`lib/router.tsx`, History API, no dependency) over
-the route table in `app/routes.tsx`, which has three blocks:
+the route table in `app/routes.tsx`, which has four blocks:
 
 - **PUBLIC** (`/login`, `/setup`): no sign-in, no shell. A path is public only if listed here.
 - **AUTHENTICATED** (the default): each row names its `role` (`member`, `admin` = family admin or
   super, `super`) and screen. The router wraps these once in `RequireAuth` + `AppShell`. An unknown
-  path is authenticated too: guard first, then Not Found inside the shell. `/` redirects to `/chat`.
+  path is authenticated too: guard first, then Not Found inside the shell. `/` is the Home launcher.
+- **REDIRECTS**: old path -> new path (`/family/alerts` -> `/alerts`, `/settings/{notifications,backends,devices}`
+  -> `/account/{notifications,apps,pagers}`, `/admin/settings` -> `/family/history`). `?query` and `#fragment`
+  are kept. The relay still puts `/family/alerts` in push notifications; the redirect covers it.
 - **API** (`/api`, `/webhooks`, `/bridge`, from `lib/apiPaths.ts`): answered by the relay, never rendered here.
 
 Screens live in `screens/` (one default-exported component each, lazy-loaded so each is its own
@@ -107,6 +110,23 @@ strings and `#fragments` are kept as written.
 Serving: Hosting (the repo-root `firebase.json` deploys; `web/firebase.json` previews) sends the API prefixes to the relay and everything
 else without a file to `/index.html`; `next dev` does the same. `lib/__tests__/routes.test.ts`
 fails if `firebase.json` and `lib/apiPaths.ts` disagree, or if a route outside PUBLIC is unguarded.
+
+## Navigation
+
+Three modes: Messages (talk to pagers), Family (administer), System (configure the server); Alerts is
+top-level; account pages hang off the avatar menu. Everything the shell shows comes from one table,
+`components/shell/sections.ts` (`SECTIONS`: link, access, path prefixes, tabs), so a page is added to a
+menu in one place.
+
+- md and up: one app bar with plain links (Messages, Alerts and Family for admins, System for super),
+  the family switcher chip (super), and the account menu. Inside a section its sub-pages show as a
+  scrollable `Tabs` row under the bar.
+- Phones: a slim top bar plus a fixed bottom navigation (Home, Messages, Alerts, Family, System; a
+  plain member gets Home, Messages, My pager). Chat threads hide the bottom bar and show a back arrow;
+  `lib/layout.ts` (`CHROME`, `threadHeightSx`) sizes a thread to fill the rest of the viewport.
+- The phone/desktop split is CSS only, so the static export never flashes the wrong layout.
+- `screens/home/Home.tsx`: the launcher. Its cards are data in `screens/home/cards.ts`; each shows one
+  live status line, reading only what the viewer's role may read (see `relay/firestore.rules`).
 
 ## Sign-in backends
 
@@ -168,7 +188,7 @@ the device is later recovered or replaced.
 device a policy to automatically lock after N minutes of inactivity; **Clear passcode** (button)
 immediately removes the passcode on the device, unlocking it.
 
-Contact requests and the address book are managed on `/family/alerts` (see the table in the
+Contact requests and the address book are managed on `/alerts` (see the table in the
 main checklist below, step 12).
 
 ## Manual checklist (walk through against `docker compose up`)
@@ -184,7 +204,7 @@ incognito window) to act as two different people at once where noted.
    generated for that address, open it). Expect: "ask your admin to add
    you" and the app signs you back out.
 2. **Admin sign-in**: sign in as the admin the same way. Expect: redirected
-   to `/chat`; the Admin menu is visible in the top bar.
+   to `/chat`; System is visible in the top bar.
 3. **Create users**: `/admin/users` -> Create user for two members (e.g.
    `mom`, `student`), one with `--email`, one with `--phone`. Confirm both
    appear in the table.
@@ -288,7 +308,7 @@ incognito window) to act as two different people at once where noted.
 ## Multi-family tenancy checklist
 
 16. **Navigation by role**: sign in as super -> switcher visible, changing it updates
-    `?family=`; as family admin -> Family menu, no Admin menu, no switcher; as member -> neither;
+    `?family=`; as family admin -> Alerts and Family links, no System link, no switcher; as member -> neither;
     a role change on the server followed by reload lands on the new nav after the forced token
     refresh.
 17. **Superadmin Families page and filters**: create a second family, move a member into

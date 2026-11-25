@@ -63,7 +63,8 @@ function HandOffToRelay({ pathname }: { pathname: string }) {
 function Redirect({ to }: { to: string }) {
   const navigate = useNavigate();
   useEffect(() => {
-    navigate.replace(to);
+    // keep ?query and #fragment (an old notification or bookmark link may carry them)
+    navigate.replace(`${to}${window.location.search}${window.location.hash}`);
   }, [navigate, to]);
   return <LoadingScreen />;
 }

@@ -1,6 +1,6 @@
 "use client";
 
-/** `/family/alerts`: inbox of `families/{fam}/alerts`, newest first; "Show handled" adds
+/** `/alerts`: inbox of `families/{fam}/alerts`, newest first; "Show handled" adds
  * `handled`/`dismissed` ones. Each row is an `AlertCard` with its own actions. */
 
 import { useMemo, useState } from "react";

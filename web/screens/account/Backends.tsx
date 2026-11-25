@@ -1,6 +1,6 @@
 "use client";
 
-/** `/settings/backends`: list, add (Google Chat link code) and enable backends. Reads
+/** `/account/apps`: list, add (Google Chat link code) and enable backends. Reads
  * `users/{uid}/backends`; writes use `/api/me/backends*`. A `gchat` backend starts disabled. */
 
 import { useMemo, useState } from "react";
@@ -67,7 +67,7 @@ function BackendsInner() {
 
   return (
     <Stack spacing={2}>
-      <Typography variant="h5">Backends</Typography>
+      <Typography variant="h5">Connected apps</Typography>
       {error && <Alert severity="error">{error}</Alert>}
 
       <Stack spacing={1.5}>
