@@ -10,7 +10,6 @@ import MenuItem from "@mui/material/MenuItem";
 import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
 import TextField from "@mui/material/TextField";
-import Typography from "@mui/material/Typography";
 
 import { ApiError, api } from "@/lib/api";
 import { familyQuery } from "@/lib/family-context";
@@ -59,7 +58,6 @@ export default function FamilySettingsSection({
 
   return (
     <Stack spacing={1}>
-      <Typography variant="subtitle1">Family settings</Typography>
       {error && <Alert severity="error">{error}</Alert>}
       <FormControlLabel
         control={

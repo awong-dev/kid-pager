@@ -91,7 +91,7 @@ describe("new person defaults", () => {
   it("match the relay's per-role defaults and are described in the page's words", () => {
     expect(NEW_PERSON_DEFAULTS.member).toEqual({ out: "people", in: "people" });
     expect(NEW_PERSON_DEFAULTS.admin).toEqual({ out: "open", in: "any" });
-    expect(newPersonLine()).toContain("A new member starts with Who they can message: People");
-    expect(newPersonLine()).toContain("A new admin starts with Open and Anyone");
+    expect(newPersonLine()).toContain('A new member can message "People"');
+    expect(newPersonLine()).toContain('A new admin can message "Open" and can be messaged by "Anyone"');
   });
 });

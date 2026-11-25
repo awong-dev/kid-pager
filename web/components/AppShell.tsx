@@ -150,7 +150,6 @@ function SectionTabs({ viewer, pathname }: { viewer: Viewer; pathname: string })
           value={activeTab?.href ?? false}
           variant="scrollable"
           scrollButtons="auto"
-          allowScrollButtonsMobile
           aria-label="Section pages"
           sx={{ minHeight: CHROME.tabRow }}
         >
@@ -161,7 +160,7 @@ function SectionTabs({ viewer, pathname }: { viewer: Viewer; pathname: string })
               label={t.label}
               component={Link}
               href={t.href}
-              sx={{ minHeight: CHROME.tabRow }}
+              sx={{ minHeight: CHROME.tabRow, minWidth: 0, px: { xs: 1.25, sm: 2 } }}
             />
           ))}
         </Tabs>

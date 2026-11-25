@@ -69,9 +69,9 @@ export function newPersonLine(): string {
   const m = NEW_PERSON_DEFAULTS.member;
   const a = NEW_PERSON_DEFAULTS.admin;
   return (
-    `A new member starts with Who they can message: ${outboundLabel(m.out)} and Who can message them: ` +
-    `${inboundLabel(m.in)} (their own family plus anyone you approve). A new admin starts with ` +
-    `${outboundLabel(a.out)} and ${inboundLabel(a.in)}. There is no family-wide default to change; set it per person.`
+    `A new member can message "${outboundLabel(m.out)}" and can be messaged by "${inboundLabel(m.in)}": ` +
+    `their own family plus anyone you approve. A new admin can message "${outboundLabel(a.out)}" and can be ` +
+    `messaged by "${inboundLabel(a.in)}". There is no family-wide default to change; set the rules per person.`
   );
 }
 
