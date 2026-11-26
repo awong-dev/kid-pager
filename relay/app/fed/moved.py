@@ -10,7 +10,7 @@ import time
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app import alerts as alerts_module
-from app.config import Settings
+from app.config import Settings, valid_base_path
 from app.fed import client as client_mod
 from app.fed import keys
 from app.fed.client import FedClient, FedError, FedHttpError
@@ -42,6 +42,7 @@ class MovedBody(BaseModel):
     pk: str
     host: str
     port: int = Field(ge=1, le=65535)
+    path: str
     ca: str | None = None
 
     @field_validator("fedId")
@@ -65,6 +66,13 @@ class MovedBody(BaseModel):
             raise ValueError("not a host name")
         return v
 
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v: str) -> str:
+        if not valid_base_path(v):
+            raise ValueError("not a base path")
+        return v
+
     @field_validator("ca")
     @classmethod
     def _ca(cls, v: str | None) -> str | None:
@@ -73,16 +81,23 @@ class MovedBody(BaseModel):
         return v or None
 
 
+def _where_of(body: MovedBody) -> str:
+    return fed_links.Remote(
+        fedId=body.fedId, name="", publicKey=body.pk, host=body.host, port=body.port, path=body.path
+    ).where
+
+
 def body_for(settings: Settings, identity: fed_families.FedFamily) -> bytes:
     from app.fed import linking
 
-    host, port = linking.public_host_port(settings)
+    host, port, path = linking.public_address(settings)
     out: dict = {
         "fedId": identity.fedId,
         "epoch": identity.epoch,
         "pk": identity.publicKey,
         "host": host,
         "port": port,
+        "path": path,
     }
     ca = linking.own_ca(settings)
     if ca:
@@ -171,6 +186,7 @@ def handle_moved(
         body.pk == remote.publicKey
         and body.host == remote.host
         and body.port == remote.port
+        and body.path == remote.path
         and (body.ca or None) == (remote.tlsCa or None)
     )
     if used_prev_key:
@@ -186,14 +202,15 @@ def handle_moved(
             epoch=body.epoch,
             host=body.host,
             port=body.port,
+            path=body.path,
             tlsCa=body.ca,
         )
         alerts_module.fed_moved(
             family_id,
             link_id=link.id,
             name=remote.name,
-            old_host=remote.host,
-            new_host=body.host,
+            old_host=remote.where,
+            new_host=_where_of(body),
             epoch=body.epoch,
         )
         updated = fed_links.get(link.id)

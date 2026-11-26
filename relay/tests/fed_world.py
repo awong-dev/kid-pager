@@ -1,5 +1,7 @@
 """Several real relays in one process, each with its own SQLite database and app, joined by an
-`httpx` transport that routes by host name. Needs `DB_BACKEND=sqlite` and `AUTH_BACKEND=home`."""
+`httpx` transport that routes by host name. A relay made with `base_path="/pager"` is mounted
+there the way the home server's nginx does it: the transport answers 404 for any path outside the
+prefix and strips the prefix before the app sees the request, so a client that forgets it fails. Needs `DB_BACKEND=sqlite` and `AUTH_BACKEND=home`."""
 
 from __future__ import annotations
 
@@ -47,7 +49,7 @@ class Hit:
     """One request as the network saw it: where it was sent, and what it claimed to be for."""
 
     method: str
-    path: str
+    path: str  # as sent on the wire: with the peer's prefix, if it has one
     ip: str
     host_header: str
     sni: str | None
@@ -107,11 +109,18 @@ class _Transport(httpx.BaseTransport):
             status, body = self.net.refuse[host]
             hit.status = status
             return httpx.Response(status, json=body)
+        prefix = relay.base_path
+        route = hit.path
+        if prefix:
+            if hit.path != prefix and not hit.path.startswith(prefix + "/"):
+                hit.status = 404  # nginx has no location for it
+                return httpx.Response(404, json={"detail": "Not Found"})
+            route = hit.path[len(prefix) :] or "/"
         headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
         with relay.active():
             resp = relay.http.request(
                 request.method,
-                f"https://{host_header}{hit.path}",
+                f"https://{host_header}{route}",
                 content=request.content,
                 headers=headers,
             )
@@ -137,12 +146,16 @@ class Relay:
         tmp_path: Path,
         *,
         host: str | None = None,
+        base_path: str = "",
         **settings: object,
     ) -> None:
         self.net = net
         self.name = name
         self.host = host or f"{name}.example.org"
-        self.settings = fed_settings(public_base_url=f"https://{self.host}", **settings)
+        self.base_path = base_path
+        self.settings = fed_settings(
+            public_base_url=f"https://{self.host}{base_path}", **settings
+        )
         self.db = sqlitestore.open_client(str(tmp_path / f"{name}.sqlite"))
         self.broker = FakeBrokerClient()
         self._stack = contextlib.ExitStack()

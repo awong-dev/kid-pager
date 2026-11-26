@@ -1,12 +1,24 @@
 // The app's service worker template; `scripts/gen-sw.mjs` writes `public/sw.js` from it.
 // The FIREBASE-BEGIN/END block (FCM compat scripts) is dropped in the home build.
 
+// URL prefix this worker is served under, read at runtime from its own scope (`/pager/` gives
+// `/pager`; `/` gives ""). The relay may host the app under a prefix it picks at startup, so
+// nothing here is baked in at build time. Payload `url`s and asset paths are logical (`/chat`).
+const BASE = new URL(self.registration.scope).pathname.replace(/\/+$/, "");
+function withBase(path) {
+  if (path.charAt(0) !== "/" || path.charAt(1) === "/") return path;
+  // A url that already carries the prefix is left alone.
+  if (BASE && (path === BASE || path.indexOf(BASE + "/") === 0)) return path;
+  return BASE + path;
+}
+const ICON = () => withBase("/icons/icon-192.png");
+
 // Payload values are all strings: `kind` (`message` | `geofence` | `alert`), `convKey`, `id`,
 // `title`, `body`, `url` (path to open). FCM delivers it as `payload.data`; Web Push as the body.
 function showPagerNotification(data) {
   const title = data.title || "Pager";
   const body = data.body || "";
-  const url = data.url || "/chat";
+  const url = withBase(data.url || "/chat");
 
   // The kinds differ only in the `tag` that collapses notifications of one kind.
   let options;
@@ -14,7 +26,7 @@ function showPagerNotification(data) {
     case "message":
       options = {
         body,
-        icon: "/icons/icon-192.png",
+        icon: ICON(),
         tag: data.convKey ? `pager-thread-${data.convKey}` : undefined,
         data: { url },
       };
@@ -22,7 +34,7 @@ function showPagerNotification(data) {
     case "geofence":
       options = {
         body,
-        icon: "/icons/icon-192.png",
+        icon: ICON(),
         tag: data.id ? `pager-geofence-${data.id}` : undefined,
         data: { url },
       };
@@ -30,13 +42,13 @@ function showPagerNotification(data) {
     case "alert":
       options = {
         body,
-        icon: "/icons/icon-192.png",
+        icon: ICON(),
         tag: data.id ? `pager-alert-${data.id}` : undefined,
         data: { url },
       };
       break;
     default:
-      options = { body, icon: "/icons/icon-192.png", data: { url } };
+      options = { body, icon: ICON(), data: { url } };
       break;
   }
 
@@ -86,7 +98,7 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const url = (event.notification.data && event.notification.data.url) || "/chat";
+  const url = withBase((event.notification.data && event.notification.data.url) || "/chat");
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
       // Prefer a client already on the right page.

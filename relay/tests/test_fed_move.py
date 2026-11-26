@@ -228,6 +228,7 @@ def moved_body(ident, host="relay-z.example.org", epoch=None, pk=None):
         "pk": pk or ident.publicKey,
         "host": host,
         "port": 443,
+        "path": "",
     }
 
 

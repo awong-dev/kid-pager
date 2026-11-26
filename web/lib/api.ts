@@ -4,6 +4,7 @@
  */
 
 import { authProvider } from "./auth";
+import { withBase } from "./basePath";
 
 // A policy-gated 403 body is `{reason, message}` (nested under `detail` or bare); `reason` is
 // a machine code and `message` is shown verbatim.
@@ -53,7 +54,7 @@ async function request<T>(
   }
   const init: RequestInit = { method, headers, body: payload };
   if (authProvider.fetchCredentials) init.credentials = authProvider.fetchCredentials;
-  const resp = await fetch(`/api${path}`, init);
+  const resp = await fetch(withBase(`/api${path}`), init);
   const text = await resp.text();
   const data = text ? JSON.parse(text) : undefined;
   if (!resp.ok) {
@@ -74,7 +75,7 @@ async function requestRaw(
   const headers: Record<string, string> = { ...(await authHeader()), ...extraHeaders };
   const init: RequestInit = { method, headers, body };
   if (authProvider.fetchCredentials) init.credentials = authProvider.fetchCredentials;
-  const resp = await fetch(`/api${path}`, init);
+  const resp = await fetch(withBase(`/api${path}`), init);
   if (!resp.ok) {
     const text = await resp.text();
     let data: unknown;

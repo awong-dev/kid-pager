@@ -30,11 +30,11 @@ def identity() -> FedFamily:
     return FedFamily(familyId="famA", fedId="f_aaaaaaaaaaaaaaaaaaaa", publicKey=public, privateKey=private)
 
 
-def link(host="peer.example.org", port=443, ca=None) -> FedLink:
+def link(host="peer.example.org", port=443, ca=None, path="") -> FedLink:
     return FedLink(
         id=f"famA_{REMOTE}",
         familyId="famA",
-        remote=Remote(fedId=REMOTE, name="B", publicKey=keys.generate()[1], host=host, port=port, tlsCa=ca),
+        remote=Remote(fedId=REMOTE, name="B", publicKey=keys.generate()[1], host=host, port=port, path=path, tlsCa=ca),
     )
 
 
@@ -334,3 +334,21 @@ def test_a_real_tls_handshake_that_does_not_verify_is_refused_as_tls(tls_server,
         with pytest.raises(client_mod.FedTransportError) as exc:
             c.directory(identity(), link(host="peer.test", port=port, ca=cas[name]))
         assert exc.value.code == "tls"
+
+
+def test_the_url_carries_the_peers_path_but_the_signature_covers_the_bare_route():
+    from app.fed import sign
+
+    rec = Recorder()
+    c = client_mod.FedClient(transport=rec, policy=policy("93.184.216.34"))
+    ident = identity()
+    c.post_inbox(ident, link(path="/apps/pager"), [])
+    (req,) = rec.requests
+    assert req.url.path == "/apps/pager/fed/v1/inbox"
+    assert req.headers["host"] == "peer.example.org" and req.url.host == "93.184.216.34"
+    parsed = sign.parse_headers(req.headers)
+    pub = keys.public_from_b64(ident.publicKey)
+    body = req.content
+    sign.verify(pub, parsed, "POST", "/fed/v1/inbox", body)
+    with pytest.raises(sign.SignatureError):
+        sign.verify(pub, parsed, "POST", "/apps/pager/fed/v1/inbox", body)

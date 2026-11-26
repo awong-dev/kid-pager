@@ -17,6 +17,8 @@ export interface FedRemote {
   name: string;
   host: string;
   port: number;
+  /** URL prefix the relay is mounted under: "" at the root, else e.g. "/kid-pager". */
+  path: string;
   fingerprint: string;
 }
 
@@ -102,6 +104,11 @@ export const listAdminFedLinks = () => api.get<FedAdminLink[]>("/admin/fed/links
 export const suspendAdminFedLink = (id: string) => api.post<FedAdminLink>(`/admin/fed/links/${seg(id)}/suspend`);
 export const resumeAdminFedLink = (id: string) => api.post<FedAdminLink>(`/admin/fed/links/${seg(id)}/resume`);
 export const deleteAdminFedLink = (id: string) => api.del<unknown>(`/admin/fed/links/${seg(id)}`);
+
+/** `host[:port]path` for a linked server; the port is shown only when it is not 443. */
+export function formatFedServer(host: string, port?: number | null, path?: string | null): string {
+  return `${host}${port && port !== 443 ? `:${port}` : ""}${path ?? ""}`;
+}
 
 /** A fingerprint for a list: the first 19 characters (e.g. four groups of
  * four) and an ellipsis when it is longer. */
@@ -229,6 +236,7 @@ export interface ReauthConfirm {
   newFingerprint: string;
   newHost: string;
   newPort: number;
+  newPath: string;
 }
 
 /** `{"detail": {"code": "reauth_confirm", ...}}` -> the confirmation data, else null. */

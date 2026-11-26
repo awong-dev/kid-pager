@@ -59,6 +59,7 @@ class RemoteOut(BaseModel):
     name: str
     host: str
     port: int
+    path: str  # where the relay is mounted on that host: "" or "/pager"
     fingerprint: str  # of the remote's public key, for the admins to compare out of band
 
 
@@ -100,6 +101,7 @@ def link_out(link: fed_links.FedLink, pending: dict[str, int] | None = None) -> 
             name=link.remote.name,
             host=link.remote.host,
             port=link.remote.port,
+            path=link.remote.path,
             fingerprint=keys.fingerprint(link.remote.publicKey),
         ),
         state=link.state,
@@ -331,6 +333,7 @@ def accept_invite(
                 "newFingerprint": keys.fingerprint(exc.blob.pk),
                 "newHost": exc.blob.host,
                 "newPort": exc.blob.port,
+                "newPath": exc.blob.path,
             },
         ) from exc
     except linking.LinkingError as exc:

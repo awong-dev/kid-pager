@@ -4,13 +4,15 @@
 import { getToken } from "firebase/messaging";
 import { ApiError, api } from "./api";
 import { AUTH_BACKEND } from "./auth";
+import { withBase } from "./basePath";
 import { getMessagingIfSupported } from "./firebase-messaging";
 import { type PushPath, ensurePushSubscription, sameKey, urlBase64ToBytes } from "./webpush";
 
 export type { PushPath } from "./webpush";
 
 /** The app's one service worker (`web/sw/sw.template.js`). */
-const SW_PATH = "/sw.js";
+const SW_PATH = "/sw.js"; // logical; `swUrl()` adds the runtime prefix
+const swUrl = (): string => withBase(SW_PATH);
 
 export function notificationsSupported(): boolean {
   return typeof window !== "undefined" && "Notification" in window;
@@ -49,7 +51,7 @@ export async function registerForPush(): Promise<PushPath | null> {
   const permission = await Notification.requestPermission();
   if (permission !== "granted") return null;
 
-  await navigator.serviceWorker.register(SW_PATH);
+  await navigator.serviceWorker.register(swUrl(), { scope: withBase("/") });
   const registration = await navigator.serviceWorker.ready;
   if (!("pushManager" in registration)) return null;
   return ensurePushSubscription({
@@ -73,7 +75,7 @@ export async function currentPushPath(): Promise<{ path: PushPath | null; subscr
   if (!notificationsSupported() || !("serviceWorker" in navigator) || !path) {
     return { path, subscribed: false };
   }
-  const registration = await navigator.serviceWorker.getRegistration(SW_PATH);
+  const registration = await navigator.serviceWorker.getRegistration(swUrl());
   const sub = registration ? await registration.pushManager.getSubscription() : null;
   if (!sub) return { path, subscribed: false };
   const isRelayKey = vapidKey !== null && sameKey(sub.options.applicationServerKey, urlBase64ToBytes(vapidKey));
@@ -89,7 +91,7 @@ async function showNotification(
 ): Promise<void> {
   let registration: ServiceWorkerRegistration | undefined;
   if ("serviceWorker" in navigator) {
-    registration = await navigator.serviceWorker.getRegistration(SW_PATH);
+    registration = await navigator.serviceWorker.getRegistration(swUrl());
   }
   if (registration) {
     await registration.showNotification(title, { ...options, data: { url } });
@@ -99,7 +101,7 @@ async function showNotification(
   n.onclick = () => {
     window.focus();
     // Full navigation, not `useRouter()` -- this runs outside React.
-    window.location.href = url;
+    window.location.href = withBase(url);
   };
 }
 
@@ -112,7 +114,7 @@ export async function showLocalTestNotification(): Promise<void> {
     "Pager test notification",
     {
       body: "If you can see this, browser notifications are working.",
-      icon: "/icons/icon-192.png",
+      icon: withBase("/icons/icon-192.png"),
     },
     "/chat"
   );
@@ -130,7 +132,7 @@ export async function showForegroundMessageNotification(
     `New message from ${label ?? `@${alias}`}`,
     {
       body: preview,
-      icon: "/icons/icon-192.png",
+      icon: withBase("/icons/icon-192.png"),
       tag: `pager-thread-${alias}`,
     },
     `/chat/${encodeURIComponent(alias)}`

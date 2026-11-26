@@ -696,7 +696,7 @@ class Routing:
                 fed_link = fed_backend_link(recipient_uid, str(b.config["remoteFedId"]))
                 if fed_link is not None:
                     entry["server"] = fed_link.remote.name
-                    entry["serverHost"] = fed_link.remote.host
+                    entry["serverHost"] = fed_link.remote.where
             deliveries[b.id] = entry
 
         msg = messages_store.create_message(

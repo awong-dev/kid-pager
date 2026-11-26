@@ -306,7 +306,7 @@ def test_reauth_code_expires_and_works_once(restored):
         "code": blob.code,
         "to": blob.fid,
         "re": 1,
-        "from": {"fedId": fed_b, "pk": stranger_public, "name": "X", "host": "relay-y.example.org", "port": 443, "epoch": 5},
+        "from": {"fedId": fed_b, "pk": stranger_public, "name": "X", "host": "relay-y.example.org", "port": 443, "path": "", "epoch": 5},
     }
     raw = json.dumps(body).encode()
     headers = sign.sign(keys.private_from_b64(stranger_private), fed_b, blob.fid, "POST", "/fed/v1/link", raw)
@@ -341,7 +341,7 @@ def test_a_mismatched_signature_in_a_reauth_request_is_refused(restored):
         "code": blob.code,
         "to": blob.fid,
         "re": 1,
-        "from": {"fedId": fed_b, "pk": pk, "name": "B", "host": "relay-y.example.org", "port": 443},
+        "from": {"fedId": fed_b, "pk": pk, "name": "B", "host": "relay-y.example.org", "port": 443, "path": ""},
     }
     raw = json.dumps(body).encode()
     other = keys.generate()[0]  # not the key it claims: no proof of possession

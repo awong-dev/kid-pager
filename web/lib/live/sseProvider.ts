@@ -6,6 +6,7 @@
 import { Bytes, Timestamp } from "firebase/firestore";
 
 import { ApiError, api } from "../api";
+import { withBase } from "../basePath";
 import { type LiveDoc, type LiveProvider, type LiveQuery, isDocQuery } from "./types";
 
 interface WireDoc {
@@ -138,7 +139,7 @@ class LiveHub {
   private ensureStream(): void {
     if (this.es || this.recreateTimer) return;
     this.streamId = crypto.randomUUID();
-    const es = new EventSource(`/api/live?stream=${this.streamId}`);
+    const es = new EventSource(withBase(`/api/live?stream=${this.streamId}`));
     this.es = es;
     es.onopen = () => {
       this.open = true;

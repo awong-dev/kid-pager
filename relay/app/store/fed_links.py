@@ -13,6 +13,7 @@ from google.api_core.exceptions import AlreadyExists
 from google.cloud.firestore import SERVER_TIMESTAMP, FieldFilter, Transaction
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.config import valid_base_path
 from app.db.firestore import get_db, run_transaction
 
 LinkState = Literal["active", "suspended", "reauth"]
@@ -60,8 +61,22 @@ class Remote(BaseModel):
     epoch: int = 0
     host: str
     port: int = 443
+    # where the peer's relay is mounted (`""` at the root, `/pager`); see `config.valid_base_path`
+    path: str = ""
     tlsCa: str | None = None
     prevPublicKey: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v: str) -> str:
+        if not valid_base_path(v):
+            raise ValueError("not a base path")
+        return v
+
+    @property
+    def where(self) -> str:
+        """Where the family lives, for people to read: `host`, `host:8443`, `host/pager`."""
+        return f"{self.host}{'' if self.port == 443 else f':{self.port}'}{self.path}"
 
 
 class Announce(BaseModel):

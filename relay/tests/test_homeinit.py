@@ -57,7 +57,7 @@ def test_first_run_creates_the_layout(tmp_path: Path):
 
     relay_env = homeinit._read_env(tmp_path / "relay.env")
     assert relay_env == {
-        "PUBLIC_BASE_URL": "https://pager.example.org",
+        "PUBLIC_BASE_URL": "https://pager.example.org/kid-pager",
         "BROKER_HOST": "pager.example.org",
         "BROKER_CA_PEM_FILE": str(tmp_path / "certs/ca/ca.crt"),
         "SORACOM_BEAM_DESTINATION": "mqtts://pager.example.org:8883",
@@ -150,3 +150,54 @@ def test_the_relay_reads_the_ca_from_broker_ca_pem_file(tmp_path: Path, monkeypa
     assert settings.broker_host == "pager.example.org"
     monkeypatch.setenv("BROKER_CA_PEM", "inline")
     assert Settings.from_env().broker_ca_pem == "inline"
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [("", "/kid-pager"), ("  ", "/kid-pager"), ("/", ""), ("/pager", "/pager"), ("/pager/", "/pager"), ("/apps/pager_2-x", "/apps/pager_2-x")],
+)
+def test_normalize_base_path(raw: str, want: str):
+    assert homeinit.normalize_base_path(raw) == want
+
+
+@pytest.mark.parametrize(
+    "raw", ["pager", "//pager", "/a//b", "/pa.ger", "/pager?x=1", "/pa ger", "/../x", "/pager//", "/é"]
+)
+def test_bad_base_path_is_an_init_error(tmp_path: Path, raw: str):
+    with pytest.raises(homeinit.InitError, match="PAGER_PATH"):
+        homeinit.run(tmp_path, "pager.example.org", "selfsigned", raw)
+    assert not (tmp_path / "relay.env").exists()
+
+
+def test_base_path_is_written_into_public_base_url(tmp_path: Path):
+    homeinit.run(tmp_path, "pager.example.org", "selfsigned", "/apps/pager/")
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert env["PUBLIC_BASE_URL"] == "https://pager.example.org/apps/pager"
+    # Only the web URL carries the prefix; the broker is reached by host.
+    assert env["BROKER_HOST"] == "pager.example.org"
+    assert env["SORACOM_BEAM_DESTINATION"] == "mqtts://pager.example.org:8883"
+    assert Settings.base_path.fget(  # type: ignore[attr-defined]
+        Settings(
+            broker_api_url="", broker_api_key=None, broker_api_secret=None, webhook_key="",
+            dev_mode=False, google_cloud_project=None, firestore_emulator_host=None,
+            firebase_auth_emulator_host=None, public_base_url=env["PUBLIC_BASE_URL"],
+        )
+    ) == "/apps/pager"
+
+
+def test_main_reads_pager_path_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PAGER_HOST", "pager.example.org")
+    monkeypatch.setenv("TLS_MODE", "selfsigned")
+    monkeypatch.setenv("PAGER_PATH", "/pager")
+    assert homeinit.main(["--data", str(tmp_path)]) == 0
+    assert homeinit._read_env(tmp_path / "relay.env")["PUBLIC_BASE_URL"] == "https://pager.example.org/pager"
+    monkeypatch.setenv("PAGER_PATH", "/bad.path")
+    assert homeinit.main(["--data", str(tmp_path / "x")]) == 1
+    monkeypatch.setenv("PAGER_PATH", "/")
+    assert homeinit.main(["--data", str(tmp_path)]) == 0
+    assert homeinit._read_env(tmp_path / "relay.env")["PUBLIC_BASE_URL"] == "https://pager.example.org"
+    monkeypatch.delenv("PAGER_PATH")
+    assert homeinit.main(["--data", str(tmp_path)]) == 0
+    assert (
+        homeinit._read_env(tmp_path / "relay.env")["PUBLIC_BASE_URL"] == "https://pager.example.org/kid-pager"
+    )

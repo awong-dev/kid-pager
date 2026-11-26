@@ -12,6 +12,14 @@ map $ssl_server_name $pager_le_privkey {
     default /data/certs/letsencrypt/live/pager/privkey.pem;
 }
 
+# PAGER_PATH (a prefix such as /kid-pager, or empty for the root) is where the app is mounted. $pager_uri is the
+# request with the prefix removed, exactly as the client encoded it and with its query string
+# (a rewrite would decode %2F); it is empty for a request outside the prefix.
+map $request_uri $pager_uri {
+    default "";
+    "~^${PAGER_PATH}(?<pager_rest>/.*)$" $pager_rest;
+}
+
 server {
     listen 80;
     listen [::]:80;
@@ -35,21 +43,31 @@ server {
     include /etc/nginx/snippets/tls.conf;
 
     client_max_body_size 16m;
+    # Redirects stay relative, so they survive a front proxy on another name or port.
+    absolute_redirect off;
+
+    # All no-ops when PAGER_PATH is empty, where nothing is outside the prefix: the bare prefix
+    # gets its slash, the root leads to the app, and anything else outside is refused.
+    rewrite ^${PAGER_PATH}$ ${PAGER_PATH}/ permanent;
+    if ($pager_uri = "") {
+        rewrite ^/$ ${PAGER_PATH}/ redirect;
+        return 404;
+    }
 
     # Scheduled-job routes answer only the compose network.
-    location /internal/ {
+    location ${PAGER_PATH}/internal/ {
         return 404;
     }
 
     # SSE stream: no buffering, held open.
-    location /api/live {
+    location ${PAGER_PATH}/api/live {
         include /etc/nginx/snippets/proxy.conf;
         proxy_buffering off;
         proxy_cache off;
         proxy_read_timeout 1h;
     }
 
-    location / {
+    location ${PAGER_PATH}/ {
         include /etc/nginx/snippets/proxy.conf;
     }
 }

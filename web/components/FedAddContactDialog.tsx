@@ -22,6 +22,7 @@ import {
   getFedDirectory,
   type FedLink,
   type FedDirectoryItem,
+  formatFedServer,
 } from "@/lib/federation";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
@@ -126,7 +127,7 @@ export default function FedAddContactDialog({
           <TextField select label="Family" value={peerId} onChange={(e) => pickPeer(e.target.value)} fullWidth>
             {active.map((l) => (
               <MenuItem key={l.id} value={l.id}>
-                {l.remote.name} ({l.remote.host})
+                {l.remote.name} ({formatFedServer(l.remote.host, l.remote.port, l.remote.path)})
               </MenuItem>
             ))}
           </TextField>

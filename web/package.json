@@ -3,8 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "predev": "node scripts/gen-manifest.mjs",
     "dev": "next dev",
-    "prebuild": "node scripts/gen-sw.mjs",
+    "prebuild": "node scripts/gen-sw.mjs && node scripts/gen-manifest.mjs build",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",

@@ -40,6 +40,7 @@ import {
   suspendFedLink,
   type FedLink,
   type FedThisFamily,
+  formatFedServer,
 } from "@/lib/federation";
 import { useFullScreenDialog } from "@/lib/useFullScreenDialog";
 
@@ -247,7 +248,7 @@ export default function FedLinksSection({
         {linked && (
           <Alert severity="success" onClose={() => setLinked(null)}>
             <Typography variant="body2">
-              Linked to {linked.remote.name} ({linked.remote.host}).
+              Linked to {linked.remote.name} ({formatFedServer(linked.remote.host, linked.remote.port, linked.remote.path)}).
             </Typography>
             <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
               Their key: <span style={{ fontFamily: "monospace" }}>{linked.remote.fingerprint}</span>
@@ -282,7 +283,7 @@ export default function FedLinksSection({
               {l.announcePending && <Chip size="small" variant="outlined" label="moving..." />}
             </Stack>
             <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>
-              {l.remote.host} &middot; {shortFingerprint(l.remote.fingerprint)}
+              {formatFedServer(l.remote.host, l.remote.port, l.remote.path)} &middot; {shortFingerprint(l.remote.fingerprint)}
             </Typography>
             {reauth && (
               <Typography variant="body2">
@@ -369,8 +370,8 @@ export default function FedLinksSection({
           {confirmReauth && (
             <Stack spacing={1.5} sx={{ mt: 1 }}>
               <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
-                Server: {confirmReauth.link.remote.host} &rarr; {confirmReauth.newHost}
-                {confirmReauth.newPort ? `:${confirmReauth.newPort}` : ""}
+                Server: {formatFedServer(confirmReauth.link.remote.host, confirmReauth.link.remote.port, confirmReauth.link.remote.path)}{" "}
+                &rarr; {formatFedServer(confirmReauth.newHost, confirmReauth.newPort, confirmReauth.newPath)}
               </Typography>
               <Typography variant="body2" sx={{ overflowWrap: "anywhere" }}>
                 Old fingerprint:{" "}

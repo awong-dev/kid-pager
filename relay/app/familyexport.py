@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from firebase_admin import auth as fb_auth
 from google.cloud.firestore import FieldFilter, transactional
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app import authn_home, datamap
 from app.config import Settings, auth_backend
@@ -904,6 +904,11 @@ def _scan(rows: Iterable[Row]) -> _Scan:
         if len(parts) == 2 and coll == "fedFamilies":
             sc.fed_family = data
         elif len(parts) == 2 and coll == "fedLinks":
+            try:
+                # the peer's coordinates (host, port, path) are used to build URLs: check them now
+                fed_links_store.Remote.model_validate(data.get("remote"))
+            except ValidationError as exc:
+                raise CorruptFile(f"{path}: bad remote ({exc.error_count()} errors)") from exc
             sc.fed_links += 1
         if (
             coll in datamap.BY_NAME

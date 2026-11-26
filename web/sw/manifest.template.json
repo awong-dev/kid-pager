@@ -1,0 +1,16 @@
+{
+  "name": "Pager",
+  "short_name": "Pager",
+  "description": "School pickup pager -- web app",
+  "start_url": "/__PAGER_BASE_PATH__/",
+  "scope": "/__PAGER_BASE_PATH__/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0b3c6f",
+  "icons": [
+    { "src": "/__PAGER_BASE_PATH__/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/__PAGER_BASE_PATH__/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/__PAGER_BASE_PATH__/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/__PAGER_BASE_PATH__/logo.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

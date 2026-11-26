@@ -79,7 +79,7 @@ def _sign_in(request: Request, response: Response, user: User) -> SignedIn:
         SESSION_COOKIE,
         token,
         max_age=int(authn_home.SESSION_IDLE.total_seconds()),
-        path="/",
+        path=request.app.state.settings.base_path or "/",
         secure=True,
         httponly=True,
         samesite="lax",
@@ -139,7 +139,13 @@ def logout(
 ) -> dict[str, bool]:
     token = creds.credentials if creds is not None else request.cookies.get(SESSION_COOKIE, "")
     authn_home.delete_session(token)
-    response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path=request.app.state.settings.base_path or "/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
     return {"ok": True}
 
 

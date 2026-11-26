@@ -4,14 +4,28 @@ WEBHOOK_KEY defaults to "" so a misconfigured deployment fails closed."""
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 DbBackend = Literal["firestore", "sqlite"]
 AuthBackend = Literal["firebase", "home"]
 SchedulerMode = Literal["none", "internal"]
 BrokerMode = Literal["rest", "mqtt"]
 FwCache = Literal["gcs", "local"]
+
+
+_BASE_PATH_RE = re.compile(r"(/[A-Za-z0-9_-]+)*")
+BASE_PATH_MAX = 200
+
+
+def valid_base_path(value: str) -> bool:
+    """`""` (served at the root) or `/a/b`: letters, digits, `-` and `_` in each segment, no
+    trailing slash, no dots, query, fragment, `%` or whitespace. The one rule for `PAGER_PATH` and
+    for a federation peer's path, which is appended to a URL whose host is an address the relay
+    already checked."""
+    return len(value) <= BASE_PATH_MAX and _BASE_PATH_RE.fullmatch(value) is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +117,13 @@ class Settings:
         from app.firmware import bucket_name
 
         return bucket_name(self.fw_bucket_base)
+
+    @property
+    def base_path(self) -> str:
+        """The path component of `public_base_url` without a trailing slash (`/pager`), `""` when
+        the app is served at the root or the URL is unset. nginx strips it before proxying, so
+        routes do not use it; it is for URLs handed out and for the static web export."""
+        return urlsplit(self.public_base_url or "").path.rstrip("/")
 
     @classmethod
     def from_env(cls) -> Settings:

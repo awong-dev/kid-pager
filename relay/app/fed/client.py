@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from app.config import valid_base_path
 from app.fed import addr, sign
 from app.fed.keys import private_from_b64
 from app.store.fed_families import FedFamily
@@ -97,9 +98,11 @@ def _ssl_cause(exc: BaseException | None) -> bool:
     return False
 
 
-def _ip_url(ip: str, port: int, path: str) -> str:
+def _ip_url(ip: str, port: int, base_path: str, route: str) -> str:
+    """`https://<ip>:<port><base_path><route>`. `base_path` (the peer's mount point, validated by
+    `call`) and `route` only ever add to the path of a URL whose authority is the checked IP."""
     host = f"[{ip}]" if ":" in ip else ip
-    return f"https://{host}:{port}{path}"
+    return f"https://{host}:{port}{base_path}{route}"
 
 
 class FedClient:
@@ -120,6 +123,7 @@ class FedClient:
         *,
         host: str,
         port: int = 443,
+        base_path: str = "",
         tls_ca: str | None = None,
         body: bytes = b"",
         sender: FedFamily | None = None,
@@ -128,7 +132,11 @@ class FedClient:
     ) -> Reply:
         """One request. `sender` (a family identity) and `receiver` (the remote fedId) sign it;
         without them it goes unsigned. `FedTransportError` when no response arrives or the host
-        is not allowed; the caller judges the status (this never raises for 4xx/5xx)."""
+        is not allowed; the caller judges the status (this never raises for 4xx/5xx).
+        `path` is the route (`/fed/v1/...`) as the peer's relay sees it, and is what is signed;
+        `base_path` is the peer's mount prefix, which only the URL carries (its proxy strips it)."""
+        if not valid_base_path(base_path) or not path.startswith("/fed/"):
+            raise FedTransportError("address_not_allowed", "unusable path")
         try:
             addresses = addr.check_host(host, port, self._policy)
         except addr.AddressNotAllowed as exc:
@@ -153,7 +161,7 @@ class FedClient:
         last: FedTransportError | None = None
         for ip in addresses:
             try:
-                return self._request_once(method, ip, port, path, headers, body, host, verify)
+                return self._request_once(method, ip, port, base_path, path, headers, body, host, verify)
             except FedTransportError as exc:
                 if exc.code != "unreachable":
                     raise
@@ -166,6 +174,7 @@ class FedClient:
         method: str,
         ip: str,
         port: int,
+        base_path: str,
         path: str,
         headers: dict[str, str],
         body: bytes,
@@ -179,7 +188,7 @@ class FedClient:
                 client = httpx.Client(verify=verify, timeout=TIMEOUT_S)
             with client, client.stream(
                 method,
-                _ip_url(ip, port, path),
+                _ip_url(ip, port, base_path, path),
                 content=body or None,
                 headers=headers,
                 follow_redirects=False,
@@ -220,6 +229,7 @@ class FedClient:
             path,
             host=link.remote.host,
             port=link.remote.port,
+            base_path=link.remote.path,
             tls_ca=link.remote.tlsCa,
             body=body,
             sender=identity,

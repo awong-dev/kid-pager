@@ -757,7 +757,7 @@ def _fed_fields(ext: users_store.User) -> dict[str, object]:
         "fed": ContactFedOut(
             linkId=link.id if link else None,
             name=link.remote.name if link else None,
-            host=link.remote.host if link else None,
+            host=link.remote.where if link else None,
             rid=str(rid) if rid else None,
         ),
         "sendable": reason is None,

@@ -68,6 +68,7 @@ def test_invite_then_link_makes_a_link_on_both_sides(world, net):
         "name": "The Alphas",
         "host": "relay-x.example.org",
         "port": 443,
+        "path": "",
         "fingerprint": keys.fingerprint(ident_a.publicKey),
     }
     assert on_x["remote"] == {
@@ -75,6 +76,7 @@ def test_invite_then_link_makes_a_link_on_both_sides(world, net):
         "name": "The Betas",
         "host": "relay-y.example.org",
         "port": 443,
+        "path": "",
         "fingerprint": keys.fingerprint(ident_b.publicKey),
     }
     for out in (on_x, on_y):
@@ -107,7 +109,7 @@ def test_the_invite_blob_describes_the_issuer(world):
         ident.publicKey,
         "The Alphas",
     )
-    assert out.json()["invite"].startswith("kpfed2.")
+    assert out.json()["invite"].startswith("kpfed3.")
     assert out.json()["expiresAt"] > 0 and blob.ca is None
 
 
@@ -233,10 +235,10 @@ def test_a_family_has_at_most_16_links(world):
 
 def test_a_malformed_invite_is_a_400(world):
     x, _ = world
-    for bad in ("", "nonsense", "kpfed1.abcd", "kpfed2.!!!", "kpfed2." + "A" * 20):
+    for bad in ("", "nonsense", "kpfed1.abcd", "kpfed3.!!!", "kpfed3." + "A" * 20):
         resp = x.post(f"{FED}/links", "adm_a", {"invite": bad or " "})
         assert resp.status_code in (400, 422), bad
-    assert x.post(f"{FED}/links", "adm_a", {"invite": "kpfed2.e30"}).status_code == 400
+    assert x.post(f"{FED}/links", "adm_a", {"invite": "kpfed3.e30"}).status_code == 400
 
 
 def test_link_transport_errors_are_reported_without_the_other_relays_words(world, net):
@@ -290,6 +292,7 @@ def link_request(x, y, *, code, to, who, signer=None, ts=None, headers_from=None
             "name": "Mallory",
             "host": "relay-y.example.org",
             "port": 443,
+            "path": "",
         },
     }
     raw = json.dumps(body).encode()

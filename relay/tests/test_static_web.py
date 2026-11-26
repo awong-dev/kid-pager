@@ -142,3 +142,62 @@ def test_create_app_mounts_only_when_web_root_exists(
     with TestClient(app) as c:
         assert c.get("/family").text == "INDEX"
         assert c.get("/healthz").status_code in (200, 503)
+
+
+PH = static_web.BASE_PATH_PLACEHOLDER
+TEMPLATED = {
+    **FILES,
+    "index.html": f'<link href="{PH}/_next/a.css"><base href="{PH}/">',
+    "sw.js": f'importScripts("{PH}/x.js")',
+    "manifest.webmanifest": f'{{"start_url":"{PH}/"}}',
+    "_next/static/blob.bin": PH,
+}
+
+
+def _client(root: Path, base_path: str) -> TestClient:
+    app = FastAPI()
+    static_web.mount(app, root, base_path)
+    return TestClient(app)
+
+
+def test_placeholder_is_rendered_with_a_prefix(tmp_path: Path):
+    c = _client(build(tmp_path / "web", TEMPLATED), "/apps/pager")
+    assert c.get("/").text == '<link href="/apps/pager/_next/a.css"><base href="/apps/pager/">'
+    assert c.get("/sw.js").text == 'importScripts("/apps/pager/x.js")'
+    assert c.get("/manifest.webmanifest").text == '{"start_url":"/apps/pager/"}'
+    # Not a text extension: copied unchanged.
+    assert c.get("/_next/static/blob.bin").text == PH
+    assert PH in (tmp_path / "web" / "index.html").read_text()  # the original is untouched
+
+
+def test_placeholder_is_removed_with_an_empty_prefix(tmp_path: Path):
+    c = _client(build(tmp_path / "web", TEMPLATED), "")
+    assert c.get("/").text == '<link href="/_next/a.css"><base href="/">'
+
+
+def test_root_is_served_as_is_without_a_placeholder(root: Path):
+    assert static_web.render(root, "/pager") == root
+
+
+def test_render_makes_a_separate_directory(tmp_path: Path):
+    src = build(tmp_path / "web", TEMPLATED)
+    out = static_web.render(src, "/p")
+    assert out != src and (out / "_next/static/x.js").read_text() == "JS"
+
+
+def test_service_worker_allowed_follows_the_prefix(tmp_path: Path):
+    c = _client(build(tmp_path / "web", TEMPLATED), "/pager")
+    for name in ("sw.js", "firebase-messaging-sw.js"):
+        assert c.get(f"/{name}").headers["Service-Worker-Allowed"] == "/pager/"
+
+
+def test_create_app_renders_from_public_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(static_web, "WEB_ROOT", build(tmp_path / "web", TEMPLATED))
+    settings = make_settings(public_base_url="https://h.example/pager")
+    assert settings.base_path == "/pager"
+    app = create_app(settings=settings, broker_client=FakeBrokerClient())
+    with TestClient(app) as c:
+        assert "/pager/_next/a.css" in c.get("/login").text
+        assert c.get("/sw.js").headers["Service-Worker-Allowed"] == "/pager/"

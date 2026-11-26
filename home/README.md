@@ -46,6 +46,51 @@ With the EMQX override, EMQX port 1883 is also not published. Its dashboard
 and API (port 18083) are published only on `127.0.0.1`. The dashboard user is
 `admin` and its password is `BROKER_ADMIN_PASSWORD` in `data/secrets.env`.
 
+## Sharing the web ports with another web server
+
+The app is served under a path, `https://PAGER_HOST/kid-pager/` by default,
+so it can sit beside other sites. If this machine already serves other sites
+on ports 80 and 443, forward that path from your existing web server. Port 8883 is not shared: the pager still
+connects to this stack directly.
+
+1. In `pager.env`, set `PAGER_HOST` to the name of your existing site. To use
+   a path other than `/kid-pager`, set `PAGER_PATH` (letters, digits, `-` and
+   `_`; more than one segment is fine).
+2. In `home/.env`, move this stack's web ports out of the way:
+
+   ```sh
+   PAGER_HTTPS_BIND=127.0.0.1:8443
+   PAGER_HTTP_BIND=127.0.0.1:8080
+   ```
+
+3. Keep `TLS_MODE=selfsigned`. Your existing web server holds the public
+   certificate; this stack's certificate only covers the hop between the two.
+4. On your existing web server, send the path to this stack **without
+   removing the prefix**. For nginx:
+
+   ```nginx
+   location /kid-pager/ {
+       proxy_pass https://127.0.0.1:8443;   # no trailing slash: the path is kept
+       proxy_http_version 1.1;
+       proxy_set_header Host $host;
+       proxy_buffering off;                 # the live-update stream
+       proxy_read_timeout 1h;
+   }
+   ```
+
+5. Start the stack and open `https://example.org/kid-pager/`. The bridge phone's
+   relay URL is `https://example.org/kid-pager`.
+
+On a machine of its own, the stack redirects `https://PAGER_HOST/` to the app
+and answers 404 for anything else outside the path. `PAGER_PATH=/` serves the
+app at the root instead. Choose `PAGER_PATH`
+before you provision pagers: the URLs a pager is given include it, and
+changing it later also signs everyone out.
+
+One thing changes behind another web server: every request arrives from that
+server's address, so the relay's per-visitor login rate limit counts all
+visitors as one.
+
 ## TLS modes
 
 Set `TLS_MODE` in `pager.env`. It controls the certificate on port 443 only.
@@ -92,13 +137,14 @@ installed. If you have a bridge phone, Let's Encrypt is the recommended mode.
    On every start the one-shot `init` service creates any secret or
    certificate missing from `data/`, then exits. It never changes one that
    already exists.
-5. Open `https://PAGER_HOST/`. Because there are no users yet, you get the
+5. Open `https://PAGER_HOST/kid-pager/` (`https://PAGER_HOST/` redirects
+   there). Because there are no users yet, you get the
    first-run page. Create the first admin there.
 
 Firmware: by default the relay uses the project's public firmware bucket.
 Set `FW_INDEX_URL` and `FW_BUCKET_BASE` in `home/.env` to change that.
 Deltas the relay makes on demand are stored in `data/fw-cache/` and served at
-`https://PAGER_HOST/fw-cache/...`.
+`https://PAGER_HOST/kid-pager/fw-cache/...`.
 
 `PAGER_DATA_DIR` and `PAGER_ENV_FILE` (set in the shell or in `home/.env`)
 move `data/` and `pager.env` somewhere else.
@@ -111,7 +157,7 @@ move `data/` and `pager.env` somewhere else.
    wording varies by Android version. With `letsencrypt`, skip this.
 2. Pair the phone as described in
    [`bridge-android/README.md`](../bridge-android/README.md). The relay URL is
-   `https://PAGER_HOST`.
+   `https://PAGER_HOST/kid-pager`.
 
 The home relay sends `outboxWaitS`, so the phone long-polls and outbound texts
 leave in about a second.
@@ -164,15 +210,65 @@ volume. They are not in the backup.
 
 ## Update
 
-The relay image is built locally:
+There are two kinds of update.
+
+**A new version of the pager software.** Do this by hand:
 
 ```sh
 git pull
-docker compose pull --ignore-buildable && docker compose up -d --build
+./update.sh
+```
+
+**Security patches for what the software runs on** (nginx, Mosquitto, certbot
+and the relay image's Python base). `./update.sh` does this too, and it should
+run unattended; see the next section. It runs:
+
+```sh
+docker compose pull --ignore-buildable   # patched nginx, Mosquitto, certbot
+docker compose build --pull              # relay rebuilt on a patched base image
+docker compose up -d                     # restarts only what changed
+docker image prune -f                    # drops the replaced, untagged images
 ```
 
 Plain `docker compose pull` fails with "pull access denied for
 pager-relay-home", because that image exists only on your machine.
+
+### Automatic security updates
+
+Three things keep an exposed server patched. Set up all three.
+
+1. **The host.** Turn on your distribution's unattended upgrades
+   (`unattended-upgrades` on Debian, Ubuntu and Raspberry Pi OS;
+   `dnf-automatic` on Fedora). This covers the kernel and Docker itself.
+2. **Image tags that keep moving.** Already done: the compose file uses
+   `nginx:stable-alpine` and `eclipse-mosquitto:2`, which are rebuilt when a
+   fix is released. The EMQX override pins an exact version on purpose; bump
+   it by hand.
+3. **A nightly run of `update.sh`.** With systemd:
+
+   ```sh
+   sudo cp systemd/pager-update.service systemd/pager-update.timer /etc/systemd/system/
+   sudoedit /etc/systemd/system/pager-update.service   # set ExecStart to this directory's update.sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now pager-update.timer
+   ```
+
+   `systemctl list-timers pager-update.timer` shows the next run and
+   `journalctl -u pager-update.service` shows what the last one did. On a NAS
+   without systemd, a root cron line does the same:
+   `15 4 * * * /path/to/home/update.sh`.
+
+`update.sh` runs plain `docker compose`, so the profile and any override must
+come from `home/.env`, not from the command line:
+
+```sh
+COMPOSE_PROFILES=letsencrypt                                 # with TLS_MODE=letsencrypt
+COMPOSE_FILE=docker-compose.yml:docker-compose.emqx.yml      # with the EMQX override
+```
+
+When a patched nginx or Mosquitto arrives, that container restarts and pagers
+reconnect within a few seconds. The timer never runs `git pull`, so the pager
+software itself changes only when you update it.
 
 ## Moving from the cloud
 

@@ -223,7 +223,8 @@ def create_first_admin(username: str, password: str) -> User:
 
 @dataclass(frozen=True, slots=True)
 class RelyingParty:
-    """Relying party id = host of `PUBLIC_BASE_URL`; the expected origin is `PUBLIC_BASE_URL`."""
+    """Relying party id = host of `PUBLIC_BASE_URL`; the expected origin is its scheme://host[:port]
+    (a browser origin never has a path, so a `/pager` mount prefix is dropped)."""
 
     id: str
     origin: str
@@ -232,10 +233,11 @@ class RelyingParty:
     def from_base_url(cls, base_url: str | None) -> RelyingParty:
         if not base_url:
             raise AuthError("PUBLIC_BASE_URL is not configured; passkeys are unavailable")
-        host = urlsplit(base_url).hostname
+        parts = urlsplit(base_url)
+        host = parts.hostname
         if not host:
             raise AuthError("PUBLIC_BASE_URL has no host; passkeys are unavailable")
-        return cls(id=host, origin=base_url.rstrip("/"))
+        return cls(id=host, origin=f"{parts.scheme}://{parts.netloc}")
 
 
 def _store_challenge(challenge: bytes, kind: str, uid: str | None) -> str:

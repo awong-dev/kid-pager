@@ -30,22 +30,34 @@ R2. **Family identity.** `fedFamilies/{fid} {fedId, publicKey, privateKey($b64),
     the life of the family, across key rotations and moves. The key is Ed25519. The fingerprint
     shown to people is of the current public key.
 R3. **Link = one local family <-> one remote family.** `fedLinks/{fid}_{remoteFedId} {familyId,
-    remote {fedId, name, publicKey, epoch, host, port, tlsCa?}, state active|suspended|reauth,
+    remote {fedId, name, publicKey, epoch, host, port, path, tlsCa?}, state active|suspended|reauth,
     shared: [uid], createdBy, createdAt, lastOkAt, lastErrAt, health{...}, announce {pending, since}?}`.
     At most 16 per family. Made by the **family admin** (a super may list, suspend and delete any):
-    - Admin A: "New invite" -> `kpfed2.<base64url(json{host, port, ca?, fid, pk, name, code})>`,
+    - Admin A: "New invite" -> `kpfed3.<base64url(json{host, port, path, ca?, fid, pk, name, code})>`,
       single use, 24 h, `fedInvites/{sha256(code)} {familyId, expiresAt}`, code = 128 random bits.
-    - Admin B pastes it. Relay B: `POST https://A/fed/v1/link {code, to: <A fedId>, from: {fedId,
-      pk, name, host, port, ca?}}` signed with B's family key (proof of possession of `from.pk`).
+    - Admin B pastes it. Relay B: `POST https://A<path>/fed/v1/link {code, to: <A fedId>, from: {fedId,
+      pk, name, host, port, path, ca?}}` signed with B's family key (proof of possession of `from.pk`).
       Relay A checks the code (constant time, burn on success), stores its link, answers with its
       signed confirmation; relay B stores its link. Both UIs show both fingerprints for an
       out-of-band compare. Rate limit on this route: 10/min per source address.
+    - **A peer is host + port + path.** `path` is where that relay is mounted on its host: `""` at
+      the root, `/pager` behind `PAGER_PATH=/pager` (the proxy strips the prefix, so the relay's
+      routes are unchanged). A relay advertises `settings.base_path` (the path of
+      `PUBLIC_BASE_URL`). `path` is always present on the wire and in the stored `remote`; it is
+      validated with the one rule `PAGER_PATH` uses (`config.valid_base_path`: `""` or
+      `/seg(/seg)*`, segments `[A-Za-z0-9_-]+`; no dots, `%`, `?`, `#`, whitespace, trailing slash),
+      because it is appended to a URL whose host is the already-checked IP. The invite tag moved to
+      `kpfed3.` with this change; `kpfed2.` blobs are not accepted.
     - Suspend stops both directions locally. Delete fails pending outbox rows `unpeered`, marks
       that link's externals unsendable, and sends a best-effort signed `unlink` so the other side
       does the same.
 R4. **Request authentication.** Headers `X-KP-Fed-From: <sender fedId>`, `X-KP-Fed-To: <receiver
     fedId>`, `X-KP-Fed-Ts`, `X-KP-Fed-Sig` = Ed25519 over
-    `"{method}\n{path}\n{ts}\n{from}\n{to}\n{sha256hex(body)}"`. The receiver resolves the local
+    `"{method}\n{path}\n{ts}\n{from}\n{to}\n{sha256hex(body)}"`, where `path` is the route as the
+    receiving relay sees it (`/fed/v1/...`, plus `?query`), **not** the prefixed URL path: the proxy
+    strips the mount prefix before the relay, so the receiver can only verify what it sees, and the
+    signature must not depend on how the peer is mounted. The request goes to
+    `https://<ip>:<port><peer path>/fed/v1/...`; only the URL carries the prefix. The receiver resolves the local
     family by `to`, the link by `(family, from)`, and verifies with the link's stored key. One
     indistinguishable 403 (same status, body and headers) for every authentication failure: unknown
     family, family or server switched off, no link, suspended or `reauth` link, missing headers,
@@ -73,10 +85,10 @@ R7. **Family move carries the federation state.** (See FAMILY_EXPORT_DESIGN.md.)
       `epoch + 1`, old key kept as `prevPrivateKey`, every link `announce.pending`. Person uids
       are unchanged by an import, so no rid map is carried in `moved`.
     - Once the family is effective on the target, the sender posts to each link
-      `POST /fed/v1/moved {fedId, epoch, pk, host, port, ca?}` signed with the **old** key. The
+      `POST /fed/v1/moved {fedId, epoch, pk, host, port, path, ca?}` signed with the **old** key. The
       receiver verifies with its stored key, requires `epoch` greater than the stored one, updates
-      key + address, raises a `fed_moved` alert to its family's admins ("<name> moved from <old
-      host> to <new host>. Suspend the link if you did not expect this."), and answers ok. Rows
+      key + address (host, port, path; a change of any of them, or of the key or CA, is not a retry), raises a `fed_moved` alert to its family's admins ("<name> moved from <old
+      host> to <new host>." where each side reads `host`, `host:port` for a non-443 port, plus the path, e.g. `example.org/pager`; Suspend the link if you did not expect this."), and answers ok. Rows
       waiting in its outbox for that link go to the new address on the next attempt. Retries follow
       the outbox backoff, then daily, without limit; when no link is pending `prevPrivateKey` is
       deleted.
@@ -100,7 +112,8 @@ R9. **Backup and reauthorization.** A backup keeps the family's configuration an
       `python -m app.familyexport backup ...`. The manifest says `kind: "backup"` (a move file:
       `"move"`). It holds everything a move does except `fedFamilies.privateKey` and
       `prevPrivateKey`: the family's `fedId`, `epoch`, public key, the `families.federation` flag,
-      every `fedLinks` row (remote fedId, name, publicKey, epoch, host, port, tlsCa, shared list)
+      every `fedLinks` row (remote fedId, name, publicKey, epoch, host, port, path, tlsCa, shared list; an
+      import refuses a file whose `remote` does not validate, `path` included)
       and the `fed` externals/backends. No passphrase is forced (no key inside).
     - **Restore** = the ordinary import. For federation it keeps the `fedId`, generates a NEW key
       pair, sets `epoch + 1` and writes every link with `state: "reauth"`. A `reauth` link sends
@@ -109,7 +122,7 @@ R9. **Backup and reauthorization.** A backup keeps the family's configuration an
       list and contacts are kept. Suspend / resume cannot switch it on. The report says
       `kind: "backup"|"move"` and `federation: {links, reauth, announcing}`.
     - **Reauthorize.** The restored family's admin: `POST /api/family/fed/links/{id}/reauth` ->
-      `{invite, url, expiresAt}`. The invite is a `kpfed2.` blob with `"re": 1` (host, port, ca?,
+      `{invite, url, expiresAt}`. The invite is a `kpfed3.` blob with `"re": 1` (host, port, path, ca?,
       `fid` = the unchanged fedId, `pk` = the NEW key, name, code, and `epoch`), single use, 24 h,
       bound to that link. `url` = `<their web base>/family/people#fedInvite=<invite>` when the
       other relay's `/fed/v1/info` reports `web`, else null; the invite is in the URL *fragment*, so
@@ -229,7 +242,9 @@ original wording means the linked family: a `link`, identified by `linkId`.
   the hostname: the TLS handshake verifies the certificate against the name the admin typed, the
   connection goes to the address that was checked, and a second DNS answer is never asked for.
   Verified against a real local TLS server (`tests/test_fed_client.py`). Each checked address is
-  tried in turn. Loopback is allowed only through `AddressPolicy(allow_loopback=True, resolver=...)`
+  tried in turn. The URL is `https://<ip>:<port><peer path><route>`; `call` refuses a `base_path` that
+  fails `valid_base_path` and a route that does not start with `/fed/`, so neither can carry an
+  authority or scheme. Loopback is allowed only through `AddressPolicy(allow_loopback=True, resolver=...)`
   passed to the `FedClient` constructor, for tests.
 - **Errors.** The admin routes surface `502 {"detail": unreachable|tls|refused|address_not_allowed|
   bad_response}` and nothing of the other side's words.
@@ -240,10 +255,12 @@ original wording means the linked family: a `link`, identified by `linkId`.
   retry); `remote.epoch` is exchanged in `from` and the link confirmation; `GET
   /api/family/fed/links/{id}/directory` items carry `added`.
 - **Alerts.** `fed_contact`, `fed_unknown`, `fed_moved`, `fed_reauth`: fields `fedLinkId`, `fedName`,
-  `fedHost`, `fedRid`, `fedOldHost` (`fed_moved`), `peerAlias` / `peerName`.
+  `fedHost`, `fedRid`, `fedOldHost` (`fed_moved`); the host fields read `host[:port][/path]`, `peerAlias` / `peerName`.
 - **Environment.** `FED_CA_PEM` / `FED_CA_PEM_FILE`, `FED_OFFLINE_AFTER_S`, `FED_DOWN_AFTER_S`,
   `WEB_BASE_URL` (all in `relay/.env.example`).
 - **Tests.** `relay/tests/fed_world.py`: each `Relay` owns a SQLite store and an app; a `Network`
   transport routes a request to the relay named by its `Host`, so a message travels A -> B through
-  both routers, including signing, the address check and the stores.
+  both routers, including signing, the address check and the stores. A `Relay(base_path="/pager")`
+  is mounted like the home nginx does it: the transport answers 404 outside the prefix and strips
+  it before the app, so a client that omits the prefix fails (`tests/test_fed_prefix.py`).
 - **Not implemented:** a docker end-to-end scenario for federation.

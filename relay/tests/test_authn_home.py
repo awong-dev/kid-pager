@@ -604,3 +604,30 @@ def test_passkeys_unavailable_without_public_base_url():
     app = create_app(settings=make_settings(public_base_url=None), broker_client=FakeBrokerClient())
     with TestClient(app, base_url=BASE_URL) as c:
         assert c.post("/api/auth/passkey/login/begin", headers=CSRF).status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("base", "origin"),
+    [
+        ("https://pager.example.test", "https://pager.example.test"),
+        ("https://pager.example.test/", "https://pager.example.test"),
+        ("https://pager.example.test/pager", "https://pager.example.test"),
+        ("https://pager.example.test:8443/apps/pager/", "https://pager.example.test:8443"),
+    ],
+)
+def test_relying_party_origin_has_no_path(base: str, origin: str):
+    rp = authn_home.RelyingParty.from_base_url(base)
+    assert rp.id == "pager.example.test" and rp.origin == origin
+
+
+@pytest.mark.parametrize(("base_url", "path"), [(BASE_URL, "/"), (BASE_URL + "/apps/pager", "/apps/pager")])
+def test_session_cookie_path_follows_the_base_path(base_url: str, path: str):
+    app = create_app(settings=make_settings(public_base_url=base_url), broker_client=FakeBrokerClient())
+    with TestClient(app, base_url=BASE_URL) as c:
+        resp = c.post(
+            "/api/setup/first-admin", json={"username": "boss", "password": PASSWORD}, headers=CSRF
+        )
+        assert resp.status_code == 200, resp.text
+        assert f"path={path}".lower() in resp.headers["set-cookie"].lower().replace("; ", ";").split(";")
+        out = c.post("/api/auth/logout", headers=CSRF)
+        assert f"path={path}".lower() in out.headers["set-cookie"].lower().replace("; ", ";").split(";")

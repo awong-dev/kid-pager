@@ -1,0 +1,11 @@
+# Nightly, at a random minute after 04:00. A run missed while the machine was off happens at boot.
+[Unit]
+Description=Nightly security update of the pager home server
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

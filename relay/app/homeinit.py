@@ -20,6 +20,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from py_vapid import Vapid02, b64urlencode
 
+from app.config import valid_base_path
+
 VAPID_PRIVATE, VAPID_PUBLIC = "WEBPUSH_VAPID_PRIVATE_KEY", "WEBPUSH_VAPID_PUBLIC_KEY"
 SECRET_KEYS = ("BROKER_ADMIN_PASSWORD", "WEBHOOK_KEY", "BROKER_API_KEY", "BROKER_API_SECRET")
 TLS_MODES = ("selfsigned", "letsencrypt")
@@ -293,11 +295,11 @@ def ensure_dynsec(mosquitto_dir: Path, values: dict[str, str]) -> None:
         os.chown(path, MOSQUITTO_UID, MOSQUITTO_UID)
 
 
-def write_relay_env(path: Path, data: Path, host: str) -> None:
+def write_relay_env(path: Path, data: Path, host: str, base_path: str = "") -> None:
     _write(
         path,
         "# Written by app/homeinit.py on every start, from pager.env. Edit pager.env instead.\n"
-        f"PUBLIC_BASE_URL=https://{host}\n"
+        f"PUBLIC_BASE_URL=https://{host}{base_path}\n"
         f"BROKER_HOST={host}\n"
         f"BROKER_CA_PEM_FILE={data / 'certs' / 'ca' / 'ca.crt'}\n"
         f"SORACOM_BEAM_DESTINATION=mqtts://{host}:8883\n"
@@ -308,11 +310,29 @@ def write_relay_env(path: Path, data: Path, host: str) -> None:
     )
 
 
-def run(data: Path, host: str, tls_mode: str) -> None:
+# Where the app is mounted when `PAGER_PATH` is unset; home/docker-compose.yml has the same default.
+DEFAULT_BASE_PATH = "/kid-pager"
+
+
+def normalize_base_path(raw: str) -> str:
+    """`PAGER_PATH` as `""` (`/`: served at the root) or `/a/b`; empty means the default. No dots,
+    because nginx uses it in a regex."""
+    value = raw.strip() or DEFAULT_BASE_PATH
+    value = value.removesuffix("/")
+    if not valid_base_path(value):
+        raise InitError(
+            f"PAGER_PATH must be / or a path like /kid-pager or /apps/pager (letters, digits, "
+            f"'-' and '_' only, no dots, no query), not {raw!r}"
+        )
+    return value
+
+
+def run(data: Path, host: str, tls_mode: str, base_path: str = "") -> None:
     if not host:
         raise InitError("PAGER_HOST is not set; put it in pager.env (home/README.md)")
     if tls_mode not in TLS_MODES:
         raise InitError(f"TLS_MODE must be one of {TLS_MODES}, not {tls_mode!r}")
+    base_path = normalize_base_path(base_path)
     for sub in ("relay", "mosquitto", "certbot/www", "certs"):
         (data / sub).mkdir(parents=True, exist_ok=True)
     values = ensure_secrets(data / "secrets.env")
@@ -322,8 +342,8 @@ def run(data: Path, host: str, tls_mode: str) -> None:
         ensure_web_cert(data / "certs" / "web", ca_cert, ca_key, host)
     ensure_emqx(data / "emqx", values)
     ensure_dynsec(data / "mosquitto", values)
-    write_relay_env(data / "relay.env", data, host)
-    print(f"homeinit: {data} ready for https://{host}/ (TLS_MODE={tls_mode})")
+    write_relay_env(data / "relay.env", data, host, base_path)
+    print(f"homeinit: {data} ready for https://{host}{base_path}/ (TLS_MODE={tls_mode})")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -335,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             args.data,
             (os.environ.get("PAGER_HOST") or "").strip(),
             (os.environ.get("TLS_MODE") or "").strip().lower(),
+            os.environ.get("PAGER_PATH") or "",
         )
     except InitError as exc:
         print(f"homeinit: {exc}", file=sys.stderr)

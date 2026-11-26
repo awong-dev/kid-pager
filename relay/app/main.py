@@ -191,7 +191,7 @@ def create_app(
 
     # Registered last so it only sees unclaimed paths.
     if static_web.WEB_ROOT.is_dir():
-        static_web.mount(app)
+        static_web.mount(app, base_path=settings.base_path)
 
     return app
 

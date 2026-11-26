@@ -204,6 +204,7 @@ def write_env_file() -> None:
         lines = [
             "PAGER_HOST=localhost",
             "TLS_MODE=selfsigned",
+            "PAGER_PATH=/",
             "DEV_MODE=1",
             "RATE_LIMIT_BACKEND_CREATE_LIMIT=1000",
             "RATE_LIMIT_ADMIN_WRITE_LIMIT=1000",

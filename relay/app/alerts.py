@@ -262,7 +262,7 @@ def fed_contact(
             "peerName": name,
             "fedLinkId": link.id,
             "fedName": remote.name,
-            "fedHost": remote.host,
+            "fedHost": remote.where,
             "fedRid": rid,
             "preview": f"{remote.name}: {name} added {target.displayName} as a contact. Add them back?"[
                 :PREVIEW_MAX_CHARS
@@ -295,7 +295,7 @@ def fed_unknown(
             "subjectAlias": target.alias,
             "fedLinkId": link.id,
             "fedName": remote.name,
-            "fedHost": remote.host,
+            "fedHost": remote.where,
             "fedRid": rid,
             "preview": f"A person in {remote.name} wrote to {target.displayName}; they are not a contact."[
                 :PREVIEW_MAX_CHARS

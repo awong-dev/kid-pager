@@ -19,6 +19,7 @@ import {
 } from "react";
 
 import { isApiPath } from "@/lib/apiPaths";
+import { isUnderBase, stripBase, withBase } from "@/lib/basePath";
 import type { Params } from "@/lib/routeMatch";
 
 const NAV_EVENT = "pager:navigate";
@@ -32,7 +33,8 @@ function subscribe(onChange: () => void): () => void {
   };
 }
 
-const getClientSnapshot = (): string | null => window.location.pathname;
+/** The logical pathname: the URL path with the runtime prefix (lib/basePath.ts) removed. */
+const getClientSnapshot = (): string | null => stripBase(window.location.pathname);
 /** `null` on the server and during hydration, so the prerendered HTML (for `/`) matches the first
  * client render whatever URL the shell was served for. */
 const getServerSnapshot = (): string | null => null;
@@ -62,9 +64,18 @@ export function useParams(): Params {
   return useContext(ParamsContext);
 }
 
+/** Resolves a logical `href` (`/chat?x=1#y`, no prefix) against the current page; the URL's
+ * pathname is the real one (prefixed). `isOwn` is false for another origin, a path outside the
+ * prefix, or an API path: those are left to the browser. */
+function resolve(href: string): { url: URL; isOwn: boolean } {
+  const url = new URL(withBase(href), window.location.href);
+  const isOwn = url.origin === window.location.origin && isUnderBase(url.pathname) && !isApiPath(stripBase(url.pathname));
+  return { url, isOwn };
+}
+
 function go(href: string, mode: "push" | "replace"): void {
-  const url = new URL(href, window.location.href);
-  if (url.origin !== window.location.origin || isApiPath(url.pathname)) {
+  const { url, isOwn } = resolve(href);
+  if (!isOwn) {
     window.location.assign(url.href);
     return;
   }
@@ -88,12 +99,12 @@ const NAVIGATE: Navigate = {
   back: () => window.history.back(),
 };
 
-/** Stable `{ push, replace, back }`; `href` may carry a query string and #fragment. */
+/** Stable `{ push, replace, back }`; `href` is a logical path and may carry a query string and #fragment. */
 export function useNavigate(): Navigate {
   return useMemo(() => NAVIGATE, []);
 }
 
-/** `<a href>` that navigates in-app on a plain left click; modified clicks, `target`, downloads
+/** `<a href>` (a logical path, without the prefix; rendered with it) that navigates in-app on a plain left click; modified clicks, `target`, downloads
  * and other origins keep the browser's default. Works with MUI's `component={Link}`. */
 export const Link = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes<HTMLAnchorElement> & { href: string; replace?: boolean }>(
   function Link({ href, replace, onClick, target, ...rest }, ref) {
@@ -111,11 +122,10 @@ export const Link = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes<HTMLAncho
       ) {
         return;
       }
-      const url = new URL(href, window.location.href);
-      if (url.origin !== window.location.origin || isApiPath(url.pathname)) return;
+      if (!resolve(href).isOwn) return;
       e.preventDefault();
       go(href, replace ? "replace" : "push");
     };
-    return <a ref={ref} href={href} target={target} onClick={handleClick} {...rest} />;
+    return <a ref={ref} href={withBase(href)} target={target} onClick={handleClick} {...rest} />;
   },
 );

@@ -1,5 +1,6 @@
 "use client";
 
+import { stripBase } from "@/lib/basePath";
 import { type ReactNode, useEffect } from "react";
 import Box from "@mui/material/Box";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -29,7 +30,7 @@ export default function RequireAuth({ children, role }: { children: ReactNode; r
   useEffect(() => {
     if (status === "signed-out" || status === "not-registered") {
       // Home backend with no users yet: first run. Keep the page asked for (and its #fragment).
-      stashReturnPath(`${window.location.pathname}${window.location.search}${window.location.hash}`);
+      stashReturnPath(`${stripBase(window.location.pathname)}${window.location.search}${window.location.hash}`);
       navigate.replace(needsSetup ? "/setup" : "/login");
     } else if (status === "signed-in" && !allowed) {
       navigate.replace("/chat");

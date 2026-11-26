@@ -1,0 +1,10 @@
+# Copy to /etc/systemd/system/ with pager-update.timer, and set ExecStart to where update.sh is.
+[Unit]
+Description=Pager home server: fetch patched images and restart what changed
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/kid-pager/home/update.sh

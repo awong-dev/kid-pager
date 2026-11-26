@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 import { API_PATH_PREFIXES } from "./lib/apiPaths";
+import { BUILD_BASE } from "./lib/buildBase";
 
 // Dev only: `rewrites()` is ignored by the export build; production gets the same two rules from
 // `firebase.json` (API prefixes to the relay, everything else to `/index.html`).
@@ -8,6 +9,10 @@ const RELAY = "http://localhost:8000";
 
 const nextConfig: NextConfig = {
   output: "export",
+
+  // Home build: asset URLs carry the placeholder the relay rewrites at startup (lib/buildBase.ts).
+  // `assetPrefix` only; the app routes itself (lib/router.tsx) under the runtime prefix.
+  ...(BUILD_BASE ? { assetPrefix: BUILD_BASE } : {}),
 
   async rewrites() {
     return {

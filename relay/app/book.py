@@ -421,7 +421,7 @@ def entries_for(owner_uid: str) -> list[BookEntry]:
                 fed={
                     "linkId": link.id if link else None,
                     "name": link.remote.name if link else None,
-                    "host": link.remote.host if link else None,
+                    "host": link.remote.where if link else None,
                 },
             )
         )

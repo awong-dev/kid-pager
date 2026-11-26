@@ -1,4 +1,4 @@
-"""Linking two families: the issuer's `kpfed2.` invite and link request handling, and the acceptor's
+"""Linking two families: the issuer's `kpfed3.` invite and link request handling, and the acceptor's
 `accept_invite`. Every refusal that does not depend on the code being right is the one 403."""
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from app import alerts as alerts_module
 from app import wire
-from app.config import Settings
+from app.config import Settings, valid_base_path
 from app.fed import client as client_mod
 from app.fed import keys, moved, sign
 from app.fed import sender as fed_sender
@@ -25,7 +25,7 @@ from app.store import fed_families, fed_links, fed_state
 from app.store import rate_limits as rate_limits_store
 from app.store.families import get_family
 
-PREFIX = "kpfed2."
+PREFIX = "kpfed3."
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 LINK_PATH = f"{client_mod.API}/link"
 NAME_MAX = 60
@@ -62,7 +62,16 @@ class _Coordinates(BaseModel):
 
     host: str
     port: int = Field(ge=1, le=65535)
+    # Where the relay is mounted behind its proxy: `""` or `/pager`. Always present on the wire.
+    path: str
     ca: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v: str) -> str:
+        if not valid_base_path(v):
+            raise ValueError("not a base path")
+        return v
 
     @field_validator("host")
     @classmethod
@@ -169,7 +178,7 @@ def encode_invite(blob: InviteBlob) -> str:
 
 
 def decode_invite(text: str) -> InviteBlob:
-    """`ValueError` for anything that is not a well-formed `kpfed2.` blob."""
+    """`ValueError` for anything that is not a well-formed `kpfed3.` blob."""
     text = text.strip()
     if not text.startswith(PREFIX):
         raise ValueError("not a link invite")
@@ -181,16 +190,19 @@ def decode_invite(text: str) -> InviteBlob:
         raise ValueError("malformed link invite") from exc
 
 
-def public_host_port(settings: Settings) -> tuple[str, int]:
-    """Where other relays dial this one: the host and port of `PUBLIC_BASE_URL` (443 without a
-    port). `LinkingError(503)` when it is not set."""
+def public_address(settings: Settings) -> tuple[str, int, str]:
+    """Where other relays dial this one: the host, port (443 without one) and path prefix of
+    `PUBLIC_BASE_URL` (`""` at the root). `LinkingError(503)` when it is not set or its path is
+    not a valid base path."""
     from urllib.parse import urlsplit
 
     parts = urlsplit(settings.public_base_url or "")
     host = (parts.hostname or "").lower()
     if not host:
         raise LinkingError(503, "PUBLIC_BASE_URL must be set to federate")
-    return host, parts.port or 443
+    if not valid_base_path(settings.base_path):
+        raise LinkingError(503, "PUBLIC_BASE_URL has an unusable path")
+    return host, parts.port or 443, settings.base_path
 
 
 def own_ca(settings: Settings) -> str | None:
@@ -203,13 +215,14 @@ def family_name(family_id: str) -> str:
 
 
 def _party(settings: Settings, identity: fed_families.FedFamily) -> dict:
-    host, port = public_host_port(settings)
+    host, port, path = public_address(settings)
     out = {
         "fedId": identity.fedId,
         "pk": identity.publicKey,
         "name": family_name(identity.familyId),
         "host": host,
         "port": port,
+        "path": path,
         "epoch": identity.epoch,
     }
     ca = own_ca(settings)
@@ -222,12 +235,13 @@ def new_invite(
     settings: Settings, identity: fed_families.FedFamily, created_by: str
 ) -> tuple[str, int]:
     """`(blob, expiresAt)`."""
-    host, port = public_host_port(settings)
+    host, port, path = public_address(settings)
     code = base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
     expires = fed_links.create_invite(code, identity.familyId, created_by)
     blob = InviteBlob(
         host=host,
         port=port,
+        path=path,
         ca=own_ca(settings),
         fid=identity.fedId,
         pk=identity.publicKey,
@@ -245,16 +259,17 @@ def new_reauth_invite(
     client: FedClient | None = None,
 ) -> tuple[str, str | None, int]:
     """`(invite, url, expiresAt)` for a restored family's `reauth` link. The blob is a normal
-    `kpfed2.` one plus `re: 1`, carrying the family's unchanged fedId and its NEW key, bound to this
+    `kpfed3.` one plus `re: 1`, carrying the family's unchanged fedId and its NEW key, bound to this
     link. `url` is `<their web base>/family/people#fedInvite=<invite>` when the other relay's
     `/fed/v1/info` reports a web base, else None: the invite rides in the URL fragment, which a
     browser never sends to any server."""
-    host, port = public_host_port(settings)
+    host, port, path = public_address(settings)
     code = base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
     expires = fed_links.create_invite(code, identity.familyId, created_by, link_id=link.id)
     blob = InviteBlob(
         host=host,
         port=port,
+        path=path,
         ca=own_ca(settings),
         fid=identity.fedId,
         pk=identity.publicKey,
@@ -274,6 +289,7 @@ def _web_url(client: FedClient, link: fed_links.FedLink, invite: str) -> str | N
             f"{client_mod.API}/info",
             host=link.remote.host,
             port=link.remote.port,
+            base_path=link.remote.path,
             tls_ca=link.remote.tlsCa,
         )
         web = reply.json().get("web") if reply.status == 200 else None
@@ -379,6 +395,7 @@ def _remote_of(party: _Party) -> fed_links.Remote:
         epoch=party.epoch,
         host=party.host,
         port=party.port,
+        path=party.path,
         tlsCa=party.ca,
     )
 
@@ -514,6 +531,7 @@ def accept_invite(
             LINK_PATH,
             host=blob.host,
             port=blob.port,
+            base_path=blob.path,
             tls_ca=blob.ca,
             body=payload,
             sender=identity,
@@ -551,6 +569,7 @@ def accept_invite(
         epoch=said.epoch,
         host=blob.host,
         port=blob.port,
+        path=blob.path,
         tlsCa=blob.ca,
     )
     if blob.re:
@@ -562,7 +581,7 @@ def accept_invite(
             identity.familyId,
             link_id=link.id,
             name=remote.name,
-            host=remote.host,
+            host=remote.where,
             epoch=remote.epoch,
         )
         return link

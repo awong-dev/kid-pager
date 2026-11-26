@@ -54,13 +54,14 @@ containers, the opposite of a Plex-like setup.
    twice and nothing is a default password.
 5. Forwards TCP 443 and 8883 on the router to the host. With Let's Encrypt, port 80 too, for
    the HTTP-01 challenge.
-6. Opens `https://PAGER_HOST/`. The relay has no users yet, so it shows a **first-run page**
+6. Opens `https://PAGER_HOST/kid-pager/` (`/` redirects there). The relay has no users yet, so it shows a **first-run page**
    that creates the first super admin: a username, a password, and an offer to add a passkey.
    This page exists only while `users/` is empty, replacing `python -m app.bootstrap`.
 7. From here on it is the existing web app: create a family, create a device, get a setup code,
    type it into the pager. The Devices page, pushes and the bridge phone work as in the cloud.
 
-Updates are `docker compose pull && docker compose up -d`. Backup is a copy of `data/`.
+Updates are `home/update.sh` (pull, rebuild the relay on a fresh base image, restart what changed),
+run nightly from a systemd timer for security patches. Backup is a copy of `data/`.
 
 What does not work without a real domain and a browser-trusted certificate: installing the PWA on
 a phone and receiving push notifications. Both require a secure context the browser accepts. With
@@ -79,7 +80,7 @@ pager is provisioned.
 
 ## 2. Edge and broker
 
-### 2.1 nginx (stock `nginx:1.27-alpine`)
+### 2.1 nginx (stock `nginx:stable-alpine`)
 
 One container, two listeners, configuration mounted from `nginx/`:
 
@@ -106,6 +107,19 @@ certificate with the webroot plugin. Containers cannot signal each other, so the
 own command is `while :; do sleep 6h; nginx -s reload; done & nginx -g 'daemon off;'`, the pattern
 the official image documents for certificate renewal: a reload every six hours picks up whatever
 certbot has written. Mosquitto never sees a certificate.
+
+*Image tag.* `stable-alpine`, not a branch tag: a branch tag such as `1.27-alpine` stops being
+rebuilt when nginx ends that branch, and `home/update.sh` can then pull no fixes for it.
+
+*Path prefix.* `PAGER_PATH` mounts the app under a path: `/kid-pager` by default, `/` for the root. A path
+lets a host whose 443 belongs to another web server forward it here unchanged; on a host of its
+own, `/` redirects to the app. nginx removes the prefix
+before the relay, using the client's raw request line so percent-encoding survives, and answers
+404 outside it; the relay's routes do not change. The relay learns the prefix from the path of
+`PUBLIC_BASE_URL`, which puts it in every URL handed to a pager (CA pointer, firmware, address
+book), scopes the session cookie to it, and substitutes it for the placeholder
+`/__PAGER_BASE_PATH__` in the web export at startup, so one image serves any prefix. A federation
+peer's coordinates include the path (`FEDERATION_DESIGN.md` R3).
 
 *Considered: Caddy.* Automatic HTTPS and `tls internal` would remove certbot and most of the nginx
 configuration. Rejected because stock Caddy proxies HTTP only; terminating MQTT TLS needs the
@@ -447,14 +461,15 @@ must for `GET /ca/{sha}.pem`, so this adds no new port.
 `VAPID_PRIVATE_KEY`, `VAPID_PUBLIC_KEY` on first run and never overwrites an existing value. The
 relay reads it as a second `env_file`. `mosquitto/dynamic-security.json` is created by `init` with
 the admin client. The user's own `pager.env` has `PAGER_HOST`, `TLS_MODE`, `LETSENCRYPT_EMAIL`
-and nothing secret. `PUBLIC_BASE_URL` is derived from `PAGER_HOST`. Cell-geolocation and Soracom
+and nothing secret. `PUBLIC_BASE_URL` is derived from `PAGER_HOST` and the optional `PAGER_PATH`
+(§2.1, *Path prefix*). Cell-geolocation and Soracom
 keys are optional lines in `pager.env`, as in the cloud `.env`.
 
 ### 7.4 Footprint
 
 | Container | Image | RAM, measured on comparable stacks | Our build? |
 |---|---|---|---|
-| nginx | `nginx:1.27-alpine` | ≈ 10 MB | no |
+| nginx | `nginx:stable-alpine` | ≈ 10 MB | no |
 | mosquitto | `eclipse-mosquitto:2` | ≈ 5 MB | no |
 | certbot | `certbot/certbot` | 0 when idle (profile) | no |
 | relay (+ init, same image) | `ghcr.io/<org>/pager-relay` | ≈ 150 MB | yes, `python:3.12-slim` base, Renovate bumps the base and dependencies, CI builds `linux/amd64` and `linux/arm64` |

@@ -6,6 +6,7 @@ import {
   fedErrorText,
   fedMovedInfo,
   fedReauthInfo,
+  formatFedServer,
   isPassphraseRequired,
   linkStateLabel,
   parseFedInviteHash,
@@ -88,7 +89,7 @@ describe("parseFedInviteHash", () => {
 });
 
 describe("reauthConfirmDetail", () => {
-  const link = { id: "l1", remote: { fedId: "f", name: "Smiths", host: "old.example", port: 443, fingerprint: "AA" } };
+  const link = { id: "l1", remote: { fedId: "f", name: "Smiths", host: "old.example", port: 443, path: "", fingerprint: "AA" } };
   it("recognises the reauth_confirm 409", () => {
     const r = reauthConfirmDetail(
       err(409, { code: "reauth_confirm", link, newFingerprint: "BB", newHost: "new.example", newPort: 8443 })
@@ -135,5 +136,20 @@ describe("parseFedLinkHash", () => {
   it("reads the link id", () => {
     expect(parseFedLinkHash("#federation&link=fam_abc")).toBe("fam_abc");
     expect(parseFedLinkHash("#federation")).toBeNull();
+  });
+});
+
+describe("formatFedServer", () => {
+  it("omits port 443 and an empty path", () => {
+    expect(formatFedServer("example.org", 443, "")).toBe("example.org");
+  });
+  it("appends the path", () => {
+    expect(formatFedServer("example.org", 443, "/kid-pager")).toBe("example.org/kid-pager");
+  });
+  it("shows a non-443 port before the path", () => {
+    expect(formatFedServer("example.org", 8443, "/kid-pager")).toBe("example.org:8443/kid-pager");
+  });
+  it("tolerates missing port and path", () => {
+    expect(formatFedServer("example.org")).toBe("example.org");
   });
 });

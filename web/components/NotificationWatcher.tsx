@@ -3,6 +3,7 @@
 /** Shows a browser notification for new messages (and, for admins, new open alerts) when the
  * tab is hidden or the thread is not open. Renders nothing. */
 
+import { withBase } from "@/lib/basePath";
 import { useEffect, useRef } from "react";
 
 import { usePathname } from "@/lib/router";
@@ -25,13 +26,12 @@ function showForegroundAlertNotification(preview: string): void {
   if (notificationPermission() !== "granted") return;
   const n = new Notification("New family alert", {
     body: preview,
-    icon: "/icons/icon-192.png",
+    icon: withBase("/icons/icon-192.png"),
     tag: "pager-alerts",
   });
   n.onclick = () => {
     window.focus();
-    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-    window.location.href = "/alerts";
+    window.location.href = withBase("/alerts");
   };
 }
 
@@ -47,13 +47,12 @@ function showForegroundGroupNotification(alias: string, name: string, preview: s
   if (notificationPermission() !== "granted") return;
   const n = new Notification(`New message in ${name}`, {
     body: preview,
-    icon: "/icons/icon-192.png",
+    icon: withBase("/icons/icon-192.png"),
     tag: `pager-thread-${alias}`,
   });
   n.onclick = () => {
     window.focus();
-    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-    window.location.href = `/chat/${encodeURIComponent(alias)}`;
+    window.location.href = withBase(`/chat/${encodeURIComponent(alias)}`);
   };
 }
 

@@ -1,5 +1,6 @@
 /** The home provider: relay sessions in an `HttpOnly` cookie; sends `X-Requested-With: pager`. */
 
+import { withBase } from "../basePath";
 import type { AuthProvider, AuthUser } from "./types";
 
 const CSRF_HEADERS = { "X-Requested-With": "pager" };
@@ -15,7 +16,7 @@ export class HomeAuthError extends Error {
 async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { ...CSRF_HEADERS };
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const resp = await fetch(`/api${path}`, {
+  const resp = await fetch(withBase(`/api${path}`), {
     method,
     headers,
     credentials: "include",

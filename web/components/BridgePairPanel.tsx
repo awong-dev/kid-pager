@@ -3,6 +3,7 @@
 /** Pairing-code dialog for a bridge phone: the 8-digit code (10-minute expiry) and the setup
  * checklist. The live bridge row flips it to "paired" with the reported SIM / Voice numbers. */
 
+import { serverUrl } from "@/lib/basePath";
 import { useEffect, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
@@ -56,8 +57,8 @@ export default function BridgePairPanel({
   const fullScreen = useFullScreenDialog();
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
-  // guard for the static export pass
-  const [origin] = useState(() => (typeof window === "undefined" ? "" : window.location.origin));
+  // origin plus the runtime URL prefix; "" for the static export pass
+  const [origin] = useState(() => serverUrl());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
