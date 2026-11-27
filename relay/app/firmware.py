@@ -108,6 +108,9 @@ class FwBuild(BaseModel):
     published: int
     full: FwObject
     deltas: list[FwDelta] = []
+    # Build capabilities written by `tools/fwpub.py` from the image's `KPCAPS1:` tag; `"mv"` marks
+    # a build that can take part in a server move.
+    caps: list[str] = []
 
     @field_validator("id")
     @classmethod
@@ -122,6 +125,21 @@ class FwBuild(BaseModel):
     @property
     def id16(self) -> str:
         return self.id[:16]
+
+
+MOVE_CAP = "mv"
+
+
+def move_refusal(build: FwBuild, *, move_state: str | None) -> str | None:
+    """Why `build` may not go to this pager (docs/MOVE_DESIGN.md §12.3), or None. A pager that has
+    moved relies on the keys and counters of a move-capable build, which a build without the `mv`
+    capability would drop; a pager that has not moved may take any build."""
+    if MOVE_CAP in build.caps or move_state != "moved":
+        return None
+    return (
+        f"build {build.id16} ({build.version}) cannot take part in a server move: "
+        "this pager has moved"
+    )
 
 
 class FirmwareIndex(BaseModel):

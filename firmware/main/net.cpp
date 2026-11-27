@@ -183,6 +183,11 @@ static char s_granted_edrx[16] = { 0 };
 static bool s_ca_written = false;
 static uint8_t s_ca_written_hash[IDENT_CA_HASH_LEN];
 
+// Same for scratch slot 13 when it holds the pending identity's PEM for a move trial; any other writer
+// of slot 13 (net_write_ca_slot()) clears it.
+static bool s_slot13_written = false;
+static uint8_t s_slot13_hash[IDENT_CA_HASH_LEN];
+
 static int64_t s_clock_epoch = 0;    // 0 = no network time yet (§3.5)
 static int64_t s_clock_epoch_us = 0; // esp_timer_get_time() at the moment s_clock_epoch was read
 
@@ -646,6 +651,51 @@ extern "C" bool net_init(void)
     return net_bringup(PAGER_ATTACH_POLL_CAP_S);
 }
 
+// The pending identity's PEM into slot 13 unless it is already there; *pinned is false for an unpinned target.
+static bool write_pending_ca(bool *pinned)
+{
+    ident_t *t = ident_scratch();
+    bool ok = ident_alt_read_ca(t->ca, sizeof(t->ca));
+    *pinned = ok && t->ca[0] != '\0';
+    if (*pinned) {
+        const uint8_t *hash = ident_alt_ca_hash();
+        if (!s_slot13_written || memcmp(s_slot13_hash, hash, IDENT_CA_HASH_LEN) != 0) {
+            ok = WalterModem::tlsWriteCredential(false, NET_TLS_CA_SCRATCH_SLOT, t->ca);
+            if (ok) {
+                memcpy(s_slot13_hash, hash, IDENT_CA_HASH_LEN);
+                s_slot13_written = true;
+                ESP_LOGI(TAG, "pending CA written to modem slot %u", (unsigned) NET_TLS_CA_SCRATCH_SLOT);
+            } else {
+                ESP_LOGI(TAG, "tlsWriteCredential(pending CA) failed");
+            }
+        }
+    }
+    ident_scratch_release();
+    return ok;
+}
+
+// Profile 2 for a move trial: the pending PEM's slot 13 validated, or slot 12 with validation off.
+static bool configure_pending_tls(void)
+{
+    bool pinned = false;
+    if (!write_pending_ca(&pinned)) {
+        return false;
+    }
+    if (!pinned) {
+        ensure_ca_slot_populated();
+    }
+    if (!WalterModem::tlsConfigProfile(PAGER_TLS_PROFILE_ID,
+                                       pinned ? WALTER_MODEM_TLS_VALIDATION_CA : WALTER_MODEM_TLS_VALIDATION_NONE,
+                                       WALTER_MODEM_TLS_VERSION_12,
+                                       pinned ? NET_TLS_CA_SCRATCH_SLOT : PAGER_TLS_CA_SLOT)) {
+        ESP_LOGI(TAG, "tlsConfigProfile(pending) failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "TLS profile %d: pending identity, %s", PAGER_TLS_PROFILE_ID,
+             pinned ? "CA in slot 13 (VALIDATION_CA)" : "no CA pinned (VALIDATION_NONE)");
+    return true;
+}
+
 // Clock, CA, TLS profile and MQTT client configuration (what a modem reset wipes). Not `static`
 // (net_internal.h). Power effect: a few AT commands, one NVRAM write if the CA changed.
 bool configure_session(void)
@@ -689,6 +739,10 @@ bool configure_session(void)
     const bool beam = net_bearer_beam();
     if (beam) {
         ESP_LOGI(TAG, "bearer beam: no TLS profile, MQTT to %s:%u plain", PAGER_BEAM_HOST, (unsigned) PAGER_BEAM_PORT);
+    } else if (ident_get_view() == IDENT_PENDING) {
+        if (!configure_pending_tls()) {
+            return false;
+        }
     } else {
         const bool pin_ca = ident_get_ca_len() > 0;
         if (pin_ca) {
@@ -873,6 +927,9 @@ extern "C" bool net_write_ca_slot(uint8_t slot, const char *ca_pem)
         return false;
     }
     // Power effect: one NVRAM write on the modem's own storage, no RRC.
+    if (slot == NET_TLS_CA_SCRATCH_SLOT) {
+        s_slot13_written = false;
+    }
     if (!WalterModem::tlsWriteCredential(false, slot, ca_pem)) {
         ESP_LOGI(TAG, "tlsWriteCredential() failed (slot %u)", (unsigned) slot);
         return false;
@@ -907,6 +964,56 @@ extern "C" bool net_tls_configure(uint8_t ca_slot, bool validated)
     ESP_LOGI(TAG, "TLS profile %d reconfigured: slot=%u %s", PAGER_TLS_PROFILE_ID, (unsigned) ca_slot,
              validated ? "VALIDATION_CA" : "VALIDATION_NONE");
     return true;
+}
+
+extern "C" bool net_login_prepare_pending(void)
+{
+    if (net_airplane()) {
+        return false;
+    }
+    if (net_bearer_beam()) {
+        return true; // plain MQTT: no CA
+    }
+    bool pinned;
+    return write_pending_ca(&pinned);
+}
+
+extern "C" bool net_login_apply(bool pending)
+{
+    if (net_airplane()) {
+        return false;
+    }
+    ident_use(pending ? IDENT_PENDING : IDENT_ACTIVE);
+    if (pending && ident_get_view() != IDENT_PENDING) {
+        return false; // no pending slot loaded
+    }
+    // Power effect: profile and client configuration, a few AT commands; the next net_session_up() connects.
+    s_session_configured = false;
+    bool ok = configure_session();
+    ESP_LOGI(TAG, "login %s: %s", pending ? "pending" : "active", ok ? "configured" : "FAILED");
+    return ok;
+}
+
+extern "C" bool net_login_commit(void)
+{
+    if (net_airplane()) {
+        return false;
+    }
+    if (net_bearer_beam()) {
+        return true;
+    }
+    // Power effect: one modem NVRAM write and one AT command; the live session is not touched.
+    if (ident_get_ca_len() > 0) {
+        if (!WalterModem::tlsWriteCredential(false, PAGER_TLS_CA_SLOT, ident_get_ca())) {
+            ESP_LOGI(TAG, "tlsWriteCredential(committed CA) failed");
+            return false;
+        }
+        memcpy(s_ca_written_hash, ident_get_ca_hash(), IDENT_CA_HASH_LEN);
+        s_ca_written = true;
+        return net_tls_configure(PAGER_TLS_CA_SLOT, true);
+    }
+    ensure_ca_slot_populated();
+    return net_tls_configure(PAGER_TLS_CA_SLOT, false);
 }
 
 extern "C" bool net_session_up(void)

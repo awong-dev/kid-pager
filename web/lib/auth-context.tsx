@@ -45,7 +45,8 @@ function normalizeMe(user: MeResponse): Me {
   };
 }
 
-export type AuthStatus = "loading" | "signed-out" | "not-registered" | "signed-in";
+/** `must-change-password`: signed in with an admin-set password; only the change form works. */
+export type AuthStatus = "loading" | "signed-out" | "not-registered" | "signed-in" | "must-change-password";
 
 interface AuthContextValue {
   status: AuthStatus;
@@ -90,6 +91,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
       setNeedsSetup(false);
+      if (user.mustChange) {
+        setMe(null);
+        setStatus("must-change-password");
+        return;
+      }
       setStatus("loading");
       try {
         let resp = await api.get<{ user: MeResponse; role: Role; claimsStale?: boolean }>(

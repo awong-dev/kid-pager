@@ -13,6 +13,8 @@ Usage (needs the relay virtualenv -- imports `httpx`/`firebase-admin`):
     relay/.venv/bin/python tools/e2e_v2.py location_periodic location_on_demand
     relay/.venv/bin/python tools/e2e_v2.py --stack home     # the home stack (Mosquitto), through nginx/TLS
     relay/.venv/bin/python tools/e2e_v2.py --stack home-emqx  # the same with the EMQX override
+    relay/.venv/bin/python tools/e2e_v2.py --stack move       # cloud stack -> home stack, both at once
+    relay/.venv/bin/python tools/e2e_v2.py --stack move-emqx  # the same, the home stack on EMQX
 
 Exit code 0 if every requested scenario passes, 1 otherwise. Always tears
 down the compose stack it started.
@@ -2270,14 +2272,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--stack",
-        choices=["cloud", "home", "home-emqx"],
+        choices=["cloud", "home", "home-emqx", "move", "move-emqx"],
         default="cloud",
         help="cloud: relay/docker-compose.yml (emulators, EMQX, plain ports). home: "
         "home/docker-compose.yml (Mosquitto, the relay as its MQTT client) + the test profile, "
         "through nginx's TLS edge with the stack's own CA. "
         "home-emqx: the same plus home/docker-compose.emqx.yml (EMQX, BROKER_MODE=rest). Both "
         "home stacks run as compose project pager-e2e with home/.e2e-data and home/.e2e.env "
-        "(never home/data or home/pager.env), removed afterwards",
+        "(never home/data or home/pager.env), removed afterwards. "
+        "move: the over-the-air move between two stacks at once (tools/e2e_move.py): the cloud "
+        "stack as the source, the home stack as the target (move-emqx: with EMQX as its broker); only --no-build and --keep-stack apply "
+        "(the move pagers speak CBOR)",
     )
     parser.add_argument(
         "--override",
@@ -2289,6 +2294,14 @@ def main(argv: list[str] | None = None) -> int:
         "relay/docker-compose.home-auth.yml (AUTH_BACKEND=home DB_BACKEND=sqlite); repeatable",
     )
     args = parser.parse_args(argv)
+    if args.stack in ("move", "move-emqx"):
+        import e2e_move
+
+        return e2e_move.main(
+            [*(["--no-build"] if args.no_build else []), *(["--keep-stack"] if args.keep_stack else []),
+             "--wire", "cbor" if args.wire == "json" else args.wire,
+             "--target-broker", "emqx" if args.stack == "move-emqx" else "mosquitto"]
+        )
     global STACK, HOME_STACK, BROKER, RELAY_URL, MQTT_PORT
     STACK = args.stack
     HOME_STACK = STACK in ("home", "home-emqx")

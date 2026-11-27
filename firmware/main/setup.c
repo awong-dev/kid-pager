@@ -313,7 +313,9 @@ bool setup_decrypt_bundle(const uint8_t bkey[32], const uint8_t *blob, size_t bl
 #include "catrust.h"
 #include "cbor.h"
 #include "ident.h"
+#include "modes.h"
 #include "net.h"
+#include "ota.h"
 #include "ui.h"
 
 static const char *TAG = "setup";
@@ -531,7 +533,6 @@ static bool decode_and_validate_bundle(const uint8_t *plain, size_t plain_len, i
     }
     out_ptr->have_ptr = have_ca_url && have_ca_sha;
 
-    out->n_epoch = 0;
     out->claimed = 0;
     return true;
 }
@@ -697,7 +698,11 @@ bool setup_run(const char *code)
     // hash of whatever ended up in id->ca (empty, inline or fetched)
     mbedtls_sha256((const unsigned char *) id->ca, id->ca_len, id->ca_hash, 0);
 
-    if (!ident_store(id)) {
+    // Drops any slot, selector or move record left by an earlier identity, and the old key's /down
+    // window, so the new identity is the only one and starts from a clean window.
+    modes_reset_down_window();
+    ota_cancel_waiting_jobs(); // a job from the old server would be pointed at the new one
+    if (!ident_erase() || !ident_store(id)) {
         ident_scratch_release();
         net_session_down();
         ESP_LOGI(TAG, "bundle valid but ident_store() (NVS write) failed");

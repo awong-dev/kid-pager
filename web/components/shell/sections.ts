@@ -71,6 +71,7 @@ export const SECTIONS: readonly Section[] = [
       { href: "/admin/allowlist",  label: "Allow-list" },
       { href: "/admin/hooks",      label: "Hooks" },
       { href: "/admin/federation", label: "Federation" },
+      { href: "/admin/move",       label: "Move" },
     ],
   },
 ];

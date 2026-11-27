@@ -110,7 +110,9 @@ def login(req: LoginRequest, request: Request, response: Response) -> SignedIn:
     user = users_store.get_user_by_alias(username)
     if user is None or not authn_home.verify_password(user.uid, req.password):
         raise HTTPException(status_code=401, detail="wrong username or password")
-    return _sign_in(request, response, user)
+    signed = _sign_in(request, response, user)
+    authn_home.retire_move_invites(user.uid)
+    return signed
 
 
 class RedeemRequest(BaseModel):
@@ -125,10 +127,18 @@ def redeem_invite(req: RedeemRequest, request: Request, response: Response) -> S
     uid = authn_home.redeem_invite(req.code)
     user = users_store.get_user(uid) if uid else None
     if user is None:
+        if authn_home.invite_spent(req.code):
+            raise HTTPException(
+                status_code=401, detail="that invite code was already used; sign in with your password"
+            )
         raise HTTPException(status_code=401, detail="that invite code is not valid")
     if req.password is not None:
         authn_home.set_password(user.uid, req.password)
-    return _sign_in(request, response, user)
+    else:
+        authn_home.drop_admin_set_password(user.uid)
+    signed = _sign_in(request, response, user)
+    authn_home.retire_move_invites(user.uid)
+    return signed
 
 
 @router.post("/logout", dependencies=[Depends(require_csrf_header)])
@@ -155,6 +165,8 @@ class SessionResponse(BaseModel):
     displayName: str
     hasPassword: bool
     passkeys: int
+    # An admin set the password; only `POST /api/auth/password` works until it is replaced.
+    mustChange: bool = False
 
 
 @router.get("/session")
@@ -165,7 +177,26 @@ def session(authed: Annotated[AuthedUser, Depends(require_user)]) -> SessionResp
         displayName=authed.user.displayName,
         hasPassword=authn_home.has_password(authed.uid),
         passkeys=len(authn_home.list_passkeys(authed.uid)),
+        mustChange=authn_home.must_change_password(authed.uid),
     )
+
+
+class ChangePasswordRequest(BaseModel):
+    currentPassword: str = Field(min_length=1, max_length=PASSWORD_MAX)
+    newPassword: Password
+
+
+@router.post("/password", dependencies=[Depends(require_csrf_header)])
+def change_password(
+    req: ChangePasswordRequest, request: Request, authed: Annotated[AuthedUser, Depends(require_user)]
+) -> dict[str, bool]:
+    _check_ip(request)
+    _check_username(authed.user.alias)
+    if req.newPassword == req.currentPassword:
+        raise HTTPException(status_code=422, detail="choose a different password")
+    if not authn_home.change_password(authed.uid, req.currentPassword, req.newPassword):
+        raise HTTPException(status_code=403, detail="the current password is wrong")
+    return {"ok": True}
 
 
 class CeremonyBegin(BaseModel):

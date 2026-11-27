@@ -399,6 +399,41 @@ void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, c
     out[out_cap - 1] = '\0';
 }
 
+/* The slot a re-queued reply takes (§6.2): the one already holding `id` (awaiting its PUBACK), else a free one
+ * set to `id`, `to`, age 0, no attempts. -1 when none is free. */
+int msg_pending_up_claim(msg_pending_up_t *tab, int n, const char *id, const char *to, int64_t now_us,
+                         bool *had_it)
+{
+    int slot = -1;
+    if (had_it) {
+        *had_it = false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (tab[i].in_use && strncmp(tab[i].id, id, MSG_ID_MAX) == 0) {
+            slot = i;
+            if (had_it) {
+                *had_it = true;
+            }
+            break;
+        }
+    }
+    for (int i = 0; slot < 0 && i < n; i++) {
+        if (!tab[i].in_use) {
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        return -1;
+    }
+    msg_pending_up_t *p = &tab[slot];
+    memset(p, 0, sizeof(*p));
+    p->created_us = now_us;
+    strncpy(p->id, id, MSG_ID_MAX - 1);
+    strncpy(p->to, to, MSG_TO_MAX - 1);
+    p->in_use = true;
+    return slot;
+}
+
 #ifdef ESP_PLATFORM
 
 #include <ctype.h>
@@ -418,6 +453,7 @@ void msg_peer_of(const msg_t *m, bool have_default, const char *default_alias, c
 #include "auth.h"
 #include "cbor.h"
 #include "ident.h"
+#include "move.h"
 #include "net.h"
 #include "rcpt.h"
 #include "pubconfirm.h"
@@ -1328,8 +1364,8 @@ static msg_ingest_t ingest_common(const char *id_str, int64_t ts, const char *fr
     return MSG_INGEST_NEW;
 }
 
-// Every device decodes CBOR; `n` and the replay window apply only when IDENT_FLAG_REQ_SIG is set
-// (docs/PROTOCOL.md §10: key 12 is on signed envelopes only).
+// Every device decodes CBOR. The replay window runs earlier, for every signed kind, in
+// on_incoming_message(); a signed envelope here still carries the trimmed `sig` pair in its count.
 msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t **out)
 {
     if (out) {
@@ -1357,9 +1393,8 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
     body_local[0] = '\0';
     int64_t ts = 0;
     size_t body_len = 0;
-    uint32_t n = 0;
     bool have_id = false, have_ts = false, have_from = false, have_body = false;
-    bool have_ack_null = false, have_n = false;
+    bool have_ack_null = false;
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t key;
@@ -1486,18 +1521,6 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
             }
             break;
         }
-        case MK_N: {
-            // `n` is up to 2^53-1 on the wire but the replay window is uint32_t: parse a wider value
-            // without rejecting the envelope and saturate; UINT32_MAX then fails the window on its own.
-            uint64_t v;
-            if (!cbor_r_uint(&r, &v)) {
-                msg_count_malformed();
-                return MSG_INGEST_MALFORMED;
-            }
-            n = (v > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t) v;
-            have_n = true;
-            break;
-        }
         default:
             if (!cbor_r_skip(&r)) {
                 msg_count_malformed();
@@ -1510,24 +1533,6 @@ msg_ingest_t msg_ingest_down_cbor(const uint8_t *buf, uint16_t len, const msg_t 
     if (!have_id || !have_ts || !have_from || !have_body || !have_ack_null) {
         msg_count_malformed();
         return MSG_INGEST_MALFORMED;
-    }
-
-    if (req_sig) {
-        // Replay window on the /down counter (docs/PROTOCOL.md §14.2); `n` exists on signed envelopes only.
-        if (!have_n || !s_auth_rtc) {
-            msg_count_malformed();
-            return MSG_INGEST_MALFORMED;
-        }
-        bool accepted;
-        s_lock();
-        accepted = auth_accept_down_n(s_auth_rtc, n);
-        s_save();
-        s_unlock();
-        if (!accepted) {
-            msg_count_malformed();
-            ESP_LOGD(TAG, "down n=%u rejected by replay window (§2.5)", (unsigned) n);
-            return MSG_INGEST_MALFORMED;
-        }
     }
 
     return ingest_common(id_local, ts, from_local, sndr_local, body_local, body_len, out);
@@ -1780,34 +1785,154 @@ static pubconfirm_t s_pc;
 static int s_pc_slot = -1; // pending_up slot being awaited, -1 = none
 static char s_pc_id[MSG_ID_MAX];
 
-// Runs on the modem event task: takes the msg lock only to flip the row, then writes msghist and
-// returns the alert request with the lock released.
-bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *alert)
+// A frozen server refused this text and did not store it (§6.2). The event task only queues the reference;
+// msg_pump() re-queues on the main task before it decides what to publish.
+#define MSG_MOVING_Q 4
+static char s_moving_q[MSG_MOVING_Q][MSG_ID_MAX]; // guarded by the msg lock; "" = free
+static msg_rcpt_alert_t s_late_alert;              // main task only
+static bool s_late_alert_valid;
+
+// Queues `ref` for the main task. False when the queue is full (the caller applies the receipt as an
+// ordinary failure).
+static bool moving_enqueue(const char *ref)
 {
-    if (alert) {
-        alert->valid = false;
+    bool ok = false;
+    s_lock();
+    for (int i = 0; i < MSG_MOVING_Q && !ok; i++) {
+        ok = strncmp(s_moving_q[i], ref, MSG_ID_MAX) == 0;
     }
-    rcpt_t r;
-    bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
-    if (!rcpt_parse_cbor(buf, len, sig_present, &r)) {
+    for (int i = 0; i < MSG_MOVING_Q && !ok; i++) {
+        if (s_moving_q[i][0] == '\0') {
+            strncpy(s_moving_q[i], ref, MSG_ID_MAX - 1);
+            s_moving_q[i][MSG_ID_MAX - 1] = '\0';
+            ok = true;
+        }
+    }
+    s_unlock();
+    return ok;
+}
+
+// The row goes back to PENDING under the same id, `to` and body, as a held reply. False when it cannot (no
+// free slot, body not in the pool, the row is not one a refusal can follow). Main task: the body goes
+// through s_tx_body and the flash writes are on this task.
+static bool requeue_moving(const char *ref)
+{
+    char to[MSG_TO_MAX] = "";
+    bool had = false;
+    int slot = -1;
+
+    s_lock();
+    msg_t *m = thread_find_locked(ref, MSG_DIR_UP);
+    bool ok = m != NULL && (m->ack_state == MSG_ACK_UP_SENT || m->ack_state == MSG_ACK_UP_PENDING) &&
+              (m->flags & MSG_F_SEND_FAILED) == 0 && pool_read_locked(m, s_tx_body, MSG_BODY_BUF);
+    if (ok) {
+        strncpy(to, m->to, MSG_TO_MAX - 1);
+        slot = msg_pending_up_claim(s_rtc->pending_up, MSG_PENDING_UP_MAX, ref, to, esp_timer_get_time(), &had);
+        ok = slot >= 0;
+    }
+    if (ok && had && s_pc_slot == slot) {
+        pubconfirm_cancel(&s_pc, s_pc.mid); // the PUBACK would mark it sent
+        s_pc_slot = -1;
+    }
+    if (ok) {
+        s_save();
+    }
+    s_unlock();
+    if (!ok) {
+        return false;
+    }
+    // A reply still holding its slot keeps its NVS body.
+    if (!had && !msgq_write_reply(slot, ref, to, s_tx_body)) {
+        s_lock();
+        s_rtc->pending_up[slot].in_use = false;
+        s_save();
+        s_unlock();
         return false;
     }
 
+    msg_t snapshot = { 0 };
+    bool found = false;
     s_lock();
-    msg_t *m = thread_find_locked(r.ref, MSG_DIR_UP);
+    m = thread_find_locked(ref, MSG_DIR_UP);
+    if (m) {
+        m->ack_state = MSG_ACK_UP_PENDING;
+        m->flags = (uint8_t) (m->flags & ~(MSG_F_SEND_FAILED | MSG_F_FAIL_UNSEEN));
+        snapshot = *m;
+        found = true;
+    }
+    s_unlock();
+    if (found) {
+        history_write_entry(&snapshot);
+    }
+    ESP_LOGI(TAG, "rcpt %s: refused while the server moves, re-queued under the same id (slot %d)", ref, slot);
+    move_note_moving_receipt();
+    return true;
+}
+
+static bool rcpt_apply_row(const rcpt_t *r, msg_rcpt_alert_t *alert);
+
+// Main task, first thing in msg_pump(): re-queues what the event task collected.
+static void moving_drain(void)
+{
+    for (;;) {
+        rcpt_t r;
+        memset(&r, 0, sizeof(r));
+        bool have = false;
+        s_lock();
+        for (int i = 0; i < MSG_MOVING_Q && !have; i++) {
+            if (s_moving_q[i][0] != '\0') {
+                memcpy(r.ref, s_moving_q[i], MSG_ID_MAX);
+                s_moving_q[i][0] = '\0';
+                have = true;
+            }
+        }
+        s_unlock();
+        if (!have) {
+            return;
+        }
+        if (requeue_moving(r.ref)) {
+            continue;
+        }
+        r.st = RCPT_ST_FAILED;
+        strcpy(r.rsn, "moving");
+        msg_rcpt_alert_t alert;
+        alert.valid = false;
+        if (rcpt_apply_row(&r, &alert) && alert.valid) {
+            s_late_alert = alert;
+            s_late_alert_valid = true;
+        }
+    }
+}
+
+bool msg_take_rcpt_alert(msg_rcpt_alert_t *out)
+{
+    if (!s_late_alert_valid) {
+        return false;
+    }
+    *out = s_late_alert;
+    s_late_alert_valid = false;
+    return true;
+}
+
+// Takes the msg lock only to flip the row, then writes msghist and returns the alert request with the
+// lock released.
+static bool rcpt_apply_row(const rcpt_t *r, msg_rcpt_alert_t *alert)
+{
+    s_lock();
+    msg_t *m = thread_find_locked(r->ref, MSG_DIR_UP);
     bool found = (m != NULL);
     rcpt_effect_t e = { false, false, false };
     msg_t snapshot = { 0 };
     int freed_slot = -1;
     if (found) {
-        e = rcpt_apply(&m->ack_state, &m->flags, m->rsn, &r);
+        e = rcpt_apply(&m->ack_state, &m->flags, m->rsn, r);
         snapshot = *m;
         if (e.confirm_pending) {
             // The row was still awaiting its PUBACK: the receipt proves the relay has it, so release the
             // pending_up slot as a PUBACK would and stop the wait.
             for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
                 if (s_rtc->pending_up[i].in_use &&
-                    strncmp(s_rtc->pending_up[i].id, r.ref, MSG_ID_MAX) == 0) {
+                    strncmp(s_rtc->pending_up[i].id, r->ref, MSG_ID_MAX) == 0) {
                     s_rtc->pending_up[i].in_use = false;
                     freed_slot = i;
                     if (s_pc_slot == i) {
@@ -1823,22 +1948,22 @@ bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *al
     s_unlock();
     if (freed_slot >= 0) {
         msgq_erase_reply(freed_slot); // unlocked flash I/O; the one write below covers the final state
-        ESP_LOGI(TAG, "rcpt %s: row was still pending, treated as confirmed", r.ref);
+        ESP_LOGI(TAG, "rcpt %s: row was still pending, treated as confirmed", r->ref);
     }
 
     if (!found) {
         // The thread is 32 deep: a receipt for an aged-out row is logged and dropped.
-        ESP_LOGI(TAG, "rcpt %s for %s: no matching row, dropped", r.st == RCPT_ST_SENT ? "sent" : "failed",
-                 r.ref);
+        ESP_LOGI(TAG, "rcpt %s for %s: no matching row, dropped", r->st == RCPT_ST_SENT ? "sent" : "failed",
+                 r->ref);
         return true;
     }
     if (!e.changed) {
-        ESP_LOGD(TAG, "rcpt %s for %s: no change (state %u)", r.st == RCPT_ST_SENT ? "sent" : "failed",
-                 r.ref, (unsigned) snapshot.ack_state);
+        ESP_LOGD(TAG, "rcpt %s for %s: no change (state %u)", r->st == RCPT_ST_SENT ? "sent" : "failed",
+                 r->ref, (unsigned) snapshot.ack_state);
         return true;
     }
-    ESP_LOGI(TAG, "rcpt %s: %s", r.ref,
-             r.st == RCPT_ST_SENT ? "delivered" : "FAILED");
+    ESP_LOGI(TAG, "rcpt %s: %s", r->ref,
+             r->st == RCPT_ST_SENT ? "delivered" : "FAILED");
     history_write_entry(&snapshot); // the third msghist write of a bridged page
     if (e.alert && alert) {
         alert->valid = true;
@@ -1848,6 +1973,23 @@ bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *al
         alert->peer[MSG_TO_MAX - 1] = '\0';
     }
     return true;
+}
+
+// Runs on the modem event task: a `moving` refusal is queued for msg_pump(); anything else is applied here.
+bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *alert)
+{
+    if (alert) {
+        alert->valid = false;
+    }
+    rcpt_t r;
+    bool sig_present = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
+    if (!rcpt_parse_cbor(buf, len, sig_present, &r)) {
+        return false;
+    }
+    if (r.st == RCPT_ST_FAILED && strcmp(r.rsn, "moving") == 0 && moving_enqueue(r.ref)) {
+        return true; // msg_pump() re-queues it
+    }
+    return rcpt_apply_row(&r, alert);
 }
 
 void msg_clear_fail_unseen(const char *id)
@@ -2023,6 +2165,8 @@ void msg_on_mqtt_disconnect(void) { pubconfirm_note_disconnect(&s_pc); }
 
 void msg_pump(void)
 {
+    moving_drain(); // before the hold below is read: a re-queued text is held before anything is published
+
     s_lock();
 
     // Replies go before acks so a typed reply is not stuck behind a pending-ack drain; with
@@ -2034,12 +2178,28 @@ void msg_pump(void)
         s_pc_slot = -1; // the awaited reply is gone (factory reset): forget it
         pubconfirm_init(&s_pc);
     }
+    const bool hold = move_hold_up(); // a server move is unsettled: replies wait for its end (§6.2)
+    static bool s_was_held = false;
+    if (s_was_held && !hold) {
+        // the hold ended (commit, cancel, or the day after a `moving` receipt): the 2 h age starts now
+        int64_t now = esp_timer_get_time();
+        for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
+            if (s_rtc->pending_up[i].in_use) {
+                s_rtc->pending_up[i].created_us = now;
+            }
+        }
+        s_save();
+    }
+    s_was_held = hold;
     for (int i = 0; i < MSG_PENDING_UP_MAX; i++) {
         if (!s_rtc->pending_up[i].in_use) {
             continue;
         }
         if (s_pc_slot >= 0 && s_pc_slot != i) {
             continue; // another reply is awaiting its PUBACK
+        }
+        if (hold && s_pc_slot != i) {
+            continue; // held: no attempt is used and its age does not run
         }
         msg_pending_up_t *p = &s_rtc->pending_up[i];
         bool too_old = (esp_timer_get_time() - p->created_us) > (int64_t) 2 * 3600 * 1000000;
@@ -2180,6 +2340,53 @@ void msg_pump(void)
     // Reached only when no reply or ack was pending: the sms_log audit queue shares the
     // one-publish-per-call rule.
     sms_try_publish_one();
+}
+
+bool msg_ack_pending(const char *id)
+{
+    bool found = false;
+    s_lock();
+    for (int i = 0; i < MSG_PENDING_ACKS_MAX && !found; i++) {
+        found = s_rtc->pending_acks[i].in_use && strncmp(s_rtc->pending_acks[i].id, id, MSG_ID_MAX) == 0;
+    }
+    s_unlock();
+    return found;
+}
+
+bool msg_reply_awaiting_puback(void)
+{
+    s_lock();
+    bool awaiting = s_pc_slot >= 0;
+    s_unlock();
+    return awaiting;
+}
+
+int msg_resweep_acks(int max, int64_t window_s)
+{
+    int64_t now = 0;
+    net_get_clock(&now);
+    int queued = 0;
+    size_t n = msg_thread_count();
+    for (size_t i = 0; i < n && queued < max; i++) {
+        const msg_t *m = msg_thread_at(i);
+        if (!m || m->dir != (uint8_t) MSG_DIR_DOWN || m->ack_state == MSG_ACK_UNSHOWN ||
+            m->id[0] == '\0' || (m->id[0] == 'x' && m->id[1] == '_')) {
+            continue; // never acked, or a synthetic SMS row
+        }
+        if (now > 0 && m->ts > 0 && now - m->ts > window_s) {
+            continue;
+        }
+        char id[MSG_ID_MAX];
+        strncpy(id, m->id, sizeof(id) - 1);
+        id[sizeof(id) - 1] = '\0';
+        bool read = m->ack_state == MSG_ACK_READ;
+        if (read ? msg_mark_read(id) : msg_mark_shown(id)) {
+            queued++;
+        } else {
+            break; // the ack queue is full
+        }
+    }
+    return queued;
 }
 
 size_t msg_thread_count(void)

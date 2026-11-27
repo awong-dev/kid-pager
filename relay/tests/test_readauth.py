@@ -331,6 +331,42 @@ def test_bridge_collections_are_default_deny(two_pairs):
             assert not _write(path, p, {"tokenHash": "hacked"})
 
 
+def test_move_record_and_claims_are_server_only(two_pairs):
+    db = get_db()
+    db.collection("settings").document("move").set({"id": "mv_0123456789ab", "role": "source"})
+    db.collection("moveClaims").document("u1").set({"code": "AAAA-BBBB", "passwordHash": "$x"})
+    admin = _make_family_admin("mv-admin", "mvadm", "famA")
+    for p in (P("u1"), P("u1", "super"), admin, None):
+        for path in ("settings/move", "moveClaims/u1"):
+            assert not _get(path, p), (path, p)
+            assert not _write(path, p, {"id": "hacked"})
+            assert not readauth.query_admissible(p, {"doc": path}) if p else True
+        assert not (p and readauth.query_admissible(p, {"collection": "moveClaims"}))
+        assert not (p and readauth.query_admissible(p, {"collection": "settings"}))
+
+
+def test_target_move_record_and_spent_claims_are_server_only(two_pairs):
+    """The target's record carries the Beam switch (group ids, SIMs); a spent claim marker and the
+    sessions stay as server-only as the codes themselves."""
+    db = get_db()
+    db.collection("settings").document("move").set(
+        {
+            "id": "mv_0123456789ab",
+            "role": "target",
+            "beam": {"switched": True, "oldGroupId": "g-old", "imsis": ["295050000000001"]},
+        }
+    )
+    db.collection("inviteCodes").document("d" * 64).set({"uid": "u1", "createdBy": "move", "spent": True})
+    db.collection("sessions").document("e" * 64).set({"uid": "u1"})
+    admin = _make_family_admin("mvt-admin", "mvtadm", "famA")
+    for p in (P("u1"), P("u1", "super"), admin, None):
+        for path in ("settings/move", f"inviteCodes/{'d' * 64}", f"sessions/{'e' * 64}"):
+            assert not _get(path, p), (path, p)
+            assert not _write(path, p, {"spent": False})
+        for coll in ("inviteCodes", "sessions", "settings"):
+            assert not (p and readauth.query_admissible(p, {"collection": coll}))
+
+
 def test_federation_collections_are_default_deny(two_pairs):
     db = get_db()
     paths = (

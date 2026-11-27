@@ -2,6 +2,7 @@
  * build/render_*.png. The PNG IDAT chunk is a zlib stream (RFC 2083 §9.3), made by compress2(). */
 #include "gfx.h"
 #include "devinfo_fmt.h"
+#include "move_ui_fmt.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -428,6 +429,141 @@ static void render_screen_device(void)
     gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter select  esc back");
 }
 
+
+/* The Device screen with the server-move lines of scr_device.c, built by the same move_ui_build(). The
+ * cursor sits on the first menu row, as after opening the screen; the window is scr_device.c's. */
+static int s_fixture_overflow = 0;
+
+static int fixture_width(const char *t) { return gfx_text_width(GFX_FONT_NORMAL, t); }
+
+static void draw_device_move(const move_ui_view_t *v)
+{
+    gfx_clear();
+    draw_fixture_status_bar(3, true, 0, 0, 3);
+
+    move_ui_lines_t ml;
+    move_ui_build(v, fixture_width, GFX_SCREEN_W - 10, &ml);
+
+    const char *info[] = {
+        "id pgr-0001  fw 0.2.0",
+        "owner kid1  claimed yes",
+        "broker kidpager.example:8883  sig on",
+        "signal -93 dBm  batt 3.28 V",
+        "session s_3ab91c02  book v4",
+        "Update: none",
+        "counters memfull 0  drops 0  resets 0",
+        "tofu glyphs 0  Fonts: factory",
+    };
+    const char *menu[] = {
+        "Device info (battery, SIM, cell)", "Re-sync address book", "Text size: normal",
+        "Rotate display: off", "Airplane mode: off (reboot)", "Reboot", "Passcode: not set",
+        "Auto-lock: never", "Carrier: auto", "Set up again", "Factory reset",
+    };
+    const char *lines[32];
+    int n = 0;
+    for (size_t i = 0; i < sizeof(info) / sizeof(info[0]); i++) {
+        lines[n++] = info[i];
+    }
+    for (int i = 0; i < ml.n; i++) {
+        lines[n++] = ml.line[i];
+    }
+    int menu_start = n;
+    if (ml.action) {
+        lines[n++] = ml.action_text;
+    }
+    for (size_t i = 0; i < sizeof(menu) / sizeof(menu[0]); i++) {
+        lines[n++] = menu[i];
+    }
+
+    const int visible = 5; /* DEVICE_VISIBLE_LINES */
+    int sel_abs = menu_start;
+    int top = sel_abs >= visible ? sel_abs - visible + 1 : 0;
+    int max_top = n > visible ? n - visible : 0;
+    if (top > max_top) {
+        top = max_top;
+    }
+    int y = FIXTURE_BODY_TOP + 2;
+    for (int i = top; i < n && i < top + visible; i++) {
+        if (i == sel_abs) {
+            gfx_text(0, y, GFX_FONT_NORMAL, ">");
+        }
+        gfx_text(10, y, GFX_FONT_NORMAL, lines[i]);
+        if (10 + fixture_width(lines[i]) > GFX_SCREEN_W) {
+            fprintf(stderr, "render_png: clipped (%d px): %s\n", 10 + fixture_width(lines[i]), lines[i]);
+            s_fixture_overflow++;
+        }
+        y += 16; /* UI_ROW_H */
+    }
+    gfx_text(0, FIXTURE_FOOTER_Y, GFX_FONT_NORMAL, "up/down move  enter select  esc back");
+}
+
+typedef struct {
+    const char *name;
+    bool have;
+    move_st_t st;
+    move_rsn_t rsn, last_rsn;
+    move_phase_t phase;
+    bool beam, action, running, committed, back, outcome, timed_out;
+    const char *host;
+    const char *note;
+} move_fixture_t;
+
+static void render_move_fixture(const move_fixture_t *f)
+{
+    move_ui_state_t u;
+    memset(&u, 0, sizeof(u));
+    u.have = f->have;
+    snprintf(u.host, sizeof(u.host), "%s", f->host ? f->host : "");
+    u.beam = f->beam;
+    u.st = f->st;
+    u.rsn = f->rsn;
+    u.last_rsn = f->last_rsn;
+    u.action_available = f->action;
+    u.running = f->running;
+    u.phase = f->phase;
+    u.outcome_committed = f->committed;
+    u.back_on_active = f->back;
+    move_ui_view_t v = {
+        .s = &u,
+        .active_host = f->committed ? "home.example.org" : "kidpager.example",
+        .beam_now = f->beam && !f->committed,
+        .outcome_visible = f->outcome,
+        .settle_timed_out = f->timed_out,
+        .note = f->note ? f->note : "",
+    };
+    draw_device_move(&v);
+}
+
+#define MV_HOST "home.example.org"
+#define MV_LONG_HOST "mmmmmmmmmmmmmmmmmmmmmmmm.kid-pager.example.com"
+static const move_fixture_t k_move_fixtures[] = {
+    { .name = "none" },
+    { .name = "server_active", .have = true, .st = MOVE_ST_OK, .host = MV_HOST },
+    { .name = "server_beam", .have = true, .st = MOVE_ST_CXL, .beam = true },
+    { .name = "pend", .have = true, .st = MOVE_ST_PEND, .action = true, .host = MV_HOST },
+    { .name = "pend_long_host", .have = true, .st = MOVE_ST_PEND, .action = true, .host = MV_LONG_HOST },
+    { .name = "pend_after_failed_trial", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CONN, .action = true, .host = MV_HOST },
+    { .name = "try_connecting", .have = true, .st = MOVE_ST_TRY, .running = true, .phase = MOVE_PHASE_CONNECTING, .host = MV_HOST },
+    { .name = "try_waiting", .have = true, .st = MOVE_ST_TRY, .running = true, .phase = MOVE_PHASE_WAITING, .host = MV_HOST },
+    { .name = "fail_budget", .have = true, .st = MOVE_ST_FAIL, .rsn = MOVE_RSN_BUDGET, .action = true, .host = MV_HOST },
+    { .name = "fail_ca", .have = true, .st = MOVE_ST_FAIL, .rsn = MOVE_RSN_CA, .action = true, .host = MV_HOST },
+    { .name = "out_committed", .have = true, .st = MOVE_ST_OK, .committed = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_ca", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CA, .last_rsn = MOVE_RSN_CA, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_tls", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_TLS, .last_rsn = MOVE_RSN_TLS, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_auth_direct", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_AUTH, .last_rsn = MOVE_RSN_AUTH, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_auth_beam", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_AUTH, .last_rsn = MOVE_RSN_AUTH, .beam = true, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_conn", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CONN, .last_rsn = MOVE_RSN_CONN, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_proof", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_PROOF, .last_rsn = MOVE_RSN_PROOF, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_busy", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_BUSY, .last_rsn = MOVE_RSN_BUSY, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_nvs", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_NVS, .last_rsn = MOVE_RSN_NVS, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_ca_long_host", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CA, .last_rsn = MOVE_RSN_CA, .action = true, .outcome = true, .host = MV_LONG_HOST },
+    { .name = "out_conn_back_on_active", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CONN, .last_rsn = MOVE_RSN_CONN, .action = true, .outcome = true, .back = true, .host = MV_HOST },
+    { .name = "out_conn_old_not_answering", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CONN, .last_rsn = MOVE_RSN_CONN, .action = true, .outcome = true, .timed_out = true, .host = MV_HOST },
+    { .name = "refuse_no_network", .have = true, .st = MOVE_ST_PEND, .action = true, .host = MV_HOST, .note = "No network" },
+    { .name = "refuse_airplane", .have = true, .st = MOVE_ST_PEND, .action = true, .host = MV_HOST, .note = "Airplane mode is on" },
+    { .name = "refuse_busy", .have = true, .st = MOVE_ST_PEND, .action = true, .host = MV_HOST, .note = "Busy, try in a few minutes" },
+};
+
 /* scr_devinfo.c: the real row builder (devinfo_rows()) with fixture data, `top` = first visible row. */
 static void render_screen_devinfo_at(int top)
 {
@@ -746,6 +882,21 @@ int main(int argc, char **argv)
             continue;
         }
         printf("render_png: wrote %s\n", path);
+    }
+    for (size_t i = 0; i < sizeof(k_move_fixtures) / sizeof(k_move_fixtures[0]); i++) {
+        render_move_fixture(&k_move_fixtures[i]);
+        snapshot_framebuffer();
+        char path[128];
+        snprintf(path, sizeof(path), "build/render_screen_device_move_%s.png", k_move_fixtures[i].name);
+        if (!write_png_gray8(path, (const uint8_t *) s_gray, GFX_SCREEN_W, GFX_SCREEN_H)) {
+            status = 1;
+            continue;
+        }
+        printf("render_png: wrote %s\n", path);
+    }
+    if (s_fixture_overflow) {
+        fprintf(stderr, "render_png: %d device-screen lines clipped\n", s_fixture_overflow);
+        status = 1;
     }
     printf("render_png: total tofu count = %u\n", (unsigned) gfx_get_tofu_count());
     return status;

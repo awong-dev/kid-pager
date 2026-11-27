@@ -1,0 +1,37 @@
+{
+  "_comment": "HKDF-SHA256 per-move derivation, docs/MOVE_DESIGN.md section 6.1. Checked by relay/tests/test_movekeys.py and the firmware host tests. k' = HKDF(ikm=k, salt=move_id ASCII, info='kp-move-key|'+dev_id, L=32); pw' = base64url_nopad(HKDF(..., info='kp-move-pw|'+dev_id, L=32))[:43].",
+  "vectors": [
+    {
+      "label": "design",
+      "k": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "move_id": "mv_0123456789ab",
+      "dev_id": "pgr-3fa9c01e",
+      "k_prime": "c1c9df9c17e6e2307e97fd99747e0f3e61d98f5448995b1465b5443c94b3d44b",
+      "pw_prime": "24asWQY9sAuF2T3kIJ2dIyLAETt3IZhwQ2Xd4rHc72Y"
+    },
+    {
+      "label": "same key, other device",
+      "k": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "move_id": "mv_0123456789ab",
+      "dev_id": "pgr-3fa9c01f",
+      "k_prime": "ca626abd0044981f37edc5019f150b721a34496aba9e71a7f6a3eeb1aa8e1a9b",
+      "pw_prime": "ze2VSidnc0AvTDB6NSYtDBdvD0HY6DEwj7E_oiBApUQ"
+    },
+    {
+      "label": "same key and device, other move",
+      "k": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "move_id": "mv_a1b2c3d4e5f6",
+      "dev_id": "pgr-3fa9c01e",
+      "k_prime": "c56c44c2be237efffacb4c5c3097af3c9f81f89c2a606cfee7b2497bc052a2ac",
+      "pw_prime": "1sXOof_JKu8wpVp-3Aex-ub46-HDEfnAbfbS0BRMXHc"
+    },
+    {
+      "label": "repeated byte key",
+      "k": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "move_id": "mv_ffffffffffff",
+      "dev_id": "pgr-00000001",
+      "k_prime": "c9c80ae1de5f8d5120d2127deeea2588581b8046dac11ff2ab3d8b58aaf75985",
+      "pw_prime": "YPKYM6GaemrOmgJDDW-lyZhgbUzsfAOSFg3LIQwyEJ0"
+    }
+  ]
+}

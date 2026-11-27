@@ -35,6 +35,7 @@ import { useAuth } from "@/lib/auth-context";
 import { CHROME } from "@/lib/layout";
 import { Link, usePathname } from "@/lib/router";
 
+import MoveBanner from "./MoveBanner";
 import NotificationWatcher from "./NotificationWatcher";
 import Logo from "./Logo";
 import AccountMenu from "./shell/AccountMenu";
@@ -224,6 +225,7 @@ function Frame({ children }: { children: ReactNode }) {
         <DesktopBar viewer={viewer} activeId={activeId} />
         <PhoneBar back={backTarget(pathname)} />
       </AppBar>
+      <MoveBanner />
       <SectionTabs viewer={viewer} pathname={pathname} />
       <Container
         maxWidth="md"

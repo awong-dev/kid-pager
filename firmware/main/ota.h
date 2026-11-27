@@ -107,6 +107,7 @@ typedef enum {
     OTA_ERR_BAD,
     OTA_ERR_NOPART, /* values are persisted: append only */
     OTA_ERR_FMT,
+    OTA_ERR_CAPS, /* the image lacks the `mv` capability after a server move */
 } ota_err_t;
 
 typedef struct {
@@ -151,7 +152,7 @@ bool ota_should_start(const ota_env_t *e, const ota_job_t *j);
 bool ota_should_install(const ota_env_t *e, bool sleep_mode, bool install_now);
 
 /* Wire strings: wait dl ready inst ok fail rb; errors base hash osha http budget flash nobl pv size
- * expired (+ mem run bad). NONE gives "". */
+ * expired (+ mem run bad caps). NONE gives "". */
 const char *ota_state_str(ota_state_t s);
 const char *ota_err_str(ota_err_t e);
 
@@ -183,6 +184,13 @@ typedef void (*ota_unlock_fn)(void);
 
 /* Call before ota_boot(). */
 void ota_bind(ota_lock_fn lock, ota_unlock_fn unlock);
+
+/* True once the running image is confirmed (not pending verify). */
+bool ota_image_confirmed(void);
+
+/* Drops a stored job that is still in `wait` and has not started (a server move commit, or a pager
+ * erased for a new setup): the new server re-issues it. A job that is downloading or installing stays. */
+void ota_cancel_waiting_jobs(void);
 
 /* Reads the running image id and rollback state and settles a job left by the previous boot.
  * Hashes ~700 KB of flash; call after the first frame is drawn. */

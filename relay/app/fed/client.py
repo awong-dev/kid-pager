@@ -169,6 +169,43 @@ class FedClient:
         assert last is not None
         raise last
 
+    def public_get(
+        self,
+        route: str,
+        *,
+        host: str,
+        port: int = 443,
+        base_path: str = "",
+        tls_ca: str | None = None,
+    ) -> Reply:
+        """An unsigned GET of a public route (`/api/...`) under the same address rules, TLS trust
+        and limits as `call`; the move's preflight reads the target's `move-info` this way.
+        `tls_ca` makes that CA the only root trusted, as for a link; the hostname is still checked."""
+        if not valid_base_path(base_path) or not route.startswith("/api/public/"):
+            raise FedTransportError("address_not_allowed", "unusable path")
+        try:
+            addresses = addr.check_host(host, port, self._policy)
+        except addr.AddressNotAllowed as exc:
+            raise FedTransportError("address_not_allowed", str(exc)) from exc
+        headers = {
+            "Accept": "application/json",
+            "Host": host if port == 443 else f"{host}:{port}",
+        }
+        try:
+            verify = tls_context(tls_ca)
+        except ValueError as exc:
+            raise FedTransportError("tls", "unusable CA") from exc
+        last: FedTransportError | None = None
+        for ip in addresses:
+            try:
+                return self._request_once("GET", ip, port, base_path, route, headers, b"", host, verify)
+            except FedTransportError as exc:
+                if exc.code != "unreachable":
+                    raise
+                last = exc
+        assert last is not None
+        raise last
+
     def _request_once(
         self,
         method: str,

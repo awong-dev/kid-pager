@@ -78,6 +78,7 @@ class SetupActivity : AppCompatActivity() {
     }
 
     private fun refresh() {
+        if (!b.relayUrl.hasFocus()) b.relayUrl.setText(Prefs.relayUrl(this))
         val s = Status.gather(this)
         if (b.simNumber.text.isNullOrBlank()) b.simNumber.setText(s.simNumber ?: "")
         b.pairState.text = if (Prefs.isPaired(this)) "Paired as ${Prefs.bridgeId(this)}" else "Not paired"

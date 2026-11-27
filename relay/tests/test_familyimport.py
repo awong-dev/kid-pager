@@ -164,6 +164,18 @@ def test_device_and_bridge_fixups(tmp_path, src_db):
     assert br["tokenHash"] is None
 
 
+def test_imported_device_reads_through_the_store_and_listings(tmp_path, src_db):
+    from app.store import devices as devices_store
+
+    dst = make_store("global", tmp_path, "dst")
+    familyexport.apply_import(dst, bundle(src_db), HOME, RecordingAuth())
+    dev = devices_store.get_device(w.DEV)
+    assert dev is not None and dev.provisionState == "moved" and dev.status.state is None
+    listed = {d.id: d for d in devices_store.list_devices()}
+    assert listed[w.DEV].provisionState == "moved"
+    assert w.DEV in {d.id for d in devices_store.list_devices(owner_uid=dev.ownerUid)}
+
+
 @pytest.mark.parametrize("src_kind", ENGINES)
 @pytest.mark.parametrize("dst_kind", ENGINES)
 def test_cross_engine_matrix(tmp_path, src_kind, dst_kind):

@@ -83,6 +83,9 @@ void catrust_before_reconnect(void);
 // On the MQTT-usable edge: clears the streak, and tls_broken if a validated retry succeeded.
 void catrust_on_mqtt_connected(void);
 
+// The active identity was replaced by a server move: the broken flag and the failure streak start over.
+void catrust_identity_changed(void);
+
 // True from fetch through commit/rollback of a two-phase apply.
 bool catrust_apply_in_progress(void);
 

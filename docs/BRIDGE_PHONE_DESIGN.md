@@ -431,6 +431,31 @@ Chat-style conversation. The DM identity is in `docs/BRIDGE_WHATSAPP_LID_DESIGN.
 - **Notification hygiene.** Covered in decision 13.
 - **Web.** Chips and labels read "WhatsApp" wherever the source is shown (see decision 12).
 
+## Server move
+
+When the relay is moved to another server, the frozen relay redirects the phone. Wire shapes only;
+the full description is MOVE_DESIGN.md §8.
+
+- **`moved` on `/bridge/*` answers.** `M = {"url": "<https base URL, path included>", "id": "<move id>"}`.
+  `heartbeat` answers `200 {"pending": 0, "moved": M}` and `outbox` `200 {"items": [], "moved": M}`;
+  `events` and `outbox/{ob}/ack` answer `503 {"detail": "moved", "moved": M}` with nothing applied, so
+  the phone keeps the events and acks and sends them to the new URL. `pair` is unchanged.
+- **`GET {url}/bridge/hello?bridge=<bridgeId>&nonce=<32 hex>`**, no token. Answer `200 {"bridgeId",
+  "moveId", "sig"}` with `sig` = lowercase hex of `HMAC-SHA256(key, "kp-bridge-hello|" + nonce + "|" +
+  bridgeId + "|" + moveId)`, where `key` is the ASCII bytes of the lowercase hex `SHA-256(token)`.
+  Vector: token `b_0123456789.test-secret`, bridgeId `b_0123456789`, nonce
+  `00112233445566778899aabbccddeeff`, moveId `mv_0123456789ab` gives
+  `sig = c987c28916b52dc0add4d1bbcd6fa99983b765d36944a0aec29d7ab709f5566d`.
+- **Follow.** On `moved` the phone calls `hello` on `M.url` and switches only if `bridgeId` is its own,
+  `moveId` equals `M.id` and `sig` matches (constant-time compare); otherwise it stays and retries in
+  5 minutes. The new URL becomes home and the old one is kept for 7 days.
+- **Failover.** After 3 consecutive failures of home (network, TLS, timeout, 5xx without `moved`) it
+  alternates with the other URL on a back-off of 1, 2, 5, 15, 30, 60 minutes: `hello` first, then an
+  authenticated heartbeat, settling only on a 2xx without `moved`. It keeps probing home and returns
+  when home answers. A 401 within the window tries the other URL and keeps the token unless that
+  answers 401 too. Neither URL is dropped before the window ends.
+- Code: `bridge-android/.../Mover.kt` (rules), `Moves.kt` (state), `RelayClient.kt`.
+
 ## Rejected
 - A headless-browser bridge on a single-board computer: Chat's DOM changes often; a Playwright-launched Chrome
   trips Google's sign-in block; notification contracts are the more stable surface.

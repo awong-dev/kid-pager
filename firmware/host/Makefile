@@ -30,7 +30,7 @@ endif
 MAIN_SRC := ../main
 BUILD := build
 
-TESTS := test_cbor test_auth test_setup test_input test_msg test_lock test_loc test_cafetch test_catrust test_cfg test_sms test_carrier test_chat_layout test_home_list test_archive test_coverage test_net_connect_guard test_net_probe_guard test_resub_verdict test_publish_quiet test_accel_rate test_bookpull test_clock test_disp_flip test_otapipe test_ota test_astpart test_gfx_assets test_battstat test_refreshpol test_temp test_devinfo test_tunes test_fuel test_pubconfirm test_rcpt
+TESTS := test_cbor test_auth test_setup test_input test_msg test_lock test_loc test_cafetch test_catrust test_cfg test_sms test_carrier test_chat_layout test_home_list test_archive test_coverage test_net_connect_guard test_net_probe_guard test_resub_verdict test_publish_quiet test_accel_rate test_bookpull test_clock test_disp_flip test_otapipe test_ota test_astpart test_gfx_assets test_battstat test_refreshpol test_temp test_devinfo test_tunes test_fuel test_pubconfirm test_rcpt test_ident test_move test_move_svc test_move_svc_off
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 # Asset image for render_png (built by tools/mkassets.py).
@@ -205,11 +205,13 @@ $(BUILD)/test_sms: $(BUILD)/sms.o $(BUILD)/cbor.o $(BUILD)/test_sms.o
 $(BUILD)/gfx.o: $(MAIN_SRC)/gfx.c $(MAIN_SRC)/gfx.h | $(BUILD)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/gfx.c
 
-$(BUILD)/render_png.o: render_png.c $(MAIN_SRC)/gfx.h | $(BUILD)
-	$(CC) $(CFLAGS) $(INCLUDES) $(ZLIB_CFLAGS) -c -o $@ render_png.c
+$(BUILD)/render_png.o: render_png.c $(MAIN_SRC)/gfx.h $(MAIN_SRC)/move_ui_fmt.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) $(ZLIB_CFLAGS) -c -o $@ render_png.c
 
-$(BUILD)/render_png: $(BUILD)/gfx.o $(BUILD)/render_png.o $(BUILD)/devinfo_fmt.o
-	$(CC) $(CFLAGS) -o $@ $(BUILD)/gfx.o $(BUILD)/render_png.o $(BUILD)/devinfo_fmt.o $(ZLIB_LIBS)
+# The Device-screen move fixtures use move_ui_fmt.c, which names reasons through move.c.
+$(BUILD)/render_png: $(BUILD)/gfx.o $(BUILD)/render_png.o $(BUILD)/devinfo_fmt.o $(BUILD)/move_ui_fmt.o \
+                    $(BUILD)/move.o $(BUILD)/ident.o $(BUILD)/catrust.o $(BUILD)/cbor.o $(BUILD)/nvs_fake.o
+	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS) $(ZLIB_LIBS)
 
 # `make emoji_png ASSETS=<emoji image>` renders the emoji sheet.
 $(BUILD)/render_emoji.o: render_emoji.c render_png.c $(MAIN_SRC)/gfx.h | $(BUILD)
@@ -419,3 +421,62 @@ $(BUILD)/test_fuel.o: test_fuel.c $(MAIN_SRC)/fuel_fmt.h | $(BUILD)
 
 $(BUILD)/test_fuel: $(BUILD)/fuel_fmt.o $(BUILD)/test_fuel.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/fuel_fmt.o $(BUILD)/test_fuel.o
+
+# ident.c runs on the in-memory NVS fake (nvs_fake.c, idf_stub/nvs.h).
+$(BUILD)/ident.o: $(MAIN_SRC)/ident.c $(MAIN_SRC)/ident.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ $(MAIN_SRC)/ident.c
+
+$(BUILD)/nvs_fake.o: nvs_fake.c nvs_fake.h idf_stub/nvs.h | $(BUILD)
+	$(CC) $(CFLAGS) $(IDF_STUB_INCLUDES) -c -o $@ nvs_fake.c
+
+$(BUILD)/test_ident.o: test_ident.c $(MAIN_SRC)/ident.h nvs_fake.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ test_ident.c
+
+$(BUILD)/test_ident: $(BUILD)/ident.o $(BUILD)/nvs_fake.o $(BUILD)/test_ident.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+# move.c: record, ledger and repair on the NVS fake; HKDF through the real mbedtls; the cfg.mv parser
+# reuses catrust.c's `ca` sub-map decoder.
+$(BUILD)/move.o: $(MAIN_SRC)/move.c $(MAIN_SRC)/move.h $(MAIN_SRC)/ident.h $(MAIN_SRC)/net.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/move.c
+
+$(BUILD)/caps.o: $(MAIN_SRC)/caps.c $(MAIN_SRC)/caps.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $(MAIN_SRC)/caps.c
+
+# msg.c with its ESP half, against the fakes in test_move.c (the `moving` receipt, docs/MOVE_FIRMWARE_DESIGN.md §6.2).
+$(BUILD)/msg_esp.o: $(MAIN_SRC)/msg.c $(MAIN_SRC)/msg.h $(MAIN_SRC)/move.h idf_stub/nvs.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ $(MAIN_SRC)/msg.c
+
+$(BUILD)/test_move.o: test_move.c $(MAIN_SRC)/move.h $(MAIN_SRC)/move_ui_fmt.h $(MAIN_SRC)/caps.h nvs_fake.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ test_move.c
+
+$(BUILD)/move_ui_fmt.o: $(MAIN_SRC)/move_ui_fmt.c $(MAIN_SRC)/move_ui_fmt.h $(MAIN_SRC)/move.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ $(MAIN_SRC)/move_ui_fmt.c
+
+$(BUILD)/test_move: $(BUILD)/move.o $(BUILD)/move_ui_fmt.o $(BUILD)/caps.o $(BUILD)/ident.o $(BUILD)/catrust.o $(BUILD)/cbor.o \
+                   $(BUILD)/msg_esp.o $(BUILD)/rcpt.o $(BUILD)/pubconfirm.o $(BUILD)/nvs_fake.o $(BUILD)/test_move.o
+	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS)
+
+# move_svc.c against fakes of the modem, messages and OTA (test_move_svc.c): the order service, the trial
+# state machine, commit and revert, the alternation. Built with the trial option on.
+$(BUILD)/move_svc.o: $(MAIN_SRC)/move_svc.c $(MAIN_SRC)/move.h idf_stub/sdkconfig.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM $(INCLUDES) $(IDF_STUB_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/move_svc.c
+
+$(BUILD)/test_move_svc.o: test_move_svc.c $(MAIN_SRC)/move.h nvs_fake.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ test_move_svc.c
+
+$(BUILD)/test_move_svc: $(BUILD)/move_svc.o $(BUILD)/move.o $(BUILD)/ident.o $(BUILD)/catrust.o $(BUILD)/cbor.o \
+                       $(BUILD)/nvs_fake.o $(BUILD)/test_move_svc.o
+	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS)
+
+
+# The same service without CONFIG_PAGER_MOVE_TRIALS: an order is refused, nothing is held.
+$(BUILD)/move_svc_off.o: $(MAIN_SRC)/move_svc.c $(MAIN_SRC)/move.h idf_stub/sdkconfig.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM -DMOVE_HOST_NO_TRIALS $(INCLUDES) $(IDF_STUB_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/move_svc.c
+
+$(BUILD)/test_move_svc_off.o: test_move_svc.c $(MAIN_SRC)/move.h nvs_fake.h | $(BUILD)
+	$(CC) $(CFLAGS) -DESP_PLATFORM -DTEST_TRIALS_OFF $(INCLUDES) $(IDF_STUB_INCLUDES) -c -o $@ test_move_svc.c
+
+$(BUILD)/test_move_svc_off: $(BUILD)/move_svc_off.o $(BUILD)/move.o $(BUILD)/ident.o $(BUILD)/catrust.o $(BUILD)/cbor.o \
+                           $(BUILD)/nvs_fake.o $(BUILD)/test_move_svc_off.o
+	$(CC) $(CFLAGS) -o $@ $^ $(MBEDTLS_LIBS)

@@ -5,17 +5,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from google.api_core.exceptions import NotFound
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app import ca_resolve
 from app.broker import BrokerClient
 from app.config import Settings
 from app.db.firestore import get_db
 from app.ids import new_message_id
+from app.movekeys import is_valid_move_id
 from app.store import backends as backends_store
 from app.store import conversations as conversations_store
 from app.store import devices as devices_store
@@ -62,7 +66,9 @@ _PENDING_CFG_OTA_FIELD = "pendingCfgOta"
 # `cfg.ast` (font job or cancel) has its own slot. Dropped by ingest when an online `/status`
 # lacks `ast`, so firmware without font OTA is not re-sent the job.
 _PENDING_CFG_AST_FIELD = "pendingCfgAst"
-# Every field `ack()`/`republish_pending()` iterate over: seven independent "newest unacked"
+# `cfg.mv` (move order, cancel or proof) has its own slot; the newest replaces the older.
+_PENDING_CFG_MV_FIELD = "pendingCfgMv"
+# Every field `ack()`/`republish_pending()` iterate over: eight independent "newest unacked"
 # slots.
 _ALL_PENDING_FIELDS = (
     _PENDING_BOOK_FIELD,
@@ -72,7 +78,13 @@ _ALL_PENDING_FIELDS = (
     _PENDING_CFG_LOC_FIELD,
     _PENDING_CFG_OTA_FIELD,
     _PENDING_CFG_AST_FIELD,
+    _PENDING_CFG_MV_FIELD,
 )
+
+# docs/MOVE_DESIGN.md §12.1 limits on `cfg.mv`.
+MV_HOST_MAX_BYTES = 127
+MV_CA_URL_MAX_BYTES = 200
+_MV_HOST_RE = re.compile(r"[A-Za-z0-9._:\[\]-]+")
 
 
 def _devices():
@@ -469,6 +481,130 @@ def clear_ota_job(device_id: str) -> None:
     _devices().document(device_id).set({"otaJob": None}, merge=True)
 
 
+class MoveCa(BaseModel):
+    """The target's CA pointer from its `move-info` (`ca.url`, `ca.sha` as 64 hex)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str
+    sha: bytes
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        if not v.startswith("https://") or len(v.encode("utf-8")) > MV_CA_URL_MAX_BYTES:
+            raise ValueError("cfg.mv ca url must be https and at most 200 bytes")
+        return v
+
+    @field_validator("sha", mode="before")
+    @classmethod
+    def _sha(cls, v: object) -> object:
+        if isinstance(v, str):
+            if re.fullmatch(r"[0-9a-f]{64}", v) is None:
+                raise ValueError("cfg.mv ca sha must be 64 lowercase hex")
+            return bytes.fromhex(v)
+        return v
+
+    @field_validator("sha")
+    @classmethod
+    def _sha_len(cls, v: bytes) -> bytes:
+        if len(v) != 32:
+            raise ValueError("cfg.mv ca sha must be 32 bytes")
+        return v
+
+
+def _mv_envelope(cfg_mv: dict[str, Any]) -> dict[str, Any]:
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "cfg",
+        "cfg": {"mv": cfg_mv},
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    return obj
+
+
+def _check_move_id(move_id: str) -> None:
+    if not is_valid_move_id(move_id):
+        raise ValueError(f"invalid move id {move_id!r}")
+
+
+def build_move_order(
+    *, move_id: str, host: str, port: int, ca: MoveCa | None
+) -> dict[str, Any]:
+    """The `cfg.mv` order `{id, host, port[, ca]}`; `ValueError` for a field outside §12.1."""
+    _check_move_id(move_id)
+    if not 1 <= len(host.encode("utf-8")) <= MV_HOST_MAX_BYTES or _MV_HOST_RE.fullmatch(host) is None:
+        raise ValueError(f"invalid move host {host!r}")
+    if isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError(f"invalid move port {port!r}")
+    mv: dict[str, Any] = {"id": move_id, "host": host, "port": port}
+    if ca is not None:
+        mv["ca"] = {"url": ca.url, "sha": ca.sha}
+    return _mv_envelope(mv)
+
+
+def build_move_cancel(move_id: str) -> dict[str, Any]:
+    """The `cfg.mv` cancel `{id, cancel: true}`."""
+    _check_move_id(move_id)
+    return _mv_envelope({"id": move_id, "cancel": True})
+
+
+def build_move_proof(move_id: str, n: int) -> dict[str, Any]:
+    """The `cfg.mv` proof `{id, ok: n}`, `n` being the `/status` envelope's `n` (0 to 2^53-1)."""
+    _check_move_id(move_id)
+    if isinstance(n, bool) or not 0 <= n <= _WORST_CASE_N:
+        raise ValueError(f"invalid proof n {n!r}")
+    return _mv_envelope({"id": move_id, "ok": n})
+
+
+def _push_move(device_id: str, obj: dict[str, Any], broker: BrokerClient) -> bool:
+    _set_pending(device_id, _PENDING_CFG_MV_FIELD, obj)
+    return broker.publish_down(device_id, obj)
+
+
+def push_move_order(
+    device_id: str,
+    *,
+    move_id: str,
+    host: str,
+    port: int,
+    ca: MoveCa | None,
+    broker: BrokerClient,
+) -> bool:
+    """Stores and publishes a `cfg.mv` order under `pendingCfgMv`.
+
+    False, with nothing stored, for an unknown device or one whose last `/status` lacked `mvc: 1`;
+    otherwise the publish result. A re-sent order after an unacked one replaces the slot."""
+    device = devices_store.get_device(device_id)
+    if device is None:
+        logger.warning("push_move_order: no such device %s", device_id)
+        return False
+    if device.status.mvc != 1:
+        logger.warning("push_move_order: device %s did not report mvc", device_id)
+        return False
+    obj = build_move_order(move_id=move_id, host=host, port=port, ca=ca)
+    return _push_move(device_id, obj, broker)
+
+
+def cancel_move(device_id: str, move_id: str, broker: BrokerClient) -> bool:
+    """Stores and publishes a `cfg.mv` cancel, replacing an unacked order in the slot."""
+    if devices_store.get_device(device_id) is None:
+        logger.warning("cancel_move: no such device %s", device_id)
+        return False
+    return _push_move(device_id, build_move_cancel(move_id), broker)
+
+
+def push_move_proof(device_id: str, move_id: str, n: int, broker: BrokerClient) -> bool:
+    """Stores and publishes a `cfg.mv` proof `{id, ok: n}`; every re-publish is re-signed."""
+    if devices_store.get_device(device_id) is None:
+        logger.warning("push_move_proof: no such device %s", device_id)
+        return False
+    return _push_move(device_id, build_move_proof(move_id, n), broker)
+
+
 def unpin_ca(device_id: str, broker: BrokerClient) -> bool:
     """`url = ""` means un-pin (docs/PROTOCOL.md §3.2); no `sha`, since there is no CA."""
     if devices_store.get_device(device_id) is None:
@@ -563,8 +699,14 @@ def ack(device_id: str, msg_id: str) -> bool:
     return matched
 
 
-def republish_pending(device_id: str, broker: BrokerClient) -> None:
-    """docs/PROTOCOL.md §5.3: re-publish the exact previously-built `obj` of each unacked slot."""
+def republish_pending(
+    device_id: str,
+    broker: BrokerClient,
+    *,
+    withhold: Callable[[dict[str, Any]], bool] | None = None,
+) -> None:
+    """docs/PROTOCOL.md §5.3: re-publish the exact previously-built `obj` of each unacked slot,
+    except one for which `withhold(obj)` is true."""
     snap = _devices().document(device_id).get()
     if not snap.exists:
         return
@@ -575,6 +717,9 @@ def republish_pending(device_id: str, broker: BrokerClient) -> None:
             continue
         obj = pending.get("obj")
         if not isinstance(obj, dict):
+            continue
+        if withhold is not None and withhold(obj):
+            logger.info("withholding unacked %s %s from device %s", obj.get("kind"), obj.get("id"), device_id)
             continue
         logger.info(
             "re-publishing unacked %s %s to device %s", obj.get("kind"), obj.get("id"), device_id

@@ -560,8 +560,33 @@ static void test_msg_peer_subsets_newest_first(void)
     }
 }
 
+/* A `moving` receipt re-queues a reply under the same id and `to` (docs/MOVE_FIRMWARE_DESIGN.md §6.2). */
+static void test_pending_up_claim(void)
+{
+    msg_pending_up_t tab[MSG_PENDING_UP_MAX];
+    memset(tab, 0, sizeof(tab));
+    bool had = true;
+
+    int s0 = msg_pending_up_claim(tab, MSG_PENDING_UP_MAX, "u_aaaaaaaa", "mum", 1000, &had);
+    CHECK(s0 == 0 && !had && tab[0].in_use && strcmp(tab[0].id, "u_aaaaaaaa") == 0 && strcmp(tab[0].to, "mum") == 0 &&
+              tab[0].created_us == 1000 && tab[0].attempts == 0,
+          "the first free slot takes the same id and `to`, age from now, no attempts");
+    int s1 = msg_pending_up_claim(tab, MSG_PENDING_UP_MAX, "u_bbbbbbbb", "", 2000, &had);
+    CHECK(s1 == 1 && tab[1].to[0] == '\0' && strcmp(tab[0].id, "u_aaaaaaaa") == 0, "the second slot; the first is untouched");
+    CHECK(msg_pending_up_claim(tab, MSG_PENDING_UP_MAX, "u_cccccccc", "x", 3000, &had) == -1 && !had,
+          "no free slot: refused, nothing changed");
+    CHECK(strcmp(tab[0].id, "u_aaaaaaaa") == 0 && strcmp(tab[1].id, "u_bbbbbbbb") == 0, "both reply slots intact");
+
+    tab[0].attempts = 2;
+    int again = msg_pending_up_claim(tab, MSG_PENDING_UP_MAX, "u_aaaaaaaa", "mum", 9000, &had);
+    CHECK(again == 0 && had && tab[0].attempts == 0 && tab[0].created_us == 9000,
+          "a reply still holding its slot is claimed in place, attempts and age start over");
+    CHECK(msg_pending_up_claim(tab, MSG_PENDING_UP_MAX, "u_aaaaaaaa", "mum", 9000, NULL) == 0, "had_it may be NULL");
+}
+
 int main(void)
 {
+    test_pending_up_claim();
     test_ascii_byte_cap();
     test_ascii_fills_to_exactly_1024_bytes();
     test_three_byte_codepoint_accepted();

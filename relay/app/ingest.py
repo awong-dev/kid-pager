@@ -12,9 +12,22 @@ from typing import Any, Literal
 import phonenumbers
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from app import alerts, book, devauth, devcfg, devsetup, location, wire
+from app import (
+    alerts,
+    book,
+    devauth,
+    devcfg,
+    devsetup,
+    location,
+    move_source,
+    move_target,
+    receipts,
+    wire,
+)
+from app import move as move_module
 from app import policy as policy_module
 from app.broker import BrokerClient
+from app.config import Settings
 from app.routing import Routing
 from app.sms_text import redact_phone
 from app.store import alerts as alerts_store
@@ -309,8 +322,14 @@ class Ingest:
     `_secret_cache` holds only the static `deviceSecrets/{d}` key material; the replay-window
     counters are read fresh from the store on every call."""
 
-    def __init__(self, broker: BrokerClient, routing: Routing | None = None) -> None:
+    def __init__(
+        self,
+        broker: BrokerClient,
+        routing: Routing | None = None,
+        settings: Settings | None = None,
+    ) -> None:
         self._broker = broker
+        self._settings = settings
         self._routing = routing if routing is not None else Routing(broker)
         self._secret_cache: dict[str, device_secrets_store.DeviceSecret] = {}
 
@@ -407,10 +426,14 @@ class Ingest:
             return
         data, _encoding = result
         if self._frozen(device):
+            assert device is not None
+            if move_module.frozen_for_move():
+                self._handle_up_frozen_for_move(device, data)
+                return
             # The family is being moved; answer anything but an ack with a `system` reply.
             if not (isinstance(data.get("ack"), str) and data.get("body") is None):
                 cause = data.get("id")
-                if isinstance(cause, str) and device is not None:
+                if isinstance(cause, str):
                     self._send_system_reply(device.id, families_store.FROZEN_REPLY, cause_id=cause)
             return
 
@@ -435,6 +458,32 @@ class Ingest:
             self._handle_ack(device_id, env)
         else:
             self._handle_up_message(device_id, device, env)
+
+    def _handle_up_frozen_for_move(
+        self, device: devices_store.Device, data: dict[str, Any]
+    ) -> None:
+        """The deployment is frozen for a move (docs/MOVE_DESIGN.md §4): acks are applied, a text is
+        refused with the `moving` receipt and not stored, everything else gets the system reply."""
+        if isinstance(data.get("ack"), str) and data.get("body") is None:
+            try:
+                env = UpEnvelope.model_validate(data)
+            except Exception as exc:  # noqa: BLE001 -- pydantic.ValidationError, narrowly caught above
+                wire.log_malformed(f"pager/{device.id}/up", b"", str(exc))
+                return
+            self._handle_ack(device.id, env)
+            move_source.note_ack(device.id, env.id)
+            return
+        cause = data.get("id")
+        if not isinstance(cause, str):
+            return
+        kind = data.get("kind")
+        if kind == "sms_log":
+            logger.info("sms_log %s from device %s dropped: frozen for a move", cause, device.id)
+        elif kind in (None, "msg") and device.status.mb is not None:
+            if not receipts.send_moving_receipt(device, cause, self._broker):
+                logger.warning("moving receipt for %s to device %s not published", cause, device.id)
+        else:
+            self._send_system_reply(device.id, families_store.FROZEN_REPLY, cause_id=cause)
 
     def _handle_contact_req(
         self,
@@ -766,6 +815,7 @@ class Ingest:
         msg = messages_store.get_message(env.id)
         if msg is None:
             if env.ack == "shown" and devcfg.ack(device_id, env.id):
+                move_target.note_ack(device_id, env.id, self._broker, self._settings)
                 return
             # docs/PROTOCOL.md §4.1 rule 3: unknown id -> log + drop, never create a row.
             logger.info("ack for unknown message id=%s from device=%s dropped", env.id, device_id)
@@ -905,7 +955,8 @@ class Ingest:
         if result is None:
             return
         data, _encoding = result
-        if self._frozen(device):
+        moving = move_module.get_record() if self._frozen(device) else None
+        if self._frozen(device) and (moving is None or not moving.frozen_for_move):
             logger.info("status from frozen family device %s dropped", device_id)
             return
         try:
@@ -943,6 +994,7 @@ class Ingest:
             ota_clear += tuple(
                 k
                 for k, v in (
+                    ("mvc", env.mvc),
                     ("battMv", env.batt_mv),
                     ("tempDc", env.temp_dc),
                     ("assetsSrc", env.ast),
@@ -969,6 +1021,7 @@ class Ingest:
             locMoveS=env.loc_move_s,
             gnss=env.gnss,
             mb=env.mb,
+            mvc=env.mvc,
             car=env.car,
             smsLost=env.sms_lost,
             link=env.link,
@@ -986,6 +1039,9 @@ class Ingest:
             assetsSrc=env.ast,
             assetsId=env.ast_id,
         )
+
+        if moving is not None:
+            move_source.note_status(device_id, env, moving)
 
         # A pager's `fed` book type depends on whether it reports `mb`; re-send the book when that
         # flips for an owner who lists a person on a peer relay.
@@ -1026,9 +1082,14 @@ class Ingest:
             # docs/PROTOCOL.md §5.3: bare offline (retained or LWT) -> mark offline only.
             return
 
-        # The first signed `/status` marks the device `provisioned`; only `hmac` devices sign.
-        if device.authMode == "hmac" and device.provisionState != "provisioned":
+        # The first signed `/status` marks the device `provisioned`; only `hmac` devices sign. A
+        # pager imported by a move is `provisioned` when it commits, not before.
+        if (
+            device.authMode == "hmac"
+            and device.provisionState not in ("provisioned", "moving")
+        ):
             devices_store.set_provision_state(device_id, "provisioned")
+        arrived = move_target.note_arrival(device)
 
         # Republish before the bv-triggered push so a fresh book is published once. A changed `link`
         # (silent modem session resume, <= 10 s subscription gap) also triggers it.
@@ -1039,8 +1100,11 @@ class Ingest:
         )
         session_changed = previous_status.session != env.session or link_changed
         offline_to_online = previous_status.state == "offline"
-        if session_changed or offline_to_online:
-            self._republish_unacked(device_id)
+        # An imported pager's first status here is an online edge whatever the stored session says.
+        if session_changed or offline_to_online or arrived:
+            self._republish_unacked(device_id, arriving=move_target.waiting_for_arrival(device))
+        move_target.note_bearer(device, env)
+        move_target.note_report(device, env, data.get("n"), self._broker, self._settings)
 
         # docs/PROTOCOL.md §5.3/§3.7: bump a zero `bookVersion` to 1 and publish, else re-nudge if
         # the reported `bv` is behind. `bv` comes from the raw dict (`StatusEnvelope` lacks it).
@@ -1056,16 +1120,20 @@ class Ingest:
             )
             devcfg.renudge_if_behind(device_id, reported_bv, self._broker)
 
-    def _republish_unacked(self, device_id: str) -> None:
+    def _republish_unacked(self, device_id: str, *, arriving: bool = False) -> None:
         """The online-edge re-publish (docs/PROTOCOL.md §5.3): pending messages from `pendingDeviceIds`
         (oldest first, capped at 10, excluding `kind:"loc_req"`), plus the newest unacked `book`/`cfg`,
-        one each, which do not count against the cap."""
+        one each, which do not count against the cap. A pager that has not yet committed its move
+        here is not sent an OTA or font job that points outside this server; the commit re-issues it."""
         for msg in messages_store.list_pending_for_device(device_id):
             if msg.kind == "loc_req":
                 continue
             logger.info("re-publishing unacked message %s to device %s", msg.id, device_id)
             self._routing.redeliver_pager(msg, device_id)
-        devcfg.republish_pending(device_id, self._broker)
+        withhold = (
+            (lambda obj: move_target.foreign_download(self._settings, obj)) if arriving else None
+        )
+        devcfg.republish_pending(device_id, self._broker, withhold=withhold)
 
 
     def handle_loc(self, topic: str, payload: bytes) -> None:

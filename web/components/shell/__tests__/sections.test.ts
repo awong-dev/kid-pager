@@ -49,7 +49,7 @@ describe("sectionOf", () => {
     expect(sectionOf("/family/people", member).section).toBeNull();
     expect(sectionOf("/admin/users", admin).section).toBeNull();
     expect(sectionOf("/admin/users", sup).section?.id).toBe("system");
-    expect(labels(sup, "/admin/hooks")).toEqual(["Families", "All users", "All devices", "Allow-list", "Hooks", "Federation"]);
+    expect(labels(sup, "/admin/hooks")).toEqual(["Families", "All users", "All devices", "Allow-list", "Hooks", "Federation", "Move"]);
   });
   it("Alerts is a section without tabs", () => {
     expect(sectionOf("/alerts", admin)).toMatchObject({ section: { id: "alerts" }, tabs: [] });

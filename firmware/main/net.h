@@ -78,6 +78,18 @@ bool net_ca_fetch_poll(uint8_t *buf, size_t cap, uint16_t *out_len, bool *out_cl
 /* Best-effort AT+SQNSH on the cafetch socket. */
 void net_ca_fetch_close(void);
 
+/* Server move (docs/MOVE_FIRMWARE_DESIGN.md §5.2). The pending identity's PEM goes to scratch slot 13; call
+ * before the disconnect so a failure leaves the session alone. Power: one modem NVRAM write. */
+bool net_login_prepare_pending(void);
+
+/* Points the modem at the pending (or, `false`, the active) identity: selects that view in ident, then TLS
+ * profile 2 (profile 0 on Beam) and the MQTT client's password. No session may be up. The next
+ * net_session_up() connects to that identity's host. Power: 2-3 AT commands, no RRC. */
+bool net_login_apply(bool pending);
+
+/* After a commit: the new active identity's PEM goes to slot 12 and profile 2 names it. */
+bool net_login_commit(void);
+
 /* Issues mqttConnect(); never on a timer (PROTOCOL.md §6.1). Power: one TLS handshake, ~5 kB. */
 bool net_session_up(void);
 

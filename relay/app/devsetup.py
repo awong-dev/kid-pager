@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -226,6 +226,13 @@ def decrypt_bundle(bkey: bytes, blob: bytes) -> dict[str, Any]:
     return wirecbor.decode(plaintext)
 
 
+class IssueOutcome(BaseModel):
+    """What the broker did with the pushes of one `issue` call."""
+
+    boot_user: Literal["ok", "manual", "error"] = "ok"
+    bundle_published: bool = True
+
+
 def issue(
     device_id: str,
     *,
@@ -241,9 +248,11 @@ def issue(
     broker: BrokerClient | None = None,
     emqx: BrokerAdmin | None = None,
     now: datetime | None = None,
+    outcome: IssueOutcome | None = None,
 ) -> str:
     """Pushes the bootstrap credential, publishes the encrypted bundle retained to
     `pager/boot/{bid}/down`, records `setupCodes/{bid}` (never the token), returns the setup code.
+    `outcome`, when given, is filled with what the broker accepted.
 
     `ca_pem` is pinned via a pointer (`ca_resolve.ca_pointer`); a missing `public_base_url` raises
     `PublicBaseUrlRequired` rather than sending an unpinned bundle."""
@@ -254,7 +263,7 @@ def issue(
     raw, token_str = token()
     bid, bpw, bkey = derive(raw)
 
-    emqx.ensure_boot_user(bid, bpw)
+    boot_result = emqx.ensure_boot_user(bid, bpw)
 
     ca_url: str | None = None
     ca_sha: bytes | None = None
@@ -274,7 +283,10 @@ def issue(
         apn=apn,
     )
     blob = bundle(device, bkey)
-    broker.publish(boot_topic_down(bid), blob, qos=1, retain=True)
+    published = broker.publish(boot_topic_down(bid), blob, qos=1, retain=True)
+    if outcome is not None:
+        outcome.boot_user = boot_result
+        outcome.bundle_published = bool(published)
 
     now = now if now is not None else datetime.now(UTC)
     setup_codes_store.create(bid, device_id, now + timedelta(minutes=EXPIRY_MINUTES))

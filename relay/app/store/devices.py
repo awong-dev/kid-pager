@@ -56,6 +56,8 @@ class DeviceStatus(BaseModel):
     # `mb` (docs/PROTOCOL.md §5.1, key 76): the largest body the firmware accepts; gates `rcpt`.
     # `None` = legacy 160 cp / 320 B pager; offline statuses leave it, a changed `fw` clears it.
     mb: int | None = None
+    # `mvc` (docs/MOVE_DESIGN.md §12.2): move capability, only ever `1`; gates a `cfg.mv` order.
+    mvc: int | None = None
     locPeriodS: int | None = None
     locMinS: int | None = None
     # Trust state and the pinned CA's short fingerprint.
@@ -163,6 +165,42 @@ class OtaJob(BaseModel):
     part: Literal["app", "assets"] = "app"
 
 
+class DeviceMoveLast(BaseModel):
+    """The pager's last `/status mv` for this move (docs/MOVE_DESIGN.md §12.2)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    st: Literal["pend", "try", "ok", "fail", "cxl"]
+    rsn: str | None = None
+    at: int | None = None
+    ts: datetime | None = None
+
+
+class DeviceMove(BaseModel):
+    """`devices/{d}.move` (docs/MOVE_DESIGN.md §7.2, §12.4): the move id and the pager's progress.
+
+    The target keeps `state`; the source keeps `capable`, `sentAt`, `ackAt`, `last` and
+    `cancelledAt`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    state: Literal["waiting", "trying", "moved", "reprovisioned"] | None = None
+    capable: bool = False
+    sentAt: datetime | None = None
+    ackAt: datetime | None = None
+    last: DeviceMoveLast | None = None
+    cancelledAt: datetime | None = None
+    # Target: the first signed `/status` here (`arrivedAt`), the latest `try` answered with the proof
+    # (`trialAt`), the commit (`movedAt`) and the setup code that ended the record (`reprovisionedAt`).
+    arrivedAt: datetime | None = None
+    trialAt: datetime | None = None
+    movedAt: datetime | None = None
+    reprovisionedAt: datetime | None = None
+    # Target: the pager has reported the Beam bearer at some point during the move.
+    onBeam: bool = False
+
+
 class Device(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -187,9 +225,12 @@ class Device(BaseModel):
     authMode: Literal["password", "hmac"] = "hmac"
     # Encoding of the device's last accepted envelope, which `/down` answers in; `None` until then.
     wire: Literal["json", "cbor"] | None = None
-    # "issued" once a setup code exists for this device (create and rotate); "provisioned" on
-    # its first signed `/status`. `None` on devices created before the field existed.
-    provisionState: Literal["issued", "provisioned"] | None = None
+    # "issued": a setup code exists (create, rotate); "provisioned": first signed `/status`;
+    # "moved": imported with a family export, no credentials until a setup code is issued;
+    # "moving": imported with a deployment bundle, arrives on commit (docs/MOVE_DESIGN.md §7.2).
+    provisionState: Literal["issued", "provisioned", "moved", "moving"] | None = None
+    # The deployment move this device is part of (`docs/MOVE_DESIGN.md` §7.2); `None` otherwise.
+    move: DeviceMove | None = None
     # Copied from the owner's `familyId` at creation; `None` on devices that predate it.
     familyId: str | None = None
     # Written directly via `get_db()` by the contacts store; modelled so `get_device()` returns it.
@@ -307,8 +348,11 @@ def set_apn(device_id: str, apn: str | None) -> None:
     _devices().document(device_id).set({"apn": apn}, merge=True)
 
 
-def set_provision_state(device_id: str, state: Literal["issued", "provisioned"]) -> None:
-    """Written "issued" on create and rotate; "provisioned" on the first signed `/status`."""
+def set_provision_state(
+    device_id: str, state: Literal["issued", "provisioned", "moved", "moving"]
+) -> None:
+    """Written "issued" on create and rotate; "provisioned" on the first signed `/status`;
+    "moved" by a family import; "moving" by a deployment import."""
     _devices().document(device_id).set({"provisionState": state}, merge=True)
 
 

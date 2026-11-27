@@ -21,9 +21,11 @@ import {
   loginWithPasskey,
   loginWithPassword,
   passkeysAvailable,
+  changePassword,
   redeemInvite,
   registerPasskey,
 } from "@/lib/auth/home";
+import { LOGIN_PASSWORD_MAX, parseInviteFragment, passwordChangeProblem } from "@/lib/move";
 import { takeReturnPath } from "@/lib/returnPath";
 
 type Mode = "sign-in" | "invite" | "offer-passkey";
@@ -48,9 +50,23 @@ export default function HomeLogin() {
   const [busy, setBusy] = useState(false);
   const [canPasskey, setCanPasskey] = useState(false);
 
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [changeTo, setChangeTo] = useState("");
+  const [changeAgain, setChangeAgain] = useState("");
+
   useEffect(() => {
     // after mount: no `window` during prerender
-    const t = setTimeout(() => setCanPasskey(passkeysAvailable()), 0);
+    const t = setTimeout(() => {
+      setCanPasskey(passkeysAvailable());
+      // A claim link (`/login#invite=<code>`) opens the invite form with the code filled in; the
+      // fragment is removed so the code does not stay in the address bar or history.
+      const claim = parseInviteFragment(window.location.hash);
+      if (claim) {
+        setCode(claim);
+        setMode("invite");
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
+    }, 0);
     return () => clearTimeout(t);
   }, []);
 
@@ -98,8 +114,11 @@ export default function HomeLogin() {
       navigate.replace(takeReturnPath());
     }, "Adding a passkey failed.");
 
+  const changeProblem = passwordChangeProblem(currentPassword, changeTo, changeAgain);
+  const change = () => run(() => changePassword(currentPassword, changeTo), "The password was not changed.");
+
   const signInValid = username.trim() !== "" && password !== "";
-  const redeemValid = code.trim() !== "" && (newPassword === "" || newPassword.length >= 8);
+  const redeemValid = code.trim() !== "" && (newPassword === "" || (newPassword.length >= 8 && newPassword.length <= LOGIN_PASSWORD_MAX));
 
   return (
     <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", p: 2 }}>
@@ -114,7 +133,50 @@ export default function HomeLogin() {
         {notRegisteredMessage && <Alert severity="warning" sx={{ mb: 2 }}>{notRegisteredMessage}</Alert>}
         {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
 
-        {mode === "sign-in" && (
+        {status === "must-change-password" && (
+          <Stack spacing={2}>
+            <Alert severity="info">
+              Your admin set this password for you. Choose your own now; nothing else works until you do.
+            </Alert>
+            <TextField
+              label="Password your admin gave you"
+              type="password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              autoComplete="current-password"
+              autoFocus
+              fullWidth
+            />
+            <TextField
+              label="New password"
+              type="password"
+              value={changeTo}
+              onChange={(e) => setChangeTo(e.target.value)}
+              helperText="At least 8 characters"
+              autoComplete="new-password"
+              fullWidth
+            />
+            <TextField
+              label="New password again"
+              type="password"
+              value={changeAgain}
+              onChange={(e) => setChangeAgain(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !changeProblem && void change()}
+              autoComplete="new-password"
+              fullWidth
+            />
+            {(changeTo !== "" || changeAgain !== "") && changeProblem && (
+              <Typography variant="body2" color="error">
+                {changeProblem}
+              </Typography>
+            )}
+            <Button variant="contained" disabled={busy || !!changeProblem} onClick={() => void change()}>
+              {busy ? "Saving..." : "Set my password"}
+            </Button>
+          </Stack>
+        )}
+
+        {status !== "must-change-password" && mode === "sign-in" && (
           <Stack spacing={2}>
             <TextField
               label="Username"
@@ -151,7 +213,7 @@ export default function HomeLogin() {
           </Stack>
         )}
 
-        {mode === "invite" && (
+        {status !== "must-change-password" && mode === "invite" && (
           <Stack spacing={2}>
             <Typography variant="body2">
               Enter the code your admin gave you. Choose a password now, or leave it blank
@@ -185,7 +247,7 @@ export default function HomeLogin() {
           </Stack>
         )}
 
-        {mode === "offer-passkey" && (
+        {status !== "must-change-password" && mode === "offer-passkey" && (
           <Stack spacing={2}>
             <Alert severity="success">You are signed in.</Alert>
             <Typography variant="body2">

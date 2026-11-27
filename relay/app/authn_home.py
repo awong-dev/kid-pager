@@ -83,7 +83,7 @@ def _credentials(uid: str):
 
 def set_password(uid: str, password: str) -> None:
     _credentials(uid).document("password").set(
-        {"kind": "password", "hash": _hasher.hash(password), "updatedAt": _now()}
+        {"kind": "password", "hash": hash_password(password), "updatedAt": _now()}
     )
 
 
@@ -104,6 +104,27 @@ def verify_password(uid: str, password: str) -> bool:
 
 def has_password(uid: str) -> bool:
     return _credentials(uid).document("password").get().exists
+
+
+def must_change_password(uid: str) -> bool:
+    """True while the password is one an admin set (a move's `mustChange` credential)."""
+    snap = _credentials(uid).document("password").get()
+    return snap.exists and (snap.to_dict() or {}).get("mustChange") is True
+
+
+def drop_admin_set_password(uid: str) -> None:
+    """Removes a `mustChange` password: a redeemed claim code proves the person, and a session held
+    to that password could not register a passkey."""
+    if must_change_password(uid):
+        _credentials(uid).document("password").delete()
+
+
+def change_password(uid: str, current: str, new: str) -> bool:
+    """Replaces the password when `current` is right; the new one carries no `mustChange`."""
+    if not verify_password(uid, current):
+        return False
+    set_password(uid, new)
+    return True
 
 
 def list_passkeys(uid: str) -> list[dict[str, Any]]:
@@ -163,15 +184,45 @@ def _normalize_code(code: str) -> str:
     return "".join(ch for ch in code.upper() if ch.isalnum())
 
 
+def new_invite_code() -> tuple[str, str]:
+    """`(code, digest)`: the code to show once (groups of four, any case/dashes accepted back) and
+    the `inviteCodes` document id it is stored under."""
+    raw = "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(_INVITE_LEN))
+    return "-".join(raw[i : i + 4] for i in range(0, _INVITE_LEN, 4)), _digest(raw)
+
+
+def hash_password(password: str) -> str:
+    """The argon2id PHC string `set_password` stores."""
+    return _hasher.hash(password)
+
+
 def mint_invite(uid: str, created_by: str, db=None) -> tuple[str, datetime]:
     """Returns `(code, expiresAt)`; the code is shown once, any case/dashes accepted back."""
-    raw = "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(_INVITE_LEN))
+    code, digest = new_invite_code()
     now = _now()
     expires = now + INVITE_TTL
-    (db or get_db()).collection("inviteCodes").document(_digest(raw)).set(
+    (db or get_db()).collection("inviteCodes").document(digest).set(
         {"uid": uid, "createdBy": created_by, "createdAt": now, "expiresAt": expires}
     )
-    return "-".join(raw[i : i + 4] for i in range(0, _INVITE_LEN, 4)), expires
+    return code, expires
+
+
+def retire_move_invites(uid: str) -> None:
+    """A person signed in: their move claim codes are spent. The rows stay as markers, so a code
+    used later is told it was already used (`invite_spent`)."""
+    snaps = get_db().collection("inviteCodes").where(filter=FieldFilter("uid", "==", uid)).stream()
+    for snap in list(snaps):
+        if (snap.to_dict() or {}).get("createdBy") == "move":
+            snap.reference.set({"uid": uid, "createdBy": "move", "spent": True, "expiresAt": _now()})
+
+
+def invite_spent(code: str) -> bool:
+    """True when `code` is a move claim code whose person has since signed in."""
+    normalized = _normalize_code(code)
+    if not normalized:
+        return False
+    snap = get_db().collection("inviteCodes").document(_digest(normalized)).get()
+    return snap.exists and (snap.to_dict() or {}).get("spent") is True
 
 
 def redeem_invite(code: str) -> str | None:
@@ -186,6 +237,8 @@ def redeem_invite(code: str) -> str | None:
         if not snap.exists:
             return None
         data = snap.to_dict() or {}
+        if data.get("spent") is True:
+            return None
         transaction.delete(ref)
         expires = data.get("expiresAt")
         if not isinstance(expires, datetime) or expires <= _now():

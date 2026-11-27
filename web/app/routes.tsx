@@ -56,6 +56,7 @@ export const AUTHENTICATED: readonly AuthRoute[] = [
   { path: "/admin/devices",         role: "super",  screen: () => import("@/screens/admin/Devices") },
   { path: "/admin/families",        role: "super",  screen: () => import("@/screens/admin/Families") },
   { path: "/admin/federation",      role: "super",  screen: () => import("@/screens/admin/Federation") },
+  { path: "/admin/move",           role: "super",  screen: () => import("@/screens/admin/Move") },
   { path: "/admin/hooks",           role: "super",  screen: () => import("@/screens/admin/Hooks") },
   { path: "/admin/users",           role: "super",  screen: () => import("@/screens/admin/Users") },
 ];

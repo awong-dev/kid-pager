@@ -22,7 +22,8 @@ id16 = its first 16 hex chars. Objects (content-addressed, immutable):
   fw/<id16>/manifest.json        this build's index entry
 and fw/index.json (no-store), newest build first. A withdrawn (bad) build is
 moved from `builds` to `withdrawn` (objects kept, so a pager running it still
-takes a delta off it); publish refuses a withdrawn id. Needs `pip install detools`
+takes a delta off it); publish refuses a withdrawn id. An image that embeds the tag
+`KPCAPS1:mv;` gets `caps: ["mv"]` in its entry, only from the tag. Needs `pip install detools`
 and `gcloud` (not needed with --dry-run).
 """
 
@@ -31,6 +32,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,9 @@ import urllib.request
 import zlib
 
 MAX_APP = 0x200000
+# A capability tag the firmware embeds in `.rodata`: `KPCAPS1:<name>;`, one per capability.
+CAP_TAG_RE = re.compile(rb"KPCAPS1:([a-z0-9_]{1,16});")
+KNOWN_CAPS = ("mv",)
 # assets_ota is 2 MiB; its last 4 KiB sector holds the commit record.
 MAX_ASSETS = 0x200000 - 4096
 ASSETS_FV_MAX = 1  # == gfx.h GFX_ASSETS_VER_MAX
@@ -66,7 +71,14 @@ def check_image(data: bytes, allow_large: bool = False) -> dict:
             "Pass --allow-large to publish anyway.")
     ident = data[-32:].hex()
     version = data[0x30:0x50].split(b"\0", 1)[0].decode("ascii", "replace")
-    return {"id": ident, "id16": ident[:16], "version": version, "size": len(data)}
+    return {"id": ident, "id16": ident[:16], "version": version, "size": len(data),
+            "caps": scan_caps(data)}
+
+
+def scan_caps(data: bytes) -> list[str]:
+    """The known capabilities whose `KPCAPS1:<name>;` tag appears in the image, sorted."""
+    found = {m.group(1).decode() for m in CAP_TAG_RE.finditer(data)}
+    return [c for c in KNOWN_CAPS if c in found]
 
 
 def check_assets(data: bytes) -> dict:
@@ -139,7 +151,7 @@ def make_delta(base: bytes, new: bytes) -> tuple[bytes, int]:
 
 def entry_for(info: dict, full: bytes, deltas: list, published: int) -> dict:
     i16 = info["id16"]
-    return {
+    entry = {
         "id": info["id"], "version": info["version"], "size": info["size"],
         "published": published,
         "full": {"path": f"fw/{i16}/full.z", "osz": len(full),
@@ -148,6 +160,9 @@ def entry_for(info: dict, full: bytes, deltas: list, published: int) -> dict:
                     "osz": len(d["dz"]), "osha": hashlib.sha256(d["dz"]).hexdigest(),
                     "psz": d["psz"]} for d in deltas],
     }
+    if info.get("caps"):
+        entry["caps"] = list(info["caps"])
+    return entry
 
 
 def merge_index(index: dict | None, entry: dict) -> dict:

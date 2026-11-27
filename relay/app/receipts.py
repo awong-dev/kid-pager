@@ -23,6 +23,9 @@ NOTICE_REASON_MAX_BYTES = 20
 # Ceiling the recipient name is cut to fit.
 NOTICE_BODY_MAX_BYTES = 90
 
+# `rsn` of the receipt a server frozen for a move answers a text with.
+MOVING_REASON = "moving"
+
 Outcome = Literal["system", "rcpt", "skip"]
 
 def _origin_devices(msg: messages_store.Message) -> list[devices_store.Device]:
@@ -127,6 +130,28 @@ def _on_delivery_terminal(
         if ok:
             outcome = path
     return outcome
+
+
+def send_moving_receipt(
+    device: devices_store.Device, ref: str, broker: BrokerClient
+) -> bool:
+    """Refuses the up text `ref` with `rsn: "moving"` (docs/MOVE_DESIGN.md §12.5); not stored.
+
+    False when the device has not reported `mb` (the caller sends the system reply instead) or
+    the publish fails. The id derives from `ref`, so a re-sent text gets the same receipt."""
+    if device.status.mb is None:
+        return False
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": sysmsg.derived_id("rcpt", device.id, ref, MOVING_REASON, "failed"),
+        "ts": int(time.time()),
+        "kind": "rcpt",
+        "ref": ref,
+        "st": "failed",
+        "rsn": MOVING_REASON,
+        "ack": None,
+    }
+    return broker.publish_down(device.id, obj)
 
 
 def _notice_body(msg: messages_store.Message, reason: str) -> str:

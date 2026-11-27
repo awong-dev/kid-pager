@@ -30,6 +30,10 @@ typedef struct {
     uint32_t up_lo;     /* low bits of the /up,/status,/loc counter */
     uint32_t down_n;    /* highest accepted /down n */
     uint32_t down_bits; /* bitmap of values below down_n */
+    uint32_t saved_n;    /* the active key's window while a move trial runs on the pending key */
+    uint32_t saved_bits;
+    uint8_t saved_valid; /* non-zero while saved_* hold a window that must come back; modes.c stores
+                            1 + the identity slot it belongs to */
 } auth_rtc_t;
 
 // Copies the key into static storage.
@@ -54,6 +58,36 @@ uint64_t auth_next_up_n(auth_rtc_t *rtc, uint32_t epoch, bool *wrapped);
 
 // Accepts a /down n inside the replay window; n == 0 is always rejected.
 bool auth_accept_down_n(auth_rtc_t *rtc, uint32_t n);
+
+// Zeroes the /down replay window (down_n, down_bits) and drops any saved one; up_lo is untouched.
+void auth_reset_down_window(auth_rtc_t *rtc);
+
+// Move trial on another key: stores the live window in saved_* and zeroes it, so the new key starts
+// from a clean window. A second call while saved_valid is set keeps the first saved window.
+void auth_window_swap_out(auth_rtc_t *rtc);
+
+// Puts the saved window back (revert, or the boot after a reset mid-trial); no-op without one.
+void auth_window_swap_back(auth_rtc_t *rtc);
+
+// Commit: the saved window belongs to the key that is gone.
+void auth_window_drop_saved(auth_rtc_t *rtc);
+
+// Boot, after the identity slots are repaired: a window saved for `active_slot` (1 + slot in saved_valid)
+// comes back; one saved for the other slot is dropped (the selector moved).
+void auth_window_boot_restore(auth_rtc_t *rtc, uint8_t active_slot);
+
+// The next /up, /status, /loc counter value, without drawing it.
+uint64_t auth_peek_up_n(const auth_rtc_t *rtc, uint32_t epoch);
+
+typedef enum {
+    AUTH_DOWN_OK,        /* `n` present and inside the window; the window has advanced */
+    AUTH_DOWN_NO_N,      /* no readable `n` (key 12), or one above 32 bits */
+    AUTH_DOWN_REPLAY,    /* `n` seen before, or older than the window */
+} auth_down_t;
+
+// Replay check for any signed /down envelope, run once after auth_verify() has trimmed `sig`. `buf`
+// is the trimmed CBOR map; its header count still includes the `sig` pair.
+auth_down_t auth_check_down(auth_rtc_t *rtc, const uint8_t *buf, size_t len);
 
 #ifdef __cplusplus
 }

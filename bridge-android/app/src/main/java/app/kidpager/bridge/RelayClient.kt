@@ -7,6 +7,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,7 +17,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Client for the relay's `/bridge/...` HTTP API. Every call but `pair` carries the bearer
- * token; a 401 clears the token, so the phone must be paired again.
+ * token. A 401 clears the token, so the phone must be paired again, unless a move left a
+ * previous URL to fall back to (see [Mover]); answers are also fed to [Moves].
  */
 class RelayClient(private val ctx: Context) {
     /** [detail] is the relay's `{"detail": "..."}` text; null when `detail` is not a string. */
@@ -25,9 +27,13 @@ class RelayClient(private val ctx: Context) {
             try { (WireJson.parseToJsonElement(body) as? JsonObject)?.get("detail")?.let { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content } }
             catch (e: Exception) { null }
         }
+        /** A 503 that redirects: the relay has moved, nothing was applied. */
+        val moved: Boolean by lazy { Mover.parseMoved(body) != null }
         fun reason(): String = detail ?: body.take(120)
     }
     class Unauthorized : IOException("401 unauthorized")
+    /** A 401 within the move window kept the token and the phone tries the other URL; the caller retries later. */
+    class FellBack : IOException("401 handled by the move failover")
 
     companion object {
         private const val TAG = "relay"
@@ -42,7 +48,60 @@ class RelayClient(private val ctx: Context) {
         .callTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    private fun base(): String = Prefs.relayUrl(ctx)
+    @Serializable
+    private data class HelloResponse(val bridgeId: String? = null, val moveId: String? = null, val sig: String? = null)
+
+    private fun noRedirects() = http.newBuilder().followRedirects(false).followSslRedirects(false).build()
+
+    /** `GET {url}/bridge/hello?bridge=&nonce=`, no credentials; null unless a 2xx answer parses. */
+    fun hello(url: String, bridgeId: String, nonce: String): HelloAnswer? {
+        val req = try {
+            Request.Builder().url("$url/bridge/hello".toHttpUrl().newBuilder()
+                .addQueryParameter("bridge", bridgeId).addQueryParameter("nonce", nonce).build())
+                .get().header("User-Agent", "kidpager-bridge/${BuildConfig.VERSION_NAME}").build()
+        } catch (e: IllegalArgumentException) { return null }
+        return try {
+            noRedirects().newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) { Log.w(TAG, "hello $url -> ${resp.code}"); return null }
+                val r = WireJson.decodeFromString(HelloResponse.serializer(), resp.body?.string().orEmpty())
+                HelloAnswer(r.bridgeId, r.moveId, r.sig)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "hello $url failed: ${e.javaClass.simpleName}")
+            null
+        }
+    }
+
+    /** An authenticated heartbeat to [url] that records nothing in [Moves]; for a URL not in use. */
+    fun probe(url: String, status: JsonObject, fcmToken: String?): Probe {
+        val tok = Prefs.token(ctx) ?: return Probe.FAIL
+        val body = buildJsonObject {
+            put("status", status)
+            if (fcmToken != null) put("fcmToken", JsonPrimitive(fcmToken))
+        }
+        val req = try {
+            Request.Builder().url("$url/bridge/heartbeat")
+                .post(WireJson.encodeToString(JsonElement.serializer(), body).toRequestBody(JSON))
+                .header("Authorization", "Bearer $tok")
+                .header("User-Agent", "kidpager-bridge/${BuildConfig.VERSION_NAME}").build()
+        } catch (e: IllegalArgumentException) { return Probe.FAIL }
+        return try {
+            noRedirects().newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                when {
+                    resp.code == 401 -> Probe.UNAUTH
+                    Mover.parseMoved(text) != null -> Probe.MOVED
+                    resp.isSuccessful -> Probe.OK
+                    else -> Probe.FAIL
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "probe $url failed: ${e.javaClass.simpleName}")
+            Probe.FAIL
+        }
+    }
+
+    private fun base(): String = Mover.activeUrl(Prefs.moveState(ctx))
 
     @Serializable
     data class Caps(val sms: Boolean, val gchat: Boolean, val gvoice: Boolean, val whatsapp: Boolean = false)
@@ -139,23 +198,35 @@ class RelayClient(private val ctx: Context) {
                 http.newCall(rb.build()).execute().use { resp ->
                     val text = resp.body?.string().orEmpty()
                     when {
-                        resp.isSuccessful -> return text
+                        resp.isSuccessful -> { if (auth) Moves.answered(ctx, text); return text }
                         resp.code == 401 && auth -> {
+                            if (Moves.unauthorized(ctx)) throw FellBack()
                             Log.w(TAG, "401 from relay; token cleared, re-pair needed")
                             Prefs.clearToken(ctx)
                             onUnauthorized?.invoke(ctx)
                             throw Unauthorized()
                         }
-                        resp.code >= 500 && attempt < retries -> Log.w(TAG, "HTTP ${resp.code}, retry ${attempt + 1}")
-                        else -> throw HttpError(resp.code, text)
+                        resp.code >= 500 && attempt < retries && Mover.parseMoved(text) == null ->
+                            Log.w(TAG, "HTTP ${resp.code}, retry ${attempt + 1}")
+                        else -> {
+                            if (auth) {
+                                when {
+                                    resp.code < 500 || Mover.parseMoved(text) != null -> Moves.answered(ctx, text)
+                                    else -> Moves.failed(ctx)
+                                }
+                            }
+                            throw HttpError(resp.code, text)
+                        }
                     }
                 }
             } catch (e: Unauthorized) {
                 throw e
+            } catch (e: FellBack) {
+                throw e
             } catch (e: HttpError) {
                 throw e
             } catch (e: IOException) {
-                if (attempt >= retries) throw e
+                if (attempt >= retries) { if (auth) Moves.failed(ctx); throw e }
                 Log.w(TAG, "IO ${e.javaClass.simpleName}, retry ${attempt + 1}")
             }
             attempt++

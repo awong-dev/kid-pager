@@ -100,6 +100,9 @@ class Settings:
     # PEM of this relay's own TLS root for link invites (`FED_CA_PEM` / `FED_CA_PEM_FILE`); with
     # `TLS_MODE=selfsigned` it defaults to `BROKER_CA_PEM`. Unset: invites carry no `ca`.
     fed_ca_pem: str | None = None
+    # The TCP port of the extra TLS listener a Soracom Beam pager reaches (`BEAM_PORT`; the home stack
+    # sets it only with `TLS_MODE=letsencrypt`). `None`: no Beam listener.
+    beam_port: int | None = None
 
     @property
     def webpush_configured(self) -> bool:
@@ -176,6 +179,7 @@ class Settings:
                 if tls_mode() == "selfsigned"
                 else None
             ),
+            beam_port=_beam_port(os.environ.get("BEAM_PORT", "")),
         )
 
 
@@ -223,6 +227,19 @@ def _fw_cache(raw: str) -> FwCache:
     if value not in ("gcs", "local"):
         raise ValueError(f"FW_CACHE must be 'gcs' or 'local', not {raw!r}")
     return value  # type: ignore[return-value]
+
+
+def _beam_port(raw: str) -> int | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"BEAM_PORT must be a port number, not {raw!r}") from None
+    if not 1 <= value <= 65535:
+        raise ValueError(f"BEAM_PORT must be a port number, not {raw!r}")
+    return value
 
 
 def _broker_mode(raw: str) -> BrokerMode:

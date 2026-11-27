@@ -164,9 +164,13 @@ class _Collector:
     def foreign_uid(self, coll: str, data: dict[str, Any]) -> bool:
         """True when a `uid_fields` value of the registry row names someone outside the family."""
         for f in datamap.get(coll).uid_fields:
-            if any(u not in self.uids for u in _as_list(data.get(f))):
+            if any(not self.in_scope(u) for u in _as_list(data.get(f))):
                 return True
         return False
+
+    def in_scope(self, uid: str) -> bool:
+        """Whether `uid` moves with this export."""
+        return uid in self.uids
 
 
     def run(self) -> Iterator[Row]:
@@ -208,10 +212,11 @@ class _Collector:
                 for snap in (
                     db.collection("users").document(uid).collection(sub).stream()
                 ):
-                    if sub == "book" and snap.id not in self.uids:
+                    if sub == "book" and not self.in_scope(snap.id):
                         self.drop("book", "names a person outside the family")
                         continue
                     yield self.row(f"users/{uid}/{sub}/{snap.id}", snap.to_dict() or {})
+            yield from self._user_extra(uid)
             alias = data.get("alias")
             if isinstance(alias, str):
                 a = db.collection("aliases").document(alias).get()
@@ -237,6 +242,10 @@ class _Collector:
         yield from self._conversations()
         if self.history:
             yield from self._history()
+
+    def _user_extra(self, uid: str) -> Iterator[Row]:
+        """Rows a subclass adds after a user's subcollections."""
+        return iter(())
 
     def _federation(self) -> Iterator[Row]:
         """The family's identity and its links. A move carries the private key; a backup never does.

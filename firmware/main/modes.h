@@ -5,6 +5,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Zeroes the /down replay window kept in RTC memory. Call before the identity is erased or replaced:
+// the window belongs to the key that is going away.
+void modes_reset_down_window(void);
+
+// Server move trials (move_svc.c): the signing key and /down window follow the ident_use() view; pending
+// saves the active window and starts the new key's at zero, active restores it. Returns the next up counter.
+uint64_t modes_auth_follow_view(void);
+
+// A move committed: the saved window belongs to the key that is gone.
+void modes_auth_commit(void);
+
 // Call once from app_main() before modes_run(); leaves the device in sleep mode.
 void modes_boot(void);
 

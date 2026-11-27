@@ -18,17 +18,23 @@ function parseReasonMessage(detail: unknown): { reason?: string; message?: strin
   };
 }
 
+/** A server frozen for a move refuses every change (`503 {"detail": "moving"}`). */
+const MOVING_MESSAGE = "This server has moved and is read-only. Use the new server to make changes.";
+
 export class ApiError extends Error {
   status: number;
   detail: unknown;
+  /** The whole parsed error body, for routes that put extras beside `detail`; `undefined` when empty. */
+  body?: unknown;
   /** Reason code from a `{reason, message}` 403 body, else `undefined`. */
   reason?: string;
 
-  constructor(status: number, detail: unknown) {
+  constructor(status: number, detail: unknown, body?: unknown) {
     const parsed = parseReasonMessage(detail);
     super(parsed?.message ?? (typeof detail === "string" ? detail : `request failed with status ${status}`));
     this.status = status;
     this.detail = detail;
+    this.body = body;
     this.reason = parsed?.reason;
   }
 }
@@ -59,7 +65,7 @@ async function request<T>(
   const data = text ? JSON.parse(text) : undefined;
   if (!resp.ok) {
     const detail = data && typeof data === "object" && "detail" in data ? data.detail : data;
-    throw new ApiError(resp.status, detail);
+    throw new ApiError(resp.status, resp.status === 503 && detail === "moving" ? MOVING_MESSAGE : detail, data);
   }
   return data as T;
 }
@@ -85,7 +91,7 @@ async function requestRaw(
       data = text;
     }
     const detail = data && typeof data === "object" && "detail" in data ? (data as { detail: unknown }).detail : data;
-    throw new ApiError(resp.status, detail);
+    throw new ApiError(resp.status, detail, data);
   }
   return resp;
 }

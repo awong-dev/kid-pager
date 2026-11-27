@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "cbor.h"
+
 // mbedTLS on-device; a self-contained HMAC-SHA256 on the host build.
 #ifdef ESP_PLATFORM
 
@@ -319,4 +321,89 @@ bool auth_accept_down_n(auth_rtc_t *rtc, uint32_t n)
     }
 
     return false; /* too far behind the window */
+}
+
+void auth_reset_down_window(auth_rtc_t *rtc)
+{
+    rtc->down_n = 0;
+    rtc->down_bits = 0;
+    auth_window_drop_saved(rtc);
+}
+
+void auth_window_swap_out(auth_rtc_t *rtc)
+{
+    if (!rtc->saved_valid) {
+        rtc->saved_n = rtc->down_n;
+        rtc->saved_bits = rtc->down_bits;
+        rtc->saved_valid = 1;
+    }
+    rtc->down_n = 0;
+    rtc->down_bits = 0;
+}
+
+void auth_window_swap_back(auth_rtc_t *rtc)
+{
+    if (!rtc->saved_valid) {
+        return;
+    }
+    rtc->down_n = rtc->saved_n;
+    rtc->down_bits = rtc->saved_bits;
+    auth_window_drop_saved(rtc);
+}
+
+void auth_window_drop_saved(auth_rtc_t *rtc)
+{
+    rtc->saved_n = 0;
+    rtc->saved_bits = 0;
+    rtc->saved_valid = 0;
+}
+
+void auth_window_boot_restore(auth_rtc_t *rtc, uint8_t active_slot)
+{
+    if (rtc->saved_valid != 0 && rtc->saved_valid != 1 + active_slot) {
+        auth_window_drop_saved(rtc);
+    } else {
+        auth_window_swap_back(rtc);
+    }
+}
+
+uint64_t auth_peek_up_n(const auth_rtc_t *rtc, uint32_t epoch)
+{
+    return (((uint64_t) (epoch & AUTH_UP_EPOCH_MASK)) << AUTH_UP_LO_BITS) | (rtc->up_lo & AUTH_UP_LO_MASK);
+}
+
+#define AUTH_KEY_N 12 /* `n`, PROTOCOL.md §10 */
+
+// Reads the top-level `n` from a trimmed envelope.
+static bool down_n_read(const uint8_t *buf, size_t len, uint64_t *n)
+{
+    cbor_r_t r;
+    cbor_r_init(&r, buf, len);
+    uint32_t count;
+    if (!cbor_r_map(&r, &count) || count == 0) {
+        return false;
+    }
+    count -= 1; /* the trimmed `sig` pair */
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t key;
+        if (!cbor_r_key(&r, &key)) {
+            return false;
+        }
+        if (key == AUTH_KEY_N) {
+            return cbor_r_uint(&r, n);
+        }
+        if (!cbor_r_skip(&r)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+auth_down_t auth_check_down(auth_rtc_t *rtc, const uint8_t *buf, size_t len)
+{
+    uint64_t n;
+    if (!down_n_read(buf, len, &n) || n > 0xFFFFFFFFu) {
+        return AUTH_DOWN_NO_N;
+    }
+    return auth_accept_down_n(rtc, (uint32_t) n) ? AUTH_DOWN_OK : AUTH_DOWN_REPLAY;
 }

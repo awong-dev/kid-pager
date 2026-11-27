@@ -43,6 +43,8 @@ export interface HomeSession {
   displayName: string;
   hasPassword: boolean;
   passkeys: number;
+  /** An admin-set password still has to be changed (docs/MOVE_DESIGN.md §9). */
+  mustChange?: boolean;
 }
 
 let current: AuthUser | null = null;
@@ -57,7 +59,7 @@ function publish(user: AuthUser | null) {
 export async function refreshSession(): Promise<HomeSession | null> {
   try {
     const session = await call<HomeSession>("GET", "/auth/session");
-    publish({ uid: session.uid });
+    publish({ uid: session.uid, mustChange: session.mustChange === true });
     return session;
   } catch {
     publish(null);
@@ -106,6 +108,13 @@ export function redeemInvite(code: string, password?: string): Promise<SignedIn>
   return signedIn(
     call<SignedIn>("POST", "/auth/invite/redeem", password ? { code, password } : { code })
   );
+}
+
+/** `POST /api/auth/password`: replaces the signed-in person's password (the only call a session
+ * with `mustChange` may make), then re-reads the session. */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  await call("POST", "/auth/password", { currentPassword, newPassword });
+  await refreshSession();
 }
 
 export function getSetupStatus(): Promise<{ needsSetup: boolean }> {

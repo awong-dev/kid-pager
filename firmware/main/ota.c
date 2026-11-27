@@ -341,6 +341,8 @@ const char *ota_err_str(ota_err_t e)
         return "nopart";
     case OTA_ERR_FMT:
         return "fmt";
+    case OTA_ERR_CAPS:
+        return "caps";
     default:
         return "";
     }
@@ -389,8 +391,11 @@ void ota_ui_text(ota_state_t s, ota_err_t err, unsigned pct, char *out, size_t c
 #ifdef ESP_PLATFORM
 
 #include "astpart.h"
+#include "caps.h"
 #include "cafetch.h"
+#include "ident.h"
 #include "modes.h"
+#include "move.h"
 #include "msg.h"
 #include "otapipe.h"
 
@@ -597,6 +602,45 @@ static void clear_job(void)
     s_job_fv = 0;
     s_unlock();
     job_persist();
+}
+
+static void request_status(void);
+
+bool ota_image_confirmed(void)
+{
+    return s_booted && !s_pending_verify;
+}
+
+void ota_cancel_waiting_jobs(void)
+{
+    if (!s_booted) {
+        job_load(); /* setup mode: the stored job has not been read yet */
+    }
+    if (s_have_job && s_job.state == OTA_ST_WAIT && !s_transfer_active && !s_pipe) {
+        ESP_LOGI(TAG, "stored %s job in wait dropped: the next server re-issues it",
+                 s_job_part == OTA_PART_ASSETS ? "font" : "app");
+        clear_job();
+        request_status();
+    }
+}
+
+/* After a server move the new image must still read the committed identity: one pass over the
+ * downloaded image for the `mv` capability tag (docs/MOVE_FIRMWARE_DESIGN.md §7). */
+static bool image_caps_ok(bool *mem_err)
+{
+    *mem_err = false;
+    if (ident_active_slot() == 0 && move_rec()->st != MOVE_ST_OK) {
+        return true;
+    }
+    const void *p = NULL;
+    esp_partition_mmap_handle_t h = 0;
+    if (esp_partition_mmap(s_target, 0, s_job.cfg.isz, ESP_PARTITION_MMAP_DATA, &p, &h) != ESP_OK) {
+        *mem_err = true;
+        return false;
+    }
+    bool ok = caps_image_has((const uint8_t *) p, s_job.cfg.isz, "mv");
+    esp_partition_munmap(h);
+    return ok;
 }
 
 static void mark_valid(const char *why)
@@ -1067,6 +1111,11 @@ static void complete_transfer(void)
     uint8_t got[32];
     if (esp_partition_get_sha256(s_target, got) != ESP_OK || memcmp(got, s_job.cfg.img, 32) != 0) {
         fail_job(OTA_ERR_HASH);
+        return;
+    }
+    bool mem_err;
+    if (!image_caps_ok(&mem_err)) {
+        fail_job(mem_err ? OTA_ERR_MEM : OTA_ERR_CAPS);
         return;
     }
     if (esp_ota_set_boot_partition(s_target) != ESP_OK) {

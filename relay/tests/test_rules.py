@@ -281,6 +281,31 @@ def test_settings_federation_is_server_only(two_pairs):
         assert _get(f"settings/{doc}", mint_id_token("u1")).status_code == 200
 
 
+def test_move_record_and_claims_are_server_only(two_pairs):
+    """`settings/move` names the bridge redirect and `moveClaims` holds claim codes and password
+    hashes: no client reads or writes either."""
+    get_db().collection("settings").document("move").set({"id": "mv_0123456789ab", "role": "source"})
+    get_db().collection("moveClaims").document("u1").set({"code": "AAAA-BBBB", "passwordHash": "$x"})
+    for token in (mint_id_token("u1"), mint_id_token("u2"), None):
+        for path in ("settings/move", "moveClaims/u1"):
+            assert _get(path, token).status_code == 403, (path, token is None)
+            assert _write(path, token, {"id": "hacked"}).status_code == 403
+    assert _get("settings/retention", mint_id_token("u1")).status_code in (200, 404)
+
+
+def test_target_move_record_and_spent_claims_are_server_only(two_pairs):
+    """The target's record carries the Beam switch; spent claim markers and sessions are default-deny."""
+    get_db().collection("settings").document("move").set(
+        {"id": "mv_0123456789ab", "role": "target", "beam": {"switched": True, "imsis": ["1"]}}
+    )
+    get_db().collection("inviteCodes").document("d" * 64).set({"uid": "u1", "spent": True})
+    get_db().collection("sessions").document("e" * 64).set({"uid": "u1"})
+    for token in (mint_id_token("u1"), mint_id_token("u2"), None):
+        for path in ("settings/move", f"inviteCodes/{'d' * 64}", f"sessions/{'e' * 64}"):
+            assert _get(path, token).status_code == 403, (path, token is None)
+            assert _write(path, token, {"spent": False}).status_code == 403
+
+
 def test_device_owner_can_read_their_device(two_pairs):
     devices_store.create_device(
         device_id="pgr-rules-1",

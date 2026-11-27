@@ -46,12 +46,16 @@ const ALL_FAMILIES = "__all__";
 
 const emptyForm = { ownerAlias: "", label: "", defaultToAlias: "", familyId: "" };
 
+const BROKER_ERROR =
+  "The broker did not accept the new login, so a setup code would not work. Make sure the broker is running and try again (for a new pager, use Rotate credentials).";
+
 // Response of device create and rotate-credentials; only the fields read here.
 interface DeviceSetupResponse {
   device: { id: string };
   setupCode: string;
   expiresAt: string;
   brokerPush: "pushed" | "manual";
+  brokerResult: "ok" | "manual" | "error";
   manualAcl?: string[] | null;
 }
 
@@ -103,6 +107,10 @@ function DevicesInner() {
       });
       setCreateOpen(false);
       setForm({ ...emptyForm, familyId: scopeFamilyId ?? "" });
+      if (resp.brokerResult === "error") {
+        setError(BROKER_ERROR);
+        return;
+      }
       setSetupResult({
         deviceId: resp.device.id,
         label: form.label,
@@ -122,6 +130,10 @@ function DevicesInner() {
       const resp = await api.post<DeviceSetupResponse>(
         `/admin/devices/${device.id}/rotate-credentials`
       );
+      if (resp.brokerResult === "error") {
+        setError(BROKER_ERROR);
+        return;
+      }
       setSetupResult({
         deviceId: device.id,
         label: device.label,

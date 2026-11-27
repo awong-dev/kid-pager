@@ -878,6 +878,7 @@ bool sms_build_log_cbor(uint8_t *out, size_t cap, size_t *out_len, bool signed_e
 
 #include "ident.h"
 #include "modes.h"
+#include "move.h"
 #include "msg.h"
 #include "net.h"
 
@@ -1243,6 +1244,9 @@ void sms_service(void)
 
 void sms_try_publish_one(void)
 {
+    if (move_hold_up()) {
+        return; // audit entries wait in their queue for the end of a server move (§6.2)
+    }
     s_lock();
     sms_audit_entry_t e;
     bool have = sms_audit_peek_oldest(&s_audit, &e);

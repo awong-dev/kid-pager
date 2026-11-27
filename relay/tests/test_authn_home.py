@@ -225,6 +225,7 @@ def test_login_logout_round_trip(client: TestClient):
         "displayName": "Kid",
         "hasPassword": True,
         "passkeys": 0,
+        "mustChange": False,
     }
 
     assert client.post("/api/auth/logout", headers=CSRF).status_code == 200
@@ -631,3 +632,17 @@ def test_session_cookie_path_follows_the_base_path(base_url: str, path: str):
         assert f"path={path}".lower() in resp.headers["set-cookie"].lower().replace("; ", ";").split(";")
         out = c.post("/api/auth/logout", headers=CSRF)
         assert f"path={path}".lower() in out.headers["set-cookie"].lower().replace("; ", ";").split(";")
+
+
+def test_redeeming_a_claim_without_a_password_supersedes_an_admin_set_one(client: TestClient):
+    """A move can carry both a claim code and an admin-set `mustChange` password; the claim alone
+    must leave a session that can register a passkey."""
+    kid = _member("kid")
+    get_db().collection("users").document(kid).collection("credentials").document("password").set(
+        {"kind": "password", "hash": authn_home.hash_password(PASSWORD), "mustChange": True}
+    )
+    code, _ = authn_home.mint_invite(kid, "move")
+    assert client.post("/api/auth/invite/redeem", json={"code": code}, headers=CSRF).status_code == 200
+    session = client.get("/api/auth/session").json()
+    assert session["mustChange"] is False and session["hasPassword"] is False
+    assert client.get("/api/me").status_code == 200

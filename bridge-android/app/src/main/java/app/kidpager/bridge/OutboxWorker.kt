@@ -86,6 +86,7 @@ class OutboxWorker(private val ctx: Context, private val scope: CoroutineScope) 
             } catch (e: RelayClient.Unauthorized) {
                 throw e
             } catch (e: RelayClient.HttpError) {
+                if (e.moved) { Log.w(TAG, "ack $id: relay has moved; kept for the new URL"); continue }
                 when (e.code) {
                     404 -> { Log.w(TAG, "ack $id 404; relay forgot it, forgetting too"); tracker.forget(id) }
                     409, 422 -> { Log.w(TAG, "ack $id rejected ${e.code}; dropping"); tracker.acked(id) }

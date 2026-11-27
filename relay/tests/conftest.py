@@ -135,14 +135,17 @@ def _clean_emulators() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _reset_fed_state() -> Iterator[None]:
-    """Drops the federation switch cache (30 s) and any injected federation client."""
+    """Drops the federation switch cache (30 s), the move record cache and any injected federation client."""
+    from app import move
     from app.fed import client as fed_client
     from app.store import fed_state
 
     fed_state.invalidate_cache()
+    move.invalidate_cache()
     fed_client.set_default_client(None)
     yield
     fed_state.invalidate_cache()
+    move.invalidate_cache()
     fed_client.set_default_client(None)
 
 

@@ -30,7 +30,45 @@ object Prefs {
     /** Defaults to the Gradle property RELAY_URL the app was built with. */
     fun relayUrl(ctx: Context): String =
         get(ctx).getString("relayUrl", null)?.ifBlank { null } ?: BuildConfig.DEFAULT_RELAY_URL.trimEnd('/')
-    fun setRelayUrl(ctx: Context, url: String) = get(ctx).edit().putString("relayUrl", url.trimEnd('/')).apply()
+    /** A URL typed by the user replaces any pending move and fallback; the same URL leaves them. */
+    fun setRelayUrl(ctx: Context, url: String) {
+        val u = url.trimEnd('/')
+        if (u == relayUrl(ctx)) return
+        saveMoveState(ctx, MoveState(relayUrl = u))
+    }
+
+    fun moveState(ctx: Context): MoveState {
+        val p = get(ctx)
+        return MoveState(
+            relayUrl = relayUrl(ctx),
+            pendingUrl = p.getString("pendingUrl", null),
+            pendingId = p.getString("pendingId", null),
+            lastTryAt = p.getLong("pendingTryAt", 0),
+            prevUrl = p.getString("prevRelayUrl", null),
+            prevUntil = p.getLong("prevUntil", 0),
+            homeMoveId = p.getString("homeMoveId", null),
+            onOther = p.getBoolean("onOther", false),
+            fails = p.getInt("moveFails", 0),
+            step = p.getInt("moveStep", 0),
+            nextAt = p.getLong("moveNextAt", 0),
+        )
+    }
+
+    fun saveMoveState(ctx: Context, s: MoveState) {
+        get(ctx).edit()
+            .putString("relayUrl", s.relayUrl)
+            .putString("pendingUrl", s.pendingUrl)
+            .putString("pendingId", s.pendingId)
+            .putLong("pendingTryAt", s.lastTryAt)
+            .putString("prevRelayUrl", s.prevUrl)
+            .putLong("prevUntil", s.prevUntil)
+            .putString("homeMoveId", s.homeMoveId)
+            .putBoolean("onOther", s.onOther)
+            .putInt("moveFails", s.fails)
+            .putInt("moveStep", s.step)
+            .putLong("moveNextAt", s.nextAt)
+            .apply()
+    }
 
     fun token(ctx: Context): String? = get(ctx).getString("token", null)
     fun bridgeId(ctx: Context): String? = get(ctx).getString("bridgeId", null)

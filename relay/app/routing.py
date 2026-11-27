@@ -10,6 +10,7 @@ from typing import Any, Literal
 from app import alerts as alerts_module
 from app import bodysplit, book, deliveries
 from app import hooks as hooks_module
+from app import move as move_module
 from app import policy as policy_module
 from app.backends.base import Backend, DeliverResult
 from app.backends.fed import link_for as fed_backend_link
@@ -734,6 +735,12 @@ class Routing:
     def _deliver_one(
         self, msg: Message, bid: str, delivery: Delivery, backend_row: BackendRow
     ) -> None:
+        if backend_row.kind == "pager" and move_module.delivery_held(
+            backend_row.config.get("deviceId")
+        ):
+            # imported pager that has not arrived: no publish, no attempt
+            logger.info("delivery of %s to %s held: pager has not arrived", msg.id, bid)
+            return
         backend = self._registry.get(backend_row.kind)
         if backend is None:
             logger.warning(

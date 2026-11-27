@@ -44,12 +44,15 @@ interface CaConfirmState {
 
 const emptyForm = { ownerAlias: "", label: "", defaultToAlias: "" };
 
-// Device create/rotate response (same shape as the admin one).
+const BROKER_ERROR =
+  "The broker did not accept the new login, so a setup code would not work. Make sure the broker is running and try again.";
+
 interface DeviceSetupResponse {
   device: { id: string };
   setupCode: string;
   expiresAt: string;
   brokerPush: "pushed" | "manual";
+  brokerResult: "ok" | "manual" | "error";
   manualAcl?: string[] | null;
 }
 
@@ -91,6 +94,10 @@ function FamilyDevicesInner() {
       });
       setCreateOpen(false);
       setForm(emptyForm);
+      if (resp.brokerResult === "error") {
+        setError(BROKER_ERROR);
+        return;
+      }
       setSetupResult({
         deviceId: resp.device.id,
         label: form.label,
@@ -110,6 +117,10 @@ function FamilyDevicesInner() {
       const resp = await api.post<DeviceSetupResponse>(
         `/family/devices/${device.id}/rotate-credentials${familyQuery()}`
       );
+      if (resp.brokerResult === "error") {
+        setError(BROKER_ERROR);
+        return;
+      }
       setSetupResult({
         deviceId: device.id,
         label: device.label,

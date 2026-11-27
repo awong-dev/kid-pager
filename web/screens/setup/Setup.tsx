@@ -22,6 +22,7 @@ import {
   passkeysAvailable,
   registerPasskey,
 } from "@/lib/auth/home";
+import { LOGIN_PASSWORD_MAX } from "@/lib/move";
 import { takeReturnPath } from "@/lib/returnPath";
 
 export default function SetupPage() {
@@ -99,7 +100,7 @@ function HomeSetup() {
     }
   }
 
-  const valid = username.trim() !== "" && password.length >= 8 && password === confirm;
+  const valid = username.trim() !== "" && password.length >= 8 && password.length <= LOGIN_PASSWORD_MAX && password === confirm;
 
   return (
     <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", p: 2 }}>
@@ -123,6 +124,10 @@ function HomeSetup() {
             <Typography variant="body2">
               This server has no accounts yet. Create the first administrator: it can add
               families, people and pagers.
+            </Typography>
+            <Typography variant="body2">
+              Moving from another server? Create the administrator here anyway, then open System, Move and import
+              the bundle. The import replaces this administrator with the people from the old server.
             </Typography>
             <TextField
               label="Username"

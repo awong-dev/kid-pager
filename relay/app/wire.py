@@ -216,6 +216,37 @@ def _ota_field_ok(name: str | None, value: object) -> bool:
     return False
 
 
+MOVE_ID_RE = re.compile(r"[a-z0-9_]{3,16}")
+MOVE_STATES = ("pend", "try", "ok", "fail", "cxl")
+MOVE_RSN_MAX_BYTES = 8
+
+
+class MoveReport(BaseModel):
+    """`/status` `mv` (CBOR key 78, docs/MOVE_DESIGN.md §12.2): the pager's move state."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    id: str
+    st: Literal["pend", "try", "ok", "fail", "cxl"]
+    rsn: str | None = None
+    # Trials started.
+    at: int = Field(ge=0, le=255)
+
+    @field_validator("id")
+    @classmethod
+    def _id(cls, v: str) -> str:
+        if MOVE_ID_RE.fullmatch(v) is None:
+            raise ValueError("invalid move id")
+        return v
+
+    @field_validator("rsn")
+    @classmethod
+    def _rsn(cls, v: str | None) -> str | None:
+        if v is not None and (len(v.encode("utf-8")) > MOVE_RSN_MAX_BYTES or not v.isprintable()):
+            raise ValueError("rsn too long")
+        return v
+
+
 class StatusEnvelope(BaseModel):
     """A payload on `pager/{device_id}/status` (device publish or broker LWT), §5.1/§5.2."""
 
@@ -267,6 +298,10 @@ class StatusEnvelope(BaseModel):
     # Largest message body in UTF-8 bytes the firmware accepts and sends (CBOR key 76, 1024); absent
     # = legacy pager; an out-of-range value drops to `None`.
     mb: int | None = None
+    # Move capability (key 77): only `1` is legal, anything else drops to `None`; the gate for a
+    # `cfg.mv` order. `mv` (key 78) is the move report, CBOR only; a malformed one drops alone.
+    mvc: int | None = None
+    mv: MoveReport | None = None
     # Carrier name the pager detected (key 70), display only; over-long or non-printable values
     # drop to `None`.
     car: str | None = None
@@ -350,6 +385,19 @@ class StatusEnvelope(BaseModel):
         if value is None or (len(value) <= 24 and value.isprintable() and value.isascii()):
             return value
         return None
+
+    @field_validator("mvc", mode="before")
+    @classmethod
+    def _check_mvc(cls, value: object) -> int | None:
+        return 1 if value == 1 and not isinstance(value, bool) else None
+
+    @field_validator("mv", mode="before")
+    @classmethod
+    def _check_mv(cls, value: object) -> MoveReport | None:
+        try:
+            return MoveReport.model_validate(value)
+        except ValueError:
+            return None
 
     @field_validator("bpull")
     @classmethod

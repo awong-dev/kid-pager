@@ -14,18 +14,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from app import alerts as alerts_module
-from app import bridge_health, bridge_numbers, chat_subscribe, deliveries, link_health
+from app import (
+    bridge_health,
+    bridge_numbers,
+    chat_subscribe,
+    deliveries,
+    link_health,
+    move,
+)
 from app.bridgeauth import mint_token, require_bridge
 from app.carriers import service as carriers_service
 from app.carriers.base import SimInfo
 from app.db import sqlitestore
 from app.db.firestore import get_db
 from app.inbound_text import handle_text, placeholder_for
-from app.routers.webhooks import _check_webhook_ip_rate_limit
+from app.routers.webhooks import _check_webhook_ip_rate_limit, _client_ip
 from app.sms_text import redact_phone, voice_link
 from app.store import bridge_conversations, bridge_outbox
 from app.store import bridges as bridges_store
@@ -127,6 +135,45 @@ def pair(req: PairRequest, request: Request) -> PairResponse:
     return PairResponse(bridgeId=bridge.id, token=token, outboxWaitS=wait_s or None)
 
 
+def bridge_moved(
+    bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)],
+) -> dict[str, str] | None:
+    """The `moved` object while this relay sends bridge phones elsewhere (docs/MOVE_DESIGN.md §8.3)."""
+    return move.bridge_moved()
+
+
+def _refused_moved(moved: dict[str, str]) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "moved", "moved": moved})
+
+
+HELLO_LIMIT = 20
+HELLO_WINDOW_S = 60
+HELLO_BRIDGE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+HELLO_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+@router.get("/hello")
+def hello(request: Request, bridge: str = "", nonce: str = "") -> JSONResponse:
+    """Proves this relay holds the bridge's token hash and this move id, without the token (§8.4)."""
+    if HELLO_BRIDGE_RE.fullmatch(bridge) is None or HELLO_NONCE_RE.fullmatch(nonce) is None:
+        return JSONResponse(status_code=400, content={"detail": "bad request"})
+    if not rate_limits_store.check_and_increment(
+        f"bridge-hello:{_client_ip(request)}", limit=HELLO_LIMIT, window_s=HELLO_WINDOW_S
+    ):
+        return JSONResponse(status_code=429, content={"detail": "too many requests"})
+    rec = move.get_record()
+    row = bridges_store.get(bridge)
+    if rec is None or row is None or row.tokenHash is None:
+        return JSONResponse(status_code=404, content={"detail": "unavailable"})
+    return JSONResponse(
+        {
+            "bridgeId": row.id,
+            "moveId": rec.id,
+            "sig": move.hello_sig(row.tokenHash, nonce, row.id, rec.id),
+        }
+    )
+
+
 class HeartbeatStatus(BaseModel):
     """What the phone may report; typed so a bad value is a 422. `error` is relay-owned, ignored."""
 
@@ -161,9 +208,12 @@ SIM_CHANGED = "SIM changed"
 def heartbeat(
     req: HeartbeatRequest,
     request: Request,
-    bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)]
+    bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)],
+    moved: Annotated[dict[str, str] | None, Depends(bridge_moved)],
 ) -> dict:
     """Record the status; a reported SIM differing from the accepted one sets `status.error`."""
+    if moved is not None:
+        return {"pending": 0, "moved": moved}
     status = req.status.model_dump(exclude_unset=True, exclude={"error"})
     if status.get("smsDefault") is not None:
         status["smsCapable"] = status["smsDefault"]
@@ -225,9 +275,12 @@ OUTBOX_POLL_INTERVAL_S = 2
 @router.get("/outbox")
 async def get_outbox(
     bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)],
+    moved: Annotated[dict[str, str] | None, Depends(bridge_moved)],
     wait: Annotated[int, Query(ge=0)] = 0,
 ) -> dict:
     """Pending items, oldest first, at most 20; `wait` (cap 25 s) long-polls without a thread."""
+    if moved is not None:
+        return {"items": [], "moved": moved}
     deadline = time.monotonic() + min(wait, OUTBOX_WAIT_CAP_S)
     woke = asyncio.Event()
     unsubscribe = None
@@ -282,8 +335,13 @@ def apply_ack_to_delivery(item: bridge_outbox.OutboxItem) -> None:
 
 @router.post("/outbox/{ob_id}/ack", status_code=204)
 def ack_outbox(
-    ob_id: str, req: AckRequest, bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)]
+    ob_id: str,
+    req: AckRequest,
+    bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)],
+    moved: Annotated[dict[str, str] | None, Depends(bridge_moved)],
 ) -> Response:
+    if moved is not None:
+        return _refused_moved(moved)
     acked = bridge_outbox.ack(bridge.id, ob_id, req.state, req.reason, req.tier)
     if acked is None:
         raise HTTPException(status_code=404, detail="no such outbox item")
@@ -588,12 +646,15 @@ def process_events(
     return results
 
 
-@router.post("/events")
+@router.post("/events", response_model=None)
 async def post_events(
     req: EventsRequest,
     request: Request,
     bridge: Annotated[bridges_store.Bridge, Depends(require_bridge)],
-) -> dict:
+    moved: Annotated[dict[str, str] | None, Depends(bridge_moved)],
+) -> dict | JSONResponse:
+    if moved is not None:
+        return _refused_moved(moved)
     results = await run_in_threadpool(
         process_events, bridge, req.events, request.app.state.routing, request.app.state.broker
     )

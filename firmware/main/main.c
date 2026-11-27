@@ -423,6 +423,36 @@ static int cmd_nvsstats(int argc, char **argv)
     return 0;
 }
 
+// `identslot show|copy|flip` -- bench only. show prints both identity slots; copy writes the active
+// slot to the inactive one; flip commits the inactive slot ("idsel"/"act"), and a reboot then
+// brings the modem session up on it.
+static void identslot_print(int slot)
+{
+    ident_slot_info_t i;
+    ident_slot_info(slot, &i);
+    printf("identslot %d%s: valid=%d sealed=%d seal=%u dev_id=%s host=%s port=%u ca_len=%u\n", slot,
+           slot == ident_active_slot() ? " (active)" : "", (int) i.valid, (int) i.sealed,
+           (unsigned) i.seal, i.dev_id, i.host, (unsigned) i.port, (unsigned) i.ca_len);
+}
+
+static int cmd_identslot(int argc, char **argv)
+{
+    const char *sub = argc > 1 ? argv[1] : "show";
+    if (strcmp(sub, "copy") == 0) {
+        printf("identslot copy: %s\n", ident_debug_copy_active() ? "ok" : "FAILED");
+    } else if (strcmp(sub, "flip") == 0) {
+        int other = 1 - ident_active_slot();
+        printf("identslot flip to %d: %s\n", other, ident_commit_slot(other) ? "ok" : "FAILED");
+    } else if (strcmp(sub, "show") != 0) {
+        printf("usage: identslot show|copy|flip\n");
+        return 1;
+    }
+    identslot_print(0);
+    identslot_print(1);
+    printf("identslot: epoch=%u\n", (unsigned) ident_get_n_epoch());
+    return 0;
+}
+
 // `refresh [floor N|ceil N|idle S|gap MS|psmin N|status]` tunes the refresh policy; knobs persist
 // to NVS "disp".
 static int cmd_refresh(int argc, char **argv)
@@ -1973,6 +2003,15 @@ static void start_normal_console(void)
         .func = &cmd_nvsstats,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&nvsstats_cmd));
+
+    const esp_console_cmd_t identslot_cmd = {
+        .command = "identslot",
+        .help = "identslot [show|copy|flip] -- bench only: print both identity slots, copy the active "
+                "slot to the inactive one, or commit the inactive slot (then reboot)",
+        .hint = NULL,
+        .func = &cmd_identslot,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&identslot_cmd));
 
     const esp_console_cmd_t padinfo_cmd = {
         .command = "padinfo",

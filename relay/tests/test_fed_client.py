@@ -352,3 +352,29 @@ def test_the_url_carries_the_peers_path_but_the_signature_covers_the_bare_route(
     sign.verify(pub, parsed, "POST", "/fed/v1/inbox", body)
     with pytest.raises(sign.SignatureError):
         sign.verify(pub, parsed, "POST", "/apps/pager/fed/v1/inbox", body)
+
+
+def test_public_get_trusts_the_given_ca_and_still_checks_the_hostname(tls_server):
+    make, seen = tls_server
+    port, own_ca = make("peer.test")
+    c = client_mod.FedClient(policy=policy("127.0.0.1", loopback=True))
+    reply = c.public_get("/api/public/move-info", host="peer.test", port=port, tls_ca=own_ca)
+    assert reply.status == 200
+    assert seen == [{"host": f"peer.test:{port}", "path": "/api/public/move-info"}]
+    # public roots only, another CA, or a certificate for another name: refused as `tls`
+    other = pem(make_ca("another CA")[1])
+    for host_port, ca in ((port, None), (port, other)):
+        with pytest.raises(client_mod.FedTransportError) as exc:
+            c.public_get("/api/public/move-info", host="peer.test", port=host_port, tls_ca=ca)
+        assert exc.value.code == "tls"
+    port2, ca2 = make("someone-else.test")
+    with pytest.raises(client_mod.FedTransportError) as exc:
+        c.public_get("/api/public/move-info", host="peer.test", port=port2, tls_ca=ca2)
+    assert exc.value.code == "tls"
+
+
+def test_public_get_refuses_a_ca_without_a_certificate():
+    c = client_mod.FedClient(policy=policy("93.184.216.34"))
+    with pytest.raises(client_mod.FedTransportError) as exc:
+        c.public_get("/api/public/move-info", host="peer.test", tls_ca="not a pem")
+    assert exc.value.code == "tls"

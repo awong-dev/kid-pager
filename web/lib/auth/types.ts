@@ -4,6 +4,8 @@
  * this is the Firebase `User` itself (which has `uid`). */
 export interface AuthUser {
   uid: string;
+  /** Home only: the password was set by an admin and must be replaced before anything else works. */
+  mustChange?: boolean;
 }
 
 export type AuthBackend = "firebase" | "home";

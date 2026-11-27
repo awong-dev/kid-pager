@@ -130,7 +130,7 @@ aliases/{alias}                {uid}                                  uniqueness
 users/{uid}/backends/{bid}     {kind: 'pager'|'webapp'|'sms'|'gchat'|…, config, enabled, verifiedAt}
 allow/{fromUid}_{toUid}        {fromUid, toUid, message: bool, locate: bool, familyIds: [fid…]}
 devices/{deviceId}             {ownerUid, label, mqttUsername, defaultToUid|null, revokedAt, familyId,
-                                authMode: 'hmac'|'password', provisionState: 'issued'|'provisioned',
+                                authMode: 'hmac'|'password', provisionState: 'issued'|'provisioned'|'moved',
                                 wire: 'json'|'cbor'|null, bookVersion: int,
                                 locatableBy: [uid…],                  derived from allow.locate, in-family only
                                 smsContacts: [{name, phone}…],        V02_DESIGN.md §6, max 8, owner/admin-managed

@@ -31,6 +31,8 @@
 - [CARRIER_V02_FIRMWARE_DESIGN.md](CARRIER_V02_FIRMWARE_DESIGN.md): carrier v0.2 firmware: board autodetection and drivers for the carrier board's peripherals.
 - [CHAT_UI_DESIGN.md](CHAT_UI_DESIGN.md): pager chat UI and address-book use: all chats, new chat, new group from the book.
 - [CONTACT_REQ_DESIGN.md](CONTACT_REQ_DESIGN.md): contact requests from the pager, SMS contacts per family, and family rename.
+- [MOVE_DESIGN.md](MOVE_DESIGN.md): moving a whole deployment to another server during a declared downtime: freeze, bundle, import, pagers and bridge phones following over the air, the wire contract.
+- [MOVE_FIRMWARE_DESIGN.md](MOVE_FIRMWARE_DESIGN.md): the pager side of a server move: identity slots, trial, commit on a signed proof, revert, bench plan.
 - [FAMILY_EXPORT_DESIGN.md](FAMILY_EXPORT_DESIGN.md): moving a family between servers: the export file, freeze, import rules, per-pager setup codes.
 - [FEDERATION_DESIGN.md](FEDERATION_DESIGN.md): relay-to-relay messaging between families: peering, shared people, outbox and receipts.
 - [GNSS_DISABLE_DESIGN.md](GNSS_DISABLE_DESIGN.md): per-device `cfg.loc.gnss` setting that stops the pager from powering the GNSS receiver.
@@ -59,7 +61,7 @@
 
 ## Runbooks
 
-- [FAMILY_MOVE.md](FAMILY_MOVE.md): move one family between servers: freeze, export, import dry run, pager setup codes, back out.
+- [FAMILY_MOVE.md](FAMILY_MOVE.md): move a whole deployment (Part A) or one family (Part B) between servers: freeze, export, import dry run, pager and bridge cutover, back out.
 - [../home/README.md](../home/README.md): the home server runbook.
 - [../infra/README.md](../infra/README.md): the cloud deployment runbook.
 

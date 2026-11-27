@@ -341,6 +341,46 @@ static void test_ast_span(void)
     CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d) && d.have_ota && !d.have_ast, "have_ast false when absent");
 }
 
+/* `mv`=7: the span of a server-move map, next to another key; absent keeps have_mv false. */
+static void test_mv_span(void)
+{
+    uint8_t buf[256];
+    cbor_w_t w;
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 4);
+    cbor_w_tstr(&w, 1, "m_55555555", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_uint(&w, 12, 77);
+    cbor_w_map_key(&w, 38, 1);
+    cbor_w_map_key(&w, 7, 2); /* mv: a cancel, { id, cancel: true } */
+    cbor_w_tstr(&w, 0, "mv_0123456789ab", 15);
+    cbor_w_bool(&w, 4, true);
+    CHECK(!w.err, "test setup: encoding the mv fixture must not overflow");
+    cfg_dispatch_t d;
+    CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d), "a cfg envelope with `mv` must be accepted");
+    CHECK(d.have_mv && !d.have_lock && !d.have_ca && !d.have_ota && !d.have_ast && !d.have_loc && !d.have_sms,
+          "have_mv, nothing else");
+    cbor_r_t r;
+    cbor_r_init(&r, buf + d.mv_off, d.mv_len);
+    uint32_t count, key;
+    const char *str;
+    size_t slen;
+    bool b;
+    CHECK(cbor_r_map(&r, &count) && count == 2, "captured mv span must decode as a 2-pair map");
+    CHECK(cbor_r_key(&r, &key) && key == 0 && cbor_r_tstr(&r, &str, &slen) && slen == 15, "mv id");
+    CHECK(cbor_r_key(&r, &key) && key == 4 && cbor_r_bool(&r, &b) && b, "mv cancel");
+    CHECK(d.mv_off + d.mv_len == w.len, "mv span ends at the end of the buffer");
+
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 1, "m_44444444", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_map_key(&w, 38, 1);
+    cbor_w_map_key(&w, 5, 1);
+    cbor_w_bool(&w, 0, true);
+    CHECK(cfg_parse(buf, (uint16_t) w.len, false, &d) && d.have_loc && !d.have_mv, "have_mv false when absent");
+}
+
 /* `loc`=5: a recognised span next to an ignored key 3 that decodes standalone; absent keeps
  * have_loc false. */
 static void test_loc_span(void)
@@ -389,6 +429,7 @@ int main(void)
     test_loc_span();
     test_ota_span();
     test_ast_span();
+    test_mv_span();
     test_lock_only();
     test_ca_only();
     test_sms_only();

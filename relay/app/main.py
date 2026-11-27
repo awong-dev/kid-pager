@@ -11,9 +11,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app import alerts as alerts_module
 from app import live, push_webpush, scheduler, static_web
+from app import move as move_module
 from app import sysmsg as sysmsg_module
 from app.backends.registry import build_registry
 from app.backends.webapp import NullFCMClient
@@ -25,6 +27,7 @@ from app.fed import sender as fed_sender
 from app.ingest import Ingest
 from app.location import Location
 from app.logging_config import configure_logging, request_id_var
+from app.move_source import MoveError
 from app.routers import (
     admin,
     auth_home,
@@ -48,6 +51,7 @@ from app.routers import (
     hooks_api,
     internal,
     me,
+    move,
     push,
     webhooks,
 )
@@ -58,6 +62,10 @@ configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("relay.api")
 
 REQUEST_ID_HEADER = "X-Request-Id"
+
+MOVING_DETAIL = "moving"
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_MOVING_EXEMPT = ("/api/admin/move", "/api/auth/")
 
 
 def create_app(
@@ -87,6 +95,7 @@ def create_app(
             push_webpush.WebPushSender(
                 settings.webpush_vapid_private_key,  # type: ignore[arg-type]
                 settings.webpush_subject or "mailto:pager@localhost",
+                base_url=settings.public_base_url,
             )
             if settings.webpush_configured
             else push_webpush.NullWebPushSender()
@@ -94,7 +103,7 @@ def create_app(
         app.state.backend_registry = build_registry(app.state.broker, fcm_client=fcm_client)
         # One Routing instance shared by the webhook path and every API router.
         app.state.routing = Routing(app.state.broker, registry=app.state.backend_registry)
-        app.state.ingest = Ingest(app.state.broker, app.state.routing)
+        app.state.ingest = Ingest(app.state.broker, app.state.routing, settings)
         # Shares the Routing instance so a claimed `loc_req` redelivers through one registry.
         app.state.location = Location(app.state.routing)
         get_db()  # fail fast at startup if Firestore/Auth are misconfigured
@@ -128,6 +137,24 @@ def create_app(
         response.headers[REQUEST_ID_HEADER] = request_id
         return response
 
+    # While frozen for a move nothing may change that the bundle does not carry; the Move routes
+    # and the sign-in answers are the exceptions.
+    @app.middleware("http")
+    async def _moving_guard(request: Request, call_next):
+        path = request.url.path
+        if (
+            request.method in _WRITE_METHODS
+            and path.startswith("/api/")
+            and not path.startswith(_MOVING_EXEMPT)
+            and await run_in_threadpool(move_module.frozen_for_move)
+        ):
+            return JSONResponse(status_code=503, content={"detail": MOVING_DETAIL})
+        return await call_next(request)
+
+    @app.exception_handler(MoveError)
+    async def _move_error(_request: Request, exc: MoveError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status, content=exc.body())
+
     @app.exception_handler(FamilyFrozen)
     async def _family_frozen(_request: Request, _exc: FamilyFrozen) -> JSONResponse:
         return JSONResponse(status_code=503, content={"detail": FROZEN_REPLY})
@@ -153,6 +180,10 @@ def create_app(
     app.include_router(family_bridge_health.router)
     app.include_router(book.router)
     app.include_router(me.router)
+    app.include_router(move.router)
+    app.include_router(move.me_router)
+    app.include_router(move.import_router)
+    app.include_router(move.public_router)
     app.include_router(push.router)
     app.include_router(internal.router)
     app.include_router(fed.router)

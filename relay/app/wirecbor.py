@@ -111,6 +111,10 @@ KEYMAP: dict[str, int] = {
     "rsn": 75,
     # `/status` max body bytes (uint, 1024 on long-message firmware). Never 52.
     "mb": 76,
+    # `/status` move capability (uint 1) and the move report map (CBOR only, docs/MOVE_DESIGN.md
+    # §12.2).
+    "mvc": 77,
+    "mv": 78,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
@@ -136,7 +140,13 @@ CFG_KEYMAP: dict[str, int] = {
     "lock": 0, "ca": 1, "sms": 2, "ota": 4, "loc": 5,
     # `cfg.ast`, the font-image job.
     "ast": 6,
+    # `cfg.mv`, the move order, cancel or proof.
+    "mv": 7,
 }  # fmt: skip
+# `cfg.mv` (docs/MOVE_DESIGN.md §12.1); `ca` reuses `CA_KEYMAP`.
+MV_KEYMAP: dict[str, int] = {"id": 0, "host": 1, "port": 2, "ca": 3, "cancel": 4, "ok": 5}
+# `/status` `mv` report (§12.2).
+MV_REPORT_KEYMAP: dict[str, int] = {"id": 0, "st": 1, "rsn": 2, "at": 3}
 # `cfg.ota`: `img`/`osha`/`base` are 64-hex digests in JSON and 32-byte bstr in CBOR; `fmt` is
 # "full"/"delta" in JSON and 0/1 in CBOR.
 OTA_KEYMAP: dict[str, int] = {
@@ -165,6 +175,8 @@ _REVERSE_LOCK = {v: k for k, v in LOCK_KEYMAP.items()}
 _REVERSE_CA = {v: k for k, v in CA_KEYMAP.items()}
 _REVERSE_SMS_CONTACT = {v: k for k, v in SMS_CONTACT_KEYMAP.items()}
 _REVERSE_CFG = {v: k for k, v in CFG_KEYMAP.items()}
+_REVERSE_MV = {v: k for k, v in MV_KEYMAP.items()}
+_REVERSE_MV_REPORT = {v: k for k, v in MV_REPORT_KEYMAP.items()}
 _REVERSE_CELL = {v: k for k, v in CELL_KEYMAP.items()}
 _REVERSE_OTA = {v: k for k, v in OTA_KEYMAP.items()}
 # `cfg.loc = {gnss}`, `gnss` is a bool.
@@ -197,7 +209,30 @@ def _ota_to_names(v: dict[Any, Any]) -> dict[str, Any]:
     return out
 
 
+def _mv_to_int(v: dict[str, Any]) -> dict[int, Any]:
+    out: dict[int, Any] = {}
+    for k, val in v.items():
+        if k == "ca" and isinstance(val, dict):
+            val = {CA_KEYMAP[ck]: cv for ck, cv in val.items()}
+        out[MV_KEYMAP[k]] = val
+    return out
+
+
+def _mv_to_names(v: dict[Any, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, val in v.items():
+        name = _REVERSE_MV.get(k)
+        if name is None:
+            continue
+        if name == "ca" and isinstance(val, dict):
+            val = {_REVERSE_CA[ck]: cv for ck, cv in val.items() if ck in _REVERSE_CA}
+        out[name] = val
+    return out
+
+
 def _value_to_int_keys(name: str, value: Any) -> Any:
+    if name == "mv" and isinstance(value, dict):
+        return {MV_REPORT_KEYMAP[k]: v for k, v in value.items() if k in MV_REPORT_KEYMAP}
     if name == "bs" and isinstance(value, dict):
         return {BS_KEYMAP[k]: v for k, v in value.items() if k in BS_KEYMAP}
     if name == "loc" and isinstance(value, dict):
@@ -226,6 +261,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
                 out[CFG_KEYMAP["ota"]] = _ota_to_int(v)
             elif k == "ast" and isinstance(v, dict):
                 out[CFG_KEYMAP["ast"]] = _ota_to_int(v)
+            elif k == "mv" and isinstance(v, dict):
+                out[CFG_KEYMAP["mv"]] = _mv_to_int(v)
             elif k == "loc" and isinstance(v, dict):
                 out[CFG_KEYMAP["loc"]] = {CFG_LOC_KEYMAP[lk]: lv for lk, lv in v.items()}
             else:
@@ -237,6 +274,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
 
 
 def _value_to_names(name: str, value: Any) -> Any:
+    if name == "mv" and isinstance(value, dict):
+        return {_REVERSE_MV_REPORT[k]: v for k, v in value.items() if k in _REVERSE_MV_REPORT}
     if name == "bs" and isinstance(value, dict):
         return {_REVERSE_BS[k]: v for k, v in value.items() if k in _REVERSE_BS}
     if name == "loc" and isinstance(value, dict):
@@ -263,6 +302,8 @@ def _value_to_names(name: str, value: Any) -> Any:
                 out["ota"] = _ota_to_names(v)
             elif k == CFG_KEYMAP["ast"] and isinstance(v, dict):
                 out["ast"] = _ota_to_names(v)
+            elif k == CFG_KEYMAP["mv"] and isinstance(v, dict):
+                out["mv"] = _mv_to_names(v)
             elif k == CFG_KEYMAP["loc"] and isinstance(v, dict):
                 # Unknown sub-keys are ignored.
                 out["loc"] = {_REVERSE_CFG_LOC[lk]: lv for lk, lv in v.items() if lk in _REVERSE_CFG_LOC}

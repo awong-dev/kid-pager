@@ -290,6 +290,40 @@ def test_setup_bundle_sets_req_sig_flag_for_an_hmac_device(
     assert seen == [1, 1]  # create, then rotate
 
 
+def test_moved_device_is_listed_and_can_be_given_a_new_setup_code(
+    client: TestClient, admin_headers: dict[str, str]
+):
+    """An imported device (`provisionState: moved`, docs/FAMILY_MOVE.md section 6) reads back,
+    shows no status, and rotate-credentials turns it into `issued`."""
+    client.post(
+        "/api/admin/users",
+        json={"alias": "ownermv", "displayName": "Owner", "email": "ownermv@example.com"},
+        headers=admin_headers,
+    )
+    resp = client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-mv01", "ownerAlias": "ownermv", "label": "moved"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    from app.db.firestore import get_db
+
+    get_db().collection("devices").document("pgr-mv01").set(
+        {"provisionState": "moved", "status": {}}, merge=True
+    )
+    device = devices_store.get_device("pgr-mv01")
+    assert device is not None and device.provisionState == "moved"
+    assert "pgr-mv01" in {d.id for d in devices_store.list_devices()}
+    listed = client.get("/api/admin/devices", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    row = next(d for d in listed.json() if d["id"] == "pgr-mv01")
+    assert row["provisionState"] == "moved"
+
+    resp = client.post("/api/admin/devices/pgr-mv01/rotate-credentials", headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert devices_store.get_device("pgr-mv01").provisionState == "issued"
+
+
 def test_create_device_picks_up_locatable_by_from_a_pre_existing_allow_edge(
     client: TestClient, admin_headers: dict[str, str]
 ):
@@ -541,6 +575,50 @@ def test_delete_family_is_super_only(client: TestClient):
     assert (
         client.delete("/api/admin/families/x", headers=auth_header(plain.uid)).status_code == 403
     )
+
+
+@pytest.mark.parametrize(
+    ("login", "boot", "publish_ok", "result"),
+    [
+        ("ok", "ok", True, "ok"),
+        ("error", "ok", True, "error"),
+        ("manual", "ok", True, "manual"),
+        ("ok", "error", True, "error"),
+        ("ok", "ok", False, "error"),
+    ],
+)
+def test_rotate_credentials_states_what_the_broker_accepted(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    fake_emqx: FakeEmqxAdmin,
+    broker: FakeBrokerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    login: str,
+    boot: str,
+    publish_ok: bool,
+    result: str,
+):
+    client.post(
+        "/api/admin/users",
+        json={"alias": "owner7", "displayName": "Owner7", "email": "owner7@example.com"},
+        headers=admin_headers,
+    )
+    client.post(
+        "/api/admin/devices",
+        json={"deviceId": "pgr-7007", "ownerAlias": "owner7", "label": "x"},
+        headers=admin_headers,
+    )
+    monkeypatch.setattr(fake_emqx, "ensure_device", lambda *_a: login)
+    monkeypatch.setattr(fake_emqx, "ensure_boot_user", lambda *_a: boot)
+    broker.fail_publish = not publish_ok
+    resp = client.post("/api/admin/devices/pgr-7007/rotate-credentials", headers=admin_headers)
+    # a broker that did not take the push is still a 200: the credential exists here and the answer says so
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["brokerResult"] == result
+    assert data["brokerPush"] == ("pushed" if result == "ok" else "manual")
+    assert (data["manualAcl"] is None) == (result == "ok")
+    assert data["setupCode"]
 
 
 def test_rotate_credentials_returns_new_setup_code_and_invalidates_old_secret(

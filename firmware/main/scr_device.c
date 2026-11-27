@@ -16,11 +16,22 @@
 #include "fuel_fmt.h"
 #include "ota.h"
 #include "disp.h"
+#include "move.h"
+#include "move_ui_fmt.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "sdkconfig.h"
+
+/* The server-move rows exist only in a build that runs trials. */
+#ifdef CONFIG_PAGER_MOVE_TRIALS
+#define DEVICE_MOVE 1
+#else
+#define DEVICE_MOVE 0
+#endif
 
 typedef enum {
     MROW_INFO = 0, /* opens the Device info screen */
@@ -58,10 +69,79 @@ static char s_pw_buf[LOCK_PASSCODE_MAX + 1];
 static size_t s_pw_len = 0;
 static bool s_pw_allow_off = false;
 
-/* 1 while an update is ready (extra first row "Install now"); menu indices are offset by it. */
+/* Extra rows above the menu as of the last render ("Switch to <host> now", "Install update now"). Keys act
+ * on what was drawn, so a row appearing between render and key cannot redirect the key. */
+static bool s_row_switch = false;
+static bool s_row_install = false;
+
 static int device_extra_rows(void)
 {
-    return ota_install_ready() ? 1 : 0;
+    return (s_row_switch ? 1 : 0) + (s_row_install ? 1 : 0);
+}
+
+#if DEVICE_MOVE
+#define DEVICE_NOTE_LEN 40
+
+static char s_note[DEVICE_NOTE_LEN];            /* a refusal from the last "Switch" key, until the next key */
+static uint32_t s_entry_seq = 0;                /* move outcome_seq when the screen opened */
+static uint32_t s_t0_seq = UINT32_MAX;          /* the outcome whose first paint is stamped in s_t0_us */
+static int64_t s_t0_us = 0;
+static move_ui_lines_t s_mv_lines;              /* what the last render drew, then scratch */
+static move_ui_lines_t s_mv_painted;
+
+static int device_text_width(const char *t)
+{
+    return gfx_text_width(GFX_FONT_NORMAL, t);
+}
+
+/* Reads the move state and builds its lines into `out`. `stamp`: the paint path, which may start the
+ * settle clock of a new outcome and drops a stale refusal once a run starts. */
+static void device_move_build(bool stamp, move_ui_lines_t *out)
+{
+    static move_ui_state_t u;
+    move_get_ui_state(&u);
+    int64_t now = esp_timer_get_time();
+    bool out_vis = u.have && !u.running && u.phase == MOVE_PHASE_IDLE && u.outcome_seq != s_entry_seq;
+    if (stamp) {
+        if (u.running) {
+            s_note[0] = '\0';
+        }
+        if (out_vis && s_t0_seq != u.outcome_seq) {
+            s_t0_seq = u.outcome_seq;
+            s_t0_us = now;
+        }
+    }
+    move_ui_view_t v = {
+        .s = &u,
+        .active_host = ident_get_host(),
+        .beam_now = net_bearer_beam(),
+        .outcome_visible = out_vis,
+        .settle_timed_out = out_vis && s_t0_seq == u.outcome_seq &&
+                            now - s_t0_us >= (int64_t) MOVE_UI_SETTLE_S * 1000000,
+        .note = s_note,
+    };
+    move_ui_build(&v, device_text_width, GFX_SCREEN_W - 10, out);
+}
+
+bool scr_device_move_due(void)
+{
+    if (ui_top() != &g_scr_device) {
+        return false;
+    }
+    device_move_build(false, &s_mv_lines);
+    return memcmp(&s_mv_lines, &s_mv_painted, sizeof(s_mv_lines)) != 0;
+}
+#else
+bool scr_device_move_due(void)
+{
+    return false;
+}
+#endif
+
+static void device_layout_refresh(bool switch_row)
+{
+    s_row_switch = switch_row;
+    s_row_install = ota_install_ready();
 }
 
 /* Highest selectable index: the tune row exists only with a piezo. */
@@ -89,6 +169,18 @@ static void device_on_event(ui_evt_t evt)
     s_pw_modal = PW_MODAL_NONE;
     s_pw_len = 0;
     s_pw_buf[0] = '\0';
+#if DEVICE_MOVE
+    {
+        move_ui_state_t u;
+        move_get_ui_state(&u);
+        s_entry_seq = u.outcome_seq;
+        s_note[0] = '\0';
+        device_move_build(false, &s_mv_lines);
+    }
+    device_layout_refresh(s_mv_lines.action);
+#else
+    device_layout_refresh(false);
+#endif
     if (s_sel < 0) {
         s_sel = 0;
     }
@@ -115,6 +207,8 @@ static void device_on_key_confirm(input_key_t key)
         if (strcmp(s_confirm_buf, ident_get_dev_id()) == 0) {
             // Power effect: a few ms of NVS erase/commit (no RF), then a full ESP32 reset.
             msg_history_erase();
+            modes_reset_down_window();
+            ota_cancel_waiting_jobs(); // the next server re-issues it
             ident_erase();
             // Power effect: full ESP32 reset; the modem is left as it was until the next boot.
             esp_restart();
@@ -185,6 +279,15 @@ static void device_on_key_pw(input_key_t key)
     }
 }
 
+/* Power effect: none here; move_service() runs a trial on its next pass (modem on, one TLS connect, up to ~4 min). */
+static void device_switch_now(void)
+{
+#if DEVICE_MOVE
+    const char *why = move_ui_refusal_text(move_request_now());
+    snprintf(s_note, sizeof(s_note), "%s", why ? why : "");
+#endif
+}
+
 static void device_on_key(input_key_t key)
 {
     if (s_confirm_active) {
@@ -196,6 +299,9 @@ static void device_on_key(input_key_t key)
         return;
     }
 
+#if DEVICE_MOVE
+    s_note[0] = '\0';
+#endif
     switch (key.type) {
     case INPUT_KEY_UP:
         if (s_sel > 0) {
@@ -208,7 +314,11 @@ static void device_on_key(input_key_t key)
         }
         break;
     case INPUT_KEY_ENTER:
-        if (device_extra_rows() == 1 && s_sel == 0) {
+        if (s_row_switch && s_sel == 0) {
+            device_switch_now();
+            break;
+        }
+        if (s_row_install && s_sel == (s_row_switch ? 1 : 0)) {
             // Power effect: none now; ota_service() reboots into the new image on its next call.
             ota_install_now();
             ui_show_toast("installing update");
@@ -342,7 +452,7 @@ static void device_render_pw(void)
 
 // Info lines (not selectable) followed by the menu rows (selectable, in
 // device_row_t order), built each render into a static buffer.
-#define DEVICE_MAX_LINES 21
+#define DEVICE_MAX_LINES 25
 #define DEVICE_LINE_LEN 72
 #define DEVICE_VISIBLE_LINES 5
 
@@ -390,8 +500,26 @@ static void device_render_normal(void)
     }
     selectable[n++] = false;
 
+    bool switch_row = false;
+#if DEVICE_MOVE
+    device_move_build(true, &s_mv_lines);
+    memcpy(&s_mv_painted, &s_mv_lines, sizeof(s_mv_painted));
+    for (int i = 0; i < s_mv_lines.n; i++) {
+        snprintf(lines[n], DEVICE_LINE_LEN, "%s", s_mv_lines.line[i]);
+        selectable[n++] = false;
+    }
+    switch_row = s_mv_lines.action;
+#endif
+    device_layout_refresh(switch_row);
+
     int menu_start = n;
-    if (device_extra_rows() == 1) {
+    if (s_row_switch) {
+#if DEVICE_MOVE
+        snprintf(lines[n], DEVICE_LINE_LEN, "%s", s_mv_lines.action_text);
+#endif
+        selectable[n++] = true;
+    }
+    if (s_row_install) {
         snprintf(lines[n], DEVICE_LINE_LEN, "Install update now");
         selectable[n++] = true;
     }

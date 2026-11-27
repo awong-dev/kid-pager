@@ -117,7 +117,22 @@ Tier 2 notes:
   the relay keeps the item for a retry once a fresh notification restores the tier-1 action.
 
 A 401 from the relay clears the token and posts a persistent "needs re-pairing" notification;
-pair again with a new code (Devices → New code).
+pair again with a new code (Devices → New code). The exception is a phone that followed a
+server move: for 7 days a 401 first tries the other URL.
+
+## Following a server move
+
+A `/bridge/...` answer from a frozen relay carries `moved: {url, id}` (200 on heartbeat and outbox;
+503 `{"detail":"moved","moved":{...}}` on events and acks, which keeps them queued and costs no
+attempt). The phone calls `GET {url}/bridge/hello?bridge=<id>&nonce=<hex>` with no token and checks
+the HMAC-signed answer (key = hex SHA-256 of the token) for its own bridge id and the move id; only
+then does it switch, retrying every 5 minutes otherwise. The new URL is home; the old one is kept
+7 days. After 3 consecutive failures of home the phone alternates with the other URL (back-off 1, 2,
+5, 15, 30, 60 min): `hello`, then an authenticated heartbeat, and it settles there only on a 2xx
+without `moved`; it keeps probing home and returns when home answers. A 401 within the window tries
+the other URL and keeps the token unless that answers 401 too. Neither URL is dropped before the
+window ends. The target must be https with a CA the phone trusts. Pure rules: `Mover.kt`
+(`MoverTest`); persistence and calls: `Moves.kt`; hooks: `RelayClient.exec`.
 
 ## What each permission is for
 
@@ -141,6 +156,7 @@ pair again with a new code (Devices → New code).
   JID helpers and media-placeholder table, accessibility selectors. **UI churn in
   Chat/Voice/WhatsApp is fixed here only.**
 - `Log.kt` — the one log wrapper (logcat + 500-line ring buffer → `LogActivity`); numbers redacted.
+- `Mover.kt` / `Moves.kt` — server-move state machine and its persistence.
 - `RelayClient.kt` — the five `/bridge` calls; bearer token; backoff on 5xx/IO; 401 handling.
 - `Events.kt` — `BridgeEvent` wire model and its field limits (`Bounds`).
 - `NotificationMapper.kt` (pure) + `ChatNotificationListener.kt` — snapshot → events; sender

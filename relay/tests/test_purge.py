@@ -60,6 +60,7 @@ def _seed(fid: str) -> dict[str, str]:
         _put(f"sessions/s-{uid}", {"uid": uid, "lastSeenAt": NOW})
         _put(f"webauthnChallenges/w-{uid}", {"uid": uid, "expiresAt": NOW})
         _put(f"inviteCodes/i-{uid}", {"uid": uid, "createdBy": uid, "expiresAt": NOW})
+        _put(f"moveClaims/{uid}", {"uid": uid, "moveId": "mv_0123456789ab"})
         _put(f"gchatLinkCodes/g-{uid}", {"uid": uid, "expiresAt": 1})
         _put(f"gchatSpaces/sp-{uid}", {"uid": uid})
     _put(f"users/{ext}", {"ownerFamilyId": fid, "kind": "external", "alias": f"x{fid}"})

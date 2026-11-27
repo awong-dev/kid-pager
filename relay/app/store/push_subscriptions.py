@@ -20,6 +20,9 @@ class PushSubscription(BaseModel):
     p256dh: str
     auth: str
     ua: str = ""
+    # "src": made against the VAPID key of the server this one was moved from (`vapid/src`);
+    # `None`: against this server's own key.
+    vapidKid: str | None = None
     createdAt: datetime | None = None
 
 
@@ -35,7 +38,8 @@ def upsert(uid: str, endpoint: str, p256dh: str, auth: str, ua: str = "") -> str
     """Idempotent per endpoint: replaces the keys, keeps `createdAt`; returns the doc id."""
     sid = subscription_id(endpoint)
     ref = _subs(uid).document(sid)
-    fields = {"endpoint": endpoint, "p256dh": p256dh, "auth": auth, "ua": ua}
+    # a fresh subscription is always against this server's own key
+    fields = {"endpoint": endpoint, "p256dh": p256dh, "auth": auth, "ua": ua, "vapidKid": None}
     if not ref.get().exists:
         fields["createdAt"] = SERVER_TIMESTAMP
     ref.set(fields, merge=True)

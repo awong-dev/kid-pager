@@ -143,6 +143,11 @@ typedef struct {
     uint32_t reply_failed;
 } msg_rtc_t;
 
+/* The slot a re-queued reply takes: the one already holding `id`, else a free one, set to `id`, `to`,
+ * age 0 and no attempts. -1 when none is free. `*had_it` (nullable) tells which. */
+int msg_pending_up_claim(msg_pending_up_t *tab, int n, const char *id, const char *to, int64_t now_us,
+                         bool *had_it);
+
 typedef void (*msg_rtc_lock_fn)(void);
 typedef void (*msg_rtc_unlock_fn)(void);
 typedef void (*msg_rtc_save_fn)(void); /* called with the lock held */
@@ -209,6 +214,20 @@ typedef struct {
     char peer[MSG_TO_MAX];
 } msg_rcpt_alert_t;
 bool msg_ingest_rcpt_cbor(const uint8_t *buf, uint16_t len, msg_rcpt_alert_t *alert);
+
+/* The failure alert of a `moving` receipt that msg_pump() could not re-queue (no free slot, body gone); main
+ * task, after msg_pump(). True once per alert. */
+bool msg_take_rcpt_alert(msg_rcpt_alert_t *out);
+
+/* True while the `shown`/`read` ack for `id` is still queued (not yet accepted by the modem). */
+bool msg_ack_pending(const char *id);
+
+/* True while a reply awaits its broker PUBACK. */
+bool msg_reply_awaiting_puback(void);
+
+/* Queues the current ack state (`shown` or `read`) of up to `max` down messages received within
+ * `window_s` (any age when there is no clock), newest first; as many as the ack queue takes. Returns the count queued. */
+int msg_resweep_acks(int max, int64_t window_s);
 
 /* Clears MSG_F_FAIL_UNSEEN on up row `id`. RAM only. */
 void msg_clear_fail_unseen(const char *id);

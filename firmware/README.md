@@ -144,6 +144,25 @@ may be sent.
 Console: `bearer [auto|direct|beam]` (NVS `carrier/bearer`) overrides the bearer for A/B tests. The
 override is read at boot. `carrier` shows what was detected and what is in force.
 
+## Server move
+
+`docs/MOVE_FIRMWARE_DESIGN.md` is the design; `docs/PROTOCOL.md` §3.2 (`cfg.mv`) and §14.8 are the wire.
+A signed `cfg.mv` order from the source server stores a second identity in the inactive slot
+(`ident1` or `ident`, selected by `idsel/act`), acks it, and holds the replies and `sms_log` entries
+until the move is settled. `move.c` (parser, key derivation, record and ledger in NVS `move/st`, boot
+repair, plan and back-off tables) runs on the host too; `move_svc.c` drives the modem and messages.
+
+- **Always built**: orders, cancels, the `/status` `mv` map, the reply hold and the `moving` re-queue,
+  the `KPCAPS1:mv;` tag (`caps.c`, read by `tools/fwpub.py`) and the install-time capability check in
+  `ota.c`. With no order the pager behaves as before.
+- **`CONFIG_PAGER_MOVE_TRIALS` (default off, `main/Kconfig.projbuild`)**: the trial on the pending
+  identity (connect, wait for the target's proof, commit or revert), the Beam prompt and probe, the
+  long-run reconnect schedule, the daily background trial, and `/status` `mvc`. Off, no relay will order a
+  move. The broker switch within one boot is unverified on the modem (docs/MOVE_FIRMWARE_DESIGN.md
+  §13.1); a trial by restart (§5.4) is the fallback.
+  Enable it for a build with `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;<file with CONFIG_PAGER_MOVE_TRIALS=y>"`.
+- Bench commands: `identslot show|copy|flip`, `nvsstats`.
+
 ## Dependencies
 
 - ESP-IDF 5.x

@@ -15,6 +15,7 @@ from py_vapid import Vapid02
 from pywebpush import WebPushException, webpush
 
 from app.store import push_subscriptions as subs_store
+from app.store import vapid as vapid_store
 
 logger = logging.getLogger("relay.push_webpush")
 
@@ -103,14 +104,56 @@ class WebPushSender:
     configured = True
 
     def __init__(
-        self, private_key: str, subject: str, session: requests.Session | None = None
+        self,
+        private_key: str,
+        subject: str,
+        session: requests.Session | None = None,
+        base_url: str | None = None,
     ) -> None:
         self._vapid = Vapid02.from_string(private_key)
         self._subject = subject
         self._session = session
+        self._base_url = (base_url or "").rstrip("/")
+        self._moved_vapid: dict[str, Vapid02] = {}
+
+    def _moved_key(self, kid: str) -> Vapid02 | None:
+        """The key of a moved-from server, read once it exists."""
+        if kid not in self._moved_vapid:
+            key = vapid_store.get(kid)
+            if key is not None:
+                self._moved_vapid[kid] = Vapid02.from_string(key.privateKey)
+        return self._moved_vapid.get(kid)
 
     def send(
         self, uid: str, subs: list[subs_store.PushSubscription], data: dict[str, str]
+    ) -> None:
+        own = [s for s in subs if s.vapidKid is None]
+        self._send_each(uid, own, self._vapid, data)
+        moved: dict[str, list[subs_store.PushSubscription]] = {}
+        for s in subs:
+            if s.vapidKid is not None:
+                moved.setdefault(s.vapidKid, []).append(s)
+        if not moved:
+            return
+        # the browser's service worker belongs to the old origin: the click opens this server
+        url = data.get("url")
+        if self._base_url and url and url.startswith("/"):
+            data = {**data, "url": self._base_url + url}
+        for kid, group in sorted(moved.items()):
+            key = self._moved_key(kid)
+            if key is None:
+                logger.warning(
+                    "web push: %d moved subscription(s) but no vapid/%s key", len(group), kid
+                )
+                continue
+            self._send_each(uid, group, key, data)
+
+    def _send_each(
+        self,
+        uid: str,
+        subs: list[subs_store.PushSubscription],
+        vapid: Vapid02,
+        data: dict[str, str],
     ) -> None:
         body = json.dumps(data, separators=(",", ":"))
         for sub in subs:
@@ -126,7 +169,7 @@ class WebPushSender:
                         "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
                     },
                     data=body,
-                    vapid_private_key=self._vapid,
+                    vapid_private_key=vapid,
                     # fresh dict per send: pywebpush fills `aud` from the endpoint origin
                     vapid_claims={"sub": self._subject},
                     ttl=TTL_S,

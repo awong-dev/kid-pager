@@ -1,0 +1,21 @@
+menu "Kid pager"
+
+    config PAGER_MOVE_TRIALS
+        bool "Server move: run trials, switch brokers and advertise mvc"
+        default n
+        help
+            With this option an order from a source server (cfg.mv) is stored and acked, replies wait while
+            one is held, and the pager connects to the new broker, commits on a signed proof or reverts, runs
+            the Beam probe and the long-run reconnect schedule, and sends /status `mvc:1` so a relay will order
+            a move at all.
+
+            Without it the pager cannot finish a move, so it takes none on: an order is acked and refused
+            (`fail`/`rej`), no pending identity is stored, and replies and cfg.ca are not held for it. An order
+            an earlier image stored is reported `fail`/`rej` at boot and its pending identity is dropped. A
+            `moving` receipt from a frozen source still holds replies for a day. Every image carries the
+            KPCAPS1:mv; tag, which only says the image can read a committed slot.
+
+            The broker switch within one power cycle is not verified on the modem (docs/MOVE_FIRMWARE_DESIGN.md
+            §13.1). Leave this off until it is.
+
+endmenu

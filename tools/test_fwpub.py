@@ -14,8 +14,9 @@ MAIN = IMAGES / "main-release-app.bin"
 KEYLAT = IMAGES / "keylat-release-app.bin"
 
 
-def synth(seed: bytes = b"a", n: int = 5000) -> bytes:
+def synth(seed: bytes = b"a", n: int = 5000, tag: bytes = b"") -> bytes:
     body = bytearray(hashlib.sha256(seed).digest() * (n // 32))
+    body[0x100:0x100 + len(tag)] = tag
     body[0] = 0xE9
     body[23] = 1
     body[0x30:0x50] = b"v-test".ljust(32, b"\0")
@@ -27,6 +28,26 @@ def test_synthetic_accepts_and_extracts():
     info = fwpub.check_image(img)
     assert info["id"] == img[-32:].hex() and len(info["id16"]) == 16
     assert info["version"] == "v-test"
+
+
+def test_caps_from_tag():
+    assert fwpub.check_image(synth())["caps"] == []
+    info = fwpub.check_image(synth(tag=b"\0KPCAPS1:mv;\0"))
+    assert info["caps"] == ["mv"]
+    # Unknown names, a missing terminator and a wrong version are not capabilities.
+    assert fwpub.scan_caps(b"KPCAPS1:zz;KPCAPS1:mv KPCAPS2:mv;") == []
+
+
+def test_caps_reach_the_index_entry(tmp_path):
+    for tag, expected in ((b"KPCAPS1:mv;", ["mv"]), (b"", None)):
+        img = synth(b"t" + tag, tag=tag)
+        p = tmp_path / "app.bin"
+        p.write_bytes(img)
+        out = tmp_path / ("out" + str(len(tag)))
+        assert fwpub.main(["publish", str(p), "--bucket", "x", "--dry-run", "--out", str(out)]) == 0
+        build = json.loads((out / "fw" / "index.json").read_text())["builds"][0]
+        assert build.get("caps") == expected
+        assert ("caps" in build) is (expected is not None)
 
 
 def test_rejects_truncated_and_bad_tail():

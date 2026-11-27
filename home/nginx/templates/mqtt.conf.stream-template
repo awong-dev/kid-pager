@@ -2,6 +2,14 @@
 resolver 127.0.0.11 valid=10s ipv6=off;
 ssl_session_cache shared:MQTT_SSL:10m;
 
+# Both listeners share this upstream, re-resolved through the resolver above.
+map $protocol $mqtt_upstream {
+    default ${MQTT_UPSTREAM};
+}
+
+# TLS_MODE=letsencrypt adds the 8884 listener; selfsigned adds nothing.
+include /etc/nginx/snippets/beam-${TLS_MODE}.conf;
+
 server {
     listen 8883 ssl;
     listen [::]:8883 ssl;
@@ -11,6 +19,5 @@ server {
 
     # A pager idles up to its keepalive (840 s on Soracom); the default 10 min would cut it.
     proxy_timeout 1h;
-    set $mqtt_upstream ${MQTT_UPSTREAM};
     proxy_pass $mqtt_upstream;
 }

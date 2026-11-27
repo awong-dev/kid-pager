@@ -1,13 +1,9 @@
 /** The URL path prefix this copy of the app is served under (`""` or e.g. `"/pager"`).
  *
- * The prefix is chosen at runtime by the home relay, which rewrites a placeholder in the exported
- * files. Because that is a plain text substitution after minification, nothing here may depend on
- * the placeholder's value or length at build time: the value is read from the DOM
- * (`<html data-pager-base>`, written by `app/layout.tsx`), which a minifier cannot fold.
- *
- * Everything that builds or reads an absolute path goes through this module. The app's own
- * routes, `Link` hrefs and `navigate.push()` arguments are "logical" paths without the prefix
- * (`/chat`); `withBase` makes one a real URL path and `stripBase` goes back. */
+ * The home relay substitutes it into the exported files after minification, so it is read from the
+ * DOM (`<html data-pager-base>`, written by `app/layout.tsx`), never from a build-time value.
+ * Routes, `Link` hrefs and `navigate.push()` take "logical" paths without the prefix (`/chat`);
+ * `withBase` makes one a real URL path and `stripBase` goes back. */
 
 let cached: string | null = null;
 

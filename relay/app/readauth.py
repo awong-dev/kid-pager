@@ -254,8 +254,9 @@ def contact_requests(p: Principal | None, r: str, data: Data) -> bool:
     )
 
 
-# `settings/federation` is server-only; other fed collections have no readable path.
-_SERVER_ONLY_SETTINGS = {"federation"}
+# `settings/federation` and `settings/move` are server-only; other fed collections and
+# `moveClaims` have no readable path.
+_SERVER_ONLY_SETTINGS = {"federation", "move"}
 
 
 def settings(p: Principal | None, s: str, data: Data) -> bool:
@@ -402,7 +403,7 @@ def _list_contact_requests(p: Principal, w: _Filters) -> bool:
 
 def _list_settings(p: Principal, w: _Filters) -> bool:
     # A list rule cannot name the document id, so a collection query would return
-    # `settings/federation`: denied.
+    # `settings/federation` and `settings/move`: denied.
     return False
 
 

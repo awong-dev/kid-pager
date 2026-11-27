@@ -206,6 +206,10 @@ void ui_format_hhmm(int64_t epoch_s, char *out, size_t out_size);
  * needs >= 6 bytes. */
 void ui_status_clock_text(bool in_use, bool seeded, int hh, int mm, char *out, size_t out_size);
 
+/* True while the Device screen is on top and its server-move lines differ from what it last drew (a phase,
+ * an outcome, the settle line). modes_run() renders on it inside the attentive window. Modes task only. */
+bool scr_device_move_due(void);
+
 /* True if the status bar HH:MM changed since it was last drawn; always false while not in use. */
 bool ui_clock_due(void);
 

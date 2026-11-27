@@ -30,7 +30,9 @@
 #include "lock.h"
 
 #include "cfg.h"
+#include "caps.h"
 #include "catrust.h"
+#include "move.h"
 
 #include "archive.h"
 #include "book.h"
@@ -137,7 +139,7 @@ static const uint32_t k_backoff_s[] = { 5, 15, 60, 300 };
 #define PAGER_ID_MAX_LEN 17 // 16 chars + NUL, PROTOCOL.md §1/§3.1
 
 // Validity plus layout version tag; bump on any layout change so a stale CRC-valid struct is rejected.
-#define PAGER_RTC_MAGIC 0x50475237u // "PGR" + layout version 7
+#define PAGER_RTC_MAGIC 0x50475238u // "PGR" + layout version 8
 
 typedef enum {
     PAGER_MODE_SLEEP = 0,
@@ -254,6 +256,10 @@ void modes_set_ca_apply_suppress(bool suppress)
     s_ca_apply_suppress = suppress;
 }
 
+// A CA apply trial or a server move trial owns the MQTT session: the reconnect loop, the registered-edge
+// reconnect, the modem health reset and the liveness service stand aside.
+static bool session_owned(void) { return s_ca_apply_suppress || move_owns_session(); }
+
 // Coverage duty-cycle policy state, and a flag mirroring "the radio is deliberately off".
 static coverage_policy_t s_coverage;
 static volatile bool s_coverage_owns_radio = false;
@@ -326,31 +332,57 @@ static int64_t approx_epoch(void)
 
 static void on_auth_epoch_wrap(void)
 {
-    // Power effect: one NVS (flash) write. ident_t has no per-field setter: snapshot every getter into
-    // the shared ident_scratch() buffer, bump n_epoch, rewrite via ident_store().
-    ident_t *snap = ident_scratch();
-    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
-    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
-    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
-    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
-    snap->port = ident_get_port();
-    strncpy(snap->ca, ident_get_ca(), sizeof(snap->ca) - 1);
-    snap->ca_len = ident_get_ca_len();
-    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
-    snap->flags = ident_get_flags();
-    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
-    memcpy(snap->ca_hash, ident_get_ca_hash(), sizeof(snap->ca_hash));
-    snap->n_epoch = (uint16_t) (ident_get_n_epoch() + 1);
-    snap->claimed = ident_get_claimed();
-
-    if (!ident_store(snap)) {
+    // Power effect: one u32 NVS (flash) write; the identity is not touched.
+    bool ok = ident_epoch_bump();
+    if (!ok) {
         ESP_LOGI(TAG, "failed to persist n_epoch=%u after up_lo wrap (§2.5) - "
                       "next boot's replay window may see a gap",
-                 (unsigned) snap->n_epoch);
+                 (unsigned) ident_get_n_epoch());
     } else {
-        ESP_LOGI(TAG, "n_epoch bumped to %u after up_lo wrap (§14.2)", (unsigned) snap->n_epoch);
+        ESP_LOGI(TAG, "n_epoch bumped to %u after up_lo wrap (§14.2), one u32 written",
+                 (unsigned) ident_get_n_epoch());
     }
-    ident_scratch_release();
+}
+
+void modes_reset_down_window(void)
+{
+    // Setup runs before modes_boot(), so the mutex may not exist yet; nothing else runs then.
+    if (s_rtc_mutex) {
+        rtc_lock();
+    }
+    if (rtc_is_valid()) {
+        auth_reset_down_window(&g_rtc.auth);
+        rtc_save();
+    }
+    if (s_rtc_mutex) {
+        rtc_unlock();
+    }
+}
+
+// The window swap and the key change under one lock, so a message is checked against the key and the window of one view.
+uint64_t modes_auth_follow_view(void)
+{
+    rtc_lock();
+    if (ident_get_view() == IDENT_PENDING) {
+        auth_window_swap_out(&g_rtc.auth);
+        g_rtc.auth.saved_valid = (uint8_t) (1 + ident_active_slot()); // whose window is saved, for modes_boot()
+    } else {
+        auth_window_swap_back(&g_rtc.auth);
+    }
+    uint64_t n = auth_peek_up_n(&g_rtc.auth, ident_get_n_epoch());
+    auth_init(ident_get_kdev());
+    rtc_save();
+    rtc_unlock();
+    return n;
+}
+
+void modes_auth_commit(void)
+{
+    rtc_lock();
+    auth_window_drop_saved(&g_rtc.auth);
+    auth_init(ident_get_kdev());
+    rtc_save();
+    rtc_unlock();
 }
 
 // docs/PROTOCOL.md §10 envelope keys written for /status.
@@ -580,6 +612,11 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     }
     nfields += 1; // key 72 ast: always sent
     nfields += 1; // key 76 mb: always sent (online status only; the LWT is built elsewhere)
+    // Server move: the gate, and the record while one exists (docs/PROTOCOL.md §5.1).
+    const bool have_mvc = move_status_mvc(signed_env, ota_image_confirmed(), ost.gate);
+    move_status_t mvs;
+    const bool have_mv = move_status_get(&mvs);
+    nfields += move_status_cbor_fields(have_mvc, have_mv ? &mvs : NULL);
     if (ost.ast == 2) {
         nfields += 1; // key 73 ast_id
     }
@@ -646,6 +683,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     }
     cbor_w_uint(&w, STK_AST, ost.ast);
     cbor_w_uint(&w, STK_MB, MSG_BODY_MAX_BYTES); // 1024 (PROTOCOL.md §5.1)
+    move_status_cbor_write(&w, have_mvc, have_mv ? &mvs : NULL);
     if (ost.ast == 2) {
         cbor_w_tstr(&w, STK_AST_ID, ost.ast_id, strlen(ost.ast_id));
     }
@@ -711,7 +749,7 @@ static volatile int64_t s_status_publish_pending_since_us = 0;
 
 static void publish_status_online(void)
 {
-    uint8_t buf[480];
+    uint8_t buf[544];
     size_t len = 0;
     if (!build_status_cbor(buf, sizeof(buf), &len, "online")) {
         ESP_LOGI(TAG, "status CBOR build failed (buffer too small or auth_sign failed)");
@@ -1483,8 +1521,21 @@ static void handle_ingest_result(msg_ingest_t r, const msg_t *out, uint16_t len,
     }
 }
 
-// Every device decodes CBOR. auth_verify() runs only when IDENT_FLAG_REQ_SIG is set; msg.c then
-// also requires the `n` replay counter.
+// A failed receipt raises the new-message alert once, for the peer the text went to.
+static void alert_rcpt_failed(const msg_rcpt_alert_t *a)
+{
+    char peer[BOOK_ALIAS_MAX];
+    if (a->peer[0] != '\0') {
+        strncpy(peer, a->peer, sizeof(peer) - 1);
+        peer[sizeof(peer) - 1] = '\0';
+    } else if (!book_get_default_alias(peer, sizeof(peer))) {
+        strcpy(peer, "(default)"); // the no-book placeholder msg_peer_of() uses
+    }
+    modes_alert_incoming(a->id, peer);
+}
+
+// Every device decodes CBOR. auth_verify() and the `n` replay window run only when
+// IDENT_FLAG_REQ_SIG is set.
 static void on_incoming_message(const char *topic, const char *body, uint16_t len)
 {
     bool req_sig = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0;
@@ -1493,11 +1544,27 @@ static void on_incoming_message(const char *topic, const char *body, uint16_t le
     if (req_sig) {
         // `body` is net.cpp's mutable RX buffer; nothing else touches it during this callback
         // (s_handler_busy), so trimming `sig` in place is safe.
-        if (!auth_verify(topic, (uint8_t *) (uintptr_t) body, &vlen)) {
+        // One replay check for every signed kind, after the tag verifies and before any handler runs; the lock keeps
+        // modes_auth_follow_view() from switching keys between the two.
+        rtc_lock();
+        const bool verified = auth_verify(topic, (uint8_t *) (uintptr_t) body, &vlen);
+        auth_down_t replay = AUTH_DOWN_REPLAY;
+        if (verified) {
+            replay = auth_check_down(&g_rtc.auth, (const uint8_t *) body, vlen);
+            rtc_save();
+        }
+        rtc_unlock();
+        if (!verified) {
             msg_count_malformed();
             ESP_LOGD(TAG,
                      "signature verify failed on %s (%u bytes) - dropped, not acked (§3.4/§14.3)",
                      topic, (unsigned) len);
+            return;
+        }
+        if (replay != AUTH_DOWN_OK) {
+            msg_count_malformed();
+            ESP_LOGD(TAG, "down %s on %s (%u bytes) - dropped, not acked (§2.5/§14.2)",
+                     replay == AUTH_DOWN_REPLAY ? "replayed" : "without n", topic, (unsigned) len);
             return;
         }
     }
@@ -1524,14 +1591,7 @@ static void on_incoming_message(const char *topic, const char *body, uint16_t le
     msg_rcpt_alert_t rcpt_alert;
     if (msg_ingest_rcpt_cbor((const uint8_t *) body, (uint16_t) vlen, &rcpt_alert)) {
         if (rcpt_alert.valid) {
-            char peer[BOOK_ALIAS_MAX];
-            if (rcpt_alert.peer[0] != '\0') {
-                strncpy(peer, rcpt_alert.peer, sizeof(peer) - 1);
-                peer[sizeof(peer) - 1] = '\0';
-            } else if (!book_get_default_alias(peer, sizeof(peer))) {
-                strcpy(peer, "(default)"); // the no-book placeholder msg_peer_of() uses
-            }
-            modes_alert_incoming(rcpt_alert.id, peer);
+            alert_rcpt_failed(&rcpt_alert);
         }
         return;
     }
@@ -1544,8 +1604,12 @@ static void on_incoming_message(const char *topic, const char *body, uint16_t le
 static void schedule_backoff(uint32_t *backoff_index, int64_t *next_retry_us)
 {
     uint32_t idx = *backoff_index;
-    uint32_t delay_s = k_backoff_s[idx < PAGER_BACKOFF_STEPS ? idx : PAGER_BACKOFF_STEPS - 1];
-    *next_retry_us = esp_timer_get_time() + (int64_t) delay_s * 1000000;
+    int64_t now_us = esp_timer_get_time();
+    // An unsettled move with trials has the long-run schedule of §5.7 (5, 15, 60, 300 s, then back-off by
+    // time without a session); otherwise the last step repeats.
+    uint32_t delay_s = move_trials_active() ? move_backoff_delay_s(idx, move_no_session_s(now_us))
+                                            : k_backoff_s[idx < PAGER_BACKOFF_STEPS ? idx : PAGER_BACKOFF_STEPS - 1];
+    *next_retry_us = now_us + (int64_t) delay_s * 1000000;
     if (idx < PAGER_BACKOFF_STEPS) {
         (*backoff_index)++;
     }
@@ -1553,6 +1617,11 @@ static void schedule_backoff(uint32_t *backoff_index, int64_t *next_retry_us)
 
 static void pin_to_steady_backoff(uint32_t *backoff_index, int64_t *next_retry_us)
 {
+    if (move_trials_active()) {
+        // §5.7: a refusal means "try the other identity next"; the schedule goes on, it is not pinned
+        schedule_backoff(backoff_index, next_retry_us);
+        return;
+    }
     *backoff_index = PAGER_BACKOFF_STEPS; // steady 300s from here on
     *next_retry_us = esp_timer_get_time() + (int64_t) k_backoff_s[PAGER_BACKOFF_STEPS - 1] * 1000000;
 }
@@ -1560,6 +1629,7 @@ static void pin_to_steady_backoff(uint32_t *backoff_index, int64_t *next_retry_u
 static void handle_mqtt_loss(const net_mqtt_status_t *st, uint32_t *backoff_index,
                               int64_t *next_retry_us)
 {
+    move_note_loss(esp_timer_get_time(), st); // an unsettled move: a refused attempt flips the login
     switch (st->last_class) {
     case NET_MQTT_RC_PERMANENT:
         ESP_LOGI(TAG, "MQTT permanently refused (rc=%d): CONN_REFUSED/AUTH/ACL_DENIED - "
@@ -1616,6 +1686,7 @@ static void handle_mqtt_loss(const net_mqtt_status_t *st, uint32_t *backoff_inde
 static void note_session_up_attempt(bool ok)
 {
     s_connect_attempt_us = ok ? esp_timer_get_time() : 0;
+    move_note_connect_issued();
 }
 
 // Rate-limited (one per PAGER_MODEM_RESET_MIN_INTERVAL_US) full modem reset via net_recover_modem();
@@ -1651,7 +1722,7 @@ static void run_modem_health_check(void)
     for (int attempt = 0; attempt < 3; attempt++) {
         if (net_check()) {
             uint32_t dark_s = net_unregistered_for_s();
-            if (dark_s >= PAGER_NO_NETWORK_RESET_S && !s_ca_apply_suppress &&
+            if (dark_s >= PAGER_NO_NETWORK_RESET_S && !session_owned() &&
                 rate_limited_modem_recover("no network for 30 min")) {
                 note_session_up_attempt(net_session_up());
             }
@@ -1689,7 +1760,8 @@ static void check_probe_stuck_escalation(void)
         s_last_stuck = pc.stuck;
         if (s_consecutive_stuck >= 6) {
             s_consecutive_stuck = 0;
-            if (rate_limited_modem_recover("URC probe stuck 6x in a row")) {
+            // A trial that owns the session reconnects or reverts on its own; the reset only ends its attempt.
+            if (rate_limited_modem_recover("URC probe stuck 6x in a row") && !session_owned()) {
                 note_session_up_attempt(net_session_up());
             }
         }
@@ -1775,12 +1847,22 @@ void modes_boot(void)
     ESP_LOGI(TAG, "pager_rtc_t size = %u bytes (of the 1184-byte budget left "
                   "after walter-modem's own ~7003 bytes, PROTOCOL.md §9.1)",
              (unsigned) sizeof(g_rtc));
+    ESP_LOGI(TAG, "build capabilities: %s", caps_tag());
     battstat_init(); // RTC_NOINIT window: kept across software/panic/watchdog resets, zeroed after power-on
     ESP_LOGI(TAG, "battstat_rtc_t size = %u bytes (RTC_NOINIT, outside pager_rtc_t)",
              (unsigned) sizeof(battstat_rtc_t));
 
     msg_bind_rtc(&g_rtc.msg, rtc_lock, rtc_unlock, rtc_save);
     msg_init(was_valid);
+
+    // The move record is repaired against the identity slots before anything reads the identity (§4). A reset
+    // in the middle of a trial left the active key's /down window saved in RTC; the active key is back.
+    move_bind(rtc_lock, rtc_unlock);
+    move_init();
+    rtc_lock();
+    auth_window_boot_restore(&g_rtc.auth, (uint8_t) ident_active_slot());
+    rtc_save();
+    rtc_unlock();
 
     // K_dev copy and the auth_rtc_t binding for msg.c's publish/ingest paths.
     auth_init(ident_get_kdev());
@@ -2352,6 +2434,10 @@ void modes_run(void)
         if (!render_now && ui_clock_due()) {
             render_now = true;
         }
+        // A server-move phase or outcome on the open Device screen: one partial, inside the same window.
+        if (!render_now && modes_in_use() && scr_device_move_due()) {
+            render_now = true;
+        }
         // Refresh policy rules 2 and 6: idle gap above FLOOR, or CEILING at the next inter-key gap,
         // never mid-burst. Power effect: one ~3 s full refresh instead of a partial.
         if (ui_awake_now && refreshpol_poll(false, false)) {
@@ -2477,9 +2563,24 @@ void modes_run(void)
             break;
         }
 
+        // What the server move needs to know this iteration (docs/MOVE_FIRMWARE_DESIGN.md §5.2).
+        move_env_t move_env;
+        memset(&move_env, 0, sizeof(move_env));
+        move_env.now_us = esp_timer_get_time();
+        move_env.now_epoch = (uint32_t) approx_epoch();
+        move_env.registered = net_unregistered_for_s() == 0;
+        move_env.airplane = net_airplane();
+        move_env.coverage_owns_radio = s_coverage_owns_radio;
+        move_env.sleep_mode = g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP;
+        {
+            int64_t input_age_ms = (move_env.now_us - s_last_input_us) / 1000;
+            move_env.input_age_ms = input_age_ms < 0 ? 0 : (input_age_ms > 0xFFFFFFF0LL ? 0xFFFFFFF0u : (uint32_t) input_age_ms);
+        }
+        move_env.downloading = ota_transfer_active() || cafetch_in_progress() || catrust_apply_in_progress();
+
         // The registered edge also fires once at boot with a connect in flight; resetting the backoff
         // then would issue a second CONNECT.
-        if (net_take_registered_edge() && !s_ca_apply_suppress &&
+        if (net_take_registered_edge() && !session_owned() &&
             !net_connect_in_flight()) {
             // Coverage is back: retry at once. A session "connected" across the gap cannot be trusted (the
             // TCP connection can be dead for up to 45 min until keepalive expires), so reconnect (~5 kB TLS).
@@ -2491,6 +2592,26 @@ void modes_run(void)
             }
             backoff_index = 0;
             next_session_retry_us = 0;
+            move_note_backoff_reset(esp_timer_get_time());
+        }
+
+        // A move trial ended, or a Beam probe wants a fresh connect on the active login.
+        switch (move_take_reconnect_request()) {
+        case MOVE_RECONNECT_NOW:
+            if (st.mqtt_connected) {
+                net_session_down(); // power effect: one AT command, then one TLS/plain connect
+                move_note_own_disconnect(esp_timer_get_time()); // its DISCONNECTED is not a loss of the new connect
+                net_get_mqtt_status(&st);
+            }
+            backoff_index = 0;
+            next_session_retry_us = 0;
+            break;
+        case MOVE_RECONNECT_BACKOFF:
+            schedule_backoff(&backoff_index, &next_session_retry_us);
+            break;
+        case MOVE_RECONNECT_NONE:
+        default:
+            break;
         }
 
         if ((st.mqtt_connected && !s_was_mqtt_connected) || st.session_restart_edge) {
@@ -2504,7 +2625,10 @@ void modes_run(void)
             s_mqtt_link_counter++;
             // Session usable (docs/PROTOCOL.md §5.4a). Must run before the status publish: catrust heals
             // broken -> pinned, or the relay sees `tls:"broken"` for a session that just validated.
-            catrust_on_mqtt_connected();
+            if (ident_get_view() == IDENT_ACTIVE) {
+                catrust_on_mqtt_connected(); // not for a trial session on the pending identity
+            }
+            move_note_usable(esp_timer_get_time());
             publish_status_online();
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
             sleeptest_note('C', 0, "");
@@ -2529,8 +2653,15 @@ void modes_run(void)
             if (st.disconnect_edge) {
                 net_ack_disconnect_edge();
             }
+        } else if (move_owns_session()) {
+            // move_service() runs the connect, the proof wait and the revert of a trial; a TLS failure in it
+            // is its own, never catrust's.
         } else if (st.disconnect_edge) {
-            handle_mqtt_loss(&st, &backoff_index, &next_session_retry_us);
+            if (move_swallow_own_disconnect(esp_timer_get_time())) {
+                net_ack_disconnect_edge(); // the DISCONNECTED of a disconnect a trial asked for
+            } else {
+                handle_mqtt_loss(&st, &backoff_index, &next_session_retry_us);
+            }
         } else if (!st.mqtt_connected && s_connect_attempt_us != 0 &&
                    (esp_timer_get_time() - s_connect_attempt_us) >= PAGER_CONNECT_WATCHDOG_US) {
             // mqttConnect() produced neither CONNECTED nor DISCONNECTED within 60 s (a silent wedge): force
@@ -2542,6 +2673,7 @@ void modes_run(void)
                      "disconnecting and backing off",
                      (unsigned) s_connect_watchdog_count);
             net_session_down(); // power effect: one AT command (mqttDisconnect), no RRC of its own
+            move_note_loss(esp_timer_get_time(), &st); // no SUBACK in time: a failed attempt for the alternation
             if (s_connect_watchdog_count >= 3) {
                 s_connect_watchdog_count = 0;
                 if (rate_limited_modem_recover("MQTT connect watchdog fired 3x in a row")) {
@@ -2553,22 +2685,29 @@ void modes_run(void)
         } else if (!st.mqtt_connected && !net_airplane()) {
             // Airplane mode: no retry or backoff. Skipped while a CA apply trial owns the session.
             // net_connect_in_flight() prevents a second CONNECT while one is outstanding (+CME ERROR: 4).
-            if (!s_ca_apply_suppress && esp_timer_get_time() >= next_session_retry_us &&
+            if (!session_owned() && esp_timer_get_time() >= next_session_retry_us &&
                 !net_connect_in_flight()) {
-                // No-op unless `broken`: picks validated vs. unvalidated for this attempt.
-                catrust_before_reconnect();
-                ESP_LOGI(TAG, "retrying MQTT session (backoff idx=%u)", (unsigned) backoff_index);
-                bool up_ok = net_session_up();
-                note_session_up_attempt(up_ok); // arms the connect watchdog
-                if (!up_ok) {
-                    // net_session_up() can keep failing if the modem's MQTT client is stuck up; after 3
-                    // failures in a row reach for a full modem reset.
-                    if (net_connect_fail_streak_maxed() &&
-                        rate_limited_modem_recover(
-                            "net_session_up() failed 3x in a row (modem MQTT client possibly stuck)")) {
-                        note_session_up_attempt(net_session_up());
-                    } else {
-                        schedule_backoff(&backoff_index, &next_session_retry_us);
+                if (move_attempt_pending_next(&move_env)) {
+                    // §5.7: the attempt before this one failed on the active login, so this one goes to the
+                    // pending identity, as a trial. move_service() takes it from here.
+                    ESP_LOGI(TAG, "retrying on the pending identity (backoff idx=%u)", (unsigned) backoff_index);
+                    move_begin_pending_attempt(&move_env);
+                } else {
+                    // No-op unless `broken`: picks validated vs. unvalidated for this attempt.
+                    catrust_before_reconnect();
+                    ESP_LOGI(TAG, "retrying MQTT session (backoff idx=%u)", (unsigned) backoff_index);
+                    bool up_ok = net_session_up();
+                    note_session_up_attempt(up_ok); // arms the connect watchdog
+                    if (!up_ok) {
+                        // net_session_up() can keep failing if the modem's MQTT client is stuck up; after 3
+                        // failures in a row reach for a full modem reset.
+                        if (net_connect_fail_streak_maxed() &&
+                            rate_limited_modem_recover(
+                                "net_session_up() failed 3x in a row (modem MQTT client possibly stuck)")) {
+                            note_session_up_attempt(net_session_up());
+                        } else {
+                            schedule_backoff(&backoff_index, &next_session_retry_us);
+                        }
                     }
                 }
             }
@@ -2584,7 +2723,7 @@ void modes_run(void)
 #endif
         // Idle-uplink liveness ping / silent-resume repair, once per iteration. The LTE transport is
         // suppressed while the coverage duty cycle or a CA apply owns the radio; this is called regardless.
-        net_set_lte_suppressed(s_coverage_owns_radio || s_ca_apply_suppress);
+        net_set_lte_suppressed(s_coverage_owns_radio || session_owned());
         net_service_session();
 
         watchdog_kick(WD_PUMP);
@@ -2593,12 +2732,16 @@ void modes_run(void)
         if (!pump_blocked && !wake_bytes_pending && st.mqtt_connected &&
             esp_timer_get_time() >= s_next_pump_us) {
             msg_pump();
+            msg_rcpt_alert_t late_alert;
+            if (msg_take_rcpt_alert(&late_alert)) {
+                alert_rcpt_failed(&late_alert);
+            }
             s_next_pump_us = esp_timer_get_time() + PAGER_PUMP_MIN_INTERVAL_US;
         }
 
         // Modem health check every 60 wake cycles in sleep mode; skipped during a CA apply trial or while
         // the coverage duty cycle keeps the radio dark on purpose (it would force a spurious reset).
-        if (!net_airplane() && !s_ca_apply_suppress && !s_coverage_owns_radio &&
+        if (!net_airplane() && !session_owned() && !s_coverage_owns_radio &&
             g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP &&
             (wake_cycle_count % PAGER_CHECKCOMM_EVERY_N_WAKES) == 0) {
             run_modem_health_check();
@@ -2637,6 +2780,10 @@ void modes_run(void)
             catrust_service(&st);
         }
 
+        // One step of the server move: an order, cancel or proof to act on, and any trial (a no-op with
+        // no move). `st` is the same snapshot the reconnect loop above saw.
+        move_service(&st, &move_env);
+
         // One step of the pending-nudge / book-fetch state machine; shares catrust's single-flight
         // cafetch guard.
         bookpull_service();
@@ -2648,7 +2795,8 @@ void modes_run(void)
             memset(&oe, 0, sizeof(oe));
             oe.airplane = net_airplane();
             oe.mqtt_usable = st.mqtt_connected;
-            oe.other_fetch = (cafetch_in_progress() && !ota_transfer_active()) || catrust_apply_in_progress();
+            oe.other_fetch = (cafetch_in_progress() && !ota_transfer_active()) || catrust_apply_in_progress() ||
+                             move_owns_session();
             oe.sleep_mode = g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP;
             oe.batt_mv = modes_batt_mv_known() ? modes_get_batt_mv() : OTA_MIN_BATT_MV; // unknown battery does not block OTA
             oe.rssi = (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : 0;

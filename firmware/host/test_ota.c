@@ -274,7 +274,9 @@ static void test_accept_assets(void)
               ota_reject_err(OTA_REJECT_RUNNING) == OTA_ERR_RUN,
           "reject -> err mapping");
     /* persisted values must not change */
-    CHECK(OTA_ERR_BAD == 13 && OTA_ERR_NOPART == 14 && OTA_ERR_FMT == 15, "ota_err_t values are persisted");
+    CHECK(OTA_ERR_BAD == 13 && OTA_ERR_NOPART == 14 && OTA_ERR_FMT == 15 && OTA_ERR_CAPS == 16,
+          "ota_err_t values are persisted");
+    CHECK(strcmp(ota_err_str(OTA_ERR_CAPS), "caps") == 0, "caps is the wire string of OTA_ERR_CAPS");
 }
 
 static void test_accept(void)

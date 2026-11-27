@@ -24,6 +24,7 @@ from app import (
     devcfg,
     devsetup,
     firmware,
+    move_target,
     purge,
     soracom,
 )
@@ -390,7 +391,11 @@ class DeviceSetupCodeResponse(BaseModel):
     device: Device
     setupCode: str
     expiresAt: datetime
+    # "pushed": the broker accepted the login and ACL; "manual": it did not, and `manualAcl` lists
+    # what to configure by hand. `brokerResult` says why: "ok", "manual" (the relay does not manage
+    # the broker) or "error" (it does, and the broker refused or did not answer; rotate again).
     brokerPush: Literal["pushed", "manual"]
+    brokerResult: Literal["ok", "manual", "error"]
     manualAcl: list[str] | None = None
 
 
@@ -420,6 +425,16 @@ def _manual_acl_lines(device_id: str) -> list[str]:
         f"publish pager/{device_id}/loc",
         f"subscribe pager/{device_id}/down",
     ]
+
+
+def _broker_result(login: EmqxResult, issued: devsetup.IssueOutcome) -> EmqxResult:
+    """One answer for the pushes of a setup code: the device login, the bootstrap login and the
+    retained bundle."""
+    if login != "ok":
+        return login
+    if issued.boot_user != "ok":
+        return issued.boot_user
+    return "ok" if issued.bundle_published else "error"
 
 
 def _broker_push_outcome(
@@ -496,6 +511,7 @@ def _create_device_impl(
 
     # push the broker credential and ACL before handing out a setup code
     emqx_result = emqx.ensure_device(device_id, password, device_id)
+    issued = devsetup.IssueOutcome()
     host, ca = _bootstrap_host_and_ca(settings)
     now = datetime.now(UTC)
     try:
@@ -512,6 +528,7 @@ def _create_device_impl(
             broker=broker,
             emqx=emqx,
             now=now,
+            outcome=issued,
         )
     except ca_resolve.PublicBaseUrlRequired as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -519,12 +536,14 @@ def _create_device_impl(
 
     device = devices_store.get_device(device_id)
     assert device is not None
+    emqx_result = _broker_result(emqx_result, issued)
     broker_push, manual_acl = _broker_push_outcome(device_id, emqx_result)
     return DeviceSetupCodeResponse(
         device=device,
         setupCode=setup_code,
         expiresAt=expires_at,
         brokerPush=broker_push,
+        brokerResult=emqx_result,
         manualAcl=manual_acl,
     )
 
@@ -625,7 +644,12 @@ def _rotate_credentials_impl(
 
     # delete the old broker credential outright before `deviceSecrets.rotate` replaces key/hash
     emqx.delete_user(device.mqttUsername)
-    device_secrets_store.rotate(device_id, hmac_key, password_hash)
+    if device_secrets_store.get(device_id) is None:
+        # a pager imported without a key (a move could not derive one)
+        device_secrets_store.create(device_id, hmac_key=hmac_key, mqtt_password_hash=password_hash)
+    else:
+        device_secrets_store.rotate(device_id, hmac_key, password_hash)
+    move_target.end_for_setup_code(device_id)
     # the alarm and its window concern the old key
     devices_store.clear_auth_alarm(device_id)
     # drop the cached secret so envelopes are not verified against the deleted `hmacKey`
@@ -633,6 +657,7 @@ def _rotate_credentials_impl(
     devices_store.set_provision_state(device_id, "issued")
 
     emqx_result = emqx.ensure_device(device.mqttUsername, password, device_id)
+    issued = devsetup.IssueOutcome()
     host, ca = _bootstrap_host_and_ca(settings)
     now = datetime.now(UTC)
     try:
@@ -649,6 +674,7 @@ def _rotate_credentials_impl(
             broker=broker,
             emqx=emqx,
             now=now,
+            outcome=issued,
         )
     except ca_resolve.PublicBaseUrlRequired as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -656,12 +682,14 @@ def _rotate_credentials_impl(
 
     updated = devices_store.get_device(device_id)
     assert updated is not None
+    emqx_result = _broker_result(emqx_result, issued)
     broker_push, manual_acl = _broker_push_outcome(device_id, emqx_result)
     return DeviceSetupCodeResponse(
         device=updated,
         setupCode=setup_code,
         expiresAt=expires_at,
         brokerPush=broker_push,
+        brokerResult=emqx_result,
         manualAcl=manual_acl,
     )
 
@@ -1002,6 +1030,11 @@ def _push_ota_impl(
         raise HTTPException(status_code=409, detail="device does not report ota:1")
     target_build = index.find(req.target)
     assert target_build is not None
+    refusal = firmware.move_refusal(
+        target_build, move_state=dev.move.state if dev.move else None
+    )
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
     if dev.status.img and dev.status.img.strip().lower()[:16] == target_build.id16:
         raise HTTPException(status_code=409, detail="already running that build")
     choice = firmware.choose(index, req.target, dev.status.img)

@@ -51,6 +51,10 @@ Commands:
 `recv` for a listed number, `blocked` for an unlisted one. `smscontacts`/`smslog` drive the
 device-owner `GET`/`PUT /api/devices/{id}/sms-contacts` and `GET /api/devices/{id}/sms-log` API.
 
+`DeviceClient(move_capable=True)` plays firmware that follows a `cfg.mv` server-move order (rules in
+`tools/pager_move.py`, docs/MOVE_DESIGN.md). `ca_file` gives a client its own CA (default
+`PAGER_CA_CERTS`), so one process can talk to a plain and a TLS broker.
+
 `DeviceClient.book`/`.lock` hold the simulated device's applied state (docs/PROTOCOL.md §3.2:
 `book`/`cfg` are not thread entries and are acked `shown` once applied).
 """
@@ -69,6 +73,7 @@ import ssl
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -84,6 +89,9 @@ if str(RELAY_DIR) not in sys.path:
 
 from app import devauth, devsetup, wirecbor
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pager_move import Held, MoveMixin, Timers, Trial
+
 DEFAULT_MQTT_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
 DEFAULT_MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
 DEFAULT_API_URL = os.environ.get("PAGER_API_URL", "http://localhost:8000")
@@ -96,13 +104,21 @@ SIM_KEEPALIVE_S = 60
 TLS_CA_CERTS: str | None = os.environ.get("PAGER_CA_CERTS") or None
 
 
-def _tls(client: mqtt.Client) -> None:
-    if TLS_CA_CERTS:
-        client.tls_set(ca_certs=TLS_CA_CERTS)
+# "Use `TLS_CA_CERTS`", as against an explicit `None` (plain MQTT, the system trust store).
+_GLOBAL_CA: Any = object()
 
 
-def _http_verify() -> ssl.SSLContext | bool:
-    return ssl.create_default_context(cafile=TLS_CA_CERTS) if TLS_CA_CERTS else True
+def _tls(client: mqtt.Client, ca_file: str | None = None, ca_pem: str | None = None) -> None:
+    """Pinned PEM (a move's CA, fetched by the pager) before a CA file; neither: plain MQTT."""
+    if ca_pem:
+        client.tls_set_context(ssl.create_default_context(cadata=ca_pem))
+    elif ca_file:
+        client.tls_set(ca_certs=ca_file)
+
+
+def _http_verify(ca_file: str | None = _GLOBAL_CA) -> ssl.SSLContext | bool:
+    ca = TLS_CA_CERTS if ca_file is _GLOBAL_CA else ca_file
+    return ssl.create_default_context(cafile=ca) if ca else True
 
 
 def new_id(prefix: str) -> str:
@@ -185,7 +201,7 @@ _DOWN_WINDOW = 32
 _DOWN_WINDOW_MASK = (1 << _DOWN_WINDOW) - 1
 
 
-class DeviceClient:
+class DeviceClient(MoveMixin):
     """A simulated pager device with the wire shapes of docs/PROTOCOL.md; `hmac_key` plays an
     `authMode: "hmac"` device (§14), `wire` selects the envelope encoding."""
 
@@ -200,7 +216,16 @@ class DeviceClient:
         hmac_key: bytes | None = None,
         wire: Literal["json", "cbor"] = "json",
         cell: dict[str, Any] | None = None,
+        ca_file: str | None = _GLOBAL_CA,
+        move_capable: bool = False,
+        move_timers: Timers | None = None,
+        move_auto: bool = True,
+        move_ca_fetch: Callable[[str], str] | None = None,
+        client_factory: Callable[..., mqtt.Client] | None = None,
     ):
+        """`ca_file`: CA for the broker (default `TLS_CA_CERTS`; `None` = plain MQTT).
+        `move_capable` plays firmware that reports `mvc` and `mb` and follows `cfg.mv`
+        (`tools/pager_move.py`)."""
         self.device_id = device_id
         self.host = host
         self.port = port
@@ -259,6 +284,10 @@ class DeviceClient:
         self._auto_thread: threading.Thread | None = None
         # Test-only knob standing in for GNSS acquisition seconds (rule 2 bounds it at 60 s).
         self.loc_answer_delay_s: float = 0.0
+        self.ca_file = TLS_CA_CERTS if ca_file is _GLOBAL_CA else ca_file
+        self._client_factory = client_factory
+        self._last_pub_info: Any = None
+        self._move_init(move_capable=move_capable, timers=move_timers, auto=move_auto, ca_fetch=move_ca_fetch)
 
     @property
     def down_topic(self) -> str:
@@ -276,8 +305,9 @@ class DeviceClient:
     def loc_topic(self) -> str:
         return f"pager/{self.device_id}/loc"
 
-    def _build_client(self) -> mqtt.Client:
-        client = mqtt.Client(
+    def _build_client(self, trial: Trial | None = None) -> mqtt.Client:
+        """The paho client for the identity in use; a `trial` gets the move's callbacks instead."""
+        client = (self._client_factory or mqtt.Client)(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=self.device_id,
             clean_session=False,
@@ -285,13 +315,18 @@ class DeviceClient:
         )
         if self.username:
             client.username_pw_set(self.username, self.password)
-        _tls(client)
+        _tls(client, self.ca_file, self.ca_pem)
         # §14.6: the broker-generated LWT carries no signature or `n`, so it bypasses `_publish`.
         lwt_obj = {"v": 1, "state": "offline", "session": self.session_id}
         lwt_payload = self._encode(lwt_obj)
         client.will_set(self.status_topic, lwt_payload, qos=1, retain=True)
-        client.on_connect = self._on_connect
         client.on_message = self._on_message
+        if trial is None:
+            client.on_connect = self._on_connect
+        else:
+            client.on_connect = lambda c, u, f, rc, p: self._trial_on_connect(trial, c, rc)
+            client.on_subscribe = lambda c, u, mid, rcs, p: self._trial_on_subscribe(trial, rcs)
+            client.on_disconnect = lambda c, u, f, rc, p: self._trial_on_disconnect(trial)
         return client
 
     def connect(self) -> None:
@@ -301,6 +336,7 @@ class DeviceClient:
         self._client = self._build_client()
         self._client.connect(self.host, self.port, keepalive=SIM_KEEPALIVE_S)
         self._client.loop_start()
+        self._move_start()
         # Let the connect handshake and subscribe land.
         deadline = time.monotonic() + 5.0
         while not self.connected and time.monotonic() < deadline:
@@ -310,6 +346,7 @@ class DeviceClient:
 
     def disconnect(self) -> None:
         self.loc_stop_auto()
+        self._move_halt()
         if self._client is not None:
             self._client.loop_stop()
             self._client.disconnect()
@@ -326,10 +363,12 @@ class DeviceClient:
         self.connect()
 
     def _on_connect(self, client, userdata, connect_flags, reason_code, properties) -> None:
+        if reason_code.is_failure:
+            print(f"connect refused for {self.device_id}: {reason_code}", file=sys.stderr)
+            return
         self.connected = True
         client.subscribe(self.down_topic, qos=1)
         self.publish_status()
-
 
     def _encode(self, obj: dict[str, Any]) -> bytes:
         """Encodes `obj` unsigned; used only for the LWT (§14.6)."""
@@ -408,13 +447,18 @@ class DeviceClient:
             self.receipts.append(
                 {k: data.get(k) for k in ("id", "ref", "st", "rsn") if data.get(k) is not None}
             )
+            if self.move_capable and data.get("rsn") == "moving" and data.get("ref"):
+                self._on_moving_receipt(data["ref"])
             return
         if kind == "book":
             # §3.2 `kind:"book"`: not a thread entry; applied, then acked `shown` unconditionally.
             self._handle_book(data)
             return
         if kind == "cfg":
-            self._handle_cfg(data)
+            if self.move_capable and "mv" in (data.get("cfg") or {}):
+                self._on_move_cfg(data)
+            else:
+                self._handle_cfg(data)
             return
         msg_id = data.get("id")
         if not msg_id:
@@ -425,11 +469,14 @@ class DeviceClient:
         elif self.autoack == "shown-only":
             self.publish_ack(msg_id, "shown")
 
-    def _publish(self, topic: str, obj: dict[str, Any], qos: int, retain: bool = False) -> None:
-        """§14.3: an `authMode: hmac` device signs every publish with a fresh `n` and `sig`."""
+    def _publish(self, topic: str, obj: dict[str, Any], qos: int, retain: bool = False) -> int | None:
+        """§14.3: an `authMode: hmac` device signs every publish with a fresh `n` and `sig`; returns
+        that `n` (None for an unsigned device)."""
         assert self._client is not None, "not connected"
+        n: int | None = None
         if self.hmac_key:
-            signed_obj = {**obj, "n": self._next_up_n()}
+            n = self._next_up_n()
+            signed_obj = {**obj, "n": n}
             if self.wire == "cbor":
                 payload = devauth.sign_cbor(self.hmac_key, topic, signed_obj)
             else:
@@ -437,7 +484,8 @@ class DeviceClient:
         else:
             payload = self._encode(obj)
         self.bytes.add_published(topic, len(payload))
-        self._client.publish(topic, payload, qos=qos, retain=retain)
+        self._last_pub_info = self._client.publish(topic, payload, qos=qos, retain=retain)
+        return n
 
     def publish_status(
         self,
@@ -447,7 +495,8 @@ class DeviceClient:
         rssi: int = -85,
         fw: str = "sim-0.2.0",
         mb: int | None = None,
-    ) -> None:
+    ) -> int | None:
+        """Publishes an online `/status`; returns the `n` it carried."""
         obj: dict[str, Any] = {
             "v": 1,
             "state": "online",
@@ -471,22 +520,33 @@ class DeviceClient:
         # Reported only while `loc track` is on.
         if self._tracking:
             obj["loc_move_s"] = self._loc_move_s
-        self._publish(self.status_topic, obj, qos=1, retain=True)
+        obj.update(self.move_status_fields())
+        return self._publish(self.status_topic, obj, qos=1, retain=True)
 
     def publish_ack(self, msg_id: str, ack: str) -> None:
         self._publish(self.up_topic, {"v": 1, "id": msg_id, "ts": now_ts(), "ack": ack}, qos=1)
         print(f"-> acked {ack} for {msg_id}")
 
     def publish_msg(self, body: str, to: str | None = None) -> str:
-        msg_id = new_id("u_")
-        obj: dict[str, Any] = {"v": 1, "id": msg_id, "ts": now_ts(), "from": self.device_id}
-        if to:
-            obj["to"] = to
-        obj["body"] = body
+        """A text reply. While a move holds replies (`move_hold_up`) it waits for the commit."""
+        held = Held(new_id("u_"), to, body, now_ts())
+        self._remember_text(held)
+        if self.move_hold_up():
+            if not self.hold_text(held):
+                raise RuntimeError("queue full: two replies already wait")
+            print(f"-- held u-message {held.id}: {body!r}")
+        else:
+            self._send_text(held)
+        return held.id
+
+    def _send_text(self, held: Held) -> None:
+        obj: dict[str, Any] = {"v": 1, "id": held.id, "ts": held.ts, "from": self.device_id}
+        if held.to:
+            obj["to"] = held.to
+        obj["body"] = held.body
         obj["ack"] = None
         self._publish(self.up_topic, obj, qos=1)
-        print(f"-> sent u-message {msg_id}{' to ' + to if to else ''}: {body!r}")
-        return msg_id
+        print(f"-> sent u-message {held.id}{' to ' + held.to if held.to else ''}: {held.body!r}")
 
 
     def publish_contact_req(self, name: str, ph: str | None = None) -> str:
@@ -567,9 +627,16 @@ class DeviceClient:
             "body": body,
             "sms_ts": now_ts(),
         }
-        self._publish(self.up_topic, obj, qos=1)
-        print(f"-> sms_log {log_id}: dir={direction} peer={peer} st={st} body={body!r}")
+        if self.move_hold_up():
+            self.held_sms.append(obj)
+            print(f"-- held sms_log {log_id}")
+        else:
+            self._send_sms_log(obj)
         return log_id
+
+    def _send_sms_log(self, obj: dict[str, Any]) -> None:
+        self._publish(self.up_topic, obj, qos=1)
+        print(f"-> sms_log {obj['id']}: dir={obj['dir']} peer={obj['peer']} st={obj['st']} body={obj['body']!r}")
 
     def sms_send(self, peer: str, body: str) -> str:
         """`sms out <phone> <text>`: always succeeds, so `st` is `sent`."""
@@ -777,6 +844,8 @@ def bootstrap_device(
     port: int | None = None,
     wire: Literal["json", "cbor"] = "json",
     timeout: float = BOOTSTRAP_TIMEOUT_S,
+    ca_file: str | None = _GLOBAL_CA,
+    move_capable: bool = False,
 ) -> DeviceClient:
     """Fetches and decrypts the retained setup bundle as `boot-{bid}`, acks it, and returns an
     unconnected `DeviceClient`; `port` overrides the bundle's port, `timeout` bounds each wait."""
@@ -810,8 +879,9 @@ def bootstrap_device(
         clean_session=True,
         protocol=mqtt.MQTTv311,
     )
+    ca = TLS_CA_CERTS if ca_file is _GLOBAL_CA else ca_file
     boot_client.username_pw_set(username, bpw)
-    _tls(boot_client)
+    _tls(boot_client, ca)
     boot_client.on_connect = _on_connect
     boot_client.on_message = _on_message
     boot_client.connect(host, conn_port, keepalive=30)
@@ -853,6 +923,8 @@ def bootstrap_device(
         plain["pw"],
         hmac_key=plain["k"],
         wire=wire,
+        ca_file=ca,
+        move_capable=move_capable,
     )
     print(f"[bootstrap] continuing as {device.device_id} with the bundle's real credentials")
     return device
@@ -867,6 +939,7 @@ class ServerClient:
         auth_url: str,
         project_id: str = "demo-pager",
         firestore_url: str | None = None,
+        ca_file: str | None = _GLOBAL_CA,
     ):
         self.api_url = api_url.rstrip("/")
         self.auth_url = auth_url.rstrip("/")
@@ -884,7 +957,7 @@ class ServerClient:
         self._id_token: str | None = None
         # Filled lazily via `GET /api/me` for `_device_id_for_owner`'s family-scoping filter.
         self._family_id: str | None | Literal["unset"] = "unset"
-        self._http = httpx.Client(timeout=10.0, verify=_http_verify())
+        self._http = httpx.Client(timeout=10.0, verify=_http_verify(ca_file))
 
     @property
     def firestore_base(self) -> str:

@@ -34,6 +34,8 @@ object EventQueue {
         kicks.trySend(Unit)
     }
 
+    fun kick() { kicks.trySend(Unit) }
+
     /** For callers on the main thread, where Room refuses the insert. */
     fun enqueueAsync(ctx: Context, events: List<BridgeEvent>, onDone: () -> Unit = {}) {
         val app = ctx.applicationContext
@@ -79,6 +81,12 @@ object EventQueue {
                 } catch (e: RelayClient.Unauthorized) {
                     break
                 } catch (e: RelayClient.HttpError) {
+                    if (e.moved) {
+                        Log.w(TAG, "relay has moved; ${rows.size} events kept")
+                        delay(2_000L)
+                        kicks.trySend(Unit)
+                        break
+                    }
                     if (e.code in 400..499 && e.code != 429) {
                         Log.w(TAG, "relay rejected batch of ${rows.size} (HTTP ${e.code}: ${e.reason()}); dropping ids=${rows.map { it.eventId }}")
                         db.pendingEvents().delete(rows.map { it.rowId })

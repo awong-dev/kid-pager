@@ -28,7 +28,7 @@ export default function RequireAuth({ children, role }: { children: ReactNode; r
   const allowed = role === "member" ? true : role === "super" ? isSuper : isFamilyAdmin;
 
   useEffect(() => {
-    if (status === "signed-out" || status === "not-registered") {
+    if (status === "signed-out" || status === "not-registered" || status === "must-change-password") {
       // Home backend with no users yet: first run. Keep the page asked for (and its #fragment).
       stashReturnPath(`${stripBase(window.location.pathname)}${window.location.search}${window.location.hash}`);
       navigate.replace(needsSetup ? "/setup" : "/login");

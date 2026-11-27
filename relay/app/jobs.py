@@ -19,6 +19,7 @@ from google.cloud.firestore import (
 )
 
 from app import bridge_health, deliveries, link_health, location
+from app import move as move_module
 from app.authn_home import SESSION_IDLE
 from app.broker import BrokerClient
 from app.carriers import service as carriers_service
@@ -69,11 +70,16 @@ def tick(
     task_queue = task_queue if task_queue is not None else build_task_queue()
     devices_checked = 0
     retries_attempted = 0
+    # A source frozen for a move leaves undelivered messages to the target: nothing here counts a
+    # retry against them or fails them.
+    frozen = move_module.frozen_for_move()
 
     for device in devices_store.list_devices():
         if device.revokedAt is not None:
             continue
         devices_checked += 1
+        if frozen:
+            continue
 
         for msg in messages_store.list_pending_for_device(device.id):
             bid = messages_store.find_pager_delivery(msg, device.id)
@@ -94,7 +100,7 @@ def tick(
     # The location class runs on the first tick of every hour (a fix outlives its limit by <= 1 h).
     if loc_pass_due(datetime.now(UTC)):
         location_pass()
-    bridge_rows_failed = _fail_stale_bridge_outbox()
+    bridge_rows_failed = 0 if frozen else _fail_stale_bridge_outbox()
     # Offline edges for every paired bridge.
     bridge_health.evaluate_all(broker=broker)
     # Carrier balance checks and low/out edges.
@@ -108,9 +114,9 @@ def tick(
     except Exception:
         logger.exception("link probes failed")
 
-    # Retry pending peer posts, fail those pending past FED_OFFLINE_AFTER_S, peer up/down notices,
-    # idle pings.
-    fed_sender.tick_pass(broker=broker)
+    # Retry pending peer posts, fail those pending past FED_OFFLINE_AFTER_S (not while frozen),
+    # peer up/down notices, idle pings.
+    fed_sender.tick_pass(broker=broker, fail_offline_rows=not frozen)
 
     return TickResult(
         bridgeOutboxFailed=bridge_rows_failed,

@@ -128,6 +128,12 @@ In CBOR the hashes are 32-byte bstr and `fmt` is 0 (full) or 1 (delta). The larg
 - Airplane mode leaves the job parked and costs nothing.
 - The relay re-publishes on an online edge like any other `cfg`.
 
+**Index `caps`.** A `fw/index.json` build may carry a `caps` list of strings. `tools/fwpub.py` writes
+it from the `KPCAPS1:<name>;` tag embedded in the image (never by hand); today the only value is
+`"mv"`, meaning the image reads the committed identity slot after a server move. A build without
+`"mv"` is not offered to a device that has moved: the push is refused with a `422` naming the build,
+and the pager refuses to install such an image itself (`ota_err` `caps`). See MOVE_DESIGN.md §12.3.
+
 **`/status` additions** (envelope keys 62–67; display only except `img`/`ota`):
 
 | Key | Field | Meaning |

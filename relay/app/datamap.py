@@ -82,9 +82,10 @@ REGISTRY: tuple[Coll, ...] = (
         "pushSubscriptions",
         "path",
         "owner",
-        "skip",
+        "move",
         parent="users",
-        note="web-push endpoint + keys",
+        note="web-push endpoint + keys; a family export leaves them, a deployment move carries them "
+        "with vapidKid 'src'",
     ),
     _c("pushTokens", "path", "owner", "skip", parent="users", note="FCM tokens"),
     _c(
@@ -333,6 +334,22 @@ REGISTRY: tuple[Coll, ...] = (
         note="doc id embeds a client IP",
     ),
     _c("cells", "global", "cache", "skip", time_field="resolvedAt"),
+    _c(
+        "vapid",
+        "global",
+        "owner",
+        "move",
+        note="doc `src`: the moved-from server's VAPID key pair, written by a deployment import",
+    ),
+    _c(
+        "moveClaims",
+        "via:user",
+        "ephemeral",
+        "skip",
+        uid_fields=("uid",),
+        note="source only, server-only: a person's claim code, admin-set password hash and "
+        "email for the move; dropped when the move is cancelled",
+    ),
     _c("cas", "global", "owner", "skip", note="public CA PEMs, content-addressed"),
     _c("batteryModels", "global", "owner", "skip", uid_fields=("updatedBy",)),
     _c(
@@ -340,7 +357,7 @@ REGISTRY: tuple[Coll, ...] = (
         "global",
         "owner",
         "skip",
-        note="docs: retention, meta, federation (the server switch)",
+        note="docs: retention, meta, federation (the server switch), move (the move record)",
     ),
     _c(
         "fedFamilies",

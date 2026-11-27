@@ -269,12 +269,18 @@ def announce_pass(*, now: float | None = None) -> int:
     return done
 
 
-def tick_pass(*, now: float | None = None, broker: BrokerClient | None = None) -> None:
+def tick_pass(
+    *,
+    now: float | None = None,
+    broker: BrokerClient | None = None,
+    fail_offline_rows: bool = True,
+) -> None:
     """`app/jobs.py` `tick()`'s federation work: retry, offline, health, idle ping. Each step is
-    isolated; a failing one is logged and does not stop the others."""
+    isolated; a failing one is logged and does not stop the others. `fail_offline_rows=False`
+    leaves pending rows to wait however long they have."""
     # With the server switch off nothing is delivered, probed or announced, but rows already
     # queued still age out to `peer_offline`.
-    steps = [("offline", lambda: fail_offline(now=now))]
+    steps = [("offline", lambda: fail_offline(now=now))] if fail_offline_rows else []
     if enabled():
         steps = [
             ("retry", lambda: retry_pass(now=now)),

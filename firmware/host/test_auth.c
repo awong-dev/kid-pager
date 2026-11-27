@@ -490,6 +490,172 @@ static void test_large_n_vectors(void)
     }
 }
 
+/* Builds a signed /down envelope {v, id, kind, n, sig} and returns it as on_incoming_message() sees it
+ * after auth_verify(): sig trimmed, the map header count still including it. */
+static size_t make_down(uint8_t *buf, size_t cap, const char *kind, uint64_t n, bool with_n)
+{
+    cbor_w_t w;
+    cbor_w_init(&w, buf, cap);
+    cbor_w_map(&w, with_n ? 5 : 4); /* + the sig pair */
+    cbor_w_uint(&w, 0, 1);
+    cbor_w_tstr(&w, 1, "m_abc", 5);
+    cbor_w_tstr(&w, 6, kind, strlen(kind));
+    if (with_n) {
+        cbor_w_uint(&w, 12, n);
+    }
+    size_t len = w.len;
+    CHECK(!w.err && auth_sign("pager/x/down", buf, &len, cap), "build %s", kind);
+    CHECK(auth_verify("pager/x/down", buf, &len), "verify %s", kind);
+    return len;
+}
+
+static void test_check_down_every_kind(void)
+{
+    uint8_t key[AUTH_KDEV_LEN];
+    for (size_t i = 0; i < sizeof(key); i++) {
+        key[i] = (uint8_t) i;
+    }
+    auth_init(key);
+
+    static const char *const kinds[] = { "msg", "cfg", "book", "loc_req", "rcpt" };
+    uint8_t buf[96];
+    auth_rtc_t rtc;
+    memset(&rtc, 0, sizeof(rtc));
+
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        uint32_t n = (uint32_t) (10 + k);
+        size_t len = make_down(buf, sizeof(buf), kinds[k], n, true);
+        CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_OK, "%s n=%u accepted once", kinds[k], (unsigned) n);
+        CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_REPLAY, "%s n=%u replayed is rejected",
+              kinds[k], (unsigned) n);
+        /* a re-publish carries a fresh n and is accepted */
+        len = make_down(buf, sizeof(buf), kinds[k], n + 100, true);
+        CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_OK, "%s re-published with a fresh n accepted", kinds[k]);
+        rtc.down_n = 0;
+        rtc.down_bits = 0;
+    }
+
+    /* one window across kinds: a replay of an old cfg after newer pages is still dropped */
+    memset(&rtc, 0, sizeof(rtc));
+    size_t len_cfg = make_down(buf, sizeof(buf), "cfg", 5, true);
+    uint8_t buf2[96];
+    size_t len_msg = make_down(buf2, sizeof(buf2), "msg", 6, true);
+    CHECK(auth_check_down(&rtc, buf, len_cfg) == AUTH_DOWN_OK, "cfg n=5");
+    CHECK(auth_check_down(&rtc, buf2, len_msg) == AUTH_DOWN_OK, "msg n=6");
+    CHECK(auth_check_down(&rtc, buf, len_cfg) == AUTH_DOWN_REPLAY, "cfg n=5 after msg n=6 is a replay");
+
+    /* no n, n = 0, or n beyond 32 bits */
+    memset(&rtc, 0, sizeof(rtc));
+    size_t len = make_down(buf, sizeof(buf), "cfg", 0, false);
+    CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_NO_N, "signed cfg without n is rejected");
+    len = make_down(buf, sizeof(buf), "cfg", 0, true);
+    CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_REPLAY, "n = 0 is rejected");
+    len = make_down(buf, sizeof(buf), "cfg", 4294967296ull, true);
+    CHECK(auth_check_down(&rtc, buf, len) == AUTH_DOWN_NO_N, "n above 32 bits is rejected, not saturated");
+    CHECK(rtc.down_n == 0, "a rejected n leaves the window alone");
+    CHECK(auth_check_down(&rtc, (const uint8_t *) "\x01", 1) == AUTH_DOWN_NO_N, "garbage is rejected");
+}
+
+static void test_reset_down_window(void)
+{
+    auth_rtc_t rtc;
+    memset(&rtc, 0, sizeof(rtc));
+    rtc.up_lo = 77;
+    CHECK(auth_accept_down_n(&rtc, 900) && auth_accept_down_n(&rtc, 899), "seed a window");
+    CHECK(rtc.down_n == 900 && rtc.down_bits != 0, "window populated");
+    auth_reset_down_window(&rtc);
+    CHECK(rtc.down_n == 0 && rtc.down_bits == 0, "down window zeroed");
+    CHECK(rtc.up_lo == 77, "the up counter is untouched");
+    CHECK(auth_accept_down_n(&rtc, 1), "a new key's n = 1 is accepted after the reset");
+}
+
+/* A move trial runs the pending key on a window of its own (§2.3). */
+static void test_window_swap(void)
+{
+    auth_rtc_t rtc;
+    memset(&rtc, 0, sizeof(rtc));
+    CHECK(auth_accept_down_n(&rtc, 700) && auth_accept_down_n(&rtc, 698), "the active key's window");
+    uint32_t n0 = rtc.down_n, b0 = rtc.down_bits;
+
+    auth_window_swap_out(&rtc);
+    CHECK(rtc.down_n == 0 && rtc.down_bits == 0 && rtc.saved_valid && rtc.saved_n == n0 && rtc.saved_bits == b0,
+          "swapped out: a clean window, the old one kept");
+    CHECK(auth_accept_down_n(&rtc, 1) && auth_accept_down_n(&rtc, 2) && !auth_accept_down_n(&rtc, 2),
+          "the new key starts at n = 1 and has its own replay window");
+    auth_window_swap_out(&rtc);
+    CHECK(rtc.saved_n == n0 && rtc.saved_bits == b0, "a second swap-out keeps the first saved window");
+
+    auth_window_swap_back(&rtc);
+    CHECK(rtc.down_n == n0 && rtc.down_bits == b0 && !rtc.saved_valid, "revert: the active window is back");
+    CHECK(!auth_accept_down_n(&rtc, 700) && !auth_accept_down_n(&rtc, 698) && auth_accept_down_n(&rtc, 701),
+          "and still rejects what it had seen");
+    uint32_t n1 = rtc.down_n;
+    auth_window_swap_back(&rtc);
+    CHECK(rtc.down_n == n1, "swap-back without a saved window does nothing");
+
+    auth_window_swap_out(&rtc);
+    auth_window_drop_saved(&rtc);
+    CHECK(!rtc.saved_valid && rtc.saved_n == 0 && rtc.down_n == 0, "commit: the saved window is dropped");
+    auth_window_swap_back(&rtc);
+    CHECK(rtc.down_n == 0, "...and cannot come back");
+
+    auth_window_swap_out(&rtc);
+    auth_reset_down_window(&rtc);
+    CHECK(!rtc.saved_valid, "a reset (Set up again) drops a saved window too");
+
+    /* a reset in the middle of a trial: the saved window is the active key's (saved for slot 0, active slot 0) and
+     * comes back; the live window was the pending key's */
+    memset(&rtc, 0, sizeof(rtc));
+    CHECK(auth_accept_down_n(&rtc, 700), "the active key has seen 700");
+    n0 = rtc.down_n;
+    b0 = rtc.down_bits;
+    auth_window_swap_out(&rtc);
+    rtc.saved_valid = 1 + 0;
+    CHECK(auth_accept_down_n(&rtc, 1), "the pending key's window");
+    auth_window_boot_restore(&rtc, 0);
+    CHECK(rtc.down_n == n0 && rtc.down_bits == b0 && !rtc.saved_valid, "boot before the selector: the saved window is restored");
+    CHECK(!auth_accept_down_n(&rtc, 700), "...and rejects what it had seen");
+
+    /* a reset after the selector was written: slot 1 is active, the saved window was slot 0's and is dropped */
+    memset(&rtc, 0, sizeof(rtc));
+    CHECK(auth_accept_down_n(&rtc, 700), "the old key has seen 700");
+    auth_window_swap_out(&rtc);
+    rtc.saved_valid = 1 + 0;
+    CHECK(auth_accept_down_n(&rtc, 1) && auth_accept_down_n(&rtc, 2), "the new key's window");
+    uint32_t live_n = rtc.down_n, live_b = rtc.down_bits;
+    auth_window_boot_restore(&rtc, 1);
+    CHECK(!rtc.saved_valid && rtc.saved_n == 0 && rtc.saved_bits == 0, "boot after the selector: the saved window is dropped");
+    CHECK(rtc.down_n == live_n && rtc.down_bits == live_b, "...and the live window, the new key's, is kept");
+    CHECK(!auth_accept_down_n(&rtc, 2) && auth_accept_down_n(&rtc, 3), "the new key's replay window still works");
+
+    /* nothing saved: nothing changes */
+    memset(&rtc, 0, sizeof(rtc));
+    CHECK(auth_accept_down_n(&rtc, 9), "n 9");
+    live_n = rtc.down_n;
+    auth_window_boot_restore(&rtc, 1);
+    CHECK(rtc.down_n == live_n && !rtc.saved_valid, "no saved window: the live one is untouched");
+
+    memset(&rtc, 0, sizeof(rtc));
+    rtc.up_lo = 12;
+    CHECK(auth_peek_up_n(&rtc, 5) == (((uint64_t) 5 << AUTH_UP_LO_BITS) | 12), "peek is the next n");
+    bool wrapped;
+    CHECK(auth_next_up_n(&rtc, 5, &wrapped) == auth_peek_up_n(&(auth_rtc_t){ .up_lo = 12 }, 5),
+          "and the next draw is that n");
+}
+
+static void test_epoch_above_16_bits(void)
+{
+    auth_rtc_t rtc;
+    memset(&rtc, 0, sizeof(rtc));
+    rtc.up_lo = AUTH_UP_LO_MASK;
+    bool wrapped = false;
+    uint64_t n = auth_next_up_n(&rtc, 70000, &wrapped);
+    CHECK(wrapped && n == ((uint64_t) 70000 << AUTH_UP_LO_BITS) + AUTH_UP_LO_MASK,
+          "epoch 70000 keeps all its bits in n");
+    n = auth_next_up_n(&rtc, 70001, &wrapped);
+    CHECK(n == ((uint64_t) 70001 << AUTH_UP_LO_BITS), "the next draw after the wrap is under the bumped epoch");
+}
+
 int main(void)
 {
     test_sign_verify_without_init_fails();
@@ -498,6 +664,10 @@ int main(void)
     test_next_up_n();
     test_accept_down_n();
     test_large_n_vectors();
+    test_check_down_every_kind();
+    test_reset_down_window();
+    test_window_swap();
+    test_epoch_above_16_bits();
 
     vector_t vectors[MAX_VECTORS];
     int n = load_vectors(AUTHVECTORS_PATH, vectors, MAX_VECTORS);

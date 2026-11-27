@@ -28,6 +28,21 @@ CSRF_VALUE = "pager"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+# A session whose password an admin set may call only these routes until it is replaced.
+MUST_CHANGE_DETAIL = "password change required"
+_MUST_CHANGE_ROUTES = frozenset({("POST", "/api/auth/password"), ("GET", "/api/auth/session")})
+
+
+def _password_change_pending(request: Request, uid: str) -> bool:
+    from app import authn_home
+
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    if (request.method, path) in _MUST_CHANGE_ROUTES:
+        return False
+    return authn_home.must_change_password(uid)
+
+
 @dataclass(frozen=True, slots=True)
 class AuthedUser:
     """The verified token plus the matching registry row."""
@@ -86,6 +101,8 @@ def _require_home_user(
         raise HTTPException(status_code=403, detail="not registered")
     if user.disabled:
         raise HTTPException(status_code=403, detail="account disabled")
+    if _password_change_pending(request, uid):
+        raise HTTPException(status_code=403, detail=MUST_CHANGE_DETAIL)
     # No token claims at home; the same keys are reported so `/api/me`'s `claims` keeps its shape.
     claims = {"uid": uid, "role": user.role, "fam": user.familyId or ""}
     return AuthedUser(uid=uid, claims=claims, user=user)

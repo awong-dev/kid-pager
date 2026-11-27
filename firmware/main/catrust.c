@@ -121,6 +121,7 @@ void catrust_fingerprint_hex(const uint8_t ca_hash[32], char out[17])
 #include "cafetch.h"
 #include "ident.h"
 #include "modes.h"
+#include "move.h"
 #include "msg.h"
 #include "net.h"
 
@@ -245,6 +246,13 @@ void catrust_before_reconnect(void)
     }
 }
 
+void catrust_identity_changed(void)
+{
+    s_broken_cache = ident_get_tls_broken();
+    s_validated_fail_streak = 0;
+    s_attempted_validated_since_boot = false;
+}
+
 void catrust_on_mqtt_connected(void)
 {
     s_validated_fail_streak = 0;
@@ -287,6 +295,12 @@ void catrust_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id)
     catrust_cfg_t cfg;
     if (!catrust_parse_cfg_submap(buf, len, &cfg)) {
         ESP_LOGI(TAG, "malformed cfg.ca sub-map dropped (id=%s)", id ? id : "");
+        return;
+    }
+
+    if (move_blocks_cfg_ca()) {
+        // A server move is pending or a trial runs: not acked, so the relay re-publishes it later.
+        ESP_LOGI(TAG, "cfg.ca deferred while a server move is pending (id=%s)", id ? id : "");
         return;
     }
 
@@ -364,28 +378,11 @@ static void ack_apply(const char *id, bool shown)
 
 static void begin_unpin(const char *id)
 {
-    // ident_scratch() is one shared 4,460 B buffer; released on every exit path
-    ident_t *snap = ident_scratch();
-    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
-    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
-    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
-    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
-    snap->port = ident_get_port();
-    snap->ca[0] = '\0';
-    snap->ca_len = 0;
-    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
-    snap->flags = ident_get_flags();
-    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
-    memset(snap->ca_hash, 0, sizeof(snap->ca_hash));
-    snap->n_epoch = ident_get_n_epoch();
-    snap->claimed = ident_get_claimed();
-
-    if (!ident_store(snap)) {
-        ident_scratch_release();
-        ESP_LOGI(TAG, "un-pin: ident_store() failed - CA left pinned, will retry on the next push");
+    static const uint8_t no_hash[IDENT_CA_HASH_LEN];
+    if (!ident_set_ca("", no_hash)) {
+        ESP_LOGI(TAG, "un-pin: ident_set_ca() failed - CA left pinned, will retry on the next push");
         return;
     }
-    ident_scratch_release();
     net_tls_configure(NET_TLS_CA_SLOT, false);
     set_broken(false);
     clear_pend_fail();
@@ -470,27 +467,11 @@ static void service_fetching(void)
 
 static void commit_apply(void)
 {
-    // ident_scratch() released as soon as ident_store() has consumed it
-    ident_t *snap = ident_scratch();
-    strncpy(snap->dev_id, ident_get_dev_id(), sizeof(snap->dev_id) - 1);
-    strncpy(snap->mqtt_pw, ident_get_mqtt_pw(), sizeof(snap->mqtt_pw) - 1);
-    memcpy(snap->kdev, ident_get_kdev(), sizeof(snap->kdev));
-    strncpy(snap->host, ident_get_host(), sizeof(snap->host) - 1);
-    snap->port = ident_get_port();
-    strncpy(snap->ca, s_apply_pem, sizeof(snap->ca) - 1);
-    snap->ca_len = strlen(snap->ca);
-    strncpy(snap->apn, ident_get_apn(), sizeof(snap->apn) - 1);
-    snap->flags = ident_get_flags();
-    strncpy(snap->label, ident_get_label(), sizeof(snap->label) - 1);
-    memcpy(snap->ca_hash, s_apply_sha, sizeof(snap->ca_hash));
-    snap->n_epoch = ident_get_n_epoch();
-    snap->claimed = ident_get_claimed();
-
     // ca_hash is the SHA-256 of the stored PEM, not of the raw HTTP body
-    mbedtls_sha256((const unsigned char *) snap->ca, snap->ca_len, snap->ca_hash, 0);
+    uint8_t hash[IDENT_CA_HASH_LEN];
+    mbedtls_sha256((const unsigned char *) s_apply_pem, strlen(s_apply_pem), hash, 0);
 
-    bool stored = ident_store(snap);
-    ident_scratch_release();
+    bool stored = ident_set_ca(s_apply_pem, hash);
     net_write_ca_slot(NET_TLS_CA_SLOT, s_apply_pem); // best-effort
     net_tls_configure(NET_TLS_CA_SLOT, true);
     set_broken(false);
@@ -498,9 +479,9 @@ static void commit_apply(void)
 
     if (!stored) {
         // Identity did not persist: count a failed apply (bounds a failing NVS write).
-        ESP_LOGI(TAG, "cfg.ca apply: live session now validated on the new CA, but ident_store() "
+        ESP_LOGI(TAG, "cfg.ca apply: live session now validated on the new CA, but ident_set_ca() "
                       "FAILED - not acking, will retry");
-        fail_current_apply("ident_store() failed after a validated commit");
+        fail_current_apply("ident_set_ca() failed after a validated commit");
         return;
     }
 
@@ -540,6 +521,9 @@ void catrust_service(const net_mqtt_status_t *st)
 {
     switch (s_phase) {
     case CATRUST_APPLY_IDLE: {
+        if (move_blocks_cfg_ca()) {
+            return; // a recorded request waits until the move settles
+        }
         // Copied under the lock: a new push could overwrite the fields while these run unlocked.
         bool present, unpin;
         char id[MSG_ID_MAX];

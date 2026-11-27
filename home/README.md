@@ -35,6 +35,7 @@ Forward these ports on your router to this machine:
 |---|---|---|
 | 443/tcp | browsers, the bridge phone, and the pager's CA and firmware downloads | nginx sends it to the relay |
 | 8883/tcp | the pager (MQTT over TLS) | nginx sends it to the broker |
+| 8884/tcp | only with `TLS_MODE=letsencrypt`: pagers behind Soracom Beam | MQTT over TLS with the public certificate; nginx sends it to the same broker as 8883 |
 | 80/tcp | only with `TLS_MODE=letsencrypt` | serves the HTTP-01 challenge; every other request is redirected to 443 |
 
 These ports are not published to the network:
@@ -62,6 +63,10 @@ connects to this stack directly.
    PAGER_HTTPS_BIND=127.0.0.1:8443
    PAGER_HTTP_BIND=127.0.0.1:8080
    ```
+
+   Two stacks on one machine also need `PAGER_MQTTS_BIND` and
+   `PAGER_BEAM_BIND` (for example `127.0.0.1:18883` and `127.0.0.1:18884`),
+   which move the published ports 8883 and 8884 the same way.
 
 3. Keep `TLS_MODE=selfsigned`. Your existing web server holds the public
    certificate; this stack's certificate only covers the hop between the two.
@@ -93,11 +98,19 @@ visitors as one.
 
 ## TLS modes
 
-Set `TLS_MODE` in `pager.env`. It controls the certificate on port 443 only.
+Set `TLS_MODE` in `pager.env`. It controls the certificate on port 443 and whether port 8884 exists.
 
 - **The pager (port 8883)** always uses a certificate from the stack's own
   CA (`data/certs/ca/ca.crt`, valid for 10 years). The pager pins this CA, so
   it never has to change. The pager does not care which mode you pick.
+- **Soracom Beam (port 8884)**: Beam validates the server against public
+  roots and cannot be given the stack's CA, so with `letsencrypt` nginx also
+  listens on 8884 with the Let's Encrypt certificate and sends it to the same
+  broker. Point the Beam group at `mqtts://PAGER_HOST:8884`. With `selfsigned`
+  there is no 8884 listener. Until the first certificate arrives, 8884 refuses
+  handshakes. The relay tells moving pagers about it (`beam` in
+  `/api/public/move-info`) only in this mode; if your router forwards a different
+  external port to 8884, set `BEAM_PORT` in `pager.env` to that port.
 - **`selfsigned`**: the web certificate on port 443 also comes from the
   stack's CA, and `init` renews it before it expires.
 - **`letsencrypt`**: needs a real domain name. certbot gets a public
@@ -271,6 +284,13 @@ reconnect within a few seconds. The timer never runs `git pull`, so the pager
 software itself changes only when you update it.
 
 ## Moving from the cloud
+
+To move a whole deployment with the pagers and bridge phones cut over the air, use
+[docs/FAMILY_MOVE.md](../docs/FAMILY_MOVE.md) Part A.
+
+The steps below are the database-convert path. It copies a Firestore export into the home database
+as it is: no family remapping, no federation key rotation, no invite codes, and it refuses a
+database that already holds documents. Treat it as a backup and restore tool.
 
 Steps 1 and 2 run wherever you have `gcloud` signed in to the cloud project.
 

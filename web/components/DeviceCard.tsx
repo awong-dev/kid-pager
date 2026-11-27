@@ -27,7 +27,8 @@ import { formatRelativeAge } from "@/lib/time";
 import type { DeviceDoc } from "@/lib/types";
 
 // `devices/{d}.provisionState`; not in the `DeviceDoc` type.
-export type ProvisionState = "issued" | "provisioned" | null | undefined;
+// "moved": imported from another server and not yet set up on this one.
+export type ProvisionState = "issued" | "provisioned" | "moved" | null | undefined;
 
 // `devices/{d}.pendingCfg`
 export interface PendingCfgDoc {
@@ -159,7 +160,13 @@ export default function DeviceCard(p: DeviceCardProps) {
               {d.status?.car && <Chip size="small" variant="outlined" label={d.status.car} />}
             </Fact>
             <Fact label="Provisioned">
-              {d.provisionState === "provisioned" ? "yes" : d.provisionState ? d.provisionState : "no"}
+              {d.provisionState === "provisioned"
+                ? "yes"
+                : d.provisionState === "moved"
+                  ? "moved here, needs a setup code"
+                  : d.provisionState
+                    ? d.provisionState
+                    : "no"}
             </Fact>
             <Fact label="Lock">
               <TextField

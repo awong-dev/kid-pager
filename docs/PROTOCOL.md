@@ -42,6 +42,7 @@ since the first release is optional, so a device that ignores all of them stays 
 | Message id (device-originated, up) | `u_` + 8 lowercase hex | 10 | from `esp_random()` |
 | Location id (device-originated, `/loc`) | `l_` + 8 lowercase hex | 10 | from `esp_random()` *(a distinct prefix so a `/loc` envelope is identifiable in logs without its topic; it is still just an `id` per the rule below.)* |
 | Session id | `s_` + 8 lowercase hex | 10 | per **cold boot**, not per deep-sleep wake; lives in RTC memory (§9) |
+| Move id (relay-originated, `cfg.mv`) | `mv_` + 12 lowercase hex | 15 | `os.urandom`, one per server move, never reused; the HKDF salt of §14.8 *(one id names the whole move, so a re-sent order is recognisably the same order; validators accept §1's `id` regex `^[a-z0-9_]{3,16}$`)* |
 
 `id` is opaque to every consumer. Validators accept `^[a-z0-9_]{3,16}$` so a future generator can
 change the prefix scheme without a protocol version bump.
@@ -138,7 +139,7 @@ Base envelope:
 | `c` | array of objects | `book` only | ≤10 contacts | Approved contacts; each has `a` (alias), `n` (name ≤16 cp), `t` (type: `web`/`sms`/`chat`/`grp`, the last for a group conversation, or `fed` for a contact on a federated relay, `docs/FEDERATION_DESIGN.md`) (`DEVICE_PLAN.md` §4.3). *(Firmware: `t` is kept verbatim in a 4-byte field and only `grp` changes behaviour; `fed` is an ordinary peer to the device, plus the bridged tags of §3.2 `rcpt`. A `t` of 5 or more bytes would be rejected, with the whole book, so a new type must stay within 4 bytes.)* *(An owner who holds an `smsNumber` (`users.smsNumber`) gets their SMS contacts in `c[]` with `t:"sms"` and an empty `cfg.sms`; otherwise they arrive as `cfg.sms`.)* *(A bridged Google Chat DM is also `t:"chat"` (docs/BRIDGE_PHONE_DESIGN.md); a bridged group is an ordinary `t:"grp"` group.)* |
 | `p` | array of objects | `book` only | ≤4 pending requests | Pending `contact_req`; each has `n` (name), `s` (status: `pend`/`no`) (`DEVICE_PLAN.md` §4.3). *(Not sent, §3.2; an absent `p` is empty.)* |
 | `more` | bool | `book` only | — | Reserved for chunking if the cap moves (`DEVICE_PLAN.md` §4.3). |
-| `cfg` | object | `/down` `cfg` kind only | — | Configuration map carrying `lock` (object with `clear` bool and `auto` int minutes; full shape in `DEVICE_PLAN.md` §5.8), `ca` (`V02_DESIGN.md` §4.4), and `sms` (§3.6 — the SMS contact allow-list). *(CFG key 3, formerly `wifi`, is retired and never reused, §10.)* *(Also `loc`, §3.2 `cfg.loc`, §10 — `{gnss}`, the GNSS enable flag.)* |
+| `cfg` | object | `/down` `cfg` kind only | — | Configuration map carrying `lock` (object with `clear` bool and `auto` int minutes; full shape in `DEVICE_PLAN.md` §5.8), `ca` (`V02_DESIGN.md` §4.4), and `sms` (§3.6 — the SMS contact allow-list). *(CFG key 3, formerly `wifi`, is retired and never reused, §10.)* *(Also `loc`, §3.2 `cfg.loc`, §10 — `{gnss}`, the GNSS enable flag.)* *(Also `mv`, §3.2 `cfg.mv`, §10 — a server move: order, cancel or proof.)* |
 | `peer` | string | `sms_log` only | E.164 | The other party's phone number (§3.6). |
 | `dir` | string | `sms_log` only | `out` \| `in` | Direction of the SMS this entry audits (§3.6). |
 | `st` | string | `sms_log` and `/down` `rcpt` | `sms_log`: `sent` \| `failed` \| `recv` \| `blocked`; `rcpt`: `sent` \| `failed` | Outcome of the SMS this entry audits (§3.6); on a `rcpt`, what the bridge did with the up page `ref` names (§3.2). |
@@ -146,7 +147,7 @@ Base envelope:
 | `m` | array of strings | `grp_req` only | 1…8 distinct aliases, each the alias regex above | Requested group members, not including the requesting device's owner (§3.8). *(the group request names people by the aliases the device already holds in its book.)* |
 | `url` | string | `/down` `book` nudge only | `https://host[:port]/path`, ≤200 bytes | Where the device fetches the full book (§3.7). *(The device holds no relay URL: its bootstrap bundle names only the broker, and a signed nudge is the one place it can learn one without re-provisioning.)* |
 | `ref` | string | `/down` `rcpt` only | the `/up` wire id, ≤ 16 bytes | The up message a delivery receipt is about (§3.2). CBOR key 74. |
-| `rsn` | string | `/down` `rcpt` with `st:"failed"` only | ≤ 16 bytes | Why the bridge could not deliver (§3.2). CBOR key 75. |
+| `rsn` | string | `/down` `rcpt` with `st:"failed"` only | ≤ 16 bytes | Why the bridge could not deliver (§3.2). CBOR key 75. *(Also `moving`: a server frozen for a move refused the up message, §3.2 `rcpt`.)* |
 
 Additional rules:
 - `body` MUST NOT contain Unicode control characters `U+0000`–`U+001F` or `U+007F`. Relay strips
@@ -189,6 +190,7 @@ Additional rules:
 | Config (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"lock":{"clear":true,"auto":5}},"ack":null,"n":…,"sig":"…"}` | Not a thread entry; carries device settings; acked `shown` on apply (the `lock` shape is in `DEVICE_PLAN.md` §5.8); only newest re-published. |
 | Config, OTA job (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"ota":{"img":"<64 hex>","isz":685168,"url":"https://storage.googleapis.com/<bucket>/fw/<id16>/full.z","osz":338784,"osha":"<64 hex>","fmt":"full"}},"ack":null,"n":…,"sig":"…"}` — ≤523 bytes signed JSON, ≤296 signed CBOR with the default bucket name (§3.3) | A `cfg` carrying `ota` (below). Sent only to a device whose last online `/status` carried `ota:1`; acked `shown` on acceptance **or** rejection; progress travels in `/status` (§5.1), not in acks. *(OTA firmware update, `docs/OTA_DESIGN.md`.)* |
 | Config, GNSS disable (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"loc":{"gnss":false}},"ack":null,"n":…,"sig":"…"}` — ≤141 bytes signed JSON | A `cfg` carrying `loc` (below). Applied and acked `shown` at once, like `lock`; the device's resulting state travels in `/status` `gnss` (§5.1). *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`.)* |
+| Config, server move (relay → device) | `/down` | `{"v":1,"id":"m_…","ts":…,"kind":"cfg","cfg":{"mv":{"id":"mv_0123456789ab","host":"home.example","port":8883,"ca":{"url":"https://home.example/kid-pager/ca/<64 hex>.pem","sha":"<43 b64url>"}}},"ack":null,"n":…,"sig":"…"}` — ≤563 bytes signed JSON (§3.3) | A `cfg` carrying `mv` (below): an order or a cancel from the server the device is on, or a proof from the server it is moving to. Sent only to a device whose last online `/status` carried `mvc:1`; outcomes travel in `/status` `mv` (§5.1). *(Server move over the air, `docs/MOVE_DESIGN.md`.)* |
 | Ack (device → relay) | `/up` | `{"v":1,"id":"m_7f3a","ts":…,"ack":"shown"}` — **51 bytes**; no `from`, no `body` | — |
 | Up message (device reply) | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","body":"ok coming","ack":null}` — **84 bytes** | Thread entry, routed to default recipient. |
 | Up message, addressed | `/up` | `{"v":1,"id":"u_91c0","ts":…,"from":"student","to":"mom","body":"ok coming","ack":null}` — **95 bytes** | Thread entry, routed to named recipient. |
@@ -256,6 +258,27 @@ SENT "relayed" (the broker has it, §4.2), DELIVERED "sent", FAILED "FAILED <rsn
 long-standing "...", "sent" on the broker's PUBACK, "FAILED" (a receipt that arrives anyway still applies, and a failure
 then reads "FAILED <rsn>"). A bridged page is written to the device's `msghist` three times: at insert, at SENT, and
 once more when a receipt moves it (record version 3 adds `rsn`).
+
+**`rsn:"moving"` (a server frozen for a move refuses a text).** *(a frozen server's `system` reply let the pager mark the
+text sent while the server dropped it, so the text was lost; a receipt the pager can act on lets it send the text again to
+the server it moves to, `docs/MOVE_DESIGN.md` §12.5.)* While a relay is frozen for a server move, it answers an up message
+with no `kind` or `kind:"msg"` from a device whose last online `/status` carried `mb` with a receipt for that message, of
+**any** recipient type, and does not store the message:
+
+```
+{"v":1,"id":"m_<8 hex>","ts":…,"kind":"rcpt","ref":"u_91c0aa11","st":"failed","rsn":"moving","ack":null,"n":…,"sig":"…"}
+```
+
+- `ref` is the refused envelope's `id` exactly; `id` = `m_` + sha256(`rcpt:{deviceId}:{ref}:moving:failed`)[:8], so a re-sent
+  text gets the same receipt id. Signed, QoS 1 and never re-published like every `rcpt`. 161 bytes signed JSON at the
+  maxima (§3.3).
+- `moving` is the one `rsn` that does not end the row: the device re-queues the text under the **same** `id` and `to` and
+  holds it until its move commits or is cancelled, or for 24 h if it holds no move order, then tries once more on its
+  current server (at most once a day). A device that cannot re-queue it (no free reply slot, body no longer held) applies
+  the receipt as an ordinary failure: the row reads `FAILED moving` with the failure alert. Every other `rsn` keeps the
+  rules above. *(the refusing server never stored the text, so the next server sees the id once.)*
+- A device without `mb` gets the `system` reply `moving servers, try later` instead, as before. A `contact_req` keeps its
+  `system` reply; an `sms_log` is dropped.
 
 **`kind:"contact_req"` (device → relay).** A contact request is an up message with
 `kind:"contact_req"`, `ack:null`, and either `ph` (E.164 phone number) or neither `ph` nor `body`
@@ -328,11 +351,17 @@ holding either a job or a cancel:
   `isz` and `osz` are 1…2097152.
 - Relay: only a super admin pushes a job or a cancel, and a job only to a device whose last online
   `/status` carried `ota:1` (§5.1). The relay sends a delta whose `base` matches the device's
-  reported `img`, otherwise the full object.
+  reported `img`, otherwise the full object. *(Server move: an image that predates moves would boot
+  the identity the device left, `docs/MOVE_DESIGN.md` §12.3.)* The firmware index entry of a
+  move-capable build carries `caps: ["mv"]`, written by `tools/fwpub.py` from the `KPCAPS1:mv;` tag
+  embedded in the image and never by hand; the relay never sends a job for a build without `mv` to
+  a device that has committed a server move (§3.2 `cfg.mv`).
 - Device: ack `shown` once the job is stored in NVS, or once it is rejected. It is rejected for a
   `base` that is not the running image, a running image still pending verify, no rollback
   bootloader, `img` already running, `img` on the device's failed list, `isz` larger than the OTA
-  slot, or a `url` that is not `https://`. A rejection still reports `ota_st:"fail"` with an
+  slot, or a `url` that is not `https://`. Once the device has committed a server move, it also
+  refuses to install a downloaded image whose `KPCAPS1:` tag does not list `mv` (checked after the
+  download verifies, before the boot partition is switched): `ota_st:"fail"`, `ota_err:"caps"`. A rejection still reports `ota_st:"fail"` with an
   `ota_err` (§5.1). A newer `cfg.ota` replaces the stored job. In airplane mode the job stays
   parked and costs nothing. Newest only and re-published on an online edge like any `cfg`.
 
@@ -363,6 +392,52 @@ to stop powering the receiver while location keeps working from the serving cell
   still reported as configured. A device that has never received `cfg.loc` behaves as `gnss:true`.
 - Relay: newest only and re-published on an online edge like any `cfg`. The device's current
   value is reported back as `/status` `gnss` (§5.1).
+
+**`cfg.mv` (relay → device, server move).** *(a whole deployment moves to another server with every
+pager following a signed message instead of a typed setup code; `docs/MOVE_DESIGN.md`,
+`docs/MOVE_FIRMWARE_DESIGN.md`.)* An eighth `cfg` member, CFG key 7 (§10), a map in one of three
+shapes. The **source** is the server the device is on; the **target** is the one it moves to.
+
+| Sub-key | Name | Type | In |
+|---|---|---|---|
+| 0 | `id` | tstr, the move id (§1), `^[a-z0-9_]{3,16}$` | all |
+| 1 | `host` | tstr, 1–127 bytes, hostname or IP literal: the target's broker | order |
+| 2 | `port` | uint, 1–65535 | order |
+| 3 | `ca` | map, the `cfg.ca` sub-map `{url, sha}` (§10): the target's CA pointer, `https://`, ≤ 200 bytes, under the target's public base URL (which may carry a path) | order, optional; absent = an unpinned target |
+| 4 | `cancel` | bool, `true` | cancel |
+| 5 | `ok` | uint, 0…2⁵³−1 | proof |
+
+- **Order** `{id, host, port[, ca]}`, neither `cancel` nor `ok`. From the source, signed under the
+  device's key `k` (§14.5). The device derives `k'` and `pw'` (§14.8), stores a pending identity
+  (target host, port, CA, `pw'`, `k'`) and acks `shown` once it is stored **or** refused; the
+  outcome travels in `/status` `mv` (§5.1). Refused (`rsn` `rej`) when the device does not sign,
+  runs an image pending verify, or the host is malformed; also (`rsn` `rej`) by firmware that cannot
+  run a move, which then stores nothing *(an image without the move trials reports no `mvc`, but an
+  order queued while an earlier image reported it can still arrive)*; refused (`rsn` `down`) when `ca` is absent
+  and the active identity is pinned *(no trust downgrade by a push)*. Deferred without an ack while
+  an OTA or font download, a CA fetch or a CA apply runs. The device fetches the CA before it
+  disconnects from the source. On the direct bearer a failed fetch is reported (`st` `fail`, `rsn`
+  `ca`) but the order stays stored, and the pending identity is not used to connect until the CA
+  has been fetched; on the Beam bearer, which needs no CA, the order is stored without it. An order whose `id`
+  is the device's current move id, or one it has finished, is acked and otherwise ignored, so the
+  source may re-send it freely.
+- **Cancel** `{id, cancel:true}`, nothing else. From the source, signed under `k`. Ends an unsettled
+  move with that `id` (`st` `cxl`); acked once applied. *(a device holding an unsettled order keeps
+  retrying the target, so abandoning a move must say so.)*
+- **Proof** `{id, ok:N}`, nothing else. From the target, on the target's broker, signed under `k'`.
+  The device, connected to the target with `pw'`, publishes `/status` signed under `k'` carrying
+  `mv{id, st:"try"}`; the target answers each such `/status` with a proof whose `N` is that
+  `/status`'s `n`. The device commits only when `N` ≥ the first `n` it drew in this trial, then acks
+  the proof `shown`. *(CONNACK alone does not show the target is genuine; only a holder of `k'` can
+  sign the proof.)*
+- Any other combination is malformed: dropped, not acked, counted.
+- Relay: sent only to a device whose last online `/status` carried `mvc:1`. Own pending slot,
+  newest only, re-published on an online edge like any `cfg`. One move id for the whole move: a
+  device that fails is never sent a new id; it retries by itself and from its Device screen.
+- Device trial schedule, reverts, Beam alternation and commit are in `docs/MOVE_FIRMWARE_DESIGN.md`
+  §5. The wire consequence a relay relies on: after a commit the device accepts nothing signed under
+  `k` and talks only to the target.
+- Encoding: `ca.sha` is bstr(32) in CBOR, base64url without padding in JSON, as `cfg.ca`.
 
 ### 3.3 Envelope size limit
 
@@ -463,6 +538,18 @@ bytes (402 CBOR with `bs` at its maximum); the headroom figures above stand.
 `car` (key 70, §5.1) at 24 characters adds 33 bytes JSON (57 if every character were escaped) / 28
 CBOR, so the every-field online `/status` becomes 625 / 309 bytes (430 CBOR with `bs` at its
 maximum); `tls:"proxy"` is shorter than `unpinned`, so it adds nothing. Still within the §3.3 limit.
+
+*(Server move, stated so the worst case stays a number in this section.)* A maximal `/down`
+`cfg.mv` order (`id` 16, `host` 127, `port` 65535, `ca.url` 200, `n` at its maximum) is **563
+bytes** signed JSON and ≈ 445 signed CBOR; a typical one (`pager.example.net`, a 107-byte CA URL
+under `/kid-pager`) is 358 bytes JSON. A cancel is 159 bytes, a proof with `ok` at its maximum 167,
+a `rcpt` with `rsn:"moving"` 161 (all signed JSON). The relay checks `cfg.mv` against the legacy
+640-byte limit like every `cfg` (`devcfg._assert_within_envelope_limit`). `/status` `mvc` (key 77)
+adds 8 bytes JSON / 3 CBOR, so the every-field online `/status` becomes 633 bytes JSON. `/status`
+`mv` (key 78) is up to 67 bytes JSON, which would take that over 640, so **`mv` is CBOR-only: a
+device that encodes `/status` as JSON MUST omit `mv`** *(the firmware emits `/status` only in CBOR,
+so this costs nothing)*; in CBOR it adds ≤ 40 bytes, so the every-field online `/status` becomes
+352 bytes CBOR (473 with `bs` at its maximum).
 
 ### 3.4 Malformed payload handling
 
@@ -823,13 +910,15 @@ broker-generated LWT.
 | `ota_t` | string | no | 16 lowercase hex chars | *(OTA)* Short id of the stored job's target image; present only while the device holds a job. **Display only.** |
 | `ota_st` | string | no | `wait` \| `dl` \| `ready` \| `inst` \| `ok` \| `fail` \| `rb` | *(OTA)* Job state: waiting for a download window, downloading, verified and waiting to install, installing, done, failed (see `ota_err`), rolled back. Present with `ota_t`. The relay ends its job record on `ok`, `fail` or `rb` for that target; otherwise **display only.** |
 | `ota_pct` | int | no | 0…100 | *(OTA)* Download progress. **Display only.** |
-| `ota_err` | string | no | 1–8 lowercase letters | *(OTA)* Why the job failed or was rejected: `base`, `hash`, `osha`, `http`, `budget`, `flash`, `nobl`, `pv`, `size`, `expired`; font jobs add `nopart`, `fmt`, `run`. A relay accepts any code in the range, since the list can grow. **Display only.** |
+| `ota_err` | string | no | 1–8 lowercase letters | *(OTA)* Why the job failed or was rejected: `base`, `hash`, `osha`, `http`, `budget`, `flash`, `nobl`, `pv`, `size`, `expired`; font jobs add `nopart`, `fmt`, `run`; after a server move, `caps` (the image lacks the `mv` capability, §3.2 `cfg.ota`). A relay accepts any code in the range, since the list can grow. **Display only.** |
 | `ast` | int | no | 0, 1 or 2 | *(font OTA, `docs/ASSETS_OTA_DESIGN.md` §3.)* 0 = firmware with font OTA but no `assets_ota` partition, 1 = factory fonts active, 2 = `assets_ota` active. CBOR key 72. Absent means firmware without font OTA. The relay offers a font update only for 1 or 2. |
 | `ast_id` | string | no | 16 lowercase hex chars | *(font OTA)* Short id of the active `assets_ota` image; present only when `ast` is 2. CBOR key 73. The relay treats it equal to a font job's target as that job done. |
 | `mb` | int | no | 1…65535 | *(Long bodies, `docs/LONG_BODY_DESIGN.md`: the capability switch for the long-body features.)* The largest message body, in UTF-8 bytes, this firmware accepts on `/down` and will send on `/up`; sent as `1024` by firmware of this generation in every online `/status`. CBOR key 76 (§10). A relay stores it as `devices.status.mb`. A device that reports `mb` gets bodies up to that size, `rcpt` receipts (§3.2) and book contacts of type `fed` (`FEDERATION_DESIGN.md`); a device that does not is treated as the previous generation (bodies ≤ 160 code points / 320 bytes, failure notices as `system` rows). The relay splits a longer text into consecutive messages per recipient, never refusing it for length. An absent value means "not reported", not 0. |
 | `bs` | map | no | sub-map below | *(battery stats, `docs/BATTERY_STATS_DESIGN.md`: the breadboard build has no fuel gauge, so drain is modelled from time spent in each state. The carrier board's gauge is read for the battery level, not for this window.)* The battery-stats window, in every online `/status` once the window holds ≥ 1 s. CBOR only (§3.3). **Display and modelling only.** |
 | `gnss` | int | no | `0` \| `1` | *(GNSS disable, `docs/GNSS_DISABLE_DESIGN.md`: shows whether a `cfg.loc` push took effect.)* `1` when the device may power its GNSS receiver, `0` when `cfg.loc` (§3.2) has disabled it. Present in every `/status` from firmware that supports `cfg.loc`; absent means firmware that predates the field, which the relay treats as unknown. **Display only.** |
 | `car` | string | no | ≤24 printable ASCII chars | *(Soracom bearer, `docs/SORACOM_DESIGN.md` §3.4: shows which carrier preset, and so which bearer, the device chose from its SIM.)* Label of the carrier preset in force, e.g. `Soracom`, `US Mobile Dark Star`; absent when no preset is in force (carrier default or typed custom APN) and in firmware that predates the field. A relay drops a malformed value alone, treating it as absent. **Display only.** |
+| `mvc` | int | no | `1` | *(Server move, `docs/MOVE_DESIGN.md`: the gate that keeps `cfg.mv` away from firmware that cannot move, like `ota`.)* Present with value `1` in every online `/status` when the firmware signs its envelopes, its running image is confirmed and a rollback bootloader is confirmed (so it cannot roll back to an image that predates moves). Only firmware that can run a move sends it *(a pager built without the move trials refuses every order, so it must not invite one)*. CBOR key 77. The relay sends an order only while the last online `/status` carried it. |
+| `mv` | map | no | sub-map below | *(Server move: the device's move state, so both servers can show it.)* Present while the device holds a move record (the last finished one is kept). CBOR key 78. **CBOR only** (§3.3): a device that encodes `/status` as JSON MUST omit it. A relay drops a malformed `mv` alone, treating it as absent. A `/status` carrying `mv{st:"try"}` on the target's broker is what the target answers with the proof (§3.2 `cfg.mv`); one carrying `mv{st:"ok"}` there also tells the target the device has committed (the proof's ack may have been lost). |
 
 *(`loc_period_s`, `loc_min_s`, `tls`, `ca_fp`, `loc_backoff_s`, `sms_lost`, `rst`, `stage`,
 `abn`, `stallcmd` and `loc_move_s` — eleven fields — are **display and diagnosis only**; the relay stores the reported
@@ -874,6 +963,15 @@ re-sent window must be recognisable and a reset must not lose one, `docs/BATTERY
 | `sa` | Optional (absent on older firmware). Shakes accepted in the window (uint). |
 | `sr` | Optional. Shake candidates rejected in the window (uint). |
 | `sp` | Optional. Whole seconds awake because a shake was pending with no hot window open (uint); a sub-measure of the `aw` `hot` bucket, so the mAh model must not add it again. |
+
+**`mv` sub-map** (key 78, keys in §10; JSON names the same, though `mv` is never sent in JSON):
+
+| Key | Name | Type | Meaning |
+|---|---|---|---|
+| 0 | `id` | tstr | The move id the record is about (§1). |
+| 1 | `st` | tstr | `pend` (order stored, waiting for a trial or for the Beam destination switch), `try` (on the target's broker, waiting for the proof), `ok` (committed), `fail` (trials used up; the device keeps retrying daily and from its Device screen), `cxl` (cancelled). |
+| 2 | `rsn` | tstr, ≤ 8 bytes | With `fail`, or with `pend` after a failed trial: `ca` (CA fetch or hash), `tls` (handshake or validation), `auth` (login refused), `conn` (no SUBACK in time, DNS, closed port), `proof` (session up, no proof), `budget` (last scheduled trial used), `nvs`, `rej` (order refused: not signing, image pending verify, bad host), `down` (trust downgrade refused), `busy` (internal). A relay accepts any value in the range. |
+| 3 | `at` | uint, 0…255 | Trials started for this id (on Beam: attempts on the pending login), saturating. |
 
 ### 5.2 LWT payload (48 bytes)
 
@@ -952,7 +1050,7 @@ Status is **never** published on a plain paging wake or on receipt of a down mes
 | LWT | **NOT SETTABLE from the library** | `mqttConfig()` emits `AT+SQNSMQTTCFG=0,"<clientId>"[,"<user>","<pass>"][,<tlsProfileId>]` and stops there (`src/proto/WalterMQTT.cpp:53-75`) — no will topic, message, QoS or retain argument, and grepping the whole of `src/` for `will`/`lastwill` returns nothing. §5.2's LWT contract therefore has no implementation path through the typed API. Fallback: `WalterModem::sendCmd()` (public) can queue a raw `AT+SQNSMQTTCFG=...` carrying the will parameters *before* `mqttConnect()`. Not verified against the Sequans AT manual. If that fails, the relay must fall back to inferring offline from keepalive expiry and §5.2's LWT becomes advisory. Tracked in §12. |
 | TLS (production) | TLS 1.2; server certificate validated **only if the bootstrap bundle carried a CA** (`DEVICE_PLAN.md` §3.3, default: none, validation off); username/password per device; profile 2. **The profile MUST name certificate slot 12 even with validation off** — with no slot named the modem's MQTT engine silently sends plaintext MQTT to the TLS port (verified on hardware, `DEVICE_PLAN.md` §3.3). | Provisioning is the vendor's `examples/mqtts` flow: `tlsWriteCredential(false, 12, ca_pem)` → `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_CA, WALTER_MODEM_TLS_VERSION_12, 12)` → `mqttConfig(client_id, user, pass, 2)`. Both functions are public (`src/WalterModem.h:4147` and `:4404`). **Slot discipline: certificate slots 0–10 and private-key index 1 are reserved for Sequans/BlueCherry — use ≥ 11, and TLS profile ≥ 2 (profile 1 is BlueCherry's).** |
 | TLS (bootstrap) | no server-cert validation; profile 2 (the library caps profile ids at 0–2, and bootstrap and production never share a power cycle) | For the one-time setup fetch (§3.2): `tlsConfigProfile(2, WALTER_MODEM_TLS_VALIDATION_NONE, WALTER_MODEM_TLS_VERSION_12, 12)`. **Verified on hardware:** the slot argument is required — `no_cert` makes the MQTT engine send plaintext (see the production row). The bundle is authenticated and encrypted under a token-derived key, so server authentication on this hop adds only DoS resistance. |
-| Bearer (Soracom Beam) | On a SIM whose carrier preset names the Beam bearer (`docs/SORACOM_DESIGN.md` §3.1, §3.3): **plain MQTT** from the modem to `beam.soracom.io:1883`, TLS profile **0** (`mqttConfig(dev_id, dev_id, mqtt_pw, 0)`, no `tlsConfigProfile`, no CA slot); client id, username and password unchanged and passed through to the broker (Beam `useClientCredentials`); Beam opens MQTTS to EMQX. Keepalive **1200 s** (the Soracom preset, §6.2), Beam's ceiling of 0 or 5…1200 s; the 840 s host liveness re-SUBSCRIBE (§6.2) crosses both legs and stays inside Beam's 1.5 × keepalive = 1800 s idle cut. Not yet tested through Beam at 1200 / 840 s. The bootstrap `boot-<bid>` session (§3.2) also goes through Beam (plain MQTT, keepalive 60); the setup code's `host:port` and the identity's stored `host`/`port` are **not used** on this bearer (Beam's group destination decides the broker) and are kept for a later direct bearer. `cfg.ca` is refused and `/status.tls` is `proxy` (§5.1). | *(Soracom bearer: moves TLS off the pager; the topics, QoS, retain flags, envelope and HMAC are unchanged, so the relay cannot tell a Beam session from a direct one.)* *(Keepalive 1200 / re-SUBSCRIBE 840 s because Soracom holds an idle flow ≥1200 s; fewer radio wakes.)* Beam's address is in carrier-grade NAT space, so the firmware selects this bearer only when the SIM's preset names it, never on another operator's network. Hop pager → Beam is plaintext inside Soracom's network; envelope authenticity still rests on §14's HMAC. |
+| Bearer (Soracom Beam) | On a SIM whose carrier preset names the Beam bearer (`docs/SORACOM_DESIGN.md` §3.1, §3.3): **plain MQTT** from the modem to `beam.soracom.io:1883`, TLS profile **0** (`mqttConfig(dev_id, dev_id, mqtt_pw, 0)`, no `tlsConfigProfile`, no CA slot); client id, username and password unchanged and passed through to the broker (Beam `useClientCredentials`); Beam opens MQTTS to EMQX. Keepalive **1200 s** (the Soracom preset, §6.2), Beam's ceiling of 0 or 5…1200 s; the 840 s host liveness re-SUBSCRIBE (§6.2) crosses both legs and stays inside Beam's 1.5 × keepalive = 1800 s idle cut. Not yet tested through Beam at 1200 / 840 s. The bootstrap `boot-<bid>` session (§3.2) also goes through Beam (plain MQTT, keepalive 60); the setup code's `host:port` and the identity's stored `host`/`port` are **not used** on this bearer (Beam's group destination decides the broker) and are kept for a later direct bearer. `cfg.ca` is refused and `/status.tls` is `proxy` (§5.1). During a server move (§3.2 `cfg.mv`) the order's `host`/`port`/`ca` are likewise stored for a later direct bearer and not used; the pager holds both logins and alternates between them on refusal until the move settles, and the move happens when the deployment's admin switches the SIMs' Beam group to the target (`docs/MOVE_DESIGN.md` §10). Each broker accepts exactly one of the two logins, so a refused login is the signal to try the other. *(Beam chooses the broker, not the pager.)* | *(Soracom bearer: moves TLS off the pager; the topics, QoS, retain flags, envelope and HMAC are unchanged, so the relay cannot tell a Beam session from a direct one.)* *(Keepalive 1200 / re-SUBSCRIBE 840 s because Soracom holds an idle flow ≥1200 s; fewer radio wakes.)* Beam's address is in carrier-grade NAT space, so the firmware selects this bearer only when the SIM's preset names it, never on another operator's network. Hop pager → Beam is plaintext inside Soracom's network; envelope authenticity still rests on §14's HMAC. |
 | Reconnect policy | **Only** on detected session loss. Never on a timer. Backoff 5 s, 15 s, 60 s, 300 s, then 300 s steady. | Each reconnect costs a full TLS handshake ≈ 5 kB (§7) — reconnects are the largest single term in the data budget. |
 
 *(scoping note, no behaviour change.)* Every row above describes the **device's**
@@ -1662,6 +1760,8 @@ Devices emit CBOR (§3) with this integer keymap. The relay accepts both JSON (t
 | 74 | `ref` | tstr, ≤16 B | `/down` `rcpt` (§3.2 — the `/up` wire id a delivery receipt is about) |
 | 75 | `rsn` | tstr, ≤16 B | `/down` `rcpt` (§3.2 — why a delivery failed, only with `st:"failed"`) |
 | 76 | `mb` | uint, 1…65535 | `/status` (long bodies, §5.1 — max body bytes; firmware of this generation sends `1024`; also the capability gate for `rcpt` and book type `fed`) |
+| 77 | `mvc` | uint, `1` | `/status` (server move, §5.1 — `cfg.mv` capability gate, optional) |
+| 78 | `mv` | map | `/status` (server move, §5.1 — the device's move record; optional, CBOR only, §3.3) |
 
 *(`rst`, `stage` and `abn` take keys 53–55 because key 52 was already `xport` when they were added; key 52 is never reused.)*
 
@@ -1699,6 +1799,14 @@ including `fv=9`; `base`/`psz` are never sent.
 `loc=5` (map inside `/down` `cfg`, `docs/GNSS_DISABLE_DESIGN.md`, §3.2): `gnss=0` (bool; absent
 means no change). Unknown sub-keys are ignored. *(Listed apart, like `ota=4`; this is `cfg`'s own namespace, distinct from key 8 `loc` in
 the `/loc` envelope.)*
+
+`mv=7` (map inside `/down` `cfg`, `docs/MOVE_DESIGN.md` §12.1, §3.2): `id=0` (tstr), `host=1` (tstr,
+1–127 B), `port=2` (uint), `ca=3` (map, the `ca` sub-map below: `{url=0, sha=1}`), `cancel=4` (bool),
+`ok=5` (uint). Shapes: order `{0,1,2[,3]}`, cancel `{0,4}`, proof `{0,5}`; any other combination is
+malformed. *(Listed apart, like `ota=4`.)*
+
+`mv` map (inside `/status`, key 78 above, §5.1): `id=0` (tstr), `st=1` (tstr), `rsn=2` (tstr, ≤ 8 B),
+`at=3` (uint). Unknown sub-keys are ignored.
 
 `bs` map (inside `/status`, key 68 above, §5.1): `sq=0, dt=1, sl=2, aw=3` (array of 6 uint)`,
 ns=4, x1=5, rl=6, rf=7` (array of 3 uint)`, mvn=8, cn=9, md=10` (array of 3 uint)`, re=11`, `sa=12`, `sr=13`, `sp=14` (uint each, optional shake counters). Unknown
@@ -1886,6 +1994,9 @@ the future.
 | 6.2 | Modem issues PINGREQ autonomously | **Yes, measured**: at the keepalive (60–1200 s seen); the ESP32 keepalive wake stays deleted | — |
 | 6.2 | The per-carrier keepalive (480 / 1200 s) is not silently clamped by modem or broker | **Partly**: EMQX granted 480 s; mosquitto took 60–1200 s as sent. Not verified for 1200 s through Beam to EMQX | Read the granted value from EMQX's connection view on a Soracom pager |
 | 6.2 | Carrier NAT tolerates the idle TCP flow | **AT&T: no beyond 240 s** (survives 240, silently dead by 360; the 10–13 min deaths were this cut). **Soracom direct: ≥1800 s**. Beam and T-Mobile not tested | Probe at the keepalive in question against the capture broker |
+| 3.2 | The modem can drop one MQTT session and open another to a different host with a different login and TLS profile within one power cycle (`cfg.mv` trial) | **Not verified**; `docs/MOVE_FIRMWARE_DESIGN.md` keeps a trial-by-restart fallback | Bench spike S1 in that document |
+| 6.1 | Beam passes the upstream broker's CONNACK refusal through to the pager, and keeps (rather than cuts) its upstream session when a SIM changes group | **Not verified**; the move's login alternation assumes a refusal is visible and that a group switch is seen at the pager's next reconnect | Refuse a login on the target broker through Beam; move a connected SIM between groups and watch both brokers |
+| 6.1 | The modem completes TLS 1.2 with nginx `stream` and an RSA-2048 certificate from a private CA (a home target's 8883) | **Not verified** on a modem; only `tools/pager_client.py` | One connect from a pager to a home stack |
 | 6.3 | eDRX API takes seconds vs. the raw 3GPP nibble | **Yes**: raw 4-bit binary nibble strings, spliced verbatim into `AT+SQNEDRX` | — |
 | 6.3 | The granted eDRX/PTW values are readable | **Yes**, `setNetworkEventHandler()` → `WALTER_MODEM_NETWORK_EVENT_EDRX_RECEIVED` → `data.edrx.nwProvidedEdrx` | — |
 | 6.3 | Carrier grants the requested 20.48 s / 2.56 s | Not verified; §6.5 breaks if it grants 40.96 s | Assert on `nwProvidedEdrx` at attach — free, first bring-up |
@@ -2090,6 +2201,9 @@ signature and the replay window before parsing and storing the message.
   provisioned via the same one-time setup code but is managed independently at the broker and relay.
 - **Rotation is a new setup code** (§3.5 of `DEVICE_PLAN.md`): the person types it on the device
   and the bootstrap fetch replaces the key. Silent over-the-air key rotation is not implemented.
+- **A server move derives a new key and broker password** (§14.8) *(the new server's login must be
+  created without the password ever crossing the wire, and the store keeps only its hash)*. The
+  device switches to them only when the move commits; nothing secret is transported.
 
 ### 14.2 Per-device, per-direction counter (`n`)
 
@@ -2134,6 +2248,18 @@ replaying an old signed `/down`. A 12-bit epoch would be exhausted after 4096 co
 - `downN` (§14.5, the relay's own per-device `/down` counter) is unaffected by any of the above: it
   counts by one from zero and is nowhere near either bound in practice, so it stays a plain
   incrementing integer with no epoch/lo split — the wide form is for the *device's* counter, which has to survive thousands of cold boots, not the relay's.
+
+**Across a server move** (§3.2 `cfg.mv`, §14.8) *(the two servers never exchange counters, so
+the rules must hold with no coordination)*:
+- **Up:** the device keeps one up counter for both keys; it only ever rises, across trials, reverts
+  and reboots (the epoch lives in NVS, not in the identity). The target may start its window for
+  `k'` anywhere at or below the source's value at the export; the first envelope it sees is a
+  forward jump. An envelope signed under `k` never verifies under `k'`, so nothing recorded on the
+  source can be replayed to the target.
+- **Down:** each key has its own window on the device. The source keeps signing under `k`,
+  continuing its own `downN`. The target signs only under `k'`, starting at any `downN` ≥ 1: the
+  device resets its down window to 0 when it switches to `k'` for a trial, and restores the `k`
+  window if it reverts.
 
 **Not implemented:** a signed resync handshake for the case where a device's NVS (and therefore its
 whole identity, not just this counter) is lost outright — with a 32-bit epoch this is needed only if NVS itself is gone, at which point re-provisioning is required anyway (`DEVICE_PLAN.md`
@@ -2264,3 +2390,28 @@ most **3** failed attempts on one nudge on its own (the first plus two retries, 
 `409` immediate retry is not counted), then waits for the next nudge, online edge or heartbeat
 re-nudge (§3.7). *(an outage otherwise costs a TLS attempt a minute.)*
 
+### 14.8 Server move: derived key and broker password
+
+*(a pager moves to another server with no setup code typed, so its new credentials are derived from
+what both ends already share and never cross the wire; `docs/MOVE_DESIGN.md` §6.)* For the move id
+of an order (§1, §3.2 `cfg.mv`), with `k` the device's current 32-byte key, `move_id` the id's ASCII
+bytes and `dev_id` the device id's ASCII bytes:
+
+```
+k'  = HKDF-SHA256(ikm = k, salt = move_id, info = "kp-move-key|" + dev_id, L = 32)
+pw' = base64url_nopad(HKDF-SHA256(ikm = k, salt = move_id, info = "kp-move-pw|" + dev_id, L = 32))[:43]
+```
+
+- `k'` replaces `K_dev` (§14.1) for every envelope and the §14.7 request once the move commits;
+  `pw'` is the MQTT password on the target's broker. Client id and username stay `device_id`.
+- Each broker accepts exactly one login for the device: the source `pw`, the target `pw'`.
+- A later move, moving back included, is a new move id and derives from the key in use then
+  (`k'' = HKDF(k', id2, …)`).
+- Test vector (shared by the relay and the firmware in `tools/move_vectors.json`):
+
+```
+k       = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+move_id = "mv_0123456789ab"     dev_id = "pgr-3fa9c01e"
+k'      = c1c9df9c17e6e2307e97fd99747e0f3e61d98f5448995b1465b5443c94b3d44b
+pw'     = 24asWQY9sAuF2T3kIJ2dIyLAETt3IZhwQ2Xd4rHc72Y
+```
