@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "cbor.h"
+#include "nvs_fake.h"
 
 #define VECTORS_PATH "../../tools/setup_code_vectors.json"
 
@@ -494,6 +495,41 @@ static void test_decrypt_and_decode(const vector_t *v, const uint8_t bkey[32])
           "the wrong key must fail to decrypt");
 }
 
+/* The code saved by the Device screen: one save gives exactly one take. */
+static void test_pending(const vector_t *v)
+{
+    char out[SETUP_CODE_MAX];
+    nvs_fake_reset();
+    CHECK(!setup_pending_take(out, sizeof(out)), "take with nothing saved must fail");
+    CHECK(nvs_fake_write_count() == 0, "take with nothing saved must not write");
+
+    CHECK(setup_pending_save(v->code), "save of the vector's code failed");
+    CHECK(setup_pending_take(out, sizeof(out)) && strcmp(out, v->code) == 0,
+          "take did not return the saved code");
+    CHECK(!nvs_fake_has_key("setup", "code"), "take left the code in NVS");
+    CHECK(!setup_pending_take(out, sizeof(out)), "a second take must fail");
+
+    CHECK(!setup_pending_save("0000000000000 @ host"), "save accepted a code that does not parse");
+    CHECK(!nvs_fake_has_key("setup", "code"), "a refused save wrote the code");
+
+    char longcode[SETUP_CODE_MAX + 64];
+    snprintf(longcode, sizeof(longcode), "%s;apn=%0*d", v->code, SETUP_CODE_MAX, 0);
+    CHECK(!setup_pending_save(longcode), "save accepted a code longer than SETUP_CODE_MAX");
+
+    /* a code too long for the caller's buffer is dropped, not kept for the next boot */
+    CHECK(setup_pending_save(v->code), "save of the vector's code failed");
+    char small[8];
+    CHECK(!setup_pending_take(small, sizeof(small)), "take into a short buffer must fail");
+    CHECK(!nvs_fake_has_key("setup", "code"), "a failed take left the code in NVS");
+
+    /* power cut on the delete: no attempt, so a code can never run twice */
+    CHECK(setup_pending_save(v->code), "save of the vector's code failed");
+    nvs_fake_cut_after(0);
+    CHECK(!setup_pending_take(out, sizeof(out)), "take must fail when the delete fails");
+    nvs_fake_cut_after(-1);
+    nvs_fake_reset();
+}
+
 static void run_vector(const char *label)
 {
     vector_t v;
@@ -508,6 +544,7 @@ static void run_vector(const char *label)
     test_parse_and_derive(&v, bkey);
     test_parse_rejects_typo(&v);
     test_decrypt_and_decode(&v, bkey);
+    test_pending(&v);
 }
 
 int main(void)
@@ -519,7 +556,7 @@ int main(void)
     run_vector("boot_bundle_ca_pointer");
 
     if (g_failures == 0) {
-        printf("PASS: setup_parse_code/setup_derive/setup_decrypt_bundle, 0 failures\n");
+        printf("PASS: setup_parse_code/setup_derive/setup_decrypt_bundle/setup_pending, 0 failures\n");
         return 0;
     }
     printf("FAIL: %d failure(s)\n", g_failures);

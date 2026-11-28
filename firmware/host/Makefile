@@ -69,15 +69,15 @@ $(BUILD)/test_auth.o: test_auth.c $(MAIN_SRC)/auth.h $(MAIN_SRC)/cbor.h | $(BUIL
 $(BUILD)/test_auth: $(BUILD)/auth.o $(BUILD)/cbor.o $(BUILD)/test_auth.o
 	$(CC) $(CFLAGS) -o $@ $(BUILD)/auth.o $(BUILD)/cbor.o $(BUILD)/test_auth.o
 
-# test_setup links the real mbedtls (HKDF, AES-256-GCM).
+# test_setup links the real mbedtls (HKDF, AES-256-GCM); the saved code runs on the NVS fake.
 $(BUILD)/setup.o: $(MAIN_SRC)/setup.c $(MAIN_SRC)/setup.h | $(BUILD)
-	$(CC) $(CFLAGS) $(INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/setup.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ $(MAIN_SRC)/setup.c
 
-$(BUILD)/test_setup.o: test_setup.c $(MAIN_SRC)/setup.h $(MAIN_SRC)/cbor.h | $(BUILD)
-	$(CC) $(CFLAGS) $(INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ test_setup.c
+$(BUILD)/test_setup.o: test_setup.c $(MAIN_SRC)/setup.h $(MAIN_SRC)/cbor.h nvs_fake.h | $(BUILD)
+	$(CC) $(CFLAGS) $(INCLUDES) $(IDF_STUB_INCLUDES) $(MBEDTLS_CFLAGS) -c -o $@ test_setup.c
 
-$(BUILD)/test_setup: $(BUILD)/setup.o $(BUILD)/cbor.o $(BUILD)/test_setup.o
-	$(CC) $(CFLAGS) -o $@ $(BUILD)/setup.o $(BUILD)/cbor.o $(BUILD)/test_setup.o $(MBEDTLS_LIBS)
+$(BUILD)/test_setup: $(BUILD)/setup.o $(BUILD)/cbor.o $(BUILD)/nvs_fake.o $(BUILD)/test_setup.o
+	$(CC) $(CFLAGS) -o $@ $(BUILD)/setup.o $(BUILD)/cbor.o $(BUILD)/nvs_fake.o $(BUILD)/test_setup.o $(MBEDTLS_LIBS)
 
 # test_input builds input.c with -DESP_PLATFORM against idf_stub.c.
 $(BUILD)/input.o: $(MAIN_SRC)/input.c $(MAIN_SRC)/input.h | $(BUILD)

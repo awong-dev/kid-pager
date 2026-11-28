@@ -776,6 +776,14 @@ static int cmd_key(int argc, char **argv)
             } else if (p[0] == '\\' && p[1] == 'e') {
                 input_feed_key(0x1B);
                 p++;
+#ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
+            } else if (p[0] == '\\' && p[1] == 'u') {
+                input_feed_key(0xB5); // up arrow; a raw 0xB5 byte does not survive esp_console's tokenizer
+                p++;
+            } else if (p[0] == '\\' && p[1] == 'd') {
+                input_feed_key(0xB6); // down arrow
+                p++;
+#endif
             } else {
                 input_feed_key((uint8_t) *p);
             }
@@ -2305,6 +2313,25 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "IDENT %s sig=%d claimed=%d", ident_get_dev_id(),
              (ident_get_flags() & IDENT_FLAG_REQ_SIG) ? 1 : 0, ident_get_claimed() ? 1 : 0);
+
+    // A code typed on the Device screen's "Set up again" (scr_setup.c). It runs here because
+    // setup_run() needs the modem with no session open. The old identity is replaced only once the
+    // new one has been fetched and checked, so a failed attempt restarts onto the old server.
+    static char pending_code[SETUP_CODE_MAX];
+    if (setup_pending_take(pending_code, sizeof(pending_code))) {
+        ESP_LOGI(TAG, "saved setup code found; running setup");
+        if (ui_init()) {
+            scr_greeting_set_mode(GREETING_HELLO);
+            scr_greeting_set_status("setting up again");
+            ui_push(&g_scr_greeting);
+            ui_render_boot();
+        }
+        modes_fuel_boot_check(); // carrier: low unplugged battery goes to Shutdown before the modem starts
+        setup_run(pending_code); // restarts on success
+        vTaskDelay(pdMS_TO_TICKS(6000)); // keeps setup_run()'s error toast readable
+        // Power effect: full ESP32 reset; the normal boot then does its own modem bring-up.
+        esp_restart();
+    }
 
 #ifdef PAGER_DEBUG_NO_LIGHT_SLEEP
     // Started before modes_boot() so the console task exists for the device's life.

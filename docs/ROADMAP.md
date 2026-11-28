@@ -59,7 +59,9 @@ Open work, unverified items and decisions still needed. Items that are done are 
   measured.
 - The flight recorder lives in PSRAM and is lost on a hard reset. Consider RTC memory so that
   dead-USB bench runs can be salvaged.
-- "Set up again" on the device menu is a stub. Setup is console-only (`docs/GOTCHAS.md`).
+- A pager with no identity (new, or after a Factory reset) takes its setup code only on the USB
+  console: Setup mode does not read the keyboard. "Set up again" on the Device screen covers a
+  pager that already has one.
 - Received SMS is persisted with `ts = 0`. It renders with no clock time, multipart messages show as
   separate messages, and the boot-time scan handles them one by one (`msg_insert_sms_in()`).
 - The location PSM-window radio route is not built. Accelerometer thresholds use datasheet defaults

@@ -72,7 +72,8 @@ fields are ignored in both directions, which is what lets firmware and relay be 
 
 Nothing is flashed per device. An admin creates the device in the web app and gets a one-time
 **setup code**, valid for ten minutes: a random token plus `@ broker-host`. It is typed into the
-pager (`setup <code>` on the USB console today). From the token both sides derive, with HKDF, a
+pager (`setup <code>` on the USB console for a new pager, **Set up again** on the Device screen for one
+already set up). From the token both sides derive, with HKDF, a
 temporary broker login, a topic and an AES-256-GCM key. The pager attaches, connects to the broker
 with that login, and receives a retained, encrypted **bundle**: its device id (issued by the relay as `pgr-` plus 8 hex digits; the human-facing name is the editable `label`), broker password,
 32-byte signing key, broker host and port, flags, label, and a pointer to the broker's CA (a URL

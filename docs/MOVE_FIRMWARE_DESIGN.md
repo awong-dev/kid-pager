@@ -8,7 +8,7 @@ the identity that works. Nothing is forwarded between the servers: the target re
 source had not delivered, from the export, and the pager keeps the texts the frozen source refused and
 sends them once it arrives (§6). The move is best effort: the source may be shut down at any time, a
 pager keeps trying both servers until it commits, and a straggler is fixed by hand on the pager
-(§5.8) or with a setup code typed on a USB console (§5.9). This document is the firmware side. The server side (stages, freeze, export and import,
+(§5.8) or with a setup code typed on the pager (§5.9). This document is the firmware side. The server side (stages, freeze, export and import,
 the bridge redirect, the Beam group switch) and the authoritative wire contract are in
 [MOVE_DESIGN.md](MOVE_DESIGN.md); where they differ on the wire, MOVE_DESIGN.md wins and this file is
 corrected.
@@ -59,7 +59,7 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
 | M11 UI | Nothing for the kid. On the adult Device screen, in a build with `CONFIG_PAGER_MOVE_TRIALS` only: a `Server:` row with the move state, and an action `Switch to <host> now` whenever a move order is held and not committed (§5.8). No on-device cancel. |
 | M12 Ledger | The current move id and the last 4 finished ids with their outcomes are kept in NVS. An order with the **current** id, in any state including `fail`, is acked and otherwise ignored: nothing is reset, nothing is logged as a replay, and the background retry and the manual action keep working for that id. An order whose id is a finished one (`ok`, `cxl`) is acked and ignored the same way. |
 | M13 Reachability | While a move is unsettled, losing the session never leaves the pager on one identity: connect attempts alternate between the active and the pending identity on a long-run backoff that falls to one attempt per 30 min (§5.7). Neither identity is discarded until a commit, a cancel or a Factory reset. |
-| M14 Setup code | A pager that never got the order is set up with a code from the target: Device screen, **Factory reset**, then `setup <code>` on the USB serial console. The reset erases `ident`, `ident1`, `idsel` and `move` and zeroes the RTC down window (§5.9). |
+| M14 Setup code | A pager that never got the order is set up with a code from the target, typed on the pager: Device screen, **Set up again**. Setup erases `ident`, `ident1`, `idsel` and `move` and zeroes the RTC down window only once the new identity is fetched and checked, so a failed attempt leaves the pager as it was (§5.9). |
 
 ## 2. Facts the design rests on
 
@@ -558,29 +558,37 @@ active identity gets a session within 60 s, otherwise `Old server not answering;
 §5.7 takes over. The Home screen and the kid's screens show nothing; the connection icon may show
 offline for the length of the trial.
 
-### 5.9 A pager that never got the order: Factory reset and a setup code
+### 5.9 A pager that never got the order: a setup code
 
 A pager that missed the order (off, out of coverage, a build without `CONFIG_PAGER_MOVE_TRIALS`, or
 an order cancelled for this move id) is set up with a code from the target
-(`rotate-credentials`). **There is no way to enter that code on the pager alone.** The Device
-screen's **Set up again** row is not wired (`setup_run()` assumes no live modem session, which holds
-only before `modes_boot()`); it shows "use the USB console: setup <code>". The path that works:
+(`rotate-credentials`), typed on the pager:
 
-1. Device screen, **Factory reset**, type the device id to confirm (`scr_device.c`
-   `device_on_key_confirm()`). The pager erases its message history, zeroes the RTC down window
-   (`modes_reset_down_window()`), cancels stored OTA/font jobs still in `wait` (the target re-issues
-   them, M10), runs `ident_erase()` (`idsel`, `move`, `ident1`, `ident`) and restarts.
-2. With no identity the pager boots into Setup mode: the screen reads `type: setup <code>`.
-3. On a computer connected by USB, type `setup <code>` on the serial console. The port is the
-   Walter's own USB-C (USB Serial/JTAG) on the breadboard build and the carrier's USB-C, J6, through
-   its USB-serial bridge on UART0 on the carrier v0.2 build (firmware/README.md, Build;
-   CARRIER_V02_FIRMWARE_DESIGN.md). The code is valid for 10 minutes. `setup.c` again zeroes the down
-   window and runs `ident_erase()` immediately before `ident_store()`, so no stale `ident1` or
-   `idsel` can point away from the new slot 0, then restarts.
+1. Device screen, **Set up again** (`scr_setup.c`). Type the code as `code@server` and press Enter.
+   The check character is verified at once; a mistyped code is refused and nothing changes.
+2. The pager stores the code in NVS (`setup/code`) and restarts. `setup_run()` needs the modem with
+   no session open, which holds only before `modes_boot()`, so `app_main()` takes the stored code
+   there, deletes it, and runs `setup_run()`. The code is deleted before it is used: one typed code
+   gets one attempt, whatever happens to it.
+3. `setup_run()` attaches, fetches and decrypts the bundle. Only then does it zero the RTC down
+   window (`modes_reset_down_window()`), cancel stored OTA/font jobs still in `wait` (the target
+   re-issues them, M10), run `ident_erase()` (`idsel`, `move`, `ident1`, `ident`) and
+   `ident_store()`, so no stale `ident1` or `idsel` can point away from the new slot 0. It restarts
+   onto the target.
+4. On any failure before that point (no network, expired code, target unreachable) the screen shows
+   the error for 6 s and the pager restarts with the old identity, and any unsettled move, untouched.
 
-The reset keeps `auth/epoch` (the up counter must keep rising), `carrier` (APN and bearer choice),
-`book`, `lock`, `msgq` and the display settings. The RTC window is zeroed because neither restart
-in this flow is a cold boot, so the old key's `down_n` would otherwise be applied to the new key's
+The code is valid for 10 minutes. Message history is kept.
+
+**Factory reset** followed by `setup <code>` on the USB serial console still works and is the only
+path for a pager with no identity: Setup mode does not read the keyboard. The reset also erases the
+message history. The port is the Walter's own USB-C (USB Serial/JTAG) on the breadboard build and
+the carrier's USB-C, J6, through its USB-serial bridge on UART0 on the carrier v0.2 build
+(firmware/README.md, Build; CARRIER_V02_FIRMWARE_DESIGN.md).
+
+Both paths keep `auth/epoch` (the up counter must keep rising), `carrier` (APN and bearer choice),
+`book`, `lock`, `msgq` and the display settings. The RTC window is zeroed because no restart
+in either flow is a cold boot, so the old key's `down_n` would otherwise be applied to the new key's
 messages and pages would be dropped unacked whenever the new server's `downN` is lower.
 
 On Beam the setup fetch also goes through Beam, so the SIM's Beam group must already point at the
@@ -719,7 +727,7 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
 | Last scheduled trial fails (direct) | schedule | `fail/budget`; background trial every 24 h | old, new once a trial succeeds |
 | Source shut down, target healthy | active refused or unreachable | §5.7 alternation reaches the pending identity → commit | new, within ≤ 30 min (≤ 60 min after 24 h) |
 | Source shut down, target down | both fail | §5.7 long-run backoff, ~4.8 mAh/day direct after 24 h | whichever comes back first |
-| Pager never got the order, source gone | no session | Factory reset, then `setup <code>` with a target code on the USB console (§5.9) | new |
+| Pager never got the order, source gone | no session | **Set up again** on the Device screen with a target code (§5.9) | new |
 | Kid texts while the source is frozen, before the order | `moving` receipt | re-queued under the same id, held (§6.2) | sent on the target after the commit |
 | Kid texts after the order | hold | held until the commit (§6.2) | sent on the target after the commit |
 | Power cut, any step | §4 table | resume or repair | old, or new if `act` was written |
@@ -754,7 +762,7 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
    switch-back happens only if no Beam pager has committed; once one has, every Beam pager depends on
    the target staying up. The pager keeps alternating at ~2.4 mAh/day until it does.
 2. **Source shut down while pagers are unsettled:** they recover by themselves only if the target
-   works (§5.7); a pager that never got the order needs a Factory reset and a computer on USB
+   works (§5.7); a pager that never got the order needs a setup code typed on it
    (§5.9).
 3. **Beam holding the old upstream session** (S4(b)): costs the probe, ~1.2 mAh/day for the first week
    and ~0.3 mAh/day after, and delays discovery by up to one probe period.
@@ -803,7 +811,7 @@ without re-attaching.
 | B11 | Current trace of one failed trial and one commit | replaces the §5.6 estimates |
 | B12 | Device-screen action on both bearers: from `pend`, from `fail/budget`, from `fail/ca` (re-fetch), with no session at all, during a download (refused), in airplane mode, repeated twice | each outcome text of §5.8; budget counter unchanged; commit when the target works |
 | B13 | Source gone: stop the old broker for 48 h with the target (a) healthy, (b) stopped then started after 24 h | (a) commits within 30 min; (b) commits within 30 min of the target's start; attempt count and mAh over the 48 h match §5.7 |
-| B14 | Factory reset with an unsettled move, then `setup <code>` with a target code on the USB console | `ident1`, `idsel`, `move` gone (`nvsstats`), `auth/epoch` kept, RTC down window zero, first page from the target shown and acked |
+| B14 | **Set up again** with an unsettled move and a target code typed on the pager; repeat once with an expired code, and once through Factory reset and `setup <code>` on the USB console | good code: `ident1`, `idsel`, `move` gone (`nvsstats`), `auth/epoch` kept, RTC down window zero, message history kept, first page from the target shown and acked. Expired code: error shown, restart, old identity and the unsettled move untouched, `setup/code` gone |
 | B15 | Background trial after `fail/budget` (direct) with the target fixed a day later | commits at the next 24 h trial |
 
 Host tests: order, cancel and proof parsing; the plan function (state, now, events → next action);

@@ -6,6 +6,7 @@
 #include "mbedtls/gcm.h"
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
+#include "nvs.h"
 
 /* Crockford base32 with a Luhn-mod-32 check character; matches relay/app/devsetup.py. */
 
@@ -297,6 +298,43 @@ bool setup_decrypt_bundle(const uint8_t bkey[32], const uint8_t *blob, size_t bl
     }
     *plain_len = ct_len;
     return true;
+}
+
+#define PENDING_NS "setup"
+#define PENDING_KEY "code"
+
+bool setup_pending_save(const char *code)
+{
+    setup_code_t sc;
+    if (!code || strlen(code) >= SETUP_CODE_MAX || !setup_parse_code(code, &sc)) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open(PENDING_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    bool ok = nvs_set_str(h, PENDING_KEY, code) == ESP_OK && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+bool setup_pending_take(char *out, size_t cap)
+{
+    nvs_handle_t h;
+    /* Read-only first: the usual boot has no saved code and must not write flash. */
+    if (!out || nvs_open(PENDING_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t len = cap;
+    esp_err_t got = nvs_get_str(h, PENDING_KEY, out, &len);
+    nvs_close(h);
+    if (got == ESP_ERR_NVS_NOT_FOUND || nvs_open(PENDING_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    /* Deleted before it is used: a code that crashes or hangs setup must not run on every boot. */
+    bool erased = nvs_erase_key(h, PENDING_KEY) == ESP_OK && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return got == ESP_OK && erased;
 }
 
 #ifdef ESP_PLATFORM

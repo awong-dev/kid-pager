@@ -15,6 +15,7 @@ extern "C" {
 #define SETUP_BPW_LEN 45 /* 44 base64url chars + NUL */
 #define SETUP_HOST_MAX 128 /* matches IDENT_HOST_MAX */
 #define SETUP_APN_MAX 32   /* matches IDENT_APN_MAX */
+#define SETUP_CODE_MAX 200 /* a whole typed code with its NUL: token, host, port and APN */
 
 typedef struct {
     uint8_t token[SETUP_TOKEN_LEN];
@@ -39,6 +40,15 @@ bool setup_decrypt_bundle(const uint8_t bkey[32], const uint8_t *blob, size_t bl
 /* Runs the whole bootstrap for a typed code. Returns false after one error toast, or reboots via
  * esp_restart() on success. Power effect: one full bootstrap network session. */
 bool setup_run(const char *code);
+
+/* A code typed on the Device screen waits in NVS for the next boot, where setup_run() can have the
+ * modem to itself. Save refuses a code setup_parse_code() rejects or one that does not fit.
+ * Power effect: one NVS write. */
+bool setup_pending_save(const char *code);
+
+/* Copies the saved code out and deletes it, so one saved code gets one attempt. False when there
+ * is none, it does not fit `cap`, or it could not be deleted. */
+bool setup_pending_take(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

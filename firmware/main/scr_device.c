@@ -1,5 +1,4 @@
-// Device screen: status lines plus the settings menu. "Set up again" is not wired: setup_run()
-// assumes no live modem/MQTT session, which holds only before modes_boot().
+// Device screen: status lines plus the settings menu.
 
 #include "ui.h"
 #include "modes.h"
@@ -387,7 +386,7 @@ static void device_on_key(input_key_t key)
             break;
         }
         case MROW_SETUP_AGAIN:
-            ui_show_toast("use the USB console: setup <code>");
+            ui_push(&g_scr_setup);
             break;
         case MROW_FACTORY_RESET:
             s_confirm_active = true;
