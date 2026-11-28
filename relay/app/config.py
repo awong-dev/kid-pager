@@ -126,8 +126,9 @@ class Settings:
     @property
     def base_path(self) -> str:
         """The path component of `public_base_url` without a trailing slash (`/pager`), `""` when
-        the app is served at the root or the URL is unset. nginx strips it before proxying, so
-        routes do not use it; it is for URLs handed out and for the static web export."""
+        the app is served at the root or the URL is unset. `app/base_path.py` removes it from a
+        request before routing, so routes do not use it; it is for URLs handed out and for the
+        static web export."""
         return urlsplit(self.public_base_url or "").path.rstrip("/")
 
     @classmethod
@@ -196,7 +197,8 @@ def auth_backend() -> AuthBackend:
 
 
 def tls_mode() -> str:
-    """`TLS_MODE` (`public`, `selfsigned`, `letsencrypt` or `external`), exposed on `GET /api/me`."""
+    """`TLS_MODE` (`public`, or the home stack's `proxy`, `selfsigned`, `letsencrypt` or `external`),
+    exposed on `GET /api/me`."""
     return (os.environ.get("TLS_MODE") or "").strip().lower() or "public"
 
 

@@ -301,18 +301,20 @@ messages where the response is stuff like "almost. 5m."
 ## Running your own server
 
 The whole service runs on one machine you own, such as a Raspberry Pi, a NAS or a mini PC, with
-Docker. You need a name that points at your home (a dynamic-DNS name is fine) and a router that
-can forward ports to that machine.
+Docker. You need a name that points at your home (a dynamic-DNS name is fine), a router that can
+forward a port to that machine, and a reverse proxy (nginx or traefik) that already serves https
+for that name.
 
 ```bash
 cd home
-./setup.sh               # asks for your server's name, picks random ports, writes the configuration
-docker compose up -d     # builds and starts the relay, the broker and the TLS front end
+./setup.sh               # asks for your server's name, writes the configuration, prints what to add to your proxy
+docker compose up -d     # builds and starts the relay and the broker
 ```
 
-`setup.sh` prints the ports to forward on your router and the address to open to create the first
-admin. [`home/README.md`](home/README.md) is the full runbook: certificates, sharing the machine
-with another web server, backups, automatic security updates and Soracom Beam.
+`setup.sh` prints the nginx or traefik configuration, the port to forward on your router and the
+address to open to create the first admin. [`home/README.md`](home/README.md) is the full runbook:
+ports, certificates, running without a proxy of your own, backups, automatic security updates and
+Soracom Beam.
 
 ## Running a development stack
 

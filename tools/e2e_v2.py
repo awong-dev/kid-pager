@@ -50,8 +50,8 @@ EMQX_SETUP_SCRIPT = TOOLS_DIR / "emqx_setup.py"
 RELAY_VENV_PYTHON = RELAY_DIR / ".venv" / "bin" / "python3"
 
 # `--stack home` uses home/docker-compose.yml (the relay as an MQTT client of Mosquitto,
-# BROKER_MODE=mqtt) plus the `test` profile (bridge-sim), reached only through its nginx edge
-# with the stack's own CA. `--stack home-emqx` adds the EMQX override (BROKER_MODE=rest).
+# BROKER_MODE=mqtt) plus docker-compose.edge.yml and the `test` profile (bridge-sim), reached only
+# through the nginx edge with the stack's own CA. `--stack home-emqx` adds the EMQX override (BROKER_MODE=rest).
 STACK = "cloud"
 HOME_STACK = False  # STACK is "home" or "home-emqx"
 BROKER = "emqx"  # the broker's compose service: "emqx" or "mosquitto"
@@ -163,6 +163,7 @@ def compose(*args: str, check: bool = True, capture: bool = False) -> subprocess
             SCHEDULER_MODE="none",
             PAGER_DATA_DIR=str(HOME_DATA),
             PAGER_ENV_FILE=str(HOME_ENV),
+            PAGER_MQTT_UPSTREAM=f"{BROKER}:1883",
         )
     return subprocess.run(
         cmd,
@@ -354,10 +355,11 @@ def stop_stack() -> None:
     print("\n=== tearing down the compose stack ===")
     if _HOST_MQTT is not None:
         _HOST_MQTT.stop()
-    if HOME_STACK and HOME_DATA.exists():
-        _clear_home_data()
     compose("down", "-v", check=False)
     if HOME_STACK and HOME_DATA.exists():
+        # After `down`: a container that is still up keeps its bind-mounted directories alive.
+        _clear_home_data()
+        compose("down", "-v", check=False)  # the network the one-off container made
         HOME_DATA.rmdir()
     restore_env_file()
 
@@ -2307,9 +2309,13 @@ def main(argv: list[str] | None = None) -> int:
     HOME_STACK = STACK in ("home", "home-emqx")
     if STACK == "home":
         BROKER = "mosquitto"
-        COMPOSE_FILES[:] = [HOME_DIR / "docker-compose.yml"]
+        COMPOSE_FILES[:] = [HOME_DIR / "docker-compose.yml", HOME_DIR / "docker-compose.edge.yml"]
     elif STACK == "home-emqx":
-        COMPOSE_FILES[:] = [HOME_DIR / "docker-compose.yml", HOME_DIR / "docker-compose.emqx.yml"]
+        COMPOSE_FILES[:] = [
+            HOME_DIR / "docker-compose.yml",
+            HOME_DIR / "docker-compose.emqx.yml",
+            HOME_DIR / "docker-compose.edge.yml",
+        ]
     if HOME_STACK:
         RELAY_URL = "https://localhost"
         MQTT_PORT = 8883

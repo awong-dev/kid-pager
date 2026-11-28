@@ -1,0 +1,78 @@
+# An nginx edge for the home stack, for a machine with no reverse proxy of its own: it terminates
+# TLS for the web app and the pager port, and with TLS_MODE=letsencrypt keeps the certificate.
+#   docker compose -f docker-compose.yml -f docker-compose.edge.yml up -d
+# TLS_MODE in pager.env is selfsigned, letsencrypt or external. PAGER_WEB_PORT, PAGER_MQTT_PORT and
+# PAGER_BEAM_PORT (443, 8883, 8884 unset) are published here as well as advertised;
+# PAGER_HTTPS_BIND, PAGER_MQTTS_BIND and PAGER_BEAM_BIND change only where this machine listens.
+# With the EMQX override, set PAGER_MQTT_UPSTREAM=emqx:1883.
+
+services:
+  # TLS edge: 443 -> relay, 8883 -> broker, 80 -> redirect + ACME, inside the container; the
+  # published ports are below. Reloads every 6 h for renewed certificates.
+  # `stable-alpine` follows nginx's supported stable branch, so update.sh picks up its security
+  # fixes; a branch tag such as 1.28 stops being rebuilt when that branch ends.
+  nginx:
+    image: nginx:stable-alpine
+    command:
+      - /bin/sh
+      - -c
+      # PAGER_PATH as `init` reads it for the relay: /kid-pager when unset, and "/" (the root) becomes "".
+      # PAGER_WEB_PORT_SUFFIX: ":port" for the port-80 redirect to https, empty on 443.
+      - PAGER_PATH="$${PAGER_PATH:-/kid-pager}" && export PAGER_PATH="$${PAGER_PATH%/}" && if [ "$$PAGER_WEB_PORT" = 443 ]; then export PAGER_WEB_PORT_SUFFIX=""; else export PAGER_WEB_PORT_SUFFIX=":$$PAGER_WEB_PORT"; fi && mkdir -p /etc/nginx/http.d && { (while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'; }
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      relay:
+        condition: service_started
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    environment:
+      MQTT_UPSTREAM: ${PAGER_MQTT_UPSTREAM:-mosquitto:1883}
+      PAGER_WEB_PORT: ${PAGER_WEB_PORT:-443}
+      # Only these are substituted; nginx's own $vars are left alone.
+      NGINX_ENVSUBST_FILTER: ^(TLS_MODE|MQTT_UPSTREAM|PAGER_PATH|PAGER_WEB_PORT_SUFFIX)$$
+      # Not conf.d/: the image's default server there would answer port 80.
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/http.d
+    ports:
+      # Port 80 is only for Let's Encrypt's HTTP check and the redirect to https. Unset, it is
+      # published on a throwaway loopback port; TLS_MODE=letsencrypt needs PAGER_HTTP_BIND=80.
+      - "${PAGER_HTTP_BIND:-127.0.0.1:}:80"
+      - "${PAGER_HTTPS_BIND:-${PAGER_WEB_PORT:-443}}:443"
+      - "${PAGER_MQTTS_BIND:-${PAGER_MQTT_PORT:-8883}}:8883"
+      # Listens only with a public certificate (Soracom Beam, README.md).
+      - "${PAGER_BEAM_BIND:-${PAGER_BEAM_PORT:-8884}}:8884"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ${PAGER_DATA_DIR:-./data}/certs:/data/certs:ro
+      # TLS_MODE=external: a directory holding fullchain.pem and privkey.pem that something else renews.
+      - ${PAGER_CERT_DIR:-${PAGER_DATA_DIR:-./data}/certs/external}:/data/certs/external:ro
+      - ${PAGER_DATA_DIR:-./data}/certbot/www:/var/www/certbot:ro
+    restart: unless-stopped
+
+  # TLS_MODE=letsencrypt only. certbot/certbot publishes no stable major tag.
+  certbot:
+    image: certbot/certbot:latest
+    profiles: [letsencrypt]
+    depends_on:
+      nginx:
+        condition: service_started
+    env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        trap exit TERM
+        if [ ! -e /etc/letsencrypt/live/pager/fullchain.pem ]; then
+          certbot certonly --webroot -w /var/www/certbot --cert-name pager \
+            -d "$$PAGER_HOST" --email "$$LETSENCRYPT_EMAIL" \
+            --agree-tos --no-eff-email --non-interactive || exit 1
+        fi
+        while :; do
+          certbot renew --webroot -w /var/www/certbot --non-interactive
+          sleep 12h & wait $$!
+        done
+    volumes:
+      - ${PAGER_DATA_DIR:-./data}/certs/letsencrypt:/etc/letsencrypt
+      - ${PAGER_DATA_DIR:-./data}/certbot/www:/var/www/certbot
+    restart: unless-stopped

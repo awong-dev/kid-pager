@@ -135,7 +135,7 @@ def target_compose(*args: str, check: bool = True, capture: bool = False) -> sub
     files = ["-f", str(HOME_DIR / "docker-compose.yml")]
     if BROKER == "emqx":
         files += ["-f", str(HOME_DIR / "docker-compose.emqx.yml")]
-    files += ["-f", str(TARGET_OVERRIDE)]
+    files += ["-f", str(HOME_DIR / "docker-compose.edge.yml"), "-f", str(TARGET_OVERRIDE)]
     env = {
         "PAGER_WEB": "none",  # a relay image without the web export
         "SCHEDULER_MODE": "none",
@@ -146,6 +146,7 @@ def target_compose(*args: str, check: bool = True, capture: bool = False) -> sub
         "PAGER_HTTPS_BIND": "127.0.0.1:443",
         "PAGER_MQTTS_BIND": "127.0.0.1:8883",
         "PAGER_BEAM_BIND": "127.0.0.1:8884",
+        "PAGER_MQTT_UPSTREAM": f"{BROKER}:1883",
     }
     return run(["docker", "compose", "-p", TGT_PROJECT, *files, *args], check=check, capture=capture, env=env, cwd=HOME_DIR)
 

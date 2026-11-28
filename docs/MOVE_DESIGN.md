@@ -103,9 +103,11 @@ thread pool) shows `FAILED moving` with the failure alert, and the kid retypes i
   `KPCAPS1:` tag (`firmware.py:111-113`, §12.3).
 - The bridge phone builds every request as the URL in use (`Mover.activeUrl`) + path; a 401 clears
   its token unless a move left it a fallback URL (`RelayClient.exec`).
-- Home compose publishes the web, pager and Beam ports as `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and
-  `PAGER_BEAM_PORT` (443, 8883 and 8884 unless set), and the relay advertises those numbers;
-  `PAGER_HTTPS_BIND`, `PAGER_MQTTS_BIND` and `PAGER_BEAM_BIND` change only the local binding.
+- At home `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and `PAGER_BEAM_PORT` are the ports the outside world
+  dials, and the relay advertises those numbers. Behind the owner's reverse proxy
+  (`TLS_MODE=proxy`) they default to 443, 18883 and no Beam port. The nginx edge
+  (`docker-compose.edge.yml`) also publishes them, 443, 8883 and 8884 unless set;
+  `PAGER_HTTPS_BIND`, `PAGER_MQTTS_BIND` and `PAGER_BEAM_BIND` change only its local binding.
 
 ## 3. Overview
 

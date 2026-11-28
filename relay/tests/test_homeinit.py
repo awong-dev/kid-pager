@@ -257,3 +257,24 @@ def test_main_reads_the_ports_from_the_environment(tmp_path: Path, monkeypatch: 
     assert (env["PUBLIC_BASE_URL"], env["BROKER_PORT"], env["BEAM_PORT"]) == (
         "https://home.example.org:24492/kid-pager", "23093", "30265",
     )
+
+
+def test_proxy_mode_advertises_the_brokers_own_port_and_no_beam(tmp_path: Path):
+    homeinit.run(tmp_path, "home.example.org", "proxy", "")
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert env["PUBLIC_BASE_URL"] == "https://home.example.org/kid-pager"
+    assert env["BROKER_PORT"] == str(homeinit.PROXY_MQTT_PORT)
+    assert env["BEAM_PORT"] == ""
+    assert not (tmp_path / "certs/web").exists()
+    # the copies EMQX's TLS listener reads
+    assert (tmp_path / "emqx/server.crt").read_bytes() == (tmp_path / "certs/mqtt/server.crt").read_bytes()
+    assert (tmp_path / "emqx/server.key").stat().st_mode & 0o777 == 0o600
+
+
+def test_proxy_mode_has_a_beam_port_only_when_one_is_named(tmp_path: Path):
+    homeinit.run(tmp_path, "home.example.org", "proxy", "", web_port=24492, mqtt_port=23093, beam_port=30265)
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert (env["PUBLIC_BASE_URL"], env["BROKER_PORT"], env["BEAM_PORT"]) == (
+        "https://home.example.org:24492/kid-pager", "23093", "30265",
+    )
+    assert env["SORACOM_BEAM_DESTINATION"] == "mqtts://home.example.org:30265"

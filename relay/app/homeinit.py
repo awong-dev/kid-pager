@@ -24,10 +24,15 @@ from app.config import valid_base_path
 
 VAPID_PRIVATE, VAPID_PUBLIC = "WEBPUSH_VAPID_PRIVATE_KEY", "WEBPUSH_VAPID_PUBLIC_KEY"
 SECRET_KEYS = ("BROKER_ADMIN_PASSWORD", "WEBHOOK_KEY", "BROKER_API_KEY", "BROKER_API_SECRET")
-TLS_MODES = ("selfsigned", "letsencrypt", "external")
-# The modes whose web certificate a public CA signed: only these have the Soracom Beam listener.
+# proxy: no edge in this stack; your own reverse proxy holds the web certificate. The others are
+# the modes of the nginx edge (home/docker-compose.edge.yml).
+TLS_MODES = ("proxy", "selfsigned", "letsencrypt", "external")
+# The edge modes whose web certificate a public CA signed: these always have the Soracom Beam
+# listener. Under `proxy` there is one only when PAGER_BEAM_PORT names it.
 PUBLIC_TLS_MODES = ("letsencrypt", "external")
 DEFAULT_WEB_PORT, DEFAULT_MQTT_PORT, DEFAULT_BEAM_PORT = 443, 8883, 8884
+# Where home/docker-compose.yml publishes the broker's own TLS listener.
+PROXY_MQTT_PORT = 18883
 TEN_YEARS = timedelta(days=3650)
 WEB_CERT_DAYS = timedelta(days=825)
 WEB_CERT_RENEW_BEFORE = timedelta(days=30)
@@ -195,12 +200,14 @@ def issue_server_cert(
 
 def ensure_mqtt_cert(mqtt_dir: Path, ca_cert, ca_key, host: str) -> None:
     crt, key_path = mqtt_dir / "server.crt", mqtt_dir / "server.key"
-    if crt.exists() and key_path.exists():
-        return
-    cert, key = issue_server_cert(ca_cert, ca_key, host, TEN_YEARS)
-    _write(key_path, _key_pem(key), 0o600)
-    _write(crt, _cert_pem(cert), 0o644)
-    print(f"homeinit: {crt}: generated for {host}")
+    if not (crt.exists() and key_path.exists()):
+        cert, key = issue_server_cert(ca_cert, ca_key, host, TEN_YEARS)
+        _write(key_path, _key_pem(key), 0o600)
+        _write(crt, _cert_pem(cert), 0o644)
+        print(f"homeinit: {crt}: generated for {host}")
+    # Mosquitto's TLS listener reads the key as its own user.
+    if os.geteuid() == 0:
+        os.chown(key_path, MOSQUITTO_UID, MOSQUITTO_UID)
 
 
 def ensure_web_cert(web_dir: Path, ca_cert, ca_key, host: str, *, now: datetime | None = None) -> None:
@@ -216,10 +223,13 @@ def ensure_web_cert(web_dir: Path, ca_cert, ca_key, host: str, *, now: datetime 
     print(f"homeinit: {chain}: issued for {host} until {cert.not_valid_after_utc:%Y-%m-%d}")
 
 
-def ensure_emqx(emqx_dir: Path, values: dict[str, str]) -> None:
-    files = {
+def ensure_emqx(emqx_dir: Path, values: dict[str, str], mqtt_dir: Path) -> None:
+    files: dict[Path, str | bytes] = {
         emqx_dir / "bootstrap_api_keys.txt": f"{values['BROKER_API_KEY']}:{values['BROKER_API_SECRET']}\n",
         emqx_dir / "emqx.env": f"EMQX_DASHBOARD__DEFAULT_PASSWORD={values['BROKER_ADMIN_PASSWORD']}\n",
+        # Copies for EMQX's TLS listener: the originals belong to Mosquitto's user.
+        emqx_dir / "server.crt": (mqtt_dir / "server.crt").read_bytes(),
+        emqx_dir / "server.key": (mqtt_dir / "server.key").read_bytes(),
     }
     for path, text in files.items():
         if not path.exists():
@@ -333,7 +343,7 @@ def write_relay_env(
     )
 
 
-def parse_port(name: str, raw: str, default: int) -> int:
+def parse_port(name: str, raw: str, default: int | None = None) -> int | None:
     raw = raw.strip()
     if not raw:
         return default
@@ -365,10 +375,11 @@ def run(
     tls_mode: str,
     base_path: str = "",
     *,
-    web_port: int = DEFAULT_WEB_PORT,
-    mqtt_port: int = DEFAULT_MQTT_PORT,
-    beam_port: int = DEFAULT_BEAM_PORT,
+    web_port: int | None = None,
+    mqtt_port: int | None = None,
+    beam_port: int | None = None,
 ) -> None:
+    """A port left `None` takes the mode's default."""
     if not host:
         raise InitError("PAGER_HOST is not set; put it in pager.env (home/README.md)")
     if tls_mode not in TLS_MODES:
@@ -382,9 +393,14 @@ def run(
     ensure_mqtt_cert(data / "certs" / "mqtt", ca_cert, ca_key, host)
     if tls_mode == "selfsigned":
         ensure_web_cert(data / "certs" / "web", ca_cert, ca_key, host)
-    ensure_emqx(data / "emqx", values)
+    ensure_emqx(data / "emqx", values, data / "certs" / "mqtt")
     ensure_dynsec(data / "mosquitto", values)
-    beam = beam_port if tls_mode in PUBLIC_TLS_MODES else None
+    web_port = web_port or DEFAULT_WEB_PORT
+    mqtt_port = mqtt_port or (PROXY_MQTT_PORT if tls_mode == "proxy" else DEFAULT_MQTT_PORT)
+    if tls_mode == "proxy":
+        beam = beam_port
+    else:
+        beam = (beam_port or DEFAULT_BEAM_PORT) if tls_mode in PUBLIC_TLS_MODES else None
     write_relay_env(
         data / "relay.env", data, host, base_path, web_port=web_port, mqtt_port=mqtt_port, beam_port=beam
     )
@@ -405,9 +421,9 @@ def main(argv: list[str] | None = None) -> int:
             (os.environ.get("PAGER_HOST") or "").strip(),
             (os.environ.get("TLS_MODE") or "").strip().lower(),
             os.environ.get("PAGER_PATH") or "",
-            web_port=parse_port("PAGER_WEB_PORT", os.environ.get("PAGER_WEB_PORT", ""), DEFAULT_WEB_PORT),
-            mqtt_port=parse_port("PAGER_MQTT_PORT", os.environ.get("PAGER_MQTT_PORT", ""), DEFAULT_MQTT_PORT),
-            beam_port=parse_port("PAGER_BEAM_PORT", os.environ.get("PAGER_BEAM_PORT", ""), DEFAULT_BEAM_PORT),
+            web_port=parse_port("PAGER_WEB_PORT", os.environ.get("PAGER_WEB_PORT", "")),
+            mqtt_port=parse_port("PAGER_MQTT_PORT", os.environ.get("PAGER_MQTT_PORT", "")),
+            beam_port=parse_port("PAGER_BEAM_PORT", os.environ.get("PAGER_BEAM_PORT", "")),
         )
     except InitError as exc:
         print(f"homeinit: {exc}", file=sys.stderr)

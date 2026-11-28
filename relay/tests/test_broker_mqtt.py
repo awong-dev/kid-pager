@@ -118,6 +118,13 @@ def mosquitto_port() -> Iterator[int]:
         try:
             subprocess.run(["docker", "cp", str(CONF), f"{name}:/mosquitto/config/mosquitto.conf"], check=True)
             subprocess.run(["docker", "cp", str(dynsec), f"{name}:/mosquitto/data/dynamic-security.json"], check=True)
+            # The config's TLS listener needs its certificate to start; the key is copied readable
+            # because `docker cp` keeps this user's ownership.
+            certs = Path(tmp) / "certs"
+            ca_cert, ca_key = homeinit.ensure_ca(Path(tmp) / "ca")
+            homeinit.ensure_mqtt_cert(certs, ca_cert, ca_key, "localhost")
+            (certs / "server.key").chmod(0o644)
+            subprocess.run(["docker", "cp", str(certs), f"{name}:/mosquitto/certs"], check=True)
             subprocess.run(["docker", "start", name], check=True, capture_output=True)
             out = subprocess.run(
                 ["docker", "port", name, "1883/tcp"], check=True, capture_output=True, text=True

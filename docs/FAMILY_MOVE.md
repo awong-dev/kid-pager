@@ -46,14 +46,16 @@ Runbook. There are two procedures:
    The target's address is then `https://<PAGER_HOST>/kid-pager`; the bundle is addressed to exactly
    that address and no other.
 3. **Certificates.**
-   - `TLS_MODE=selfsigned` (the default) works. Its web certificate and the pagers' broker CA both
-     come from `data/certs/ca/ca.crt`. You will paste that CA into the source at A4, import it into
-     each person's phone and browser (home/README.md) and install it on each bridge phone as a user
-     CA (A10).
-   - A public certificate (`TLS_MODE=letsencrypt` or `external`) is required only if a pager uses
-     Soracom Beam: it opens the Beam listener (A9).
-   - The router forwards the target's web and pager ports (and the Beam port for Beam); `setup.sh`
-     on the target prints them (home/README.md, "Name and ports").
+   - Behind your own reverse proxy (`TLS_MODE=proxy`, what `setup.sh` writes) the web certificate
+     is the proxy's public one, and nothing has to be imported. A pager on Soracom Beam also needs
+     the proxy's Beam listener: `./setup.sh --beam-port N` (A9).
+   - With the nginx edge, `TLS_MODE=selfsigned` works. Its web certificate and the pagers' broker
+     CA both come from `data/certs/ca/ca.crt`. You will paste that CA into the source at A4, import
+     it into each person's phone and browser (home/README.md) and install it on each bridge phone
+     as a user CA (A10). A public certificate (`TLS_MODE=letsencrypt` or `external`) is required
+     only if a pager uses Soracom Beam: it opens the Beam listener (A9).
+   - The router forwards the target's pager port, and its web and Beam ports reach the proxy or the
+     edge; `setup.sh` on the target prints them (home/README.md, "Ports").
 4. **Settings the bundle cannot carry**: copy them into the target's environment by hand. The import
    report names the ones the source had set (`SORACOM_AUTH_KEY_ID`, `SORACOM_AUTH_KEY`,
    `FW_INDEX_URL`); copy any other environment key you use, such as the cell-location key, too. With
@@ -165,12 +167,12 @@ The two servers do not talk to each other, so each page shows what it knows.
 
 ## A9. Soracom Beam
 
-Only if a pager's bearer is Beam. The target needs a public certificate, `TLS_MODE=letsencrypt` or `external` (A2).
+Only if a pager's bearer is Beam. The target needs a Beam listener with a public certificate: its reverse proxy's (`./setup.sh --beam-port N`), or the nginx edge with `TLS_MODE=letsencrypt` or `external` (A2).
 
 1. Wait until the source's page shows every Beam pager acked. A Beam pager that has not acked when
    the group is switched cannot reach either server and needs a setup code.
 2. Optional canary: in the Soracom console, move one SIM to a group whose destination is
-   `mqtts://<target host>:<Beam port>` (8884 unless `PAGER_BEAM_PORT` says otherwise), and watch that pager arrive on the target's page.
+   `mqtts://<target host>:<Beam port>` (`PAGER_BEAM_PORT`; 8884 on the nginx edge unless set), and watch that pager arrive on the target's page.
 3. Target, Move page, Beam: **Switch Beam group** (target with the Soracom key: it creates the group
    `pager-beam-<target host>` and moves every SIM of the source's Beam group into it), or, after
    doing it in the console yourself, **Done, I switched it**.

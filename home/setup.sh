@@ -1,26 +1,34 @@
 #!/bin/sh
-# First-time configuration of the home stack: writes pager.env and .env next to this file, then
-# tells you which ports to forward. It starts nothing and never overwrites an existing file
-# without --force. README.md, "Install and first run".
+# First-time configuration of the home stack behind your own reverse proxy: writes pager.env and
+# .env next to this file, then prints what to add to nginx or traefik. It starts nothing and never
+# overwrites an existing file without --force. README.md, "Install and first run".
 set -eu
 cd "$(dirname "$0")"
+
+# Where docker-compose.yml publishes the app servers unless .env says otherwise.
+HTTP_LOCAL=18480 MQTTS_LOCAL=18883 MQTT_LOCAL=11883
 
 usage() {
     cat <<'EOF'
 Usage: ./setup.sh [options]
+       ./setup.sh --print-proxy [--proxy nginx|traefik|both]
 
   --host NAME          the name pagers, phones and browsers use for this machine,
                        e.g. a dynamic-DNS name (asked for when missing)
-  --tls MODE           selfsigned (default), letsencrypt or external
-  --email ADDR         letsencrypt: the address Let's Encrypt sends expiry notices to
-  --cert-dir DIR       external: a directory with fullchain.pem and privkey.pem that
-                       something else keeps renewed
   --path PATH          where the app is served (default /kid-pager; / for the root)
-  --web-port N         public port for the web app (default: a random high port)
-  --mqtt-port N        public port for pagers (default: a random high port)
-  --beam-port N        public port for Soracom Beam pagers; only used with a public
-                       certificate (default: a random high port)
-  --standard-ports     use 443, 8883 and 8884 instead of random ports
+  --web-port N         the https port your reverse proxy answers on, as the internet
+                       sees it (default 443)
+  --mqtt-port N        the pager port as the internet sees it; your router forwards
+                       it to port 18883 of this machine (default 18883)
+  --beam-port N        a port for pagers on Soracom Beam, which your proxy serves
+                       with its public certificate (default: none)
+  --proxy KIND         print configuration for nginx, traefik or both (default both)
+  --upstream ADDR      the address your proxy reaches this machine at (default
+                       127.0.0.1). An IP address other than 127.0.0.1, such as the
+                       Docker bridge 172.17.0.1 for a proxy in a container, also
+                       becomes the address the app ports listen on.
+  --print-proxy        write nothing; print the proxy configuration for the
+                       pager.env and .env that are already here
   --force              replace an existing pager.env and .env (the old ones are kept
                        as *.bak)
   -h, --help           this text
@@ -32,28 +40,196 @@ die() {
     exit 1
 }
 
-host="" tls="" email="" cert_dir="" path="" web_port="" mqtt_port="" beam_port=""
-standard=0 force=0
+host="" path="" web_port="" mqtt_port="" beam_port="" proxy="" upstream=""
+force=0 print_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
     --host) host="${2:?--host needs a value}"; shift 2 ;;
-    --tls) tls="${2:?--tls needs a value}"; shift 2 ;;
-    --email) email="${2:?--email needs a value}"; shift 2 ;;
-    --cert-dir) cert_dir="${2:?--cert-dir needs a value}"; shift 2 ;;
     --path) path="${2:?--path needs a value}"; shift 2 ;;
     --web-port) web_port="${2:?--web-port needs a value}"; shift 2 ;;
     --mqtt-port) mqtt_port="${2:?--mqtt-port needs a value}"; shift 2 ;;
     --beam-port) beam_port="${2:?--beam-port needs a value}"; shift 2 ;;
-    --standard-ports) standard=1; shift ;;
+    --proxy) proxy="${2:?--proxy needs a value}"; shift 2 ;;
+    --upstream) upstream="${2:?--upstream needs a value}"; shift 2 ;;
+    --print-proxy) print_only=1; shift ;;
     --force) force=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
     esac
 done
 
+case "${proxy:-both}" in
+nginx | traefik | both) ;;
+*) die "--proxy is nginx, traefik or both, not $proxy" ;;
+esac
+
+# value FILE KEY: the last KEY=... in FILE, or nothing.
+value() {
+    [ -f "$1" ] || return 0
+    sed -n "s/^$2=//p" "$1" | tail -n 1
+}
+
+# An address is an IPv4 literal when it has only digits and dots.
+is_ip() {
+    case "$1" in
+    *[!0-9.]* | '') return 1 ;;
+    *) return 0 ;;
+    esac
+}
+
+print_nginx() {
+    cat <<EOF
+---- nginx ----------------------------------------------------------------
+Inside the server { } block that answers https://$host$url_port (within http { }):
+
+    location $app_path/ {
+        proxy_pass http://$upstream:$http_local;    # no path after the port
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;                       # the live-update stream
+        proxy_read_timeout 1h;
+        client_max_body_size 16m;
+    }
+EOF
+    if [ -n "$app_path" ]; then
+        echo "    location = $app_path { return 308 $app_path/; }"
+    else
+        echo "    location /internal/ { return 404; }"
+    fi
+    [ -n "$beam_port" ] || return 0
+    cat <<EOF
+
+For Soracom Beam, at the top level of nginx.conf (not inside http { }; needs
+the stream module), with the same certificate as https://$host$url_port:
+
+    stream {
+        server {
+            listen $beam_port ssl;
+            ssl_certificate     /path/to/fullchain.pem;
+            ssl_certificate_key /path/to/privkey.pem;
+            proxy_timeout 1h;
+            proxy_pass $upstream:$mqtt_local;
+        }
+    }
+EOF
+}
+
+print_traefik() {
+    rule="Host(\`$host\`)"
+    if [ -n "$app_path" ]; then
+        rule="$rule && PathPrefix(\`$app_path\`)"
+    else
+        rule="$rule && !PathPrefix(\`/internal/\`)"
+    fi
+    cat <<EOF
+---- traefik --------------------------------------------------------------
+Dynamic configuration (a file your file provider loads). "websecure" is the
+entry point that answers https://$host$url_port and "letsencrypt" your
+certificate resolver: use your own names.
+
+    http:
+      routers:
+        kid-pager:
+          rule: "$rule"
+          entryPoints: [websecure]
+          service: kid-pager
+          tls:
+            certResolver: letsencrypt
+      services:
+        kid-pager:
+          loadBalancer:
+            servers:
+              - url: "http://$upstream:$http_local"
+EOF
+    [ -n "$beam_port" ] || return 0
+    cat <<EOF
+    tcp:
+      routers:
+        kid-pager-beam:
+          rule: "HostSNI(\`$host\`)"
+          entryPoints: [pager-beam]
+          service: kid-pager-beam
+          tls:
+            certResolver: letsencrypt
+      services:
+        kid-pager-beam:
+          loadBalancer:
+            servers:
+              - address: "$upstream:$mqtt_local"
+
+For Soracom Beam, also a new entry point in the static configuration:
+
+    entryPoints:
+      pager-beam:
+        address: ":$beam_port"
+EOF
+}
+
+print_proxy() {
+    app_path="${path:-/kid-pager}"
+    app_path="${app_path%/}"
+    url_port=":$web_port"
+    [ "$web_port" != 443 ] || url_port=""
+    echo
+    echo "Add this to your reverse proxy, then reload it:"
+    echo
+    case "${proxy:-both}" in
+    nginx) print_nginx ;;
+    traefik) print_traefik ;;
+    both) print_nginx; echo; print_traefik ;;
+    esac
+    cat <<EOF
+
+Router: forward TCP port $mqtt_port to port $mqtts_local of this machine. That is the pager
+port; the stack serves it with its own certificate, so it does not go through the proxy.
+EOF
+    [ -z "$beam_port" ] || echo "Also forward TCP port $beam_port to your proxy, and set the Beam group's destination to mqtts://$host:$beam_port."
+    cat <<EOF
+
+Then:
+  docker compose up -d
+and open https://$host$url_port$app_path/ to create the first admin.
+
+Check from a phone on mobile data, not your Wi-Fi, that pagers can reach you:
+  openssl s_client -connect $host:$mqtt_port
+EOF
+}
+
+# The port of a compose bind value such as 127.0.0.1:18480, or the default.
+bind_port() { # bind_port KEY DEFAULT
+    v=$(value .env "$1")
+    [ -n "$v" ] || { echo "$2"; return; }
+    echo "${v##*:}"
+}
+
+if [ "$print_only" = 1 ]; then
+    [ -f pager.env ] || die "there is no pager.env here yet; run ./setup.sh first"
+    host=$(value pager.env PAGER_HOST)
+    path=$(value pager.env PAGER_PATH)
+    web_port=$(value .env PAGER_WEB_PORT)
+    mqtt_port=$(value .env PAGER_MQTT_PORT)
+    beam_port=$(value .env PAGER_BEAM_PORT)
+    http_local=$(bind_port PAGER_APP_HTTP_BIND "$HTTP_LOCAL")
+    mqtts_local=$(bind_port PAGER_APP_MQTTS_BIND "$MQTTS_LOCAL")
+    mqtt_local=$(bind_port PAGER_APP_MQTT_BIND "$MQTT_LOCAL")
+    if [ -z "$upstream" ]; then
+        bind=$(value .env PAGER_APP_HTTP_BIND)
+        case "$bind" in
+        *:*) upstream="${bind%:*}" ;;
+        esac
+    fi
+    upstream="${upstream:-127.0.0.1}"
+    web_port="${web_port:-443}" mqtt_port="${mqtt_port:-$MQTTS_LOCAL}"
+    print_proxy
+    exit 0
+fi
+
 if [ "$force" = 0 ]; then
     for f in pager.env .env; do
-        [ ! -e "$f" ] || die "$f already exists; edit it, or pass --force to start over"
+        [ ! -e "$f" ] || die "$f already exists; edit it, pass --force to start over, or --print-proxy to see the proxy configuration again"
     done
 fi
 
@@ -80,75 +256,17 @@ case "$host" in
 *[!A-Za-z0-9.:-]* | *://*) die "the host is a bare name or IP address, not $host" ;;
 esac
 
-if [ -z "$tls" ] && [ "$interactive" = 1 ]; then
-    cat <<'EOF'
-
-Which certificate should the web app use?
-  selfsigned   made here. Works at once, but every phone and browser must import
-               this server's CA before it can install the app or get notifications.
-  letsencrypt  fetched and renewed by this stack. Port 80 of this name must reach
-               this machine.
-  external     a certificate you already keep renewed for this name, for example
-               by a dynamic-DNS (DNS-01) script. No port 80 needed.
-EOF
-    ask tls "Certificate" selfsigned
-fi
-tls="${tls:-selfsigned}"
-case "$tls" in
-selfsigned | letsencrypt | external) ;;
-*) die "--tls is selfsigned, letsencrypt or external, not $tls" ;;
+[ -n "$web_port" ] || ask web_port "The https port your reverse proxy answers on" 443
+[ -n "$proxy" ] || ask proxy "Print configuration for nginx, traefik or both" both
+case "${proxy:-both}" in
+nginx | traefik | both) ;;
+*) die "--proxy is nginx, traefik or both, not $proxy" ;;
 esac
-
-if [ "$tls" = letsencrypt ] && [ -z "$email" ]; then
-    ask email "Email address for Let's Encrypt expiry notices"
-    [ -n "$email" ] || die "letsencrypt needs --email ADDR"
-fi
-if [ "$tls" = external ]; then
-    [ -n "$cert_dir" ] || ask cert_dir "Directory holding fullchain.pem and privkey.pem"
-    [ -n "$cert_dir" ] || die "external needs --cert-dir DIR"
-    [ -d "$cert_dir" ] || die "$cert_dir is not a directory"
-    cert_dir="$(cd "$cert_dir" && pwd)"
-    for f in fullchain.pem privkey.pem; do
-        [ -f "$cert_dir/$f" ] || echo "setup.sh: warning: $cert_dir/$f does not exist yet" >&2
-    done
-    for f in fullchain.pem privkey.pem; do
-        # Docker mounts the directory, so a link that points outside it is dangling in the container.
-        if [ -L "$cert_dir/$f" ]; then
-            echo "setup.sh: warning: $cert_dir/$f is a symbolic link; if it points outside" \
-                "$cert_dir (certbot's live/ does), copy the files instead" >&2
-        fi
-    done
-fi
 
 case "${path:-/kid-pager}" in
 / | /*) ;;
 *) die "--path starts with /, like /kid-pager" ;;
 esac
-
-port_in_use() {
-    if command -v ss >/dev/null 2>&1; then
-        ss -Htln 2>/dev/null | grep -Eq "[:.]$1[[:space:]]"
-    elif command -v netstat >/dev/null 2>&1; then
-        netstat -an 2>/dev/null | grep -i listen | grep -Eq "[:.]$1[[:space:]]"
-    else
-        return 1
-    fi
-}
-
-# 20000-32767: above the registered services people usually run, below Linux's range for outgoing
-# connections (32768 up), so the port is never taken by one at start.
-taken=""
-random_port() {
-    while :; do
-        n=$(od -An -N2 -tu2 /dev/urandom | tr -d ' \n')
-        p=$((20000 + n % 12768))
-        case " $taken " in *" $p "*) continue ;; esac
-        port_in_use "$p" && continue
-        taken="$taken $p"
-        echo "$p"
-        return
-    done
-}
 
 check_port() { # check_port NAME VALUE
     case "$2" in
@@ -157,20 +275,17 @@ check_port() { # check_port NAME VALUE
     [ "$2" -ge 1 ] && [ "$2" -le 65535 ] || die "$1 is a port number from 1 to 65535, not $2"
 }
 
-if [ "$standard" = 1 ]; then
-    web_port="${web_port:-443}" mqtt_port="${mqtt_port:-8883}" beam_port="${beam_port:-8884}"
-fi
-taken="$web_port $mqtt_port $beam_port"
-# Assigned one at a time: a command substitution cannot update $taken for the next call.
-[ -n "$web_port" ] || { web_port=$(random_port); taken="$taken $web_port"; }
-[ -n "$mqtt_port" ] || { mqtt_port=$(random_port); taken="$taken $mqtt_port"; }
-[ -n "$beam_port" ] || { beam_port=$(random_port); taken="$taken $beam_port"; }
+web_port="${web_port:-443}" mqtt_port="${mqtt_port:-$MQTTS_LOCAL}"
 check_port --web-port "$web_port"
 check_port --mqtt-port "$mqtt_port"
-check_port --beam-port "$beam_port"
+[ -z "$beam_port" ] || check_port --beam-port "$beam_port"
 if [ "$web_port" = "$mqtt_port" ] || [ "$web_port" = "$beam_port" ] || [ "$mqtt_port" = "$beam_port" ]; then
     die "the web, pager and Beam ports must differ"
 fi
+upstream="${upstream:-127.0.0.1}"
+case "$upstream" in
+*[!A-Za-z0-9.-]*) die "--upstream is a name or an IPv4 address, not $upstream" ;;
+esac
 
 if [ "$force" = 1 ]; then
     for f in pager.env .env; do
@@ -182,54 +297,34 @@ fi
     echo "# Written by setup.sh. Nothing here is secret: the stack generates every password and key"
     echo "# into data/. pager.env.example explains each value."
     echo "PAGER_HOST=$host"
-    echo "TLS_MODE=$tls"
-    echo "LETSENCRYPT_EMAIL=$email"
+    echo "# proxy: the web certificate is your reverse proxy's."
+    echo "TLS_MODE=proxy"
     [ -z "$path" ] || echo "PAGER_PATH=$path"
 } >pager.env
 
 {
     echo "# Written by setup.sh; read by docker compose. docker-compose.yml explains each value."
     echo "# The ports the outside world dials. Pagers store the pager port: choose before you"
-    echo "# provision any, and forward each one on your router to the same port on this machine."
+    echo "# provision any."
     echo "PAGER_WEB_PORT=$web_port"
     echo "PAGER_MQTT_PORT=$mqtt_port"
-    echo "PAGER_BEAM_PORT=$beam_port"
-    if [ "$tls" = letsencrypt ]; then
-        echo "# Let's Encrypt checks this name on port 80."
-        echo "PAGER_HTTP_BIND=80"
-        echo "COMPOSE_PROFILES=letsencrypt"
+    [ -z "$beam_port" ] || echo "PAGER_BEAM_PORT=$beam_port"
+    if is_ip "$upstream" && [ "$upstream" != 127.0.0.1 ]; then
+        echo "# Where the proxy reaches the relay and the plain broker port."
+        echo "PAGER_APP_HTTP_BIND=$upstream:$HTTP_LOCAL"
+        echo "PAGER_APP_MQTT_BIND=$upstream:$MQTT_LOCAL"
     fi
-    [ "$tls" != external ] || echo "PAGER_CERT_DIR=$cert_dir"
 } >.env
 
-app_path="${path:-/kid-pager}"
-[ "$app_path" != / ] || app_path=""
-url_port=":$web_port"
-[ "$web_port" != 443 ] || url_port=""
+echo
+echo "Wrote $(pwd)/pager.env and $(pwd)/.env"
+http_local=$HTTP_LOCAL mqtts_local=$MQTTS_LOCAL mqtt_local=$MQTT_LOCAL
+print_proxy
+if ! is_ip "$upstream"; then
+    cat <<EOF
 
-cat <<EOF
-
-Wrote $(pwd)/pager.env and $(pwd)/.env
-
-Forward these TCP ports on your router to this machine, same port number:
-  $web_port   web app, bridge phone, pager downloads
-  $mqtt_port   pagers
+$upstream is a name, so the app ports still listen on 127.0.0.1 only. If your
+proxy cannot reach that, set PAGER_APP_HTTP_BIND and PAGER_APP_MQTT_BIND in .env
+(docker-compose.yml).
 EOF
-case "$tls" in
-selfsigned)
-    echo "(Soracom Beam pagers need a public certificate: TLS mode letsencrypt or external.)"
-    ;;
-*)
-    echo "  $beam_port   pagers on Soracom Beam (Beam group destination: mqtts://$host:$beam_port)"
-    ;;
-esac
-[ "$tls" != letsencrypt ] || echo "  80      Let's Encrypt's check"
-cat <<EOF
-
-Then:
-  docker compose up -d
-and open https://$host$url_port$app_path/ to create the first admin.
-
-Check from a phone on mobile data, not your Wi-Fi, that pagers can reach you:
-  openssl s_client -connect $host:$mqtt_port
-EOF
+fi

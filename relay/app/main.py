@@ -19,6 +19,7 @@ from app import move as move_module
 from app import sysmsg as sysmsg_module
 from app.backends.registry import build_registry
 from app.backends.webapp import NullFCMClient
+from app.base_path import BasePathMiddleware
 from app.broker import BrokerClient, make_broker_client
 from app.broker_mqtt import MqttBrokerClient
 from app.config import Settings, auth_backend
@@ -223,6 +224,10 @@ def create_app(
     # Registered last so it only sees unclaimed paths.
     if static_web.WEB_ROOT.is_dir():
         static_web.mount(app, base_path=settings.base_path)
+
+    # Added last, so it is outermost and every other middleware sees the path without the prefix.
+    if settings.base_path:
+        app.add_middleware(BasePathMiddleware, base_path=settings.base_path)
 
     return app
 
