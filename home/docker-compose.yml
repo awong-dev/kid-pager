@@ -1,20 +1,17 @@
 # The home server stack: the app servers, with no web server in front.
 #   ./setup.sh && docker compose up -d
-# The relay answers plain HTTP and the broker speaks MQTT, with TLS under the stack's own CA and
-# without. Your own reverse proxy terminates TLS for the web app; setup.sh prints its configuration.
+# The relay answers plain HTTP and the broker plain MQTT, on loopback. Your own reverse proxy
+# terminates TLS for both with its public certificate; setup.sh prints its configuration.
 # docker-compose.edge.yml adds an nginx edge for a machine that has no proxy.
 # Mosquitto with dynamic-security; the relay is its one MQTT client (BROKER_MODE=mqtt).
 # Everything worth backing up lives in ./data. PAGER_DATA_DIR and PAGER_ENV_FILE move it and pager.env.
 #
 # Ports on this machine (home/.env overrides each):
-#   PAGER_APP_HTTP_BIND   127.0.0.1:18480  the relay, plain HTTP: your proxy's upstream
-#   PAGER_APP_MQTTS_BIND  18883            the broker over TLS with the stack's CA: forward the
-#                                          pager port on your router straight here
-#   PAGER_APP_MQTT_BIND   127.0.0.1:11883  the broker, plain MQTT: the upstream of a proxy listener
-#                                          with a public certificate (Soracom Beam)
-# PAGER_WEB_PORT, PAGER_MQTT_PORT and PAGER_BEAM_PORT are the ports the outside world dials, written
-# into the links, setup codes and move orders the relay hands out. Unset, they are 443, 18883 and
-# no Beam port.
+#   PAGER_APP_HTTP_BIND   127.0.0.1:18480  the relay, plain HTTP
+#   PAGER_APP_MQTT_BIND   127.0.0.1:11883  the broker, plain MQTT
+# Neither may be reachable from the internet. PAGER_WEB_PORT and PAGER_MQTT_PORT are the ports
+# your proxy answers on as the outside world dials them, written into the links, setup codes and
+# move orders the relay hands out. Unset, they are 443 and 8883.
 
 name: pager-home
 
@@ -91,12 +88,10 @@ services:
       init:
         condition: service_completed_successfully
     ports:
-      - "${PAGER_APP_MQTTS_BIND:-18883}:8883"
       - "${PAGER_APP_MQTT_BIND:-127.0.0.1:11883}:1883"
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ${PAGER_DATA_DIR:-./data}/mosquitto:/mosquitto/data
-      - ${PAGER_DATA_DIR:-./data}/certs/mqtt:/mosquitto/certs:ro
     restart: unless-stopped
 
   # `--profile backup run --rm backup` writes data/backups/<UTC stamp>.sqlite and <stamp>.tar.gz

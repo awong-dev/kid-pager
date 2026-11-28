@@ -404,7 +404,16 @@ HMAC_KEY_BYTES = 32
 
 def _bootstrap_host_and_ca(settings: Settings) -> tuple[str, str | None]:
     """The broker host for the bootstrap bundle and the CA PEM to pin (settings win)."""
-    ca = settings.broker_ca_pem or ca_resolve.get_broker_ca_pem()
+    ca = ca_resolve.current_pem(settings)
+    if ca is None and settings.broker_ca_resolve:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"could not read a publicly trusted certificate from the pager port "
+                f"{settings.broker_host}:{settings.broker_port}; check that the reverse proxy "
+                f"serves it and that the port is forwarded"
+            ),
+        )
     return settings.broker_host, ca
 
 
@@ -798,7 +807,7 @@ def _push_ca_impl(
     if req.action == "unpin":
         ok = devcfg.unpin_ca(device_id, broker)
         return {"ok": ok}
-    ca_pem = settings.broker_ca_pem or ca_resolve.get_broker_ca_pem()
+    ca_pem = ca_resolve.current_pem(settings)
     if not ca_pem:
         raise HTTPException(
             status_code=400, detail="no CA is configured on this relay to push"

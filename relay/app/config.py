@@ -54,6 +54,10 @@ class Settings:
     # The broker CA PEM; wins over auto-resolve. Empty: `app/ca_resolve.py` looks it up;
     # if that fails, bundles carry no `ca`.
     broker_ca_pem: str | None = None
+    # `BROKER_CA_RESOLVE=1`, for a pager port whose certificate a public CA signed and something
+    # else renews: with no `BROKER_CA_PEM`, the relay pins the root of the chain that port serves
+    # (`app/ca_resolve.py`) and refuses to issue a setup code until it can.
+    broker_ca_resolve: bool = False
     # The relay's public base URL, for `GET /ca/{sha256hex}.pem` pointers. Empty with a CA
     # configured makes `app/devsetup.py` and the CA-push route refuse.
     public_base_url: str | None = None
@@ -149,6 +153,7 @@ class Settings:
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
             broker_port=_port("BROKER_PORT", os.environ.get("BROKER_PORT", "")) or 8883,
             broker_ca_pem=os.environ.get("BROKER_CA_PEM") or _read_pem_file(os.environ.get("BROKER_CA_PEM_FILE")),
+            broker_ca_resolve=(os.environ.get("BROKER_CA_RESOLVE") or "").strip() == "1",
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
             push_backend=os.environ.get("PUSH_BACKEND", "null").strip().lower(),
             fw_index_url=(os.environ.get("FW_INDEX_URL") or "").strip() or None,

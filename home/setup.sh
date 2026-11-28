@@ -6,7 +6,7 @@ set -eu
 cd "$(dirname "$0")"
 
 # Where docker-compose.yml publishes the app servers unless .env says otherwise.
-HTTP_LOCAL=18480 MQTTS_LOCAL=18883 MQTT_LOCAL=11883
+HTTP_LOCAL=18480 MQTT_LOCAL=11883
 
 usage() {
     cat <<'EOF'
@@ -18,10 +18,8 @@ Usage: ./setup.sh [options]
   --path PATH          where the app is served (default /kid-pager; / for the root)
   --web-port N         the https port your reverse proxy answers on, as the internet
                        sees it (default 443)
-  --mqtt-port N        the pager port as the internet sees it; your router forwards
-                       it to port 18883 of this machine (default 18883)
-  --beam-port N        a port for pagers on Soracom Beam, which your proxy serves
-                       with its public certificate (default: none)
+  --mqtt-port N        the port your reverse proxy answers pagers on (MQTT over
+                       TLS), as the internet sees it (default 8883)
   --proxy KIND         print configuration for nginx, traefik or both (default both)
   --upstream ADDR      the address your proxy reaches this machine at (default
                        127.0.0.1). An IP address other than 127.0.0.1, such as the
@@ -40,7 +38,7 @@ die() {
     exit 1
 }
 
-host="" path="" web_port="" mqtt_port="" beam_port="" proxy="" upstream=""
+host="" path="" web_port="" mqtt_port="" proxy="" upstream=""
 force=0 print_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,7 +46,6 @@ while [ $# -gt 0 ]; do
     --path) path="${2:?--path needs a value}"; shift 2 ;;
     --web-port) web_port="${2:?--web-port needs a value}"; shift 2 ;;
     --mqtt-port) mqtt_port="${2:?--mqtt-port needs a value}"; shift 2 ;;
-    --beam-port) beam_port="${2:?--beam-port needs a value}"; shift 2 ;;
     --proxy) proxy="${2:?--proxy needs a value}"; shift 2 ;;
     --upstream) upstream="${2:?--upstream needs a value}"; shift 2 ;;
     --print-proxy) print_only=1; shift ;;
@@ -99,18 +96,18 @@ EOF
     else
         echo "    location /internal/ { return 404; }"
     fi
-    [ -n "$beam_port" ] || return 0
     cat <<EOF
 
-For Soracom Beam, at the top level of nginx.conf (not inside http { }; needs
-the stream module), with the same certificate as https://$host$url_port:
+For pagers, at the top level of nginx.conf (not inside http { }; needs the
+stream module), with the certificate of https://$host$url_port:
 
     stream {
         server {
-            listen $beam_port ssl;
+            listen $mqtt_port ssl;
             ssl_certificate     /path/to/fullchain.pem;
             ssl_certificate_key /path/to/privkey.pem;
-            proxy_timeout 1h;
+            ssl_protocols TLSv1.2 TLSv1.3;         # the pager's modem speaks TLS 1.2
+            proxy_timeout 1h;                      # a sleeping pager stays connected
             proxy_pass $upstream:$mqtt_local;
         }
     }
@@ -143,28 +140,27 @@ certificate resolver: use your own names.
           loadBalancer:
             servers:
               - url: "http://$upstream:$http_local"
-EOF
-    [ -n "$beam_port" ] || return 0
-    cat <<EOF
     tcp:
       routers:
-        kid-pager-beam:
-          rule: "HostSNI(\`$host\`)"
-          entryPoints: [pager-beam]
-          service: kid-pager-beam
+        kid-pager-mqtt:
+          rule: "HostSNI(\`*\`)"
+          entryPoints: [pager-mqtt]
+          service: kid-pager-mqtt
           tls:
             certResolver: letsencrypt
+            domains:
+              - main: "$host"
       services:
-        kid-pager-beam:
+        kid-pager-mqtt:
           loadBalancer:
             servers:
               - address: "$upstream:$mqtt_local"
 
-For Soracom Beam, also a new entry point in the static configuration:
+and a new entry point for pagers in the static configuration:
 
     entryPoints:
-      pager-beam:
-        address: ":$beam_port"
+      pager-mqtt:
+        address: ":$mqtt_port"
 EOF
 }
 
@@ -183,11 +179,9 @@ print_proxy() {
     esac
     cat <<EOF
 
-Router: forward TCP port $mqtt_port to port $mqtts_local of this machine. That is the pager
-port; the stack serves it with its own certificate, so it does not go through the proxy.
-EOF
-    [ -z "$beam_port" ] || echo "Also forward TCP port $beam_port to your proxy, and set the Beam group's destination to mqtts://$host:$beam_port."
-    cat <<EOF
+Router: forward TCP port $mqtt_port to your proxy, like port $web_port. Pagers on
+Soracom Beam use the same port: the Beam group's destination is
+mqtts://$host:$mqtt_port.
 
 Then:
   docker compose up -d
@@ -195,6 +189,9 @@ and open https://$host$url_port$app_path/ to create the first admin.
 
 Check from a phone on mobile data, not your Wi-Fi, that pagers can reach you:
   openssl s_client -connect $host:$mqtt_port
+It must show a certificate for $host from a public authority. The relay reads
+it from that same address to tell pagers which authority to trust, and gives
+out no setup code until it can.
 EOF
 }
 
@@ -211,9 +208,7 @@ if [ "$print_only" = 1 ]; then
     path=$(value pager.env PAGER_PATH)
     web_port=$(value .env PAGER_WEB_PORT)
     mqtt_port=$(value .env PAGER_MQTT_PORT)
-    beam_port=$(value .env PAGER_BEAM_PORT)
     http_local=$(bind_port PAGER_APP_HTTP_BIND "$HTTP_LOCAL")
-    mqtts_local=$(bind_port PAGER_APP_MQTTS_BIND "$MQTTS_LOCAL")
     mqtt_local=$(bind_port PAGER_APP_MQTT_BIND "$MQTT_LOCAL")
     if [ -z "$upstream" ]; then
         bind=$(value .env PAGER_APP_HTTP_BIND)
@@ -222,7 +217,7 @@ if [ "$print_only" = 1 ]; then
         esac
     fi
     upstream="${upstream:-127.0.0.1}"
-    web_port="${web_port:-443}" mqtt_port="${mqtt_port:-$MQTTS_LOCAL}"
+    web_port="${web_port:-443}" mqtt_port="${mqtt_port:-8883}"
     print_proxy
     exit 0
 fi
@@ -257,6 +252,7 @@ case "$host" in
 esac
 
 [ -n "$web_port" ] || ask web_port "The https port your reverse proxy answers on" 443
+[ -n "$mqtt_port" ] || ask mqtt_port "The port it should answer pagers on" 8883
 [ -n "$proxy" ] || ask proxy "Print configuration for nginx, traefik or both" both
 case "${proxy:-both}" in
 nginx | traefik | both) ;;
@@ -275,13 +271,10 @@ check_port() { # check_port NAME VALUE
     [ "$2" -ge 1 ] && [ "$2" -le 65535 ] || die "$1 is a port number from 1 to 65535, not $2"
 }
 
-web_port="${web_port:-443}" mqtt_port="${mqtt_port:-$MQTTS_LOCAL}"
+web_port="${web_port:-443}" mqtt_port="${mqtt_port:-8883}"
 check_port --web-port "$web_port"
 check_port --mqtt-port "$mqtt_port"
-[ -z "$beam_port" ] || check_port --beam-port "$beam_port"
-if [ "$web_port" = "$mqtt_port" ] || [ "$web_port" = "$beam_port" ] || [ "$mqtt_port" = "$beam_port" ]; then
-    die "the web, pager and Beam ports must differ"
-fi
+[ "$web_port" != "$mqtt_port" ] || die "the web and pager ports must differ"
 upstream="${upstream:-127.0.0.1}"
 case "$upstream" in
 *[!A-Za-z0-9.-]*) die "--upstream is a name or an IPv4 address, not $upstream" ;;
@@ -297,20 +290,19 @@ fi
     echo "# Written by setup.sh. Nothing here is secret: the stack generates every password and key"
     echo "# into data/. pager.env.example explains each value."
     echo "PAGER_HOST=$host"
-    echo "# proxy: the web certificate is your reverse proxy's."
+    echo "# proxy: your reverse proxy terminates TLS for the web app and for pagers."
     echo "TLS_MODE=proxy"
     [ -z "$path" ] || echo "PAGER_PATH=$path"
 } >pager.env
 
 {
     echo "# Written by setup.sh; read by docker compose. docker-compose.yml explains each value."
-    echo "# The ports the outside world dials. Pagers store the pager port: choose before you"
-    echo "# provision any."
+    echo "# The ports your reverse proxy answers on, as the outside world dials them. Pagers store"
+    echo "# the pager port: choose before you provision any."
     echo "PAGER_WEB_PORT=$web_port"
     echo "PAGER_MQTT_PORT=$mqtt_port"
-    [ -z "$beam_port" ] || echo "PAGER_BEAM_PORT=$beam_port"
     if is_ip "$upstream" && [ "$upstream" != 127.0.0.1 ]; then
-        echo "# Where the proxy reaches the relay and the plain broker port."
+        echo "# Where the proxy reaches the relay and the broker."
         echo "PAGER_APP_HTTP_BIND=$upstream:$HTTP_LOCAL"
         echo "PAGER_APP_MQTT_BIND=$upstream:$MQTT_LOCAL"
     fi
@@ -318,7 +310,7 @@ fi
 
 echo
 echo "Wrote $(pwd)/pager.env and $(pwd)/.env"
-http_local=$HTTP_LOCAL mqtts_local=$MQTTS_LOCAL mqtt_local=$MQTT_LOCAL
+http_local=$HTTP_LOCAL mqtt_local=$MQTT_LOCAL
 print_proxy
 if ! is_ip "$upstream"; then
     cat <<EOF

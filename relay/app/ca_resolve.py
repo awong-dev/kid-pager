@@ -7,6 +7,7 @@ import hashlib
 import logging
 import socket
 import ssl
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -20,6 +21,9 @@ from app.store import cas as cas_store
 logger = logging.getLogger("relay.ca_resolve")
 
 _CONNECT_TIMEOUT_S = 5.0
+# A failed resolution is not retried sooner than this: each try can block a request for the
+# connect timeout.
+_RETRY_S = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,13 +36,33 @@ class BrokerCa:
 
 # Resolved once, not on every request that wants the CA.
 _cached: BrokerCa | None = None
+_failed_at: float | None = None
 
 
 def reset_cache() -> None:
     """Test-only: forgets the resolved CA and the memoized certifi bundle."""
-    global _cached
+    global _cached, _failed_at
     _cached = None
+    _failed_at = None
     _load_ca_roots.cache_clear()
+
+
+def current_pem(settings: Settings) -> str | None:
+    """The CA a pager is told to pin: `BROKER_CA_PEM`, else what was resolved before, else, only
+    with `BROKER_CA_RESOLVE`, a resolution made now from the certificate the pager port serves."""
+    global _failed_at
+    if settings.broker_ca_pem:
+        return settings.broker_ca_pem
+    if _cached is not None:
+        return _cached.pem
+    if not settings.broker_ca_resolve:
+        return None
+    now = time.monotonic()
+    if _failed_at is not None and now - _failed_at < _RETRY_S:
+        return None
+    resolved = resolve_broker_ca(settings)
+    _failed_at = None if resolved is not None else now
+    return resolved.pem if resolved is not None else None
 
 
 def get_broker_ca_pem() -> str | None:
@@ -90,7 +114,8 @@ def resolve_broker_ca(settings: Settings) -> BrokerCa | None:
 
 def fetch_served_chain(host: str, port: int, timeout: float = _CONNECT_TIMEOUT_S) -> list[bytes]:
     """Returns the DER chain the server sent, leaf first, with verification disabled."""
-    # The stdlib exposes the full chain only from 3.13 (`get_unverified_chain`); on 3.12 the leaf
+    # The stdlib exposes the full chain from 3.13 (`get_unverified_chain`); before that the same
+    # call exists on the private `_sslobj` and returns certificate objects. Failing both, the leaf
     # alone suffices when its issuer is a certifi root, else resolution fails closed.
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
@@ -99,16 +124,26 @@ def fetch_served_chain(host: str, port: int, timeout: float = _CONNECT_TIMEOUT_S
         socket.create_connection((host, port), timeout=timeout) as raw,
         context.wrap_socket(raw, server_hostname=host) as tls,
     ):
-        get_chain = getattr(tls, "get_unverified_chain", None)
+        get_chain = getattr(tls, "get_unverified_chain", None) or getattr(
+            getattr(tls, "_sslobj", None), "get_unverified_chain", None
+        )
         if callable(get_chain):
             try:
-                chain = get_chain() or []
-            except ssl.SSLError:
+                chain = [_der(cert) for cert in get_chain() or []]
+            except (ssl.SSLError, TypeError, ValueError):
                 chain = []
             if chain:
-                return list(chain)
+                return chain
         leaf = tls.getpeercert(binary_form=True)
         return [leaf] if leaf else []
+
+
+def _der(cert: object) -> bytes:
+    if isinstance(cert, bytes):
+        return cert
+    import _ssl
+
+    return cert.public_bytes(_ssl.ENCODING_DER)  # type: ignore[attr-defined]
 
 
 def resolve_ca_from_chain(chain_der: Sequence[bytes]) -> BrokerCa | None:

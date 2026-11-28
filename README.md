@@ -302,7 +302,7 @@ messages where the response is stuff like "almost. 5m."
 
 The whole service runs on one machine you own, such as a Raspberry Pi, a NAS or a mini PC, with
 Docker. You need a name that points at your home (a dynamic-DNS name is fine), a router that can
-forward a port to that machine, and a reverse proxy (nginx or traefik) that already serves https
+forward ports to that machine, and a reverse proxy (nginx or traefik) that already serves https
 for that name.
 
 ```bash
@@ -311,7 +311,7 @@ cd home
 docker compose up -d     # builds and starts the relay and the broker
 ```
 
-`setup.sh` prints the nginx or traefik configuration, the port to forward on your router and the
+`setup.sh` prints the nginx or traefik configuration, the ports to forward on your router and the
 address to open to create the first admin. [`home/README.md`](home/README.md) is the full runbook:
 ports, certificates, running without a proxy of your own, backups, automatic security updates and
 Soracom Beam.

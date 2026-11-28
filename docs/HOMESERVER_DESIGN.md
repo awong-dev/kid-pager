@@ -608,12 +608,13 @@ Built in this order; each step keeps both deployments working and can be verifie
 Where the implementation differs from, or adds to, the sections above:
 
 - **The edge is optional (§0, §2.1).** `home/docker-compose.yml` is the app servers alone, for a
-  machine whose own reverse proxy holds the web certificate (`TLS_MODE=proxy`): the relay on plain
-  HTTP at `127.0.0.1:18480`, Mosquitto's own TLS listener with the stack's CA on 18883 for pagers,
-  and plain MQTT at `127.0.0.1:11883` for a proxy listener with a public certificate (Soracom
-  Beam). The relay removes `PAGER_PATH` from requests itself (`app/base_path.py`), so a proxy
-  forwards them unchanged, and refuses `/internal/` under the prefix. `home/setup.sh` prints the
-  nginx or traefik configuration. nginx and certbot as described in §2.1 are the overlay
+  machine whose own reverse proxy terminates all TLS with its public certificate
+  (`TLS_MODE=proxy`): the relay on plain HTTP at `127.0.0.1:18480` and Mosquitto on plain MQTT at
+  `127.0.0.1:11883`, neither facing the internet. Pagers pin the root of the proxy's certificate,
+  which the relay reads from the pager port (`BROKER_CA_RESOLVE`, `app/ca_resolve.py`), and Soracom
+  Beam uses the same port. The relay removes `PAGER_PATH` from requests itself
+  (`app/base_path.py`), so a proxy forwards them unchanged, and refuses `/internal/` under the
+  prefix. `home/setup.sh` prints the nginx or traefik configuration. nginx and certbot as described in §2.1 are the overlay
   `home/docker-compose.edge.yml`.
 - **Shim writes (§3.1).** `WriteBatch` and `Transaction` subclass google's own classes and apply
   the `Write` protobufs google's `DocumentExtractor` produces, so sentinels, update masks and

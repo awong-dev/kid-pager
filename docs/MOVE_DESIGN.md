@@ -105,7 +105,7 @@ thread pool) shows `FAILED moving` with the failure alert, and the kid retypes i
   its token unless a move left it a fallback URL (`RelayClient.exec`).
 - At home `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and `PAGER_BEAM_PORT` are the ports the outside world
   dials, and the relay advertises those numbers. Behind the owner's reverse proxy
-  (`TLS_MODE=proxy`) they default to 443, 18883 and no Beam port. The nginx edge
+  (`TLS_MODE=proxy`) they default to 443 and 8883, and Beam uses the pager port. The nginx edge
   (`docker-compose.edge.yml`) also publishes them, 443, 8883 and 8884 unless set;
   `PAGER_HTTPS_BIND`, `PAGER_MQTTS_BIND` and `PAGER_BEAM_BIND` change only its local binding.
 

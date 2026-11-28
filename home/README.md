@@ -31,9 +31,9 @@ This file is the runbook.
 ## Two ways to run it
 
 - **Behind your own reverse proxy** (this page's main path). The stack is the
-  app servers only: the relay and the broker, on fixed ports. Your existing
-  nginx or traefik keeps the web certificate and forwards one path to the
-  relay. `./setup.sh` prints the configuration to add.
+  app servers only: the relay and the broker, on fixed loopback ports. Your
+  existing nginx or traefik terminates TLS for both, with its certificate.
+  `./setup.sh` prints the configuration to add.
 - **With the stack's own nginx edge**, for a machine that has no proxy. See
   "The nginx edge" below.
 
@@ -44,34 +44,31 @@ that today.
 
 ## Ports
 
-The app servers listen on fixed ports of this machine. They are not the
-protocols' usual ports, so they do not collide with what you already run.
+The app servers listen on two fixed ports of this machine, on loopback. They
+are not the protocols' usual ports, so they do not collide with what you
+already run.
 
 | Port on this machine | What answers | Who connects |
 |---|---|---|
 | `127.0.0.1:18480` | the relay, plain HTTP | your reverse proxy |
-| `18883` | the broker, MQTT over TLS with the stack's own CA | pagers, through a port forward on your router |
-| `127.0.0.1:11883` | the broker, plain MQTT | your reverse proxy, for Soracom Beam only |
+| `127.0.0.1:11883` | the broker, plain MQTT | your reverse proxy |
 
-`PAGER_APP_HTTP_BIND`, `PAGER_APP_MQTTS_BIND` and `PAGER_APP_MQTT_BIND` in
-`home/.env` change them. The two loopback ports must never be reachable from
-the internet: the first carries sign-ins without TLS.
+Nothing of the stack faces the internet: your proxy terminates TLS for both
+and is the only thing a stranger can reach. `PAGER_APP_HTTP_BIND` and
+`PAGER_APP_MQTT_BIND` in `home/.env` change the two ports. They must never be
+reachable from outside: they carry sign-ins and pager traffic without TLS.
 
 The relay also has to know the ports the outside world dials, because it
 writes them into what it hands out: the web address in links, the pager port
-in setup codes and move orders, the Beam port in the Beam destination.
-`setup.sh` writes them to `home/.env`:
+in setup codes and move orders. `setup.sh` writes them to `home/.env`:
 
 | Setting in `home/.env` | Default | Meaning |
 |---|---|---|
 | `PAGER_WEB_PORT` | 443 | the https port your reverse proxy answers on |
-| `PAGER_MQTT_PORT` | 18883 | the pager port on your router, forwarded to 18883 here |
-| `PAGER_BEAM_PORT` | none | a proxy port for Soracom Beam pagers |
+| `PAGER_MQTT_PORT` | 8883 | the port it answers pagers on (MQTT over TLS) |
 
 **Choose them before you provision pagers**: a pager stores the pager port,
-and changing the web port breaks passkeys, saved links and the bridge phone's
-relay address. The outside pager port can be any number you like; only the
-forward's destination is fixed.
+and the web port is part of the address pagers download from.
 
 With the EMQX override, its dashboard and API (port 18083) are published only
 on `127.0.0.1`. The dashboard user is `admin` and its password is
@@ -79,19 +76,32 @@ on `127.0.0.1`. The dashboard user is `admin` and its password is
 
 ## Certificates
 
-- **The web app** uses your reverse proxy's certificate. Browsers need one
-  they trust before they allow installing the app, push notifications and
-  passkeys, and so does the bridge phone, so use a public certificate such as
-  Let's Encrypt's.
-- **The pager port** uses a certificate from the stack's own CA
-  (`data/certs/ca/ca.crt`, valid for 10 years). The pager pins this CA, so it
-  never has to change and no renewal can lock a pager out. That is why the
-  pager port goes straight to the broker and not through your proxy.
-- **Soracom Beam** validates the server against public roots and cannot be
-  given the stack's CA. For Beam pagers your proxy listens on one more port
-  with its public certificate and passes the connection to the plain broker
-  port. Run `./setup.sh --beam-port N`, and point the Beam group at
-  `mqtts://PAGER_HOST:N`.
+Your reverse proxy holds the one certificate, for the web app and for pagers.
+It must be from a public authority such as Let's Encrypt:
+
+- Browsers need a certificate they trust before they allow installing the
+  app, push notifications and passkeys, and so does the bridge phone.
+- Soracom Beam only connects to a server with a public certificate. Beam
+  pagers use the same pager port as the others; point the Beam group at
+  `mqtts://PAGER_HOST:PAGER_MQTT_PORT`.
+- A pager is told which authority to trust. The relay finds that out by
+  connecting to `PAGER_HOST:PAGER_MQTT_PORT` and reading the certificate your
+  proxy serves there, and pins its root (for Let's Encrypt, ISRG Root X1). It
+  gives out no setup code until that works, so the proxy and the port forward
+  must be in place first, and this machine must be able to reach its own
+  outside name.
+
+  If it cannot (some routers do not let inside machines dial the outside
+  address), save the root certificate as `data/certs/public-ca.pem` and
+  restart the stack; the relay then uses that file.
+
+If you later change certificate authority, pagers still hold the old root.
+A pager whose check fails twice goes on connecting without the check and
+reports it; push the new root from the pager's page in the web app.
+
+Not yet tried on a real pager: whether its modem sends the server name when it
+connects. The printed traefik configuration needs it to pick the certificate;
+nginx does not.
 
 ## The path
 
@@ -113,13 +123,13 @@ printed configuration sets it to the visitor's address.
 1. Install Docker with the Compose plugin (Compose 2.17 or later).
 2. Copy this `home/` directory to the machine. The relay image is built
    locally, so you also need `../relay`, `../web` and `../tools` beside it.
-3. Run `./setup.sh`. It asks for the name of this server and the port your
-   proxy answers on, writes `pager.env` and `.env`, and prints what to add to
-   nginx or traefik. `./setup.sh --help` lists the options for running it
+3. Run `./setup.sh`. It asks for the name of this server and the two ports
+   your proxy answers on, writes `pager.env` and `.env`, and prints what to
+   add to nginx or traefik. `./setup.sh --help` lists the options for running it
    without questions, for example:
 
    ```sh
-   ./setup.sh --host myhome.dedyn.io --web-port 24492 --proxy nginx
+   ./setup.sh --host myhome.dedyn.io --web-port 24492 --mqtt-port 27514 --proxy traefik
    ```
 
    It never overwrites an existing `pager.env` or `.env` unless you pass
@@ -131,7 +141,7 @@ printed configuration sets it to the visitor's address.
    machine. Pass the address it can reach, for example the Docker bridge:
    `./setup.sh --upstream 172.17.0.1`. The app ports then listen on that
    address.
-5. Forward the pager port on your router to port 18883 of this machine.
+5. Forward the pager port on your router to the proxy, like the web port.
 6. Start the stack: `docker compose up -d`.
 
    On every start the one-shot `init` service creates any secret or
@@ -144,7 +154,9 @@ printed configuration sets it to the visitor's address.
 ## The nginx edge
 
 `docker-compose.edge.yml` adds an nginx container that terminates TLS itself,
-for a machine with no reverse proxy:
+for a machine with no reverse proxy. Its pager port uses a certificate from
+the stack's own CA (`data/certs/ca/ca.crt`, valid for 10 years), which pagers
+pin:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.edge.yml up -d
@@ -153,7 +165,7 @@ docker compose -f docker-compose.yml -f docker-compose.edge.yml up -d
 `setup.sh` does not configure it; write `pager.env` from `pager.env.example`.
 `TLS_MODE` there picks the web certificate:
 
-- **`selfsigned`**: from the stack's CA, renewed by `init`. Every phone and
+- **`selfsigned`**: also from the stack's CA, renewed by `init`. Every phone and
   browser must import `data/certs/ca/ca.crt` before it can install the app,
   get notifications or use passkeys. There is no Beam port.
 - **`letsencrypt`**: certbot in the stack gets and renews a public
@@ -164,8 +176,9 @@ docker compose -f docker-compose.yml -f docker-compose.edge.yml up -d
   directory `PAGER_CERT_DIR` names (`fullchain.pem` and `privkey.pem`, as
   real files: certbot's `live/` directory links outside itself).
 
-The edge publishes `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and `PAGER_BEAM_PORT`
-(443, 8883 and 8884 unless set) on this machine; `PAGER_HTTPS_BIND`,
+With a public certificate the edge also listens on `PAGER_BEAM_PORT` for
+Soracom Beam. It publishes `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and
+`PAGER_BEAM_PORT` (443, 8883 and 8884 unless set) on this machine; `PAGER_HTTPS_BIND`,
 `PAGER_MQTTS_BIND` and `PAGER_BEAM_BIND` change only where it listens. For
 plain `docker compose` commands and `update.sh`, put
 `COMPOSE_FILE=docker-compose.yml:docker-compose.edge.yml` in `home/.env`.
@@ -430,12 +443,13 @@ home/
     relay/pager.sqlite      the database
     backups/                files written by the backup service
     fw-cache/               firmware deltas made on demand
-    certs/ca/               the stack's CA (ca.crt, ca.key)
-    certs/mqtt/             the certificate for the pager port
+    certs/public-ca.pem     optional: the root pagers pin, when the relay cannot read it from the proxy
+    certs/ca/               the stack's CA (ca.crt, ca.key), used by the edge
+    certs/mqtt/             the edge's certificate for the pager port
     certs/web/              the edge's web certificate (selfsigned only)
     certs/external/         where the edge mounts PAGER_CERT_DIR (external only)
     certs/letsencrypt/      certbot's files (edge, letsencrypt only)
     certbot/www/            the ACME webroot (edge)
-    emqx/                   EMQX's API key, dashboard password and a copy of the pager-port certificate (override only)
+    emqx/                   EMQX's API key and dashboard password (override only)
     mosquitto/              dynamic-security.json (broker logins and ACLs) and the broker's persistence
 ```

@@ -26,12 +26,8 @@ services:
         condition: service_completed_successfully
     environment:
       EMQX_API_KEY__BOOTSTRAP_FILE: /pager/bootstrap_api_keys.txt
-      # The TLS listener on 8883 serves the stack's certificate (copies in data/emqx/).
-      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__CERTFILE: /pager/server.crt
-      EMQX_LISTENERS__SSL__DEFAULT__SSL_OPTIONS__KEYFILE: /pager/server.key
     ports:
       - "127.0.0.1:18083:18083"
-      - "${PAGER_APP_MQTTS_BIND:-18883}:8883"
       - "${PAGER_APP_MQTT_BIND:-127.0.0.1:11883}:1883"
     volumes:
       - ../relay/emqx/emqx.conf:/opt/emqx/etc/emqx.conf:ro

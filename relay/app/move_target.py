@@ -126,7 +126,7 @@ def info(settings: Settings) -> dict[str, Any]:
     """`GET /api/public/move-info` (§7.1): only what a pager is told anyway."""
     if not settings.public_base_url:
         raise MoveError(503, "PUBLIC_BASE_URL is not set on this server")
-    ca_pem = settings.broker_ca_pem or ca_resolve.get_broker_ca_pem()
+    ca_pem = ca_resolve.current_pem(settings)
     ca = None
     if ca_pem:
         url, sha = ca_resolve.ca_pointer(ca_pem, settings)

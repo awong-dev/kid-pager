@@ -250,3 +250,22 @@ def test_ca_pointer_without_public_base_url_raises():
 
     with pytest.raises(ca_resolve.PublicBaseUrlRequired):
         ca_resolve.ca_pointer(pem, settings)
+
+
+def test_current_pem_resolves_on_demand_only_when_asked_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    ca_resolve.reset_cache()
+    calls: list[tuple[str, int]] = []
+
+    def _refuse(host: str, port: int, timeout: float = 0) -> list[bytes]:
+        calls.append((host, port))
+        raise OSError("refused")
+
+    monkeypatch.setattr(ca_resolve, "fetch_served_chain", _refuse)
+    off = make_settings(broker_host="home.example.org", broker_port=23093)
+    assert ca_resolve.current_pem(off) is None and calls == []
+
+    on = make_settings(broker_host="home.example.org", broker_port=23093, broker_ca_resolve=True)
+    assert ca_resolve.current_pem(on) is None
+    assert ca_resolve.current_pem(on) is None  # a failure is not retried at once
+    assert calls == [("home.example.org", 23093)]
+    ca_resolve.reset_cache()

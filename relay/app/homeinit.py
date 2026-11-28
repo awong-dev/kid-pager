@@ -24,15 +24,16 @@ from app.config import valid_base_path
 
 VAPID_PRIVATE, VAPID_PUBLIC = "WEBPUSH_VAPID_PRIVATE_KEY", "WEBPUSH_VAPID_PUBLIC_KEY"
 SECRET_KEYS = ("BROKER_ADMIN_PASSWORD", "WEBHOOK_KEY", "BROKER_API_KEY", "BROKER_API_SECRET")
-# proxy: no edge in this stack; your own reverse proxy holds the web certificate. The others are
-# the modes of the nginx edge (home/docker-compose.edge.yml).
+# proxy: no edge in this stack; your own reverse proxy terminates TLS for the web app and the pager
+# port with its public certificate. The others are the modes of the nginx edge
+# (home/docker-compose.edge.yml), where the pager port has the stack's own CA.
 TLS_MODES = ("proxy", "selfsigned", "letsencrypt", "external")
-# The edge modes whose web certificate a public CA signed: these always have the Soracom Beam
-# listener. Under `proxy` there is one only when PAGER_BEAM_PORT names it.
+# The edge modes whose web certificate a public CA signed: these have the extra Soracom Beam
+# listener. Under `proxy` the pager port itself has a public certificate and Beam uses it.
 PUBLIC_TLS_MODES = ("letsencrypt", "external")
 DEFAULT_WEB_PORT, DEFAULT_MQTT_PORT, DEFAULT_BEAM_PORT = 443, 8883, 8884
-# Where home/docker-compose.yml publishes the broker's own TLS listener.
-PROXY_MQTT_PORT = 18883
+# `proxy`: a root to pin instead of the one the relay reads from the pager port.
+PINNED_PUBLIC_CA = Path("certs") / "public-ca.pem"
 TEN_YEARS = timedelta(days=3650)
 WEB_CERT_DAYS = timedelta(days=825)
 WEB_CERT_RENEW_BEFORE = timedelta(days=30)
@@ -200,14 +201,12 @@ def issue_server_cert(
 
 def ensure_mqtt_cert(mqtt_dir: Path, ca_cert, ca_key, host: str) -> None:
     crt, key_path = mqtt_dir / "server.crt", mqtt_dir / "server.key"
-    if not (crt.exists() and key_path.exists()):
-        cert, key = issue_server_cert(ca_cert, ca_key, host, TEN_YEARS)
-        _write(key_path, _key_pem(key), 0o600)
-        _write(crt, _cert_pem(cert), 0o644)
-        print(f"homeinit: {crt}: generated for {host}")
-    # Mosquitto's TLS listener reads the key as its own user.
-    if os.geteuid() == 0:
-        os.chown(key_path, MOSQUITTO_UID, MOSQUITTO_UID)
+    if crt.exists() and key_path.exists():
+        return
+    cert, key = issue_server_cert(ca_cert, ca_key, host, TEN_YEARS)
+    _write(key_path, _key_pem(key), 0o600)
+    _write(crt, _cert_pem(cert), 0o644)
+    print(f"homeinit: {crt}: generated for {host}")
 
 
 def ensure_web_cert(web_dir: Path, ca_cert, ca_key, host: str, *, now: datetime | None = None) -> None:
@@ -223,13 +222,10 @@ def ensure_web_cert(web_dir: Path, ca_cert, ca_key, host: str, *, now: datetime 
     print(f"homeinit: {chain}: issued for {host} until {cert.not_valid_after_utc:%Y-%m-%d}")
 
 
-def ensure_emqx(emqx_dir: Path, values: dict[str, str], mqtt_dir: Path) -> None:
-    files: dict[Path, str | bytes] = {
+def ensure_emqx(emqx_dir: Path, values: dict[str, str]) -> None:
+    files = {
         emqx_dir / "bootstrap_api_keys.txt": f"{values['BROKER_API_KEY']}:{values['BROKER_API_SECRET']}\n",
         emqx_dir / "emqx.env": f"EMQX_DASHBOARD__DEFAULT_PASSWORD={values['BROKER_ADMIN_PASSWORD']}\n",
-        # Copies for EMQX's TLS listener: the originals belong to Mosquitto's user.
-        emqx_dir / "server.crt": (mqtt_dir / "server.crt").read_bytes(),
-        emqx_dir / "server.key": (mqtt_dir / "server.key").read_bytes(),
     }
     for path, text in files.items():
         if not path.exists():
@@ -322,9 +318,16 @@ def write_relay_env(
     web_port: int = DEFAULT_WEB_PORT,
     mqtt_port: int = DEFAULT_MQTT_PORT,
     beam_port: int | None = None,
+    ca_file: Path | None = None,
 ) -> None:
     """The ports are the ones the outside world dials (the router's side of a forward). `beam_port`
-    is `None` when there is no Beam listener."""
+    is `None` when there is no Beam listener. `ca_file` is the CA a pager pins; `None` has the
+    relay read it from the certificate the pager port serves."""
+    ca_lines = (
+        f"BROKER_CA_PEM_FILE={ca_file}\n"
+        if ca_file is not None
+        else "# The root of the certificate the reverse proxy serves on the pager port.\nBROKER_CA_RESOLVE=1\n"
+    )
     _write(
         path,
         "# Written by app/homeinit.py on every start, from pager.env and the PAGER_*_PORT values in\n"
@@ -332,7 +335,7 @@ def write_relay_env(
         f"PUBLIC_BASE_URL={public_base_url(host, base_path, web_port)}\n"
         f"BROKER_HOST={host}\n"
         f"BROKER_PORT={mqtt_port}\n"
-        f"BROKER_CA_PEM_FILE={data / 'certs' / 'ca' / 'ca.crt'}\n"
+        f"{ca_lines}"
         "# Empty: no Soracom Beam listener.\n"
         f"BEAM_PORT={beam_port or ''}\n"
         f"SORACOM_BEAM_DESTINATION=mqtts://{host}:{beam_port or mqtt_port}\n"
@@ -393,16 +396,26 @@ def run(
     ensure_mqtt_cert(data / "certs" / "mqtt", ca_cert, ca_key, host)
     if tls_mode == "selfsigned":
         ensure_web_cert(data / "certs" / "web", ca_cert, ca_key, host)
-    ensure_emqx(data / "emqx", values, data / "certs" / "mqtt")
+    ensure_emqx(data / "emqx", values)
     ensure_dynsec(data / "mosquitto", values)
     web_port = web_port or DEFAULT_WEB_PORT
-    mqtt_port = mqtt_port or (PROXY_MQTT_PORT if tls_mode == "proxy" else DEFAULT_MQTT_PORT)
+    mqtt_port = mqtt_port or DEFAULT_MQTT_PORT
     if tls_mode == "proxy":
-        beam = beam_port
+        beam: int | None = mqtt_port
+        pinned = data / PINNED_PUBLIC_CA
+        ca_file = pinned if pinned.exists() else None
     else:
         beam = (beam_port or DEFAULT_BEAM_PORT) if tls_mode in PUBLIC_TLS_MODES else None
+        ca_file = data / "certs" / "ca" / "ca.crt"
     write_relay_env(
-        data / "relay.env", data, host, base_path, web_port=web_port, mqtt_port=mqtt_port, beam_port=beam
+        data / "relay.env",
+        data,
+        host,
+        base_path,
+        web_port=web_port,
+        mqtt_port=mqtt_port,
+        beam_port=beam,
+        ca_file=ca_file,
     )
     print(
         f"homeinit: {data} ready for {public_base_url(host, base_path, web_port)}/ "
