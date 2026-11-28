@@ -5,6 +5,8 @@
 
 x-relay-image: &relay-image
   image: pager-relay-home:local
+  # Built here and in no registry: without this, `up` first tries to pull it and warns.
+  pull_policy: build
   build:
     context: ../relay
     additional_contexts:

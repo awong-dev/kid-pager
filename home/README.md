@@ -271,8 +271,8 @@ docker compose up -d                     # restarts only what changed
 docker image prune -f                    # drops the replaced, untagged images
 ```
 
-Plain `docker compose pull` fails with "pull access denied for
-pager-relay-home", because that image exists only on your machine.
+The relay image exists only on your machine, so it is always built, never
+pulled.
 
 ### Automatic security updates
 
