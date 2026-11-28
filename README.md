@@ -292,15 +292,32 @@ messages where the response is stuff like "almost. 5m."
 | `relay/` | FastAPI relay: webhook ingest, routing, delivery backends, admin and conversation APIs, device provisioning, authentication, retention. See `relay/README.md` to run it locally. |
 | `web/` | Next.js + MUI web app on Firebase (Auth, Firestore listeners, FCM). See `web/README.md`. |
 | `bridge-android/` | Android app that relays a member's SMS, voice and chat conversations to the relay (the bridge phone). |
-| `home/` | Docker Compose stack for running the whole service on one machine you own. See `home/README.md`. |
+| `home/` | Docker Compose stack for running the whole service on one machine you own. `setup.sh` writes its configuration. See `home/README.md`. |
 | `hardware/` | Carrier board and enclosure design files. |
 | `infra/` | Terraform for GCP (Cloud Run, Firestore, Firebase Hosting and Auth, Scheduler, Tasks, Secret Manager, Workload Identity Federation). See `infra/README.md`. |
 | `tools/` | `pager_client.py` (simulated device and server driver), `e2e_v2.py` (end-to-end suite against the local stack), `send.py`, `provision.py`, `emqx_setup.py`. |
 | `.github/workflows/` | `ci.yml` runs the relay unit tests and the end-to-end suite on push. `deploy.yml` builds the relay image and applies Terraform on a push to `main`. |
 
-## Running a local server.
+## Running your own server
 
-Run the local stack (broker, Firebase emulators and relay) and the end-to-end suite:
+The whole service runs on one machine you own, such as a Raspberry Pi, a NAS or a mini PC, with
+Docker. You need a name that points at your home (a dynamic-DNS name is fine) and a router that
+can forward ports to that machine.
+
+```bash
+cd home
+./setup.sh               # asks for your server's name, picks random ports, writes the configuration
+docker compose up -d     # builds and starts the relay, the broker and the TLS front end
+```
+
+`setup.sh` prints the ports to forward on your router and the address to open to create the first
+admin. [`home/README.md`](home/README.md) is the full runbook: certificates, sharing the machine
+with another web server, backups, automatic security updates and Soracom Beam.
+
+## Running a development stack
+
+This is for working on the code, not for real use. Run the local stack (broker, Firebase emulators
+and relay) and the end-to-end suite:
 
 ```bash
 # Start the local stack (EMQX, Firebase emulators, relay)

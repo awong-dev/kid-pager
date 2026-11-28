@@ -94,7 +94,7 @@ Two certificates, deliberately:
 
 | Listener | Certificate | Why |
 |---|---|---|
-| 443 (browsers, bridge phone, pager CA/OTA fetch) | Let's Encrypt when `TLS_MODE=letsencrypt`, else the stack's own CA | browsers need a public CA for the PWA; the pager fetches CA and firmware with validation off and trusts the hash (`DEVICE_PLAN.md` §3.3, `OTA_DESIGN.md` D3), so it accepts either |
+| 443 (browsers, bridge phone, pager CA/OTA fetch) | Let's Encrypt when `TLS_MODE=letsencrypt`, a certificate kept renewed outside the stack when `TLS_MODE=external`, else the stack's own CA | browsers need a public CA for the PWA; the pager fetches CA and firmware with validation off and trusts the hash (`DEVICE_PLAN.md` §3.3, `OTA_DESIGN.md` D3), so it accepts either |
 | 8883 (the pager) | **always** a server certificate issued by the stack's own CA, 10 years, RSA-2048 | the pager pins a CA PEM by hash. A private CA never rotates its root, so no pager is stranded by a public CA's root change (ISRG Root X1 expires in 2035, and a cross-sign change would fall back to unvalidated and require a `cfg.ca` push to every pager). The modem validates against the CA only (`WALTER_MODEM_TLS_VALIDATION_CA`), never the hostname, so the certificate's name does not matter. RSA because the only chains verified against the modem so far are RSA (DigiCert, ISRG); an ECDSA CA is a bench verification item, not an assumption. |
 
 The CA PEM is about 1.3 kB, under the 1.5 kB bundle limit that forced the pointer design, but it is

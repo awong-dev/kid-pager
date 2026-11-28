@@ -19,8 +19,6 @@ from app.store import cas as cas_store
 
 logger = logging.getLogger("relay.ca_resolve")
 
-# The broker's production (non-bootstrap) TLS listener, docs/PROTOCOL.md §6.1.
-BROKER_TLS_PORT = 8883
 _CONNECT_TIMEOUT_S = 5.0
 
 
@@ -68,12 +66,12 @@ def resolve_broker_ca(settings: Settings) -> BrokerCa | None:
         return _cached
 
     try:
-        chain_der = fetch_served_chain(settings.broker_host, BROKER_TLS_PORT)
+        chain_der = fetch_served_chain(settings.broker_host, settings.broker_port)
     except OSError as exc:
         logger.warning(
             "broker CA auto-resolve: could not connect to %s:%d (%s)",
             settings.broker_host,
-            BROKER_TLS_PORT,
+            settings.broker_port,
             exc,
         )
         _cached = None
@@ -84,7 +82,7 @@ def resolve_broker_ca(settings: Settings) -> BrokerCa | None:
         logger.warning(
             "broker CA auto-resolve: no certifi root matches the chain served by %s:%d",
             settings.broker_host,
-            BROKER_TLS_PORT,
+            settings.broker_port,
         )
     _cached = resolved
     return resolved

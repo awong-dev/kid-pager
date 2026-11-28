@@ -173,7 +173,7 @@ function NotificationsInner() {
         <Alert severity="warning">
           This server uses its own certificate, not a publicly trusted one. Browsers only deliver
           push notifications to a site whose certificate they trust, so notifications need the
-          server switched to Let&apos;s Encrypt (TLS_MODE=letsencrypt in pager.env).
+          server switched to a public certificate (TLS_MODE=letsencrypt or external in pager.env).
         </Alert>
       )}
 

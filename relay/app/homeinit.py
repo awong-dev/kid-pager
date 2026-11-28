@@ -24,7 +24,10 @@ from app.config import valid_base_path
 
 VAPID_PRIVATE, VAPID_PUBLIC = "WEBPUSH_VAPID_PRIVATE_KEY", "WEBPUSH_VAPID_PUBLIC_KEY"
 SECRET_KEYS = ("BROKER_ADMIN_PASSWORD", "WEBHOOK_KEY", "BROKER_API_KEY", "BROKER_API_SECRET")
-TLS_MODES = ("selfsigned", "letsencrypt")
+TLS_MODES = ("selfsigned", "letsencrypt", "external")
+# The modes whose web certificate a public CA signed: only these have the Soracom Beam listener.
+PUBLIC_TLS_MODES = ("letsencrypt", "external")
+DEFAULT_WEB_PORT, DEFAULT_MQTT_PORT, DEFAULT_BEAM_PORT = 443, 8883, 8884
 TEN_YEARS = timedelta(days=3650)
 WEB_CERT_DAYS = timedelta(days=825)
 WEB_CERT_RENEW_BEFORE = timedelta(days=30)
@@ -295,19 +298,48 @@ def ensure_dynsec(mosquitto_dir: Path, values: dict[str, str]) -> None:
         os.chown(path, MOSQUITTO_UID, MOSQUITTO_UID)
 
 
-def write_relay_env(path: Path, data: Path, host: str, base_path: str = "") -> None:
+def public_base_url(host: str, base_path: str, web_port: int) -> str:
+    port = "" if web_port == DEFAULT_WEB_PORT else f":{web_port}"
+    return f"https://{host}{port}{base_path}"
+
+
+def write_relay_env(
+    path: Path,
+    data: Path,
+    host: str,
+    base_path: str = "",
+    *,
+    web_port: int = DEFAULT_WEB_PORT,
+    mqtt_port: int = DEFAULT_MQTT_PORT,
+    beam_port: int | None = None,
+) -> None:
+    """The ports are the ones the outside world dials (the router's side of a forward). `beam_port`
+    is `None` when there is no Beam listener."""
     _write(
         path,
-        "# Written by app/homeinit.py on every start, from pager.env. Edit pager.env instead.\n"
-        f"PUBLIC_BASE_URL=https://{host}{base_path}\n"
+        "# Written by app/homeinit.py on every start, from pager.env and the PAGER_*_PORT values in\n"
+        "# home/.env. Edit those instead.\n"
+        f"PUBLIC_BASE_URL={public_base_url(host, base_path, web_port)}\n"
         f"BROKER_HOST={host}\n"
+        f"BROKER_PORT={mqtt_port}\n"
         f"BROKER_CA_PEM_FILE={data / 'certs' / 'ca' / 'ca.crt'}\n"
-        f"SORACOM_BEAM_DESTINATION=mqtts://{host}:8883\n"
+        "# Empty: no Soracom Beam listener.\n"
+        f"BEAM_PORT={beam_port or ''}\n"
+        f"SORACOM_BEAM_DESTINATION=mqtts://{host}:{beam_port or mqtt_port}\n"
         "# The relay's MQTT login is the dynsec admin client (BROKER_MODE=mqtt);\n"
         "# expanded from secrets.env when the relay's entrypoint sources this file.\n"
         'BROKER_MQTT_PASSWORD=${BROKER_ADMIN_PASSWORD}\n',
         0o644,
     )
+
+
+def parse_port(name: str, raw: str, default: int) -> int:
+    raw = raw.strip()
+    if not raw:
+        return default
+    if not raw.isdigit() or not 1 <= int(raw) <= 65535:
+        raise InitError(f"{name} must be a port number from 1 to 65535, not {raw!r}")
+    return int(raw)
 
 
 # Where the app is mounted when `PAGER_PATH` is unset; home/docker-compose.yml has the same default.
@@ -327,13 +359,23 @@ def normalize_base_path(raw: str) -> str:
     return value
 
 
-def run(data: Path, host: str, tls_mode: str, base_path: str = "") -> None:
+def run(
+    data: Path,
+    host: str,
+    tls_mode: str,
+    base_path: str = "",
+    *,
+    web_port: int = DEFAULT_WEB_PORT,
+    mqtt_port: int = DEFAULT_MQTT_PORT,
+    beam_port: int = DEFAULT_BEAM_PORT,
+) -> None:
     if not host:
         raise InitError("PAGER_HOST is not set; put it in pager.env (home/README.md)")
     if tls_mode not in TLS_MODES:
         raise InitError(f"TLS_MODE must be one of {TLS_MODES}, not {tls_mode!r}")
     base_path = normalize_base_path(base_path)
-    for sub in ("relay", "mosquitto", "certbot/www", "certs"):
+    # certs/external is nginx's mount point for TLS_MODE=external and must exist in every mode.
+    for sub in ("relay", "mosquitto", "certbot/www", "certs/external"):
         (data / sub).mkdir(parents=True, exist_ok=True)
     values = ensure_secrets(data / "secrets.env")
     ca_cert, ca_key = ensure_ca(data / "certs" / "ca")
@@ -342,8 +384,15 @@ def run(data: Path, host: str, tls_mode: str, base_path: str = "") -> None:
         ensure_web_cert(data / "certs" / "web", ca_cert, ca_key, host)
     ensure_emqx(data / "emqx", values)
     ensure_dynsec(data / "mosquitto", values)
-    write_relay_env(data / "relay.env", data, host, base_path)
-    print(f"homeinit: {data} ready for https://{host}{base_path}/ (TLS_MODE={tls_mode})")
+    beam = beam_port if tls_mode in PUBLIC_TLS_MODES else None
+    write_relay_env(
+        data / "relay.env", data, host, base_path, web_port=web_port, mqtt_port=mqtt_port, beam_port=beam
+    )
+    print(
+        f"homeinit: {data} ready for {public_base_url(host, base_path, web_port)}/ "
+        f"(TLS_MODE={tls_mode}, pagers on port {mqtt_port}"
+        + (f", Soracom Beam on port {beam})" if beam else ")")
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -356,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
             (os.environ.get("PAGER_HOST") or "").strip(),
             (os.environ.get("TLS_MODE") or "").strip().lower(),
             os.environ.get("PAGER_PATH") or "",
+            web_port=parse_port("PAGER_WEB_PORT", os.environ.get("PAGER_WEB_PORT", ""), DEFAULT_WEB_PORT),
+            mqtt_port=parse_port("PAGER_MQTT_PORT", os.environ.get("PAGER_MQTT_PORT", ""), DEFAULT_MQTT_PORT),
+            beam_port=parse_port("PAGER_BEAM_PORT", os.environ.get("PAGER_BEAM_PORT", ""), DEFAULT_BEAM_PORT),
         )
     except InitError as exc:
         print(f"homeinit: {exc}", file=sys.stderr)

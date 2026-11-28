@@ -103,8 +103,9 @@ thread pool) shows `FAILED moving` with the failure alert, and the kid retypes i
   `KPCAPS1:` tag (`firmware.py:111-113`, §12.3).
 - The bridge phone builds every request as the URL in use (`Mover.activeUrl`) + path; a 401 clears
   its token unless a move left it a fallback URL (`RelayClient.exec`).
-- Home compose binds 443, 8883 and the Beam port 8884 through `PAGER_HTTPS_BIND`, `PAGER_MQTTS_BIND`
-  and `PAGER_BEAM_BIND`.
+- Home compose publishes the web, pager and Beam ports as `PAGER_WEB_PORT`, `PAGER_MQTT_PORT` and
+  `PAGER_BEAM_PORT` (443, 8883 and 8884 unless set), and the relay advertises those numbers;
+  `PAGER_HTTPS_BIND`, `PAGER_MQTTS_BIND` and `PAGER_BEAM_BIND` change only the local binding.
 
 ## 3. Overview
 
@@ -194,7 +195,7 @@ every online edge. A pager that never receives it needs a setup code from the ta
 | Case | Remedy |
 |---|---|
 | The pager **holds an unfinished order** (trials failed, budget spent, or Beam not switched yet). The source page shows it acked | an adult opens the pager's Device screen and chooses **Switch to <host> now** (M11). The row exists only in a firmware build with `CONFIG_PAGER_MOVE_TRIALS`, and only while the pager holds an unfinished order. It retries at once, whatever its budget. The pager also retries by itself every 24 h on the direct bearer (M6). Works after the source is gone |
-| The pager **never got the order** (not capable, off, left behind by a Beam switch, or its order was cancelled) | a setup code from the target (`rotate-credentials`), allowed in every move state, also after the source is gone. It ends the device's move record and replaces the login. **There is no way to enter the code without a computer.** On the pager: Device screen, **Factory reset**, type the device id; the pager restarts into Setup mode. Then, on a computer connected by USB, type `setup <code>` on the serial console (MOVE_FIRMWARE_DESIGN.md §5.9). The USB port is the Walter's own USB-C on the breadboard build and the carrier's USB-C (J6) on the carrier v0.2 build (firmware/README.md, Build). The Device screen's **Set up again** row is not wired: it only says to use the USB console. A code is valid for 10 minutes. A Beam pager reaches the target only once its SIM's Beam group points there (§10) |
+| The pager **never got the order** (not capable, off, left behind by a Beam switch, or its order was cancelled) | a setup code from the target (`rotate-credentials`), allowed in every move state, also after the source is gone. It ends the device's move record and replaces the login. It is typed on the pager: Device screen, **Set up again**, `code@server`, Enter. The pager restarts, fetches the new identity and replaces the old one only once it has checked it; a failed attempt leaves the pager as it was (MOVE_FIRMWARE_DESIGN.md §5.9). A pager with no identity (after a Factory reset) takes the code as `setup <code>` on the USB serial console instead. A code is valid for 10 minutes. A Beam pager reaches the target only once its SIM's Beam group points there (§10) |
 
 The target cannot see the source's ack column (§7.3), so its page names both remedies for a pager
 not arrived (`remedy: "switch_now_or_setup"`): "check the source page: acked → Switch now; not
@@ -359,7 +360,7 @@ pw'     = 24asWQY9sAuF2T3kIJ2dIyLAETt3IZhwQ2Xd4rHc72Y
 ```
 
 `ca` is null when the target has no broker CA; `beam` is null unless `BEAM_PORT` is set (§10; the
-home stack sets it only with `TLS_MODE=letsencrypt`); `empty` is §5.4's rule; `move` becomes
+home stack sets it only with a public certificate, `TLS_MODE=letsencrypt` or `external`); `empty` is §5.4's rule; `move` becomes
 `{"id":"mv_…","imported":true}` once an import has finished (`state: "imported"`). The CA PEM itself
 is served at `ca.url` (`routers/ca.py`).
 
@@ -367,7 +368,7 @@ is served at `ca.url` (`routers/ca.py`).
 cutover check, the status page) goes through the federation client, so its outbound address rules
 apply: loopback and link-local addresses are refused, and on a cloud relay private ones too. The
 answer's own `baseUrl` must be the address asked. The target's web certificate must verify:
-- a publicly trusted certificate (`TLS_MODE=letsencrypt`, or a cloud host) needs nothing more;
+- a publicly trusted certificate (`TLS_MODE=letsencrypt` or `external`, or a cloud host) needs nothing more;
 - a certificate from the target's own CA (the home default, `TLS_MODE=selfsigned`, whose web
   certificate and broker CA both come from `data/certs/ca/ca.crt`) needs that CA: the super pastes
   it as `caPem` (optional) on preflight and on Freeze. The source keeps it in its move record and
@@ -673,13 +674,14 @@ The SIM's Beam group decides where a Beam pager goes; the relay never maps SIMs 
 which devices are on Beam from `tls: "proxy"` in their last `/status`.
 
 - **Destination.** Beam validates against a normal root store, and Beam with a private CA is not
-  verified. The target opens a second nginx `stream` listener, `BEAM_PORT` (8884), with the Let's
-  Encrypt certificate; 8883 keeps the private CA for direct pagers. Beam pagers therefore need
-  `TLS_MODE=letsencrypt` on the target. Beam orders still carry the target's 8883 host, port and CA
+  verified. The target opens a second nginx `stream` listener, `BEAM_PORT` (8884 unless
+  `PAGER_BEAM_PORT` is set), with the public certificate; the pager port keeps the private CA for
+  direct pagers. Beam pagers therefore need `TLS_MODE=letsencrypt` or `external` on the target. Beam
+  orders still carry the target's pager-port host, port and CA
   (kept by the pager for a later direct bearer).
 - **Switch Beam group** (target page, whenever the admin chooses; the source page shows which Beam
   pagers have acked). Preferred: create `pager-beam-<target host>` with destination
-  `mqtts://<host>:8884` and pass-through credentials (`soracom.ensure_group_created`,
+  `mqtts://<host>:<BEAM_PORT>` and pass-through credentials (`soracom.ensure_group_created`,
   `soracom.beam_entry`), then move every SIM in the old group into it (`soracom.list_sims` filtered by
   the old group id, `soracom.enroll`), recording which SIMs moved. The old group is left as the way
   back. Alternative: change the old group's destination. Without the Soracom key on the target, the

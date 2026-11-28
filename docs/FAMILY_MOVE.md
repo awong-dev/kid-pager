@@ -20,8 +20,7 @@ Runbook. There are two procedures:
 - **Only pagers running a build with the move option follow by themselves.** The option is
   `CONFIG_PAGER_MOVE_TRIALS`; it is off by default until the bench spike S1 of
   MOVE_FIRMWARE_DESIGN.md passes. A pager without it is never sent an order and needs a setup code
-  typed on a computer connected to it by USB (A13). Plan a person, a computer and a cable for each
-  such pager.
+  typed on the pager itself (A13). Plan a person with each such pager in hand.
 - **Nothing in flight is lost.** Pages a pager had not shown at Freeze, and pages written on the
   target before the pager arrives, are delivered on the target under their original ids. A text a
   pager sends to the frozen source is refused with a `moving` receipt and sent again to the target
@@ -51,9 +50,10 @@ Runbook. There are two procedures:
      come from `data/certs/ca/ca.crt`. You will paste that CA into the source at A4, import it into
      each person's phone and browser (home/README.md) and install it on each bridge phone as a user
      CA (A10).
-   - `TLS_MODE=letsencrypt` is required only if a pager uses Soracom Beam: it opens the Beam
-     listener on 8884 (A9).
-   - The router forwards 443 and 8883 to the target (and 8884 for Beam).
+   - A public certificate (`TLS_MODE=letsencrypt` or `external`) is required only if a pager uses
+     Soracom Beam: it opens the Beam listener (A9).
+   - The router forwards the target's web and pager ports (and the Beam port for Beam); `setup.sh`
+     on the target prints them (home/README.md, "Name and ports").
 4. **Settings the bundle cannot carry**: copy them into the target's environment by hand. The import
    report names the ones the source had set (`SORACOM_AUTH_KEY_ID`, `SORACOM_AUTH_KEY`,
    `FW_INDEX_URL`); copy any other environment key you use, such as the cell-location key, too. With
@@ -165,12 +165,12 @@ The two servers do not talk to each other, so each page shows what it knows.
 
 ## A9. Soracom Beam
 
-Only if a pager's bearer is Beam. The target needs `TLS_MODE=letsencrypt` (A2).
+Only if a pager's bearer is Beam. The target needs a public certificate, `TLS_MODE=letsencrypt` or `external` (A2).
 
 1. Wait until the source's page shows every Beam pager acked. A Beam pager that has not acked when
    the group is switched cannot reach either server and needs a setup code.
 2. Optional canary: in the Soracom console, move one SIM to a group whose destination is
-   `mqtts://<target host>:8884`, and watch that pager arrive on the target's page.
+   `mqtts://<target host>:<Beam port>` (8884 unless `PAGER_BEAM_PORT` says otherwise), and watch that pager arrive on the target's page.
 3. Target, Move page, Beam: **Switch Beam group** (target with the Soracom key: it creates the group
    `pager-beam-<target host>` and moves every SIM of the source's Beam group into it), or, after
    doing it in the console yourself, **Done, I switched it**.
@@ -225,26 +225,28 @@ be emptied, since the import accepts only an empty server). The Cancel dialog sa
 | Case | Remedy |
 |---|---|
 | The pager **holds an unfinished order** (acked on the source page; target: not arrived) | On the pager: Device screen, **Switch to <host> now**. It tries the target at once, whatever its tries so far, and shows the outcome. The row exists only on a build with the move option, and only while the pager holds an unfinished order. Works after the source is gone |
-| The pager **never got the order** (cannot move by itself, was off, its order was cancelled, or left behind by a Beam switch) | A setup code from the target, then a computer. There is **no way to do this on the pager alone**. Below |
+| The pager **never got the order** (cannot move by itself, was off, its order was cancelled, or left behind by a Beam switch) | A setup code from the target, typed on the pager. Below |
 | A bridge phone does not follow | A pair code from the target (Part B, B6 item 3) |
 | A person cannot sign in | Home: a target admin gives them an invite code or resets their password. Firebase: a sign-in link by email |
 
 **A setup code, step by step.**
-1. Have a computer with a serial terminal (for example `idf.py monitor`, `screen` or `tio`) and a USB
-   cable ready. The port: on the breadboard pager, the Walter's own USB-C; on the carrier v0.2 pager,
-   the carrier's USB-C (J6). The Walter's own port is not reachable on the carrier (firmware/README.md,
-   Build).
-2. On the pager: Device screen, **Factory reset**, type the device id shown, Enter. The pager restarts
-   in Setup mode and shows `type: setup <code>`. (The **Set up again** row only says to use the USB
-   console.)
-3. On the target's Move page, press **Issue a setup code** on the pager's row (or
+1. On the target's Move page, press **Issue a setup code** on the pager's row (or
    `POST /api/admin/devices/{deviceId}/rotate-credentials`). The code is valid for 10 minutes. If the
    answer says the broker login is manual (`brokerPush: "manual"`), apply the `manualAcl` lines on the
    broker first.
-4. On the computer, connect to the pager and type `setup <code>`. The pager fetches its identity,
-   restarts and connects to the target. A Beam pager does this through Beam, so its SIM's Beam group
-   must already point at the target.
+2. On the pager: Device screen, **Set up again**. Type the code exactly as shown, as `code@server`,
+   and press Enter. A mistyped code is refused on the spot.
+3. The pager restarts, shows `setting up again`, fetches its identity, restarts once more and
+   connects to the target. Its messages are kept. A Beam pager does this through Beam, so its SIM's
+   Beam group must already point at the target.
+4. If it fails (no coverage, an expired code), the pager shows the reason and restarts as it was.
+   Issue a new code and try again.
 5. The target's page shows the pager `reprovisioned`; send it a page to check.
+
+A pager that has been through **Factory reset** has no keyboard entry: it shows
+`type: setup <code>` and takes the code over USB from a computer with a serial terminal (for example
+`idf.py monitor`, `screen` or `tio`). The port: on the breadboard pager, the Walter's own USB-C; on
+the carrier v0.2 pager, the carrier's USB-C (J6) (firmware/README.md, Build).
 
 # Part B. Move one family
 
@@ -429,8 +431,8 @@ Work through this list. Each item is independent.
    `inspect` on the file. Sign in as one admin and look at the family page.
 2. **Each pager.** An admin creates a new setup code for the pager on the target:
    `POST /api/admin/devices/{deviceId}/rotate-credentials` (the web's Devices pages have the same
-   action). The code replaces the broker login and signing key. Enter it on the pager with a
-   Factory reset and `setup <code>` on the USB console, as in A13. The pager then uses the target's
+   action). The code replaces the broker login and signing key. Enter it on the pager with
+   **Set up again** on the Device screen, as in A13. The pager then uses the target's
    broker host and CA. Send one message from the pager and one back to confirm.
 3. **Each bridge phone.** The import clears each bridge's token, so the bridge arrives unpaired and keeps
    its id, owner, numbers, conversations and subscriptions. Create a pair code with

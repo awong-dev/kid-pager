@@ -46,9 +46,11 @@ class Settings:
     google_cloud_project: str | None
     firestore_emulator_host: str | None
     firebase_auth_emulator_host: str | None
-    # Production MQTT/TLS host for bootstrap bundles; `app/ca_resolve.py` connects to :8883
-    # to resolve the CA when BROKER_CA_PEM is unset.
+    # Where a pager reaches the broker over TLS (`BROKER_HOST`, `BROKER_PORT`): written into setup
+    # codes and move orders. `app/ca_resolve.py` connects there to resolve the CA when
+    # BROKER_CA_PEM is unset.
     broker_host: str = "localhost"
+    broker_port: int = 8883
     # The broker CA PEM; wins over auto-resolve. Empty: `app/ca_resolve.py` looks it up;
     # if that fails, bundles carry no `ca`.
     broker_ca_pem: str | None = None
@@ -101,7 +103,7 @@ class Settings:
     # `TLS_MODE=selfsigned` it defaults to `BROKER_CA_PEM`. Unset: invites carry no `ca`.
     fed_ca_pem: str | None = None
     # The TCP port of the extra TLS listener a Soracom Beam pager reaches (`BEAM_PORT`; the home stack
-    # sets it only with `TLS_MODE=letsencrypt`). `None`: no Beam listener.
+    # sets it only when its web certificate is a public one). `None`: no Beam listener.
     beam_port: int | None = None
 
     @property
@@ -144,6 +146,7 @@ class Settings:
             firestore_emulator_host=os.environ.get("FIRESTORE_EMULATOR_HOST") or None,
             firebase_auth_emulator_host=os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or None,
             broker_host=os.environ.get("BROKER_HOST", "localhost"),
+            broker_port=_port("BROKER_PORT", os.environ.get("BROKER_PORT", "")) or 8883,
             broker_ca_pem=os.environ.get("BROKER_CA_PEM") or _read_pem_file(os.environ.get("BROKER_CA_PEM_FILE")),
             public_base_url=(os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/") or None,
             push_backend=os.environ.get("PUSH_BACKEND", "null").strip().lower(),
@@ -179,7 +182,7 @@ class Settings:
                 if tls_mode() == "selfsigned"
                 else None
             ),
-            beam_port=_beam_port(os.environ.get("BEAM_PORT", "")),
+            beam_port=_port("BEAM_PORT", os.environ.get("BEAM_PORT", "")),
         )
 
 
@@ -193,7 +196,7 @@ def auth_backend() -> AuthBackend:
 
 
 def tls_mode() -> str:
-    """`TLS_MODE` (`public`, `selfsigned` or `letsencrypt`), exposed on `GET /api/me`."""
+    """`TLS_MODE` (`public`, `selfsigned`, `letsencrypt` or `external`), exposed on `GET /api/me`."""
     return (os.environ.get("TLS_MODE") or "").strip().lower() or "public"
 
 
@@ -229,16 +232,16 @@ def _fw_cache(raw: str) -> FwCache:
     return value  # type: ignore[return-value]
 
 
-def _beam_port(raw: str) -> int | None:
+def _port(name: str, raw: str) -> int | None:
     raw = raw.strip()
     if not raw:
         return None
     try:
         value = int(raw)
     except ValueError:
-        raise ValueError(f"BEAM_PORT must be a port number, not {raw!r}") from None
+        raise ValueError(f"{name} must be a port number, not {raw!r}") from None
     if not 1 <= value <= 65535:
-        raise ValueError(f"BEAM_PORT must be a port number, not {raw!r}")
+        raise ValueError(f"{name} must be a port number, not {raw!r}")
     return value
 
 

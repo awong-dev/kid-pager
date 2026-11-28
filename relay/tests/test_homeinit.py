@@ -59,6 +59,8 @@ def test_first_run_creates_the_layout(tmp_path: Path):
     assert relay_env == {
         "PUBLIC_BASE_URL": "https://pager.example.org/kid-pager",
         "BROKER_HOST": "pager.example.org",
+        "BROKER_PORT": "8883",
+        "BEAM_PORT": "",
         "BROKER_CA_PEM_FILE": str(tmp_path / "certs/ca/ca.crt"),
         "SORACOM_BEAM_DESTINATION": "mqtts://pager.example.org:8883",
         "BROKER_MQTT_PASSWORD": "${BROKER_ADMIN_PASSWORD}",
@@ -200,4 +202,58 @@ def test_main_reads_pager_path_from_the_environment(tmp_path: Path, monkeypatch:
     assert homeinit.main(["--data", str(tmp_path)]) == 0
     assert (
         homeinit._read_env(tmp_path / "relay.env")["PUBLIC_BASE_URL"] == "https://pager.example.org/kid-pager"
+    )
+
+
+def test_public_ports_reach_the_relay_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    homeinit.run(
+        tmp_path, "home.example.org", "external", "/kid-pager", web_port=24492, mqtt_port=23093, beam_port=30265
+    )
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert env["PUBLIC_BASE_URL"] == "https://home.example.org:24492/kid-pager"
+    assert env["BROKER_PORT"] == "23093"
+    assert env["BEAM_PORT"] == "30265"
+    assert env["SORACOM_BEAM_DESTINATION"] == "mqtts://home.example.org:30265"
+    # external: the web certificate is someone else's, and its mount point exists for nginx
+    assert not (tmp_path / "certs/web").exists()
+    assert (tmp_path / "certs/external").is_dir()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    settings = Settings.from_env()
+    assert (settings.broker_host, settings.broker_port, settings.beam_port) == ("home.example.org", 23093, 30265)
+    assert settings.base_path == "/kid-pager"
+
+
+def test_selfsigned_has_no_beam_port_and_default_ports_are_not_written_into_the_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    homeinit.run(tmp_path, "home.example.org", "selfsigned", "/", mqtt_port=23093)
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert env["PUBLIC_BASE_URL"] == "https://home.example.org"
+    assert env["BEAM_PORT"] == ""
+    assert env["SORACOM_BEAM_DESTINATION"] == "mqtts://home.example.org:23093"
+    monkeypatch.setenv("BEAM_PORT", "8884")  # a stale value must not survive relay.env
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert Settings.from_env().beam_port is None
+
+
+@pytest.mark.parametrize("raw", ["0", "65536", "https", "-1", "88 83"])
+def test_a_bad_port_exits_nonzero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str):
+    monkeypatch.setenv("PAGER_HOST", "home.example.org")
+    monkeypatch.setenv("TLS_MODE", "selfsigned")
+    monkeypatch.setenv("PAGER_MQTT_PORT", raw)
+    assert homeinit.main(["--data", str(tmp_path)]) == 1
+
+
+def test_main_reads_the_ports_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PAGER_HOST", "home.example.org")
+    monkeypatch.setenv("TLS_MODE", "letsencrypt")
+    monkeypatch.setenv("PAGER_WEB_PORT", "24492")
+    monkeypatch.setenv("PAGER_MQTT_PORT", "23093")
+    monkeypatch.setenv("PAGER_BEAM_PORT", "30265")
+    assert homeinit.main(["--data", str(tmp_path)]) == 0
+    env = homeinit._read_env(tmp_path / "relay.env")
+    assert (env["PUBLIC_BASE_URL"], env["BROKER_PORT"], env["BEAM_PORT"]) == (
+        "https://home.example.org:24492/kid-pager", "23093", "30265",
     )

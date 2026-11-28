@@ -11,6 +11,12 @@ map $ssl_server_name $pager_le_fullchain {
 map $ssl_server_name $pager_le_privkey {
     default /data/certs/letsencrypt/live/pager/privkey.pem;
 }
+map $ssl_server_name $pager_ext_fullchain {
+    default /data/certs/external/fullchain.pem;
+}
+map $ssl_server_name $pager_ext_privkey {
+    default /data/certs/external/privkey.pem;
+}
 
 # PAGER_PATH (a prefix such as /kid-pager, or empty for the root) is where the app is mounted. $pager_uri is the
 # request with the prefix removed, exactly as the client encoded it and with its query string
@@ -29,7 +35,7 @@ server {
         root /var/www/certbot;
     }
     location / {
-        return 301 https://$host$request_uri;
+        return 301 https://$host${PAGER_WEB_PORT_SUFFIX}$request_uri;
     }
 }
 

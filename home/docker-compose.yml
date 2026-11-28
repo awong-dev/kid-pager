@@ -1,7 +1,13 @@
 # The home server stack.
-#   docker compose up -d
+#   ./setup.sh && docker compose up -d
 # Mosquitto with dynamic-security; the relay is its one MQTT client (BROKER_MODE=mqtt).
 # Everything worth backing up lives in ./data. PAGER_DATA_DIR and PAGER_ENV_FILE move it and pager.env.
+#
+# Ports (home/.env, written by setup.sh). PAGER_WEB_PORT, PAGER_MQTT_PORT and PAGER_BEAM_PORT are the
+# ports the outside world dials: they are published on this machine and written into the links,
+# setup codes and move orders the relay hands out. Unset, they are 443, 8883 and 8884.
+# PAGER_HTTPS_BIND, PAGER_MQTTS_BIND and PAGER_BEAM_BIND change only where this machine listens, for
+# a router that forwards to another port or a web server in front (e.g. 127.0.0.1:8443).
 
 name: pager-home
 
@@ -28,6 +34,10 @@ services:
     <<: *relay-image
     command: ["python", "-m", "app.homeinit"]
     env_file: ["${PAGER_ENV_FILE:-pager.env}"]
+    environment:
+      PAGER_WEB_PORT: ${PAGER_WEB_PORT:-443}
+      PAGER_MQTT_PORT: ${PAGER_MQTT_PORT:-8883}
+      PAGER_BEAM_PORT: ${PAGER_BEAM_PORT:-8884}
     volumes:
       - ${PAGER_DATA_DIR:-./data}:/data
     restart: "no"
@@ -39,13 +49,6 @@ services:
       init:
         condition: service_completed_successfully
     env_file: ["${PAGER_ENV_FILE:-pager.env}"]
-    # BEAM_PORT (the Soracom Beam port move-info advertises) is set only with TLS_MODE=letsencrypt,
-    # the one mode where nginx listens on it; pager.env may override the number.
-    entrypoint:
-      - /bin/sh
-      - -c
-      - set -a && . /data/secrets.env && . /data/relay.env && set +a && if [ "$$TLS_MODE" = letsencrypt ]; then export BEAM_PORT="$${BEAM_PORT:-8884}"; else unset BEAM_PORT; fi && exec "$$@"
-      - --
     environment:
       DB_BACKEND: sqlite
       AUTH_BACKEND: home
@@ -71,7 +74,8 @@ services:
       timeout: 5s
       retries: 30
 
-  # TLS edge: 443 -> relay, 8883 -> broker, 80 -> redirect + ACME. Reloads every 6 h for renewed certificates.
+  # TLS edge: 443 -> relay, 8883 -> broker, 80 -> redirect + ACME, inside the container; the
+  # published ports are below. Reloads every 6 h for renewed certificates.
   # `stable-alpine` follows nginx's supported stable branch, so update.sh picks up its security
   # fixes; a branch tag such as 1.28 stops being rebuilt when that branch ends.
   nginx:
@@ -80,7 +84,8 @@ services:
       - /bin/sh
       - -c
       # PAGER_PATH as `init` reads it for the relay: /kid-pager when unset, and "/" (the root) becomes "".
-      - PAGER_PATH="$${PAGER_PATH:-/kid-pager}" && export PAGER_PATH="$${PAGER_PATH%/}" && mkdir -p /etc/nginx/http.d && { (while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'; }
+      # PAGER_WEB_PORT_SUFFIX: ":port" for the port-80 redirect to https, empty on 443.
+      - PAGER_PATH="$${PAGER_PATH:-/kid-pager}" && export PAGER_PATH="$${PAGER_PATH%/}" && if [ "$$PAGER_WEB_PORT" = 443 ]; then export PAGER_WEB_PORT_SUFFIX=""; else export PAGER_WEB_PORT_SUFFIX=":$$PAGER_WEB_PORT"; fi && mkdir -p /etc/nginx/http.d && { (while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'; }
     depends_on:
       init:
         condition: service_completed_successfully
@@ -89,24 +94,26 @@ services:
     env_file: ["${PAGER_ENV_FILE:-pager.env}"]
     environment:
       MQTT_UPSTREAM: mosquitto:1883
+      PAGER_WEB_PORT: ${PAGER_WEB_PORT:-443}
       # Only these are substituted; nginx's own $vars are left alone.
-      NGINX_ENVSUBST_FILTER: ^(TLS_MODE|MQTT_UPSTREAM|PAGER_PATH)$$
+      NGINX_ENVSUBST_FILTER: ^(TLS_MODE|MQTT_UPSTREAM|PAGER_PATH|PAGER_WEB_PORT_SUFFIX)$$
       # Not conf.d/: the image's default server there would answer port 80.
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/http.d
-    # PAGER_HTTP_BIND / PAGER_HTTPS_BIND (shell or home/.env) move the web ports when another web
-    # server owns 80 and 443 on this machine, e.g. PAGER_HTTPS_BIND=127.0.0.1:8443.
-    # PAGER_MQTTS_BIND and PAGER_BEAM_BIND do the same for 8883 and 8884.
     ports:
-      - "${PAGER_HTTP_BIND:-80}:80"
-      - "${PAGER_HTTPS_BIND:-443}:443"
-      - "${PAGER_MQTTS_BIND:-8883}:8883"
-      # Listens only with TLS_MODE=letsencrypt (Soracom Beam, README.md).
-      - "${PAGER_BEAM_BIND:-8884}:8884"
+      # Port 80 is only for Let's Encrypt's HTTP check and the redirect to https. Unset, it is
+      # published on a throwaway loopback port; TLS_MODE=letsencrypt needs PAGER_HTTP_BIND=80.
+      - "${PAGER_HTTP_BIND:-127.0.0.1:}:80"
+      - "${PAGER_HTTPS_BIND:-${PAGER_WEB_PORT:-443}}:443"
+      - "${PAGER_MQTTS_BIND:-${PAGER_MQTT_PORT:-8883}}:8883"
+      # Listens only with a public certificate (Soracom Beam, README.md).
+      - "${PAGER_BEAM_BIND:-${PAGER_BEAM_PORT:-8884}}:8884"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/templates:/etc/nginx/templates:ro
       - ./nginx/snippets:/etc/nginx/snippets:ro
       - ${PAGER_DATA_DIR:-./data}/certs:/data/certs:ro
+      # TLS_MODE=external: a directory holding fullchain.pem and privkey.pem that something else renews.
+      - ${PAGER_CERT_DIR:-${PAGER_DATA_DIR:-./data}/certs/external}:/data/certs/external:ro
       - ${PAGER_DATA_DIR:-./data}/certbot/www:/var/www/certbot:ro
     restart: unless-stopped
 

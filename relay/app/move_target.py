@@ -139,7 +139,7 @@ def info(settings: Settings) -> dict[str, Any]:
         "schemaVersion": familyexport.SCHEMA_VERSION,
         "relayVersion": familyexport.relay_version(),
         "baseUrl": settings.public_base_url,
-        "broker": {"host": settings.broker_host, "port": ca_resolve.BROKER_TLS_PORT},
+        "broker": {"host": settings.broker_host, "port": settings.broker_port},
         "ca": ca,
         "beam": (
             {"host": settings.broker_host, "port": settings.beam_port}

@@ -7,7 +7,7 @@ map $protocol $mqtt_upstream {
     default ${MQTT_UPSTREAM};
 }
 
-# TLS_MODE=letsencrypt adds the 8884 listener; selfsigned adds nothing.
+# A public-certificate mode (letsencrypt, external) adds the 8884 listener; selfsigned adds nothing.
 include /etc/nginx/snippets/beam-${TLS_MODE}.conf;
 
 server {
