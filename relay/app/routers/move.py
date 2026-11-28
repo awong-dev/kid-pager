@@ -126,11 +126,15 @@ class BeamSwitchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     byHand: bool = False
+    # Switch although Beam pagers have still to arrive from the old server.
+    force: bool = False
 
 
 @router.post("/beam/switch", dependencies=[Depends(require_admin_write_rate_limit)])
 def beam_switch(request: Request, req: BeamSwitchRequest | None = None) -> dict:
-    return move_target.beam_switch(request.app.state.settings, by_hand=bool(req and req.byHand))
+    return move_target.beam_switch(
+        request.app.state.settings, by_hand=bool(req and req.byHand), force=bool(req and req.force)
+    )
 
 
 @router.post("/beam/switch-back", dependencies=[Depends(require_admin_write_rate_limit)])

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from app import (
     alerts,
+    bearer_try,
     book,
     devauth,
     devcfg,
@@ -995,6 +996,7 @@ class Ingest:
                 k
                 for k, v in (
                     ("mvc", env.mvc),
+                    ("brc", env.brc),
                     ("battMv", env.batt_mv),
                     ("tempDc", env.temp_dc),
                     ("assetsSrc", env.ast),
@@ -1022,6 +1024,7 @@ class Ingest:
             gnss=env.gnss,
             mb=env.mb,
             mvc=env.mvc,
+            brc=env.brc,
             car=env.car,
             smsLost=env.sms_lost,
             link=env.link,
@@ -1105,6 +1108,7 @@ class Ingest:
             self._republish_unacked(device_id, arriving=move_target.waiting_for_arrival(device))
         move_target.note_bearer(device, env)
         move_target.note_report(device, env, data.get("n"), self._broker, self._settings)
+        bearer_try.note_report(device, env, self._broker)
 
         # docs/PROTOCOL.md §5.3/§3.7: bump a zero `bookVersion` to 1 and publish, else re-nudge if
         # the reported `bv` is behind. `bv` comes from the raw dict (`StatusEnvelope` lacks it).

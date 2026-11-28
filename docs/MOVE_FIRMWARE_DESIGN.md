@@ -9,7 +9,7 @@ source had not delivered, from the export, and the pager keeps the texts the fro
 sends them once it arrives (§6). The move is best effort: the source may be shut down at any time, a
 pager keeps trying both servers until it commits, and a straggler is fixed by hand on the pager
 (§5.8) or with a setup code typed on the pager (§5.9). This document is the firmware side. The server side (stages, freeze, export and import,
-the bridge redirect, the Beam group switch) and the authoritative wire contract are in
+the bridge redirect) and the authoritative wire contract are in
 [MOVE_DESIGN.md](MOVE_DESIGN.md); where they differ on the wire, MOVE_DESIGN.md wins and this file is
 corrected.
 "Estimate" means not measured, with the assumption stated. Line references in §2.2, §2.4 and §2.5,
@@ -23,22 +23,25 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
 
 - **In the tree:** §9's counter and identity fixes; the identity slots, seal, selector and `auth/epoch` (§4,
   `ident.c`); the move module (`move.c`: parser, derivation, record, ledger, boot repair, plan,
-  back-off, alternation; `move_svc.c`: orders, cancels, proofs, the in-boot trial of §5.2, the Beam
-  rules, §5.7, the Device-screen action); the reply hold and the `moving` re-queue (`msg.c`,
+  back-off, alternation; `move_svc.c`: orders, cancels, proofs, the in-boot trial of §5.2, the move
+  off Beam of §5.3, §5.7, the Device-screen action); the bearer change `cfg.br` (§5.10, `bearer_try.c`:
+  parser, request record, boot repair, decisions; `bearer_try_svc.c`: the attempts on Beam); the
+  bearer selection in RAM (`net.cpp` `net_bearer_select()`); the reply hold and the `moving` re-queue (`msg.c`,
   `sms.c`); the capability tag and the install check (`caps.c`, `ota.c`); the Device-screen rows
   (`scr_device.c`, `move_ui_fmt.c`). The trial by restart (§5.4) is not built.
 - **The option `CONFIG_PAGER_MOVE_TRIALS`** (`main/Kconfig.projbuild`, default off) decides whether a
-  build takes part in a move. **With it**, the pager advertises `mvc`, stores orders, holds replies
-  for them, runs trials, the Beam rules and §5.7, and shows the Device-screen move rows. **Without
-  it**, the pager never advertises `mvc`; an order is acked and refused with `fail`/`rej` and leaves
+  build takes part in a move. **With it**, the pager advertises `mvc` and `brc`, stores orders, holds replies
+  for them, runs trials (from Beam too, §5.3) and §5.7, acts on `cfg.br` (§5.10), and shows the
+  Device-screen move rows. **Without
+  it**, the pager never advertises `mvc` or `brc`; `cfg.br` is left alone like an unknown `cfg` key; an order is acked and refused with `fail`/`rej` and leaves
   nothing stored; no reply is held for a move record; and at boot an unfinished order stored by an
   earlier image is turned into `fail`/`rej` and its pending slot and CA URL dropped
   (`move_boot_refuse_unsettled()`). Both kinds of build handle cancels and proofs, keep the ledger,
   hold a reply re-queued by a `moving` receipt for 24 h (§6.2), embed the capability tag (M15) and
   run the install check (§7). The option stays off until spike S1 passes.
 - **Tests:** the host suite (`make -C firmware/host test`) covers the module in both builds
-  (`test_move`, `test_move_svc`, `test_move_svc_off`, `test_ident`, on the NVS fake
-  `host/nvs_fake.c`) and passes. **No bench item of §11 has been run**, spikes included.
+  (`test_move`, `test_move_svc`, `test_move_svc_off`, `test_bearer_try`, `test_bearer_try_svc`,
+  `test_ident`, `test_carrier`, on the NVS fake `host/nvs_fake.c`) and passes. **No bench item of §11 has been run**, spikes included.
 - Relies on the relay re-signing every `/down` re-publish with a fresh `n` (G8).
 
 ## 1. Decisions
@@ -51,15 +54,16 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
 | M3 Order | `/down` `kind:"cfg"`, `cfg.mv` (cfg sub-key 7). Order and cancel come from the **source** relay, signed under `k` like any `cfg` push; the source keeps accepting `/status` and acks while frozen and can re-send the order or send a cancel while it is up. The proof comes from the **target**, which never signs under `k`: it uses only `k'`, with a fresh down window. Shapes: order `{id,host,port[,ca]}`, cancel `{id,cancel:true}`, proof `{id,ok:N}`. Acked `shown` on accept or reject; outcomes travel in `/status` `mv`. |
 | M4 Commit proof | The pager connects with the pending identity, publishes `/status` signed with `k'` carrying `mv{id,st:"try"}`, and commits only when it receives `cfg.mv{id, ok:N}` signed with `k'` with `N >= n_first`, where `n_first` is the first up `n` drawn on this trial session. CONNACK/SUBACK alone never commits (§2.6). |
 | M5 Commit point | One NVS write: `idsel/act` (u8). Everything before it is reversible; everything after it is repair (§4). |
-| M6 Budget (direct) | Scheduled trials at +0, +10 min, +60 min, +6 h. After them `st=fail`, `rsn=budget`, and a background trial every 24 h for as long as the move is unsettled (§5.7). There is **one move id for the whole move**: a failed pager is never sent a new order, it retries by itself and through the Device-screen action (§5.8). The source re-sending the same order changes nothing (M12). |
-| M7 Beam | The pager cannot choose the broker, and the admin switches the Beam group whenever they choose, seconds or weeks after a pager's ack; a switch-back happens only while no Beam pager has committed (MOVE_DESIGN.md). The pager makes one prompt attempt on the pending login 120 s after the ack, then stays on the active login in normal operation and alternates logins on refusal for as long as the move is unsettled, with a deliberate reconnect probe (60 min for 7 days, then 4 h) in case Beam keeps the old upstream session (§5.3). The pending login is kept until commit, cancel or a Factory reset (§5.9). Each broker accepts exactly one login set. |
-| M8 CA | The order's `ca` is a pointer to the **target's** `https://<public base>/ca/<sha>.pem` (the base may carry a path prefix). Fetched before any disconnect; a failure is `fail/ca` on the direct bearer, non-fatal on Beam. No trust downgrade: an unpinned order is accepted only when the active identity is itself unpinned. |
+| M6 Budget | Scheduled trials at +0, +10 min, +60 min, +6 h. After them `st=fail`, `rsn=budget`, and a background trial every 24 h for as long as the move is unsettled (§5.7). There is **one move id for the whole move**: a failed pager is never sent a new order, it retries by itself and through the Device-screen action (§5.8). The source re-sending the same order changes nothing (M12). |
+| M7 Beam | Beam's group decides which broker a Beam session reaches, so a pager cannot follow an order through Beam. A pager on Beam therefore runs the same trial as a direct one (§5.2): it leaves Beam in RAM, dials the order's `host`:`port` with TLS and the order's CA, and waits for the proof. A failed trial ends on the active identity over Beam again. The commit stores the bearer choice `direct` (NVS `carrier/bearer`) with the new identity (§4), and the pager stays direct until the target's `cfg.br` brings it back (M16). Nobody touches the Soracom group for a move. |
+| M8 CA | The order's `ca` is a pointer to the **target's** `https://<public base>/ca/<sha>.pem` (the base may carry a path prefix). Fetched before any disconnect; a failure is `fail/ca` on either bearer. No trust downgrade: an unpinned order is accepted only when the active identity is itself unpinned **and the pager is on the direct bearer**; on Beam it is refused with `down` (§5.3). |
 | M9 Replies | From the moment an order is stored until a commit or a cancel, replies (`pending_up`) and `sms_log` audit entries are **held** on the pager and sent after it arrives at the target; acks, `/status` and `/loc` are not held. A reply the frozen source refused before the order arrived comes back as a `moving` receipt and is re-queued under the same id (§6.2). |
 | M10 OTA | At commit, stored OTA/font jobs in state `wait` are cancelled (`ota_st` reported, the target re-issues). A move order is deferred (no ack) while an OTA/font download or any `cafetch` runs. |
 | M11 UI | Nothing for the kid. On the adult Device screen, in a build with `CONFIG_PAGER_MOVE_TRIALS` only: a `Server:` row with the move state, and an action `Switch to <host> now` whenever a move order is held and not committed (§5.8). No on-device cancel. |
 | M12 Ledger | The current move id and the last 4 finished ids with their outcomes are kept in NVS. An order with the **current** id, in any state including `fail`, is acked and otherwise ignored: nothing is reset, nothing is logged as a replay, and the background retry and the manual action keep working for that id. An order whose id is a finished one (`ok`, `cxl`) is acked and ignored the same way. |
 | M13 Reachability | While a move is unsettled, losing the session never leaves the pager on one identity: connect attempts alternate between the active and the pending identity on a long-run backoff that falls to one attempt per 30 min (§5.7). Neither identity is discarded until a commit, a cancel or a Factory reset. |
-| M14 Setup code | A pager that never got the order is set up with a code from the target, typed on the pager: Device screen, **Set up again**. Setup erases `ident`, `ident1`, `idsel` and `move` and zeroes the RTC down window only once the new identity is fetched and checked, so a failed attempt leaves the pager as it was (§5.9). |
+| M16 Bearer change | `cfg.br` (cfg sub-key 8) from the pager's own server asks a pager that left Beam to try it again. The stored bearer choice stays `direct` for the whole try; an attempt selects Beam in RAM only, with the same login and key, and Beam becomes the stored choice again only on a signed proof received over Beam. Three attempts, counted in NVS before each starts; without a proof the pager is on the direct bearer after any failure, timeout or reset (§5.10). |
+| M14 Setup code | A pager that never got the order is set up with a code from the target, typed on the pager: Device screen, **Set up again**. Setup erases `ident`, `ident1`, `idsel`, `move` and `brtry` and zeroes the RTC down window only once the new identity is fetched and checked, so a failed attempt leaves the pager as it was (§5.9). |
 
 ## 2. Facts the design rests on
 
@@ -80,7 +84,7 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
 - `ident_t` holds a PEM buffer of `IDENT_CA_MAX` = 4000 bytes, the NVS string limit, so
   `ident_load()` uses the shared scratch. `ident_alt_t` (host, port, `mqtt_pw`, `kdev`, `ca_hash`)
   holds the pending slot in RAM.
-- `ident_erase()` erases `idsel`, `move`, `ident1` and `ident`, in that order. It is called by the
+- `ident_erase()` erases `brtry`, `idsel`, `move`, `ident1` and `ident`, in that order. It is called by the
   Device screen's **Factory reset** and by `setup.c` before it stores a new identity (§5.9).
 - NVS partition: 24 kB, the first row of `partitions.csv`; it cannot grow over the air.
 
@@ -109,6 +113,15 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
   the TLS-fail fallback (`modes.c:1570-1604`). catrust already suppresses the first three with
   `s_ca_apply_suppress` (`modes.c:246-254`) and the fourth with `catrust_apply_in_progress()`
   (`modes.c:1573`).
+- The bearer is resolved at each attach from the SIM's carrier preset and NVS `carrier/bearer`
+  (`effective_apn()`, `carrier_bearer_resolve()`); `net_bearer_beam()` is what `configure_session()`
+  (profile 0 or 2) and `lte_session_up()` (Beam's host or the identity's) read. `net_bearer_select()`
+  forces direct or Beam in RAM over that stored choice, for the sessions configured after it; a
+  reset, or a modem recover with its new attach, leaves NVS as the only source again. Beam is honoured
+  only when the preset names it, forced or not, so the MQTT password never leaves in clear on another
+  operator's network. The PDP context, the APN and the keepalive (the Soracom preset's 1200 / 840 s)
+  are the same on both bearers. **A change of TLS profile number (0 ↔ 2) and of host between two
+  `mqttConfig` calls in one power cycle has never run** (spike S5).
 - Failure classes: `classify_mqtt_rc()` (`xport_lte.cpp:205-223`) maps AUTH/REFUSED/ACL to
   PERMANENT, TLS to TLS_FAIL, the rest to TRANSIENT.
 
@@ -148,8 +161,8 @@ broker** = the one the pending identity reaches. `k` = the active HMAC key, `k'`
 
 ### 2.6 Why the proof and not CONNACK
 
-- On Beam the CONNACK may be Beam's own; whether Beam passes an upstream refusal through is
-  unverified (S4).
+- A `cfg.br` attempt (§5.10) connects through Beam, where the CONNACK may be Beam's own; whether Beam
+  passes an upstream refusal through is unverified (S4).
 - On an unpinned target any server can CONNACK.
 - A broker can accept the login while its rule engine or the relay is broken. The proof is the only
   thing that shows the whole loop (broker → relay → REST publish → broker → pager) works.
@@ -184,12 +197,17 @@ Shape rules: an order has `host` and `port` and neither `cancel` nor `ok`; a can
 | 77 | `mvc` | uint `1` | every online `/status` when M1 holds; CBOR and JSON |
 | 78 | `mv` | map `{id=0 tstr, st=1 tstr, rsn=2 tstr ≤ 8 B, at=3 uint 0–255}` | while a move record exists (the last terminal record is kept); **CBOR only**, like `bs`: in JSON it would take the every-field `/status` over 640 bytes. The firmware emits `/status` only in CBOR (`modes.c` `build_status_cbor()`), so nothing changes on the device |
 
-`st`: `pend` (stored, waiting for a trial or for the Beam destination switch), `try` (on the new broker, waiting for
+`st`: `pend` (stored, waiting for a trial), `try` (on the new broker, waiting for
 the proof), `ok`, `fail`, `cxl`. `rsn` (with `fail`, or with `pend` after a failed trial): `ca` (fetch
 or hash), `tls` (handshake or validation), `auth` (login refused), `conn` (no SUBACK within the guard,
 DNS, closed port), `proof` (session up, no proof), `budget` (last trial used), `nvs`, `rej` (refused at
 parse: not signing, pending verify, bad host), `down` (trust downgrade), `busy` (internal). `at` =
-trials started for this id (on Beam: attempts on the pending login), saturating at 255.
+trials started for this id, saturating at 255.
+
+`cfg` sub-key **8** `br` (map), §5.10: try `{id=0 tstr, b=1 tstr "beam"}`, proof `{id=0, ok=2 bool true}`;
+anything else is malformed. `/status` key **79** `brc` (uint `1`, sent whenever `mvc` is) and key **80**
+`br` (map `{id=0 tstr, st=1 tstr, rsn=2 tstr}`, CBOR only, while a request is held): `st` is `try`,
+`ok`, `fail` or `na`; `rsn` goes with `fail` only: `conn`, `auth`, `proof`.
 
 ## 4. NVS layout and atomic commit
 
@@ -200,13 +218,17 @@ trials started for this id (on Beam: attempts on the pending login), saturating 
 | `idsel/act` | u8 | **commit point**: active slot, absent = 0 |
 | `auth/epoch` | u32 | up-counter epoch, per device; mirrored into slot 0's `n_epoch32` |
 | `move/st` | blob ≤ 160 B | move record (below) |
+| `carrier/bearer` | u8 | the stored bearer choice: absent = automatic (the preset's), 1 = direct, 2 = Beam (honoured on a Beam preset only). Written by a commit from Beam (`direct`), by a `cfg.br` proof (erased) and by the `bearer` console command |
+| `brtry/st` | blob 21 B | `cfg.br` request record: `ver`, `id[17]`, `st`, `rsn`, `at` (§5.10) |
 
 - A slot is valid only if `seal` is present and non-zero and `ident_load()`'s existing checks pass.
   Slot 0 with no `seal` is accepted (migration: every pager from before the identity slots has one), and `seal=1` is written
   once at first boot.
 - Move record (`move_rec_t`): `ver`, `id[17]`, `st`, `rsn`, `lrsn` (the last failed trial's reason,
   for the Device screen), `at`, `sched` (scheduled trials started), `slot` (the pending slot index),
-  `bearer` (direct/beam at the time of the order), `acked`, `tb` (trial-by-restart armed, §5.4),
+  `bearer` (1 = the order was taken on Beam, so the commit stores the bearer choice `direct`; in an
+  `ok` record 0 = stored, 2 = that write is still owed; a 1 left in an `ok` record by firmware that
+  moved through Beam's group asks for nothing), `acked`, `tb` (trial-by-restart armed, §5.4),
   `next_try_ts` (epoch s, 0 = no clock), `ack_ts`, `ca_sha[32]` (0s = unpinned), ledger `ids[4][17]`
   + `out[4]`. The order's CA URL is kept beside it (`move_url_load()`).
 - **Epoch.** At boot the epoch is the higher of `auth/epoch` and slot 0's `n_epoch32` (or the legacy
@@ -216,8 +238,8 @@ trials started for this id (on Beam: attempts on the pending login), saturating 
   `n` this image drew, and a return to this image picks up whatever that one bumped. The epoch is per
   device, not per identity: it keeps rising across moves.
 - Pending slot contents: `dev_id`, `apn`, `flags`, `label`, `claimed` copied; `mqtt_pw = pw'`,
-  `kdev = k'`; `host`, `port` from the order; `ca`/`ca_hash` from the fetched PEM (empty if unpinned
-  or the Beam fetch failed).
+  `kdev = k'`; `host`, `port` from the order; `ca`/`ca_hash` from the fetched PEM (empty if unpinned,
+  or after `fail/ca` until the PEM is fetched again).
 - Space: one more slot is about 2 kB with an RSA-2048 root of ~1.2–1.3 kB PEM (estimate: ~1.3 kB PEM +
   ~0.4 kB fields + 32 B per entry). Measured with `nvsstats` before and after (B10).
 - RAM: no second `ident_t`. `ident.c` keeps the active one in `ident_t` and a small `ident_alt_t`
@@ -229,8 +251,19 @@ trials started for this id (on Beam: attempts on the pending login), saturating 
 **Write order for an accepted order:** record `st=recv` → write the inactive slot's keys → its `seal`
 → record `st=pend, acked=0` → ack `shown` → record `acked=1` after the ack's modem OK.
 
-**Commit:** `idsel/act = slot` → record `st=ok`, ledger entry → write the PEM to modem slot 12 and
-point profile 2 at it → ack the proof → `/status mv ok`.
+**Commit:** `idsel/act = slot` → if the order was taken on Beam, `carrier/bearer = direct` → record
+`st=ok` (`bearer` 0), ledger entry → drop the `cfg.br` record (it came from the server the pager left)
+→ write the PEM to modem slot 12 and point profile 2 at it → ack the proof → `/status mv ok`.
+
+**A move from Beam and the two writes.** `idsel/act` and `carrier/bearer` are separate NVS entries, so
+one can be written without the other. The order above, with the record as the witness, gives two
+reachable states and no third: before `act`, the old identity with the bearer choice untouched (Beam);
+after `act`, the new identity with `direct` stored, or with a record that still asks for it.
+`move_boot_repair()` runs before `net_init()` resolves the bearer, finds the record unsettled on the
+active slot, and writes `direct` before it writes `ok`. If that write itself fails, the record keeps
+asking (`move_bearer_owed()`), `move_init()` forces the direct bearer in RAM for that boot, every
+later boot tries again, and a new order is deferred meanwhile so the record that asks is not
+replaced. So no boot connects the new identity through Beam.
 
 | Power lost | Next boot |
 |---|---|
@@ -239,14 +272,17 @@ point profile 2 at it → ack the proof → `/status mv ok`.
 | after `st=pend`, before the ack | boots active; the order is re-published with the same id → ack again, no other effect |
 | during a trial (`st=pend` or `try`) | boots active (`act` unchanged); `at` was raised **before** the trial started, so a crash loop spends the budget; the schedule resumes from `next_try_ts` |
 | proof received, before `act` | boots active; the next trial gets a new proof |
-| after `act`, before `st=ok` | `act == record.slot` and `st` is `pend`/`try` → treated as committed: record set to `ok`, slot 12 written by `configure_session()` at boot as on every boot |
+| after `act`, before `carrier/bearer` (a move from Beam) | as the next row; the repair writes `carrier/bearer = direct` first, so the boot attaches direct with the new identity |
+| after `act`, before `st=ok` | `act == record.slot` and `st` is `pend`/`try` → treated as committed: the bearer choice is written again if the record asks for it, record set to `ok`, slot 12 written by `configure_session()` at boot as on every boot |
+| a trial from Beam, any point before `act` | the forced direct bearer was RAM only: boots the active identity over Beam |
 | during a revert | nothing persistent changes; boots active |
 | during a modem slot 13 write | rewritten before every trial |
 | any reset during a trial, with the active key's `/down` window saved in RTC | at boot the saved window is restored if `idsel/act` still names the slot that was active when it was saved, and dropped if the selector moved (a commit happened): the committed key starts from its own window (`auth_window_boot_restore()`) |
 
 Every identity rewrite in place (catrust commit and un-pin, `claimed`) writes the **active** slot's
 namespace only and never touches `idsel` or the other slot. Factory reset and setup erase
-`ident`, `ident1`, `idsel` and `move` (not `auth`: the epoch keeps rising); see §5.9.
+`ident`, `ident1`, `idsel`, `move` and `brtry` (not `auth`: the epoch keeps rising; not `carrier`: the
+bearer choice stays); see §5.9.
 
 ## 5. Behaviour
 
@@ -258,31 +294,34 @@ namespace only and never touches `idsel` or the other slot. Factory reset and se
    or an id in the ledger → ack, no change. Then a refusal acks and reports `fail` with the reason,
    and stores nothing: a build without `CONFIG_PAGER_MOVE_TRIALS` → `rej`; not signing → `rej`; image
    pending verify → `rej`; host fails the hostname/IP syntax or port 0 → `rej`; `ca` absent while the
-   active identity is pinned → `down`. A refused order leaves no slot, so a re-sent one is decided
+   active identity is pinned, or while the pager is on Beam (§5.3) → `down`. A refused order leaves no slot, so a re-sent one is decided
    again.
 4. Deferred without an ack (re-published on the next online edge) while a catrust apply, an OTA or
-   font download, a `cafetch`, or a trial of another id is running.
+   font download, a `cafetch`, or a trial of another id is running, or while a `cfg.br` request is `try`
+   (§5.10).
 5. The current id again (any state): ack, nothing else (M12). A different id while one is unsettled
    (only a later, separate move can carry one) replaces it when no trial is running: the old id goes
    to the ledger as `cxl`, the pending slot is rewritten.
 6. Fetch the CA (if `ca` present) from `ca.url`, verify `ca.sha`. The PEM buffer
    (`CAFETCH_PEM_MAX`, in PSRAM) is allocated for each fetch and freed once the PEM is stored or the
-   fetch has failed; no buffer is held between fetches. Direct bearer: three failures
+   fetch has failed; no buffer is held between fetches. Three failures
    (60 s apart, not counted as trials) → the slot is still written, with `ca_sha` set and no PEM,
    and the record says `fail/ca`; ack. The 24 h background trial (§5.7) and the Device-screen action
    (§5.8) fetch the CA again before they connect, and a slot without its PEM is never connected
-   with. Beam: one attempt; a failure stores the slot without the PEM and continues (Beam needs no
-   CA).
+   with. A pager on Beam does the same: its trial is a TLS session too (§5.3), and the fetch itself
+   goes out over the SIM's own data path, not through Beam.
 7. Derive `k'`, `pw'`; write the slot and record (§4); ack `shown`; publish `/status` with
    `mv{id,st:"pend",at:0}`. From here replies and `sms_log` entries are held (M9).
 
-### 5.2 Direct bearer: one trial within a boot (primary design)
+### 5.2 One trial within a boot (primary design)
+
+The same trial on both bearers; §5.3 says what a pager on Beam adds.
 
 Preconditions: `st=pend` (or `fail` for the 24 h background trial), now ≥ `next_try_ts`, the CA PEM
 stored if the order had a `ca` (fetched again first if not), session usable, no download running, no reply awaiting
 its PUBACK (wait up to 30 s, then go anyway), not airplane. **No clock:** without network time
 (`now_epoch` 0) `next_try_ts` cannot be checked, so once an order has had one attempt (`at > 0`)
-no scheduled or background trial and no Beam prompt attempt runs until the clock is set; only the
+no scheduled or background trial runs until the clock is set; only the
 Device-screen action does. When the clock appears, `move_next_try_fill()` sets `next_try_ts` from
 the spacing left. This keeps a reset loop without a clock from running a trial per boot.
 
@@ -315,69 +354,47 @@ scheduled step, after which the 24 h background trial runs (§5.7). Held replies
 source would refuse them. If the active login cannot get a session either (the source may be gone),
 §5.7's alternation takes over.
 
-### 5.3 Beam bearer
+### 5.3 A pager on Beam: the move goes over the direct bearer
 
-Profile 0, host `beam.soracom.io:1883`, no CA steps, so an attempt costs no TLS handshake. The admin
-switches the Beam group's destination whenever they choose: seconds after this pager's ack, or weeks
-later. The switch is for the whole group, and a switch-back happens only while no Beam pager has
-committed (MOVE_DESIGN.md). The pager cannot tell when the switch happens, so it makes
-one prompt attempt and then relies on a discovery rule that is cheap over weeks.
+On Beam the modem speaks plain MQTT to `beam.soracom.io:1883` and Beam's group decides which broker
+that reaches. A pager cannot point Beam at the target, so it does not try to move through it. It runs
+§5.2 unchanged, with these additions:
 
-1. **Prompt attempt.** At the ack's modem OK + 120 s, one attempt on the **pending login first**, with
-   the §5.2 preconditions (no reply awaiting its PUBACK, no download): `mqttDisconnect()` →
-   `mqttConfig(dev_id, dev_id, pw', 0)` → connect, SUBACK guard 30 s. Refused or no SUBACK →
-   `mqttConfig(dev_id, dev_id, pw, 0)` → connect on the active login at once (no backoff), so the
-   pager is back on the old broker ~2–5 s after a refusal. SUBACK → item 4.
-2. **Steady state while pending.** Otherwise the pager stays on the active login: it receives what the
-   frozen source still sends (orders, cancels), sends `/status`, acks and liveness pings, and holds
-   replies (M9). `st` stays `pend`.
-3. **Alternation rule.** Whenever a move is unsettled (`st` is `pend`, `try` or `fail`), a PERMANENT
-   result (login refused) or no SUBACK within 30 s on one login makes the next connect use the other
-   login. Every reconnect counts, whatever caused it: coverage loss, a dead liveness ping, a modem
-   recover, a reboot. After the switch the active login is refused at the new destination, so the next
-   connect uses the pending login. While neither login gets a session, §5.7's long-run backoff applies.
-4. **Pending login accepted** (SUBACK) → §5.2 steps 6–9 with profile 0: `/status mv try` under `k'`,
-   proof within 180 s → commit, then held replies go out.
-5. **Pending login accepted, no proof in 180 s** → revert to the active login (rule 3 applies if that
-   is refused). After 3 such results in a row, attempts on the pending login slow to one per 60 min
-   until a proof or a cancel arrives: this bounds the cost when the target broker takes
-   the login but its relay is down.
-6. **Probe.** Beam may keep the upstream connection to the old broker for an existing session after
-   the group's destination changes (unverified, S4(b)). If it does, the session keeps working through
-   the old broker and rule 3 never fires. So, while `st` is `pend` or `fail` and `acked=1`, the pager
-   makes a **deliberate reconnect on the active login** every 60 min for the first 7 days after the
-   ack, then every 4 h (`PAGER_MOVE_BEAM_PROBE_S`, `PAGER_MOVE_BEAM_PROBE_LONG_S`). It is taken from an
-   ordinary 5 s wake, only in sleep mode, with no key pressed in the last 60 s, no publish waiting on
-   its PUBACK and no download running. Before the switch it reconnects to the old broker (one connect,
-   the session back in ~1–2 s); after the switch the active login is refused and rule 3 takes the
-   pending login. If S4(b) shows that Beam cuts the session when the destination changes, the probe is
-   compiled out; the constants stay.
-7. **Boot.** A boot with an unsettled Beam move connects on the active login first, then rule 3. The
-   probe timer restarts at boot.
-8. **Keeping the pending login.** It is dropped only by a commit, a cancel or a Factory reset. The
-   target keeps the login of a pager that has not arrived (MOVE_DESIGN.md), so there is always a login
-   to try. A switch-back should come with a cancel from the source; until one arrives the probe
-   continues.
-9. **No attempt budget on Beam.** There is nothing for the pager to give up on, because it cannot pick
-   the broker; `fail` is reported only for refusals at parse time.
+1. **Order.** Accepted and stored as on direct, with the CA fetched first (§5.1). The record's
+   `bearer` is set, and set again at the start of each trial while the session runs through Beam. An
+   order **without** a `ca` is refused with `fail`/`down`: on Beam the hop is inside the carrier's
+   network and Beam validates the broker, while an unpinned trial would be a TLS session that
+   validates nothing and hands `pw'` to whoever answers at `host`. *(This is stricter than
+   PROTOCOL.md §3.2, which refuses an unpinned order only for a pinned active identity. A deployment
+   whose target is unpinned moves its Beam pagers with a setup code, §5.9.)*
+2. **Trial.** Steps 1–3 of §5.2 on the Beam session. Before step 4, `net_bearer_select(direct)`:
+   from here `configure_session()` builds TLS profile 2 on slot 13 and `mqttConfig(…, pw', 2)`, and
+   the connect goes to `host'`:`port'`. The stored choice in NVS is not touched. Guard 60 s for
+   SUBSCRIBED, 180 s for the proof, as on direct.
+3. **Revert.** `mqttDisconnect()` → `net_bearer_select(stored)` → `mqttConfig(dev_id, dev_id, pw, 0)`
+   → the reconnect loop connects to Beam at once. The pager is back on the source over Beam. A reset
+   anywhere in a trial ends the same way, because the forced bearer was RAM only.
+4. **Commit.** §4: `idsel/act`, then `carrier/bearer = direct`, then the record. The session is
+   already direct and stays up. From then on every attach resolves to direct and the identity's own
+   `host`:`port` is dialled, with its CA pinned in slot 12. `/status.tls` reports the catrust state
+   instead of `proxy`, and `cfg.ca` is accepted again.
+5. **Schedule, budget, background trial, alternation (§5.7), Device-screen action (§5.8).** As on
+   direct. An attempt on the pending identity is always a direct trial; an attempt on the active
+   identity is a plain connect through Beam.
+6. **Coming back to Beam.** Only the target can ask, with `cfg.br` (§5.10), once its admin has pointed
+   a Beam group at it.
 
-**How fast a pager notices the switch.**
-- Switched within 120 s of the ack: at the prompt attempt.
-- Beam cuts the session when the destination changes: at the next reconnect, about 5–20 s.
-- Beam keeps the session: within one probe period (≤ 60 min in the first week, ≤ 4 h after), plus
-  two connects, or at the next natural reconnect if that comes first.
+**What a pager on Beam needs for this to work** (none of it verified on hardware, S5): the SIM's data
+path reaches the target's public `host`:`port` and its CA URL (a Soracom Air SIM routes to the
+Internet; a group that blocks it makes every trial fail `conn` or `ca` and the pager stays on the
+source over Beam); the modem accepts `mqttConfig` with profile 2 after a session on profile 0 in the
+same power cycle, and back.
 
-**What waiting costs** (estimates, not measured; a plain Beam connect assumed ~1 kB and ~0.05 mAh: about
-2 s of RRC-connected modem at ~60 mA plus the tail):
-- Prompt attempt, not switched: 2 connects ≈ 0.1 mAh and ~2 kB, once per move.
-- Probe, first 7 days: 24 connects/day ≈ **1.2 mAh/day** (~1.2 % of the 95–107 mAh/day sleep-mode
-  budget, PROTOCOL.md §8.4) and ~24 kB/day.
-- Probe after 7 days: 6 connects/day ≈ **0.3 mAh/day** and ~6 kB/day. A 30-day wait costs ~16 mAh
-  and ~0.3 MB in total, against 100 MB/month.
-- After the switch: one extra connect (the refused active login), once.
-- Target taking the login with its relay down (rule 5): 3 attempts on the backoff, then one per hour,
-  ≲ 1.5 mAh/day including the 180 s proof waits.
-- With the probe compiled out (S4(b) shows the session is cut): 0.
+**Cost** (estimates): a failed trial from Beam is one TLS handshake plus one plain connect back,
+~0.15 mAh and ~6 kB; a successful move is one TLS handshake, ~0.1 mAh. After the commit each
+reconnect is a TLS handshake (~5 kB) instead of a plain connect (~1 kB) until `cfg.br` succeeds;
+the keepalive and the liveness interval are the preset's on both bearers, so the idle cost does not
+change.
 
 ### 5.4 Fallback: trial by restart (selected if spike S1 fails)
 
@@ -392,14 +409,16 @@ one power cycle.
 - **Trial boot:** `modes_boot()` reads the record before `net_init()`. With `tb=1` it first writes
   `tb=0` (one-shot: any crash or watchdog in the trial boots the active identity next time), then calls
   `ident_use(IDENT_PENDING)` and `auth_init(k')` with a zero window. `configure_session()` then builds
-  profile 2 on slot 13 (or profile 0 on Beam) and `mqttConfig` with `pw'`, and the normal connect runs
+  profile 2 on slot 13 and `mqttConfig` with `pw'`, and the normal connect runs
   against `host'`. The boot splash is not pushed on a trial boot (the e-paper keeps the last image).
   Steps 8–9 of §5.2 follow.
 - **Commit:** as §4. No restart: the session is already on the new broker.
 - **Revert:** `mqttDisconnect()`, modem reset, `esp_restart()`. `tb` is already 0, so the next boot
   uses the active identity; the record's `rsn` was written before the restart.
-- **Beam:** each login switch costs a restart, so the alternation rule switches at most once per
-  backoff step.
+- **From Beam:** the trial boot also selects the direct bearer in RAM (`tb` says so together with the
+  pending identity), and the revert restart attaches by the stored choice, Beam. A `cfg.br` attempt
+  (§5.10) would need the same treatment: a one-shot flag, cleared before the attempt, that makes one
+  boot attach through Beam.
 - **Cost:** two modem resets and two attaches per failed trial. Estimate: ~1 mAh (2 × ~20–60 s attach
   at ~30 mA average; the Soracom attach measured 17 s, SORACOM_DESIGN.md §6), against ~0.25 mAh for
   §5.2. Four failed direct trials ≈ 4 mAh, about 4 % of one day's 95–107 mAh in sleep mode
@@ -410,7 +429,7 @@ one power cycle.
 | Message | State | Effect |
 |---|---|---|
 | order, current id | `pend` or `try` | ack, no change |
-| order, current id | `fail` | ack, no change: no new budget, not counted or logged as a replay; the 24 h background trial (direct), the Beam rules and the Device-screen action continue for this id |
+| order, current id | `fail` | ack, no change: no new budget, not counted or logged as a replay; the 24 h background trial and the Device-screen action continue for this id |
 | order, a finished id | `cxl`, `ok` (ledger) | ack, no change |
 | order, a different id | unsettled, no trial running | a later, separate move: replace (§5.1 step 5) |
 | order, a different id | trial running | deferred, no ack |
@@ -428,26 +447,30 @@ new id. `/down` is never retained (PROTOCOL.md §2).
 
 | Timer | Value | Where |
 |---|---|---|
-| Ack wait before the first trial | PUBACK of the ack, ≤ 30 s (direct) | `move_service()` |
-| Beam prompt attempt | pending login first, once, at ack + 120 s | `move.c` (RAM) |
-| Beam probe while pending | deliberate reconnect every 60 min for 7 days after the ack, then every 4 h | `move.c` |
-| Beam pending-login slow-down | after 3 SUBACK-without-proof results, 1 attempt per 60 min | `move.c` |
+| Ack wait before the first trial | PUBACK of the ack, ≤ 30 s | `move_service()` |
 | Reply drain before disconnect | ≤ 30 s | §5.2 |
-| SUBACK guard on the new broker | 60 s direct, 30 s Beam | existing 60 s connect watchdog (`modes.c:2534`) or `move.c` |
+| SUBACK guard on the new broker | 60 s | `move.c` |
 | Proof wait | 180 s | `move.c` (RAM, `esp_timer`) |
-| Trial schedule (direct) | +0, +10 min, +60 min, +6 h; then every 24 h while unsettled | `move/st.next_try_ts` |
+| Trial schedule | +0, +10 min, +60 min, +6 h; then every 24 h while unsettled | `move/st.next_try_ts` |
 | Long-run alternation, no session on either identity | 5, 15, 60 s, then 300 s until 1 h without a session, then 15 min until 24 h, then 30 min | `modes.c` backoff, §5.7 |
 | CA fetch retries | 3, 60 s apart | `move.c` |
+| `cfg.br`: ack wait before the first attempt | ≤ 30 s | `bearer_try.c` |
+| `cfg.br`: a usable Beam session | 180 s from the connect | `bearer_try.c` (RAM) |
+| `cfg.br`: the proof | 180 s from the usable session | `bearer_try.c` (RAM) |
+| `cfg.br`: on direct between two attempts | 60 s | `bearer_try.c` (RAM) |
 
 Wake sources are unchanged: the light-sleep timer (5 s), ext1 and the modem UART (PROTOCOL.md §8).
 A trial runs from the normal loop and is serviced once per iteration, like `catrust_service()`. The
 pager stays in its current mode; the proof arrives as an ordinary `/down` (≤ ~30 s in sleep mode).
 
 Energy (estimates, not measured):
-- Failed direct trial (§5.2): two TLS handshakes plus radio tail, ~0.2–0.3 mAh (2 × ~6 s at ~60 mA
+- Failed trial (§5.2): two TLS handshakes plus radio tail, ~0.2–0.3 mAh (2 × ~6 s at ~60 mA
   average) and ~10 kB. Four trials ≈ 1 mAh and 40 kB, under 1 % of a day's sleep-mode energy and
   0.04 % of the 100 MB month.
-- Beam attempt: plain MQTT connect, ~0.05 mAh and ~1 kB.
+- From Beam the way back after a failed trial is a plain connect, ~0.05 mAh and ~1 kB, instead of
+  the second handshake.
+- `cfg.br` attempt that fails: one plain connect, up to 360 s without a session, one TLS handshake
+  back; ~0.15 mAh and ~6 kB. Three of them at worst, once per request.
 - Successful move: one extra handshake, ~0.1 mAh.
 
 ### 5.7 Unsettled move: staying reachable when either server may be down
@@ -461,16 +484,16 @@ target is the one that is down it is the pager's only way back. After a commit t
 the inactive slot and is overwritten by the next order.
 
 **Session up on the active identity** (the source works):
-- Direct: the scheduled trials (M6), then one **background trial every 24 h**, from a sleep-mode wake
+- The scheduled trials (M6), then one **background trial every 24 h**, from a sleep-mode wake
   with no key pressed in the last 60 s, until a commit or a cancel. Cost per failed
-  trial ~0.25 mAh and ~10 kB (§5.6): ~0.25 mAh/day and ~0.3 MB/month.
-- Beam: the probe of §5.3 item 6.
+  trial ~0.25 mAh and ~10 kB (§5.6): ~0.25 mAh/day and ~0.3 MB/month. The same on both bearers.
 
 **No session on either identity** (the source is gone and the target is not working yet, or there is no
 coverage for MQTT):
 - Each connect attempt alternates the identity: the one that last had a session first, then the other.
-  On the direct bearer an attempt on the pending identity is a full §5.2 trial (steps 2–11, without
-  the disconnect when nothing is connected); on Beam it is the pending login.
+  An attempt on the pending identity is a full §5.2 trial (steps 2–11, without
+  the disconnect when nothing is connected), over the direct bearer whatever the active identity
+  uses; an attempt on the active identity of a Beam pager is a plain connect through Beam.
 - A PERMANENT result does not pin the backoff to steady 300 s as `handle_mqtt_loss()` does with no move held
   (`modes.c:1564-1569`); in an unsettled move it means "try the other identity next" and the schedule
   continues.
@@ -483,14 +506,14 @@ coverage for MQTT):
 - Whichever identity gets a session first wins: the active one resumes normal operation (and the
   "session up" rules above), the pending one runs to the proof and commits.
 
-**Cost of the long run** (estimates; a direct attempt ≈ one TLS handshake, ~5 kB and ~0.1 mAh; a Beam
-attempt ~1 kB and ~0.05 mAh):
+**Cost of the long run** (estimates; a TLS attempt ≈ one handshake, ~5 kB and ~0.1 mAh; a plain
+connect through Beam ~1 kB and ~0.05 mAh; a Beam pager alternates the two):
 
-| Period without a session | Attempts | Direct | Beam |
+| Period without a session | Attempts | Direct pager | Beam pager |
 |---|---|---|---|
-| first hour | ~15 | ~1.5 mAh, ~75 kB | ~0.8 mAh, ~15 kB |
-| hours 1–24 | 4/h | ~9 mAh/day, ~0.5 MB/day | ~4.6 mAh/day |
-| after 24 h | 2/h | **~4.8 mAh/day** (~5 % of the daily sleep budget), ~0.24 MB/day (~7 MB/month) | **~2.4 mAh/day**, ~1.4 MB/month |
+| first hour | ~15 | ~1.5 mAh, ~75 kB | ~1.1 mAh, ~45 kB |
+| hours 1–24 | 4/h | ~9 mAh/day, ~0.5 MB/day | ~7 mAh/day, ~0.3 MB/day |
+| after 24 h | 2/h | **~4.8 mAh/day** (~5 % of the daily sleep budget), ~0.24 MB/day (~7 MB/month) | **~3.6 mAh/day**, ~0.14 MB/day (~4 MB/month) |
 
 For comparison, with no move held and its only broker down the firmware retries at a steady 300 s for ever: 288
 handshakes/day ≈ 29 mAh/day (same estimate). Applying the same long-run backoff when no move is
@@ -510,8 +533,7 @@ Rows on the adult Device screen (`scr_device.c`, texts in `move_ui_fmt.c`), belo
 **only in a build with `CONFIG_PAGER_MOVE_TRIALS`**; a build without it shows none of them and
 `move_request_now()` answers "not built". The Device screen is reached
 only when the pager is unlocked (the lock screen is pushed over everything, `modes.c:1744-1753`), so no
-extra gate is added. `<host>` is the order's `host`, shown on Beam too (it is stored for a later direct
-bearer).
+extra gate is added. `<host>` is the order's `host`, on Beam too (the trial dials it).
 
 | Move state | `Server:` row | Action row |
 |---|---|---|
@@ -522,14 +544,12 @@ bearer).
 
 **What the action does.** `move_request_now()` from the UI task; `move_service()` runs it on the next
 loop iteration.
-- **Both bearers:** ignores the budget, `fail`, `next_try_ts`, the ledger outcome and the quiet-time
+- Ignores the budget, `fail`, `next_try_ts`, the ledger outcome and the quiet-time
   conditions. It waits ≤ 5 s for a reply awaiting its PUBACK, then goes. It increments `at` but not
   the scheduled-budget counter. It resets §5.7's long-run interval to 5 s.
-- **Direct:** if the pending slot has no CA but the order had one (an earlier `fail/ca`), it first
-  fetches the CA again from the stored `ca.url`. It then runs a §5.2 trial. If no session is up (the
-  source may be gone), it skips the disconnect.
-- **Beam:** disconnect, connect on the pending login (profile 0), then the proof. On a refusal it goes
-  back to the active login at once.
+- If the pending slot has no CA but the order had one (an earlier `fail/ca`), it first
+  fetches the CA again from the stored `ca.url`. It then runs a §5.2 trial, over the direct bearer
+  from Beam too (§5.3). If no session is up (the source may be gone), it skips the disconnect.
 - It can be repeated as soon as the previous run has finished. It is the remedy once the source is
   gone. The target keeps the derived login of every pager that has not arrived (only a cancel or a
   setup code removes it, MOVE_DESIGN.md), so the action always has a login to use.
@@ -544,8 +564,7 @@ run: `Connecting to <host>…`, then `Waiting for <host>…` (the proof wait), t
 | commit | `Moved to <host>` |
 | `ca` | `Can't get <host> certificate` |
 | `tls` | `Certificate doesn't match` |
-| `auth`, direct | `<host> refused this pager` |
-| `auth`, Beam | `Not switched yet` (a refused pending login on Beam almost always means the group has not been switched) |
+| `auth` | `<host> refused this pager` |
 | `conn` | `Can't reach <host>` |
 | `proof` | `<host> did not answer` |
 | `busy` | `Busy, try in a few minutes` |
@@ -553,10 +572,15 @@ run: `Connecting to <host>…`, then `Waiting for <host>…` (the proof wait), t
 | airplane | `Airplane mode is on` |
 | `nvs` | `Storage error` |
 
-After a failure the screen adds a second line once the revert settles: `Back on <active host>` when the
+After a failure the screen adds a second line once the revert settles: `Back on <active host>` (`Back on Beam` for a pager whose active identity runs through Beam) when the
 active identity gets a session within 60 s, otherwise `Old server not answering; trying both`, and
 §5.7 takes over. The Home screen and the kid's screens show nothing; the connection icon may show
 offline for the length of the trial.
+
+**Bearer.** The `Server:` row reads `Server: via Beam` only while the session runs through Beam, so
+after a move from Beam it shows the new host. The Device info screen's carrier row shows the bearer
+in use (`beam` or `direct`, read from `net_bearer_beam()`), and beside it `(beam try N/3)` while a
+`cfg.br` request is tried and `(beam failed)` after one failed (§5.10).
 
 ### 5.9 A pager that never got the order: a setup code
 
@@ -572,7 +596,7 @@ an order cancelled for this move id) is set up with a code from the target
    gets one attempt, whatever happens to it.
 3. `setup_run()` attaches, fetches and decrypts the bundle. Only then does it zero the RTC down
    window (`modes_reset_down_window()`), cancel stored OTA/font jobs still in `wait` (the target
-   re-issues them, M10), run `ident_erase()` (`idsel`, `move`, `ident1`, `ident`) and
+   re-issues them, M10), run `ident_erase()` (`brtry`, `idsel`, `move`, `ident1`, `ident`) and
    `ident_store()`, so no stale `ident1` or `idsel` can point away from the new slot 0. It restarts
    onto the target.
 4. On any failure before that point (no network, expired code, target unreachable) the screen shows
@@ -591,9 +615,86 @@ Both paths keep `auth/epoch` (the up counter must keep rising), `carrier` (APN a
 in either flow is a cold boot, so the old key's `down_n` would otherwise be applied to the new key's
 messages and pages would be dropped unacked whenever the new server's `downN` is lower.
 
-On Beam the setup fetch also goes through Beam, so the SIM's Beam group must already point at the
-target. The target sends the book, `cfg` and any re-deliveries on the first online edge. The old
+While the stored bearer choice resolves to Beam the setup fetch also goes through Beam, so the SIM's
+Beam group must already point at the target. A pager that left Beam for a move (`carrier/bearer =
+direct`, kept by both paths) dials the code's `host`:`port` itself. The target sends the book, `cfg` and any re-deliveries on the first online edge. The old
 book stays until the target's `bookVersion` passes the pager's `bv` (G5).
+
+### 5.10 `cfg.br`: trying Beam again, with a way back that cannot fail
+
+A pager that moved from Beam is on the direct bearer. Once the target's admin has pointed a Beam group
+at the target, the target sends `cfg.br` `{id, b:"beam"}`, signed like any `cfg`. The pager then has
+to find out whether Beam now reaches **its** server, and must never end up on Beam when it does not.
+
+**Invariant.** `carrier/bearer` is `direct` from the moment a request is stored until a proof is
+taken. An attempt uses Beam through `net_bearer_select(beam)`, which is RAM. So every reset, at any
+point of a try, boots on the direct bearer unless the proof was taken; and the attempts, counted in
+NVS before each starts, never exceed three.
+
+**Request** (`brtry_decide_try()`), in this order:
+1. The stored id, in any state → ack, nothing else.
+2. A request is `try`, or a server move is unsettled or its trial runs, or an OTA or font download, a
+   `cafetch` or a catrust apply runs → deferred: no ack, looked at again on every loop pass.
+3. The preset in force has no Beam bearer → record `na`, ack, `/status`.
+4. The session already runs through Beam → record `ok`, ack, `/status`.
+5. Otherwise, with `direct` the stored choice → record `try`, `at=0`; ack; `/status` with
+   `br{id, st:"try"}`. (If the pager is direct only in RAM because a committed move still owes its
+   bearer write, §4, the request is deferred: there is no stored `direct` to fall back to yet.)
+
+**Attempt** (`brtry_service()`, the session owner as for a move trial). Preconditions: the request's
+ack has left (≤ 30 s), a usable direct session, registered, not airplane, the coverage policy does not
+own the radio, nothing of item 2 running, 60 s since the previous attempt ended.
+1. Record `at += 1`. If this write fails no attempt is made.
+2. `mqttDisconnect()`; wait for DISCONNECTED, at most 5 s.
+3. `net_bearer_select(beam)` → `mqttConfig(dev_id, dev_id, pw, 0)` (the same login and key) →
+   `mqttConnect(beam.soracom.io, 1883)`. One connect per attempt.
+4. Usable within 180 s: the usable edge publishes `/status` as on every session, now carrying
+   `br{id, st:"try"}` and `tls:"proxy"`; the relay answers it with the proof `{id, ok:true}`. A
+   DISCONNECTED first is a failed attempt: `auth` for a refusal class (the group still points at
+   another server, whose broker does not know this login), `conn` otherwise; 180 s without a session
+   is `conn`.
+5. Proof within 180 s of the usable session, for the stored id, on the Beam session → commit. No
+   proof → failed attempt `proof`. A session lost, airplane mode or lost registration while waiting →
+   `conn`.
+6. **Failed attempt:** `mqttDisconnect()` → `net_bearer_select(stored)` → `mqttConfig(…, pw, 2)` →
+   the reconnect loop connects direct at once; the usable edge reports `br{st:"try"}` again, or
+   `br{st:"fail", rsn}` after the third. The reason of the last attempt is the one reported.
+7. **Commit:** record `proved` (the commit point) → erase `carrier/bearer` (automatic, which a Beam
+   preset resolves to Beam) → record `ok` → ack the proof → `/status` with `br{st:"ok"}`. The session
+   is kept.
+
+A proof on a direct session, for another id, or with no attempt waiting is dropped and not acked (it
+is not counted as malformed: the relay answers the `try` reported on the direct session between two
+attempts too). A proof for a request already `ok`, on Beam, is acked again.
+
+**Boot** (`brtry_boot_repair()`, before `net_init()`):
+
+| Record at boot | Meaning | Repair |
+|---|---|---|
+| `proved` | the proof was taken, the bearer write or the `ok` write was cut | erase `carrier/bearer`, record `ok`: boots on Beam |
+| `try`, `at` < 3 | a reset before or during an attempt | `carrier/bearer` is checked and written `direct` again if it is anything else; the loop makes the next attempt |
+| `try`, `at` = 3 | the reset came in the third attempt | record `fail` (the stored reason, or `conn`): direct for good |
+| `ok`, `fail`, `na` | settled | nothing |
+
+`fail` is only ever written once `carrier/bearer` is `direct` (read, or written again). If a write the
+repair needs fails, `brtry_init()` forces the direct bearer in RAM for that boot and the plan gives
+the request up (`brtry_give_up()`, retried every 60 s) instead of attempting.
+
+**Why this cannot strand a pager on Beam.** Beam is in use in two cases only. (a) During an attempt:
+RAM, preceded by a stored count that cannot pass three, and ended by a timer, an event or a reset, each
+of which lands on the stored choice `direct`. The longest stay is 5 s + 180 s + 180 s per attempt. (b)
+By the stored choice: written only after the record says `proved`, which needs a `cfg.br` proof under
+the pager's key, received on a Beam session, for the stored id. Host tests cut the power at every
+NVS write of a whole try, with and without a proof, and reset the service in every phase
+(`test_bearer_try`, `test_bearer_try_svc`).
+
+**Other rules.** A move order and a `cfg.ca` are deferred while a request is `try`. A move commit and
+`ident_erase()` drop the record: the request belonged to the server the pager left. A new id replaces
+a settled request and starts a fresh count; the same id is never tried again.
+
+**Trial by restart.** If S1/S5 fail, an attempt needs §5.4's shape: a one-shot NVS flag, cleared at
+the start of the boot that honours it, makes that one boot attach through Beam; every other boot
+follows `carrier/bearer`. Not built.
 
 ## 6. Messages and counters across the switch
 
@@ -647,7 +748,7 @@ device without `mb`, the pager would show "sent" on the row and the system messa
    release, not its creation (`created_us` is re-based at release). The row shows its normal pending
    tag. `sms_log` entries already wait in their own NVS queue; `sms.c`'s publisher checks the same
    predicate. With 2 `pending_up` slots (`msg.h:31`) a third reply is refused by the composer
-   ("queue full"); that is the cost of a long Beam wait.
+   ("queue full"); that is the cost of a long move.
 2. **A refusal the pager can act on (server and firmware).** For a text it refuses while frozen, the
    source answers a device that reports `mb` (all move-capable firmware does) with a `rcpt` (PROTOCOL.md
    §3.2: `ref` = the up `id`, `st:"failed"`, `rsn:"moving"`) **instead of** the `system` text, and does
@@ -684,8 +785,12 @@ MOVE_DESIGN.md says where each is met.
   it; it keeps accepting `/status` and acks, and it sends the order (and any cancel) under `k`.
 - **G10** Each broker accepts exactly one login set for a device: the source only `pw`, the target only
   `pw'`. The target keeps `pw'` for a pager that has not arrived until a cancel or a setup code.
-- **G11** Beam: the group's destination is switched when the admin chooses, and switched back only while
-  no Beam pager has committed; abandoning a move sends a cancel while the source is up.
+- **G11** Beam: nobody touches the SIMs' Beam group for a move. The target sends `cfg.br` only after its
+  admin has pointed a Beam group at it, only to a pager whose `/status` carries `brc`, and answers every
+  `/status` carrying `br{id, st:"try"}` for an id it issued with the proof (§5.10). Abandoning a move
+  sends a cancel while the source is up.
+- **G12** The target's broker is reachable at the order's `host`:`port` from a Soracom SIM's own data
+  path, with the order's CA, and the CA URL likewise (§5.3).
 
 **What can still go wrong:** a redelivered message older than the newest 32 thread entries is shown
 again (the export and redelivery are bounded by §5.3 of PROTOCOL.md: unacked, under 24 h, at most 10
@@ -711,6 +816,9 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
   its first online edge.
 - **Book.** The pager stores no relay URL; the nudge carries it. A book pull in flight during the
   switch fails verification under the new key and retries on the next nudge.
+- **`cfg.br`.** A request is deferred while a move is unsettled; an order and a `cfg.ca` are deferred
+  while a request is `try`; no attempt starts during a download, and no download starts during an
+  attempt (§5.10).
 - **Airplane mode.** No trial; the schedule is paused, not consumed.
 - **Coverage duty cycle.** No trial while the coverage policy owns the radio; the schedule is paused.
 
@@ -718,13 +826,13 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
 
 | Failure | Detected by | Result | Pager ends on |
 |---|---|---|---|
-| CA fetch fails or hash mismatch (direct) | `cafetch` | `fail/ca` after 3 tries, no disconnect | old |
+| CA fetch fails or hash mismatch | `cafetch` | `fail/ca` after 3 tries, no disconnect | old |
 | Host typo / DNS fail | no CONNECTED in 60 s or DISCONNECTED | revert, `pend/conn`, next step | old |
 | Closed port / CGNAT blackhole | 60 s guard | revert, `pend/conn` | old |
 | Wrong CA / TLS mismatch | `WALTER_MODEM_MQTT_TLS` | revert, `pend/tls` (no catrust fallback) | old |
 | Target lacks the derived login | PERMANENT rc | revert, `pend/auth` | old |
 | Broker up, relay or webhook down | no proof in 180 s | revert, `pend/proof` | old |
-| Last scheduled trial fails (direct) | schedule | `fail/budget`; background trial every 24 h | old, new once a trial succeeds |
+| Last scheduled trial fails | schedule | `fail/budget`; background trial every 24 h | old, new once a trial succeeds |
 | Source shut down, target healthy | active refused or unreachable | §5.7 alternation reaches the pending identity → commit | new, within ≤ 30 min (≤ 60 min after 24 h) |
 | Source shut down, target down | both fail | §5.7 long-run backoff, ~4.8 mAh/day direct after 24 h | whichever comes back first |
 | Pager never got the order, source gone | no session | **Set up again** on the Device screen with a target code (§5.9) | new |
@@ -732,12 +840,14 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
 | Kid texts after the order | hold | held until the commit (§6.2) | sent on the target after the commit |
 | Power cut, any step | §4 table | resume or repair | old, or new if `act` was written |
 | Crash or watchdog in a trial | `at` raised first; §5.4 `tb` one-shot | next boot on old | old |
-| Beam, switched within 120 s of the ack | prompt attempt | proof → commit | new |
-| Beam, not switched yet | prompt attempt refused, active works | back on active within ~5 s; probe 60 min, then 4 h | old |
-| Beam, switched, Beam cuts the session | active refused at the next connect | pending login → proof → commit | new |
-| Beam, switched, Beam keeps the old upstream | probe reconnect | active refused → pending → commit | new, ≤ 60 min (≤ 4 h after 7 days) late |
-| Beam, switched, target broker takes the login, relay down | no proof | revert; 3 tries then hourly | new destination, unusable, until the relay recovers or the server switches back |
-| Beam, switched, target broker down | both logins fail | §5.7 long-run alternation | new when the target is back; old only if switched back |
+| Pager on Beam, order with a CA, target healthy | trial over the direct bearer | proof → commit, `carrier/bearer = direct` | new, direct |
+| Pager on Beam, target's `host`:`port` or CA URL not reachable from the SIM | 60 s guard, or `cafetch` | revert `pend/conn`, or `fail/ca` | old, Beam |
+| Pager on Beam, order without a CA | parse | `fail/down`, nothing stored | old, Beam |
+| Power cut between `idsel/act` and `carrier/bearer` | boot repair (§4) | `direct` written before the bearer is resolved | new, direct |
+| `cfg.br`, Beam group not pointed at this server | refused login, or no proof in 180 s | 3 attempts, then `br fail/auth` or `fail/proof` | same server, direct |
+| `cfg.br`, Beam unreachable or the session never usable | 180 s | 3 attempts, then `br fail/conn` | same server, direct |
+| `cfg.br`, reset or power cut in any attempt | boot repair (§5.10) | the attempt stays counted; direct at boot | same server, direct (Beam only if the proof was taken) |
+| `cfg.br` on a SIM whose preset has no Beam bearer | request | `br na` | unchanged |
 | Image pending verify / not signing / built without `CONFIG_PAGER_MOVE_TRIALS` | parse | `fail/rej`, nothing stored | old |
 | Unfinished order stored, then an image without the trials boots | boot | `fail/rej`, pending slot dropped | old |
 | Order would downgrade trust | parse | `fail/down` | old |
@@ -758,14 +868,18 @@ be re-queued (§6.2, no free slot) is visibly failed, not silently lost.
 
 ## 10. Risks, ranked
 
-1. **Beam, destination switched to a broken target:** the pager cannot recover by itself. A
-   switch-back happens only if no Beam pager has committed; once one has, every Beam pager depends on
-   the target staying up. The pager keeps alternating at ~2.4 mAh/day until it does.
+1. **Bearer switch within one boot unverified (S5):** a move from Beam and every `cfg.br` attempt
+   change the modem's TLS profile number and host between two `mqttConfig` calls. If the modem refuses,
+   a trial from Beam fails `tls`/`conn` and the pager stays on the source over Beam; a `cfg.br` try
+   ends `fail/conn` on direct. Neither strands the pager, but neither works until §5.4's restart shape
+   is built for them.
 2. **Source shut down while pagers are unsettled:** they recover by themselves only if the target
    works (§5.7); a pager that never got the order needs a setup code typed on it
    (§5.9).
-3. **Beam holding the old upstream session** (S4(b)): costs the probe, ~1.2 mAh/day for the first week
-   and ~0.3 mAh/day after, and delays discovery by up to one probe period.
+3. **A Beam pager whose SIM cannot reach the target directly** (no Internet route in its Soracom
+   group, or a target with no public listener): it cannot move over the air and needs a setup code
+   through Beam (§5.9). After a move, a deployment that wanted Beam for its cost pays a TLS handshake
+   per reconnect until `cfg.br` succeeds.
 4. **Broker switch within one boot unverified:** if S1 fails, every trial costs two restarts (§5.4).
 5. **Message loss or duplication** depends on G1–G4 and G9 as much as on the firmware; a frozen
    source that still answers with the `system` text instead of the `moving` receipt loses the text
@@ -792,7 +906,8 @@ without re-attaching.
 | S1 | Broker switch in one boot: session up on broker A as user U1/pw1; `mqttDisconnect`; `mqttConfig(U1, U1, pw2, 2)`; `mqttConnect` to broker B (which knows only pw2). Repeat B → A. Run once with raw AT (`AT+SQNSMQTTDISCONNECT=0`, `AT+SQNSMQTTCFG=0,...`, `AT+SQNSMQTTCONNECT=0,...`) and once through the library (`mvspike`), and read `AT+SQNSMQTTCFG?` between steps | CONNECTED + SUBSCRIBED on B with pw2, and back on A with pw1, no modem reset, no `+CME ERROR: 4`. Fail selects §5.4 |
 | S2 | Second `mqttConfig` with a new password on the same broker | the broker sees the new password (wrong one refused, rc AUTH) |
 | S3 | Profile 2 on slot 13, VALIDATION_CA, against the home private RSA-2048 root behind nginx on 8883; plus a wrong root (must fail with TLS), plus SNI capture on the nginx side; plus `cafetch` of `https://<home>/kid-pager/ca/<sha>.pem` | validated connect; wrong root refused; fetch and hash OK |
-| S4 | Beam: (a) a login the destination refuses — what the pager sees (CONNACK rc, DISCONNECTED, or nothing); (b) move the SIM to a group with a different destination while a session is up: is the session cut; if not, do publishes still reach the old broker, and for how long (soak ≥ 2 h); does a reconnect reach the new destination; (c) group destination = the home public-certificate listener | (a) gives a refusal distinguishable from success within 30 s; (b) recorded, and it decides whether the §5.3 probe ships; (c) connects |
+| S4 | Beam: (a) a login the destination refuses — what the pager sees (CONNACK rc, DISCONNECTED, or nothing); (b) move the SIM to a group with a different destination while a session is up: is the session cut; if not, do publishes still reach the old broker, and for how long (soak ≥ 2 h); does a reconnect reach the new destination; (c) group destination = the home public-certificate listener | (a) gives a refusal distinguishable from success within 30 s, which is what lets a `cfg.br` attempt report `auth` instead of `conn` or `proof` (§5.10); (b) recorded (no part of a move depends on it); (c) connects |
+| S5 | Bearer switch in one boot, on a Soracom SIM: session up through Beam (profile 0, `beam.soracom.io:1883`); `mqttDisconnect`; `tlsWriteCredential(13)`, `tlsConfigProfile(2, …, 13)`, `mqttConfig(U1, U1, pw2, 2)`; `mqttConnect` to broker B's public `host`:8883; then back: `mqttConfig(U1, U1, pw1, 0)` and `mqttConnect(beam.soracom.io, 1883)`. Plus `cafetch` of B's CA URL while on Beam | CONNECTED + SUBSCRIBED each way, 5 cycles, no modem reset, no `+CME ERROR: 4`; the fetch succeeds. Fail selects §5.4 for §5.3 and §5.10 |
 
 **Feature tests (after implementation):**
 
@@ -803,24 +918,28 @@ without re-attaching.
 | B3 | Power cut (EN reset and battery pull) at every row of the §4 table | the table's outcome |
 | B4 | Messages: pages at every phase; a reply awaiting its PUBACK at the switch; a text during the freeze before the order (`moving` receipt) and after it (held); a third reply with both slots held; target redelivery of already delivered ids; an ack sent to the frozen source | no loss, no duplicate in the thread or on the web; re-queued text sent once on the target with its original id; third reply refused by the composer; F2 sweep seen |
 | B5 | The source re-sends the same order after `fail` and after a cold boot; replay an old proof | acked, nothing reset, no replay counted; background trial and manual action still work; old proof ignored (`N < n_first`) |
-| B6 | Beam: (1) switch within 120 s of the ack: committed at the prompt attempt; (2) not switched: the prompt attempt returns to the active login within 5 s; (3) switch hours later with the session idle: found by the probe; (4) switch, then coverage loss: found at the reconnect; (5) a day of probes, measured mAh and kB; (6) switch to a stopped target broker, then start it: commits through §5.7; (7) target broker up, relay stopped: rule 5 slow-down | §5.3 outcomes; probe cost within the §5.3 estimate |
+| B6 | Move from Beam: (1) order with a CA, target healthy: committed over direct, `tls` is not `proxy`, reboot stays direct on the new host; (2) target stopped: trial fails `conn`, back on the source through Beam within seconds, schedule continues; (3) order without a CA: `fail/down`; (4) EN reset during the trial and between `idsel/act` and `carrier/bearer` (a debug hook): old identity over Beam, or new identity over direct; (5) source broker stopped: §5.7 alternates a plain Beam connect and a direct trial, commits when the target is up | §5.3 outcomes; never the new identity through Beam |
+| B16 | `cfg.br` after B6(1): (1) Beam group pointed at the target: `try` → proof → `ok`, `tls:"proxy"`, reboot stays on Beam; (2) group still pointed at the source: three attempts, `fail/auth` (or what S4(a) shows), direct, no fourth attempt after a reboot; (3) target relay stopped: `fail/proof`; (4) EN reset in each attempt phase and a battery pull during the proof wait: direct at boot, at most three attempts in total; (5) a second request id after `fail`: a fresh count; (6) a SIM without a Beam preset: `na` | §5.10 outcomes; measured time without a session per attempt ≤ 365 s |
 | B7 | Order during an OTA download (deferred); order with the image pending verify (`fail/rej`); `wait` job cancelled at commit; after a commit, an OTA of a build without the `KPCAPS1:mv;` tag | as specified; the untagged build is refused with `ota_err` `caps`; `fwpub.py` writes `caps: ["mv"]` for a tagged build and nothing for an untagged one |
 | B8 | Counters: after commit the target accepts every up `n`; the target's first `k'` `/down` (`n` = 1) is accepted | no `sigFailures`, no window drops |
 | B9 | §5.4 only if selected: trial boot, crash in a trial boot (one-shot), revert restart | boots old after a crash; no splash on trial boots |
 | B10 | `nvsstats` before and after a pending slot | free entries recorded; the doc's 2 kB estimate replaced by the measurement |
 | B11 | Current trace of one failed trial and one commit | replaces the §5.6 estimates |
-| B12 | Device-screen action on both bearers: from `pend`, from `fail/budget`, from `fail/ca` (re-fetch), with no session at all, during a download (refused), in airplane mode, repeated twice | each outcome text of §5.8; budget counter unchanged; commit when the target works |
+| B12 | Device-screen action from both bearers: from `pend`, from `fail/budget`, from `fail/ca` (re-fetch), with no session at all, during a download (refused), in airplane mode, repeated twice | each outcome text of §5.8; budget counter unchanged; commit when the target works |
 | B13 | Source gone: stop the old broker for 48 h with the target (a) healthy, (b) stopped then started after 24 h | (a) commits within 30 min; (b) commits within 30 min of the target's start; attempt count and mAh over the 48 h match §5.7 |
 | B14 | **Set up again** with an unsettled move and a target code typed on the pager; repeat once with an expired code, and once through Factory reset and `setup <code>` on the USB console | good code: `ident1`, `idsel`, `move` gone (`nvsstats`), `auth/epoch` kept, RTC down window zero, message history kept, first page from the target shown and acked. Expired code: error shown, restart, old identity and the unsettled move untouched, `setup/code` gone |
-| B15 | Background trial after `fail/budget` (direct) with the target fixed a day later | commits at the next 24 h trial |
+| B15 | Background trial after `fail/budget` with the target fixed a day later | commits at the next 24 h trial |
 
 Host tests: order, cancel and proof parsing; the plan function (state, now, events → next action);
 the ledger; boot-time repair from every §4 row; HKDF vectors shared with the relay
-(`tools/move_vectors.json`).
+(`tools/move_vectors.json`); a commit from Beam with the power cut at every write, followed by a boot
+whose own writes are cut; the `cfg.br` parser, decisions, plan and attempt steps, the request record
+with the power cut at every write of a whole try, and the attempt service reset in every phase.
 
 **Not verified (each named by its test):** broker switch within one boot (S1); a second `mqttConfig`
 (S2); slot 13 against a private RSA-2048 root behind nginx, and SNI (S3); Beam refusal signalling and
-group-change behaviour (S4); that a power cut mid-`nvs_set_*` keeps the old value (B3); whether the
+group-change behaviour (S4); the change between Beam (profile 0) and direct TLS (profile 2) within one
+boot, and a Soracom SIM reaching a public broker and CA URL directly (S5); that a power cut mid-`nvs_set_*` keeps the old value (B3); whether the
 modem keeps `SQNSMQTTCFG` and the TLS profile across a modem reset (not relied on: both are re-applied
 before every connect); clean session (not relied on).
 
@@ -830,34 +949,38 @@ Source lines, counted in the tree (`wc -l`, `git diff --numstat`):
 
 | File | What | Lines |
 |---|---|---|
-| `move.c` / `move.h` (new) | parser, derivation, record, ledger, boot repair, plan, back-off, alternation | 894 + 444 |
-| `move_svc.c` (new) | orders, cancels, proofs, the in-boot trial, Beam rules, §5.7, the Device-screen action | 1,097 |
-| `move_ui_fmt.c` / `.h` (new) | Device-screen lines and outcome texts | 234 |
+| `move.c` / `move.h` (new) | parser, derivation, record, ledger, boot repair, plan, back-off, alternation | 902 + 434 |
+| `move_svc.c` (new) | orders, cancels, proofs, the in-boot trial, the move off Beam, §5.7, the Device-screen action | 1,074 |
+| `bearer_try.c` / `.h`, `bearer_try_svc.c` (new) | `cfg.br`: parser, request record, boot repair, decisions; the attempts on Beam | 479 + 228, 434 |
+| `move_ui_fmt.c` / `.h` (new) | Device-screen lines and outcome texts | 230 |
 | `caps.c` / `.h`, `Kconfig.projbuild` (new) | the capability tag; `CONFIG_PAGER_MOVE_TRIALS` | 97 |
 | `ident.c` / `ident.h` | two slots, `seal`, `idsel`, `ident_use()`, `ident_alt_t`, epoch, erase-all | +516 / −65 |
 | `modes.c` / `modes.h` | owner flag, loss branch, §5.7 back-off, `/status` 77–78, boot repair, key switch under the lock | +220 / −59 |
 | `msg.c` / `msg.h` / `sms.c` | hold, `moving` re-queue, age re-base, F2 sweep, D1 | +285 / −52 |
 | `auth.c` / `auth.h` | saved window, swap, boot restore | +122 |
-| `net.cpp` / `net.h` | login switch, pending CA to slot 13 | +119 |
+| `net.cpp` / `net.h` | login switch, pending CA to slot 13, bearer selection in RAM | +119 before the bearer selection |
 | `scr_device.c`, `setup.c`, `ota.c`, `cfg.c`, `catrust.c`, others | rows, erase before store, install check, sub-key 7, per-slot store | +288 / −51 |
 | `tools/fwpub.py` | `caps` from the tag | +18 / −2 |
 | host tests and fakes (new and changed) | §11's host tests | ~4,800 |
 
-About 4,300 firmware lines added. Measured with `idf.py size` (ESP-IDF 5.2, esp32s3, app partition
+About 4,300 firmware lines added for the move as first built, and the three `bearer_try` files
+(1,141 lines) for `cfg.br`; the other rows' counts are from before `cfg.br`. Measured with `idf.py size` (ESP-IDF 5.2, esp32s3, app partition
 0x200000 = 2,097,152 bytes); static RAM is `.data` + `.bss`; the baseline is the unmodified HEAD firmware
 built from a clean export:
 
 | Build | `.bin` bytes | `.data` | `.bss` | Static RAM | App partition free |
 |---|---|---|---|---|---|
 | HEAD, `sdkconfig.defaults` | 762,032 | 31,192 | 172,304 | 203,496 | 1,335,120 (63.7 %) |
-| default (`sdkconfig.defaults`) | 777,024 | 31,192 | 174,568 | 205,760 | 1,320,128 (62.9 %) |
-| option on (`defaults` + `CONFIG_PAGER_MOVE_TRIALS=y`) | 786,672 | 31,192 | 175,496 | 206,688 | 1,310,480 (62.5 %) |
+| default (`sdkconfig.defaults`) | 779,952 | 31,192 | 174,992 | 206,184 | 1,317,200 (62.8 %) |
+| option on (`defaults` + `CONFIG_PAGER_MOVE_TRIALS=y`) | 794,880 | 31,192 | 176,096 | 207,288 | 1,302,272 (62.1 %) |
 | HEAD, `sdkconfig.carrier` | 766,416 | 31,288 | 172,312 | 203,600 | 1,330,736 (63.5 %) |
-| carrier (`defaults` + `sdkconfig.carrier`) | 781,248 | 31,288 | 174,576 | 205,864 | 1,315,904 (62.7 %) |
+| carrier (`defaults` + `sdkconfig.carrier`), before `cfg.br` and the move off Beam | 781,248 | 31,288 | 174,576 | 205,864 | 1,315,904 (62.7 %) |
 
-Against HEAD the default build is +14,992 bytes of image and +2,264 bytes of static RAM; the option adds
-another +9,648 bytes and +928 bytes of RAM. Carrier is +14,832 bytes and +2,264 bytes over its own
-baseline. The carrier build with the option on was not measured.
+Against HEAD the default build is +17,920 bytes of image and +2,688 bytes of static RAM; the option adds
+another +14,928 bytes and +1,104 bytes of RAM. The two rows were measured with `cfg.br` and the move
+off Beam in the tree; the carrier row was not measured again, and the carrier build with the option on
+was never measured. The tree holds other changes made since the HEAD rows were taken, so the
+differences are not the cost of the move alone.
 RTC: the saved window adds `saved_n`, `saved_bits`,
 `saved_valid` to `auth_rtc_t`; the slack against PROTOCOL.md §9.1's 1184-byte budget is printed at
 boot. NVS: one more slot, about 2 kB (estimate, B10).
@@ -867,14 +990,16 @@ boot. NVS: one more slot, about 2 kB (estimate, B10).
 | Module (`firmware/main/`) | Responsibility |
 |---|---|
 | `move.c`, `move.h` | order parser, derivation, move record, ledger, boot repair, trial plan, back-off, alternation, reply hold |
-| `move_svc.c` | orders, cancels and proofs, the in-boot trial (§5.2), Beam rules, §5.7, the Device-screen action |
+| `move_svc.c` | orders, cancels and proofs, the in-boot trial (§5.2), the move off Beam (§5.3), §5.7, the Device-screen action |
+| `bearer_try.c`, `bearer_try.h`, `bearer_try_svc.c` | `cfg.br` (§5.10): parser, request record, boot repair, decisions, `/status` 79–80; the attempts on Beam |
+| `carrier.c` | the stored bearer choice `carrier/bearer` (also built on the host) |
 | `move_ui_fmt.c` | Device-screen rows and outcome texts (§5.8) |
 | `caps.c`, `Kconfig.projbuild` | capability tag (M15), `CONFIG_PAGER_MOVE_TRIALS` |
 | `ident.c` | two identity slots, `seal`, `idsel`, `ident_use()`, epoch, erase-all |
-| `modes.c`, `net.cpp`, `auth.c` | `/status` 77-78, session owner and loss branch, login switch, key switch and saved window |
+| `modes.c`, `net.cpp`, `auth.c` | `/status` 77-80, session owner and loss branch, login switch, bearer selection in RAM, key switch and saved window |
 | `msg.c`, `sms.c` | reply hold, `moving` re-queue, age re-base |
-| `cfg.c`, `catrust.c`, `ota.c`, `setup.c`, `scr_device.c` | cfg sub-key 7, per-slot CA store, install check, Factory reset and setup erase, Device-screen rows |
-| `firmware/host/test_move.c`, `test_move_svc*.c`, `test_ident.c`, `nvs_fake.c` | host tests (`make -C firmware/host test`) |
+| `cfg.c`, `catrust.c`, `ota.c`, `setup.c`, `scr_device.c`, `scr_devinfo.c` | cfg sub-keys 7 and 8, per-slot CA store, install check, Factory reset and setup erase, Device-screen rows, the bearer note |
+| `firmware/host/test_move.c`, `test_move_svc*.c`, `test_bearer_try*.c`, `test_ident.c`, `test_carrier.c`, `nvs_fake.c` | host tests (`make -C firmware/host test`) |
 | `tools/move_vectors.json` | key-derivation vector shared with the relay |
 
 ### 13.1 Spike procedure (before relying on the in-boot switch)
@@ -941,5 +1066,16 @@ really replaced the old one.
     then reaches B.
 - **(c) Public-certificate destination.** The (b) connect to G2's destination succeeds.
 
+**S5, bearer switch in one boot.** On the Soracom SIM with G1 pointed at A and the session up through
+Beam (`bearer` shows `auto -> beam`):
+1. `cafetch https://<B>/kid-pager/ca/<sha>.pem <sha>`: the SIM's own data path reaches B's CA URL.
+2. `mvspike hold`, wait for DISCONNECTED; `mvspike ca …`, `mvspike tls 13 ca`,
+   `mvspike cfg <dev_id> <pw2> 2`, `mvspike conn <B> 8883`. Expect CONNECTED and a subscribe on B.
+3. `mvspike hold`; `mvspike cfg <dev_id> <pw1> 0`, `mvspike conn beam.soracom.io 1883`. Expect
+   CONNECTED through Beam on A.
+4. Repeat steps 2–3 five times, reading `AT+SQNSMQTTCFG?` after each `cfg`; then `mvspike release`.
+5. **Pass:** all 10 connects succeed with no `+CME ERROR: 4` and no modem reset.
+
 **What to report for each spike:** pass or fail, the console log, the broker-side log, and for S4(b)
-the timeline. S1 selects §5.2 or §5.4. S4(b) decides whether the Beam probe of §5.3 item 6 ships.
+the timeline. S1 selects §5.2 or §5.4; S5 selects the same for a move from Beam (§5.3) and for
+`cfg.br` (§5.10). S4(a) decides what a `cfg.br` attempt reports when the group points elsewhere.

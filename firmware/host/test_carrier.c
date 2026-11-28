@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "carrier.h"
+#include "nvs_fake.h"
 
 static int g_failures = 0;
 #define CHECK(cond, ...)                                                                           \
@@ -139,6 +140,21 @@ int main(void)
         carrier_mqtt_params(NULL, &ka, &pg);
         CHECK(ka == 480 && pg == 240, "NULL (custom APN) 480/240");
     }
+
+    // The stored bearer choice (NVS carrier/bearer): absent = auto; a failed write changes nothing.
+    nvs_fake_reset();
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO, "no key: auto");
+    CHECK(carrier_bearer_override_set(CARRIER_BEARER_OVR_AUTO), "erasing an absent key is not a failure");
+    CHECK(carrier_bearer_override_set(CARRIER_BEARER_OVR_DIRECT) &&
+              carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT,
+          "direct is stored");
+    nvs_fake_cut_after(0);
+    CHECK(!carrier_bearer_override_set(CARRIER_BEARER_OVR_AUTO) &&
+              carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT,
+          "a write the power cut stops leaves direct");
+    nvs_fake_cut_after(-1);
+    CHECK(carrier_bearer_override_set(CARRIER_BEARER_OVR_AUTO) && carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO,
+          "back to auto");
 
     if (g_failures == 0) {
         printf("PASS: carrier, 0 failures\n");

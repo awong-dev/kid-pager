@@ -549,10 +549,15 @@ def _beam_pager(world, state: str = "waiting") -> None:
 def test_the_beam_block_counts_beam_pagers(beam):
     _beam_pager(beam)
     block = beam.dst.get("/api/admin/move", "sup").json()["beam"]
+    devices = block.pop("devices")
     assert block == {
         "host": "new.example.org", "port": 8884, "count": 1, "movedCount": 0,
+        "waitingCount": 0, "onBeamCount": 1,
         "switched": False, "soracom": True, "byHand": False,
     }
+    assert [(d["deviceId"], d["bearer"], d["canTry"], d["try"]) for d in devices] == [
+        ("pgr-a", "beam", False, None)
+    ]
 
 
 def test_switch_moves_the_old_groups_sims_into_a_new_group(beam):
@@ -926,8 +931,9 @@ def test_a_beam_pager_is_remembered_after_it_reports_another_bearer(beam):
                  session="s_00000002")
     assert _device(beam).move.state == "moved" and _device(beam).status.tls == "unpinned"
     block = beam.dst.get("/api/admin/move", "sup").json()["beam"]
-    assert block["count"] == 1 and block["movedCount"] == 1
-    assert beam.dst.post("/api/admin/move/beam/switch-back", "sup", {}).status_code == 409
+    assert block["count"] == 1 and block["movedCount"] == 1 and block["onBeamCount"] == 0
+    # it is on the direct bearer now, so the group can go back without cutting it off
+    assert beam.dst.post("/api/admin/move/beam/switch-back", "sup", {}).status_code == 200
 
 
 def test_a_direct_pager_is_not_marked_as_on_beam(live):
@@ -1037,3 +1043,98 @@ def test_a_build_without_mv_is_refused_only_to_a_pager_that_has_moved():
         assert firmware.move_refusal(build, move_state=state) is None
     build.caps = ["mv"]
     assert firmware.move_refusal(build, move_state="moved") is None
+
+
+# ---- Beam after a move over the direct bearer -----------------------------------------------------
+
+
+def _beam_origin(world, *, brc: int | None = 1) -> None:
+    """pgr-a as the importer leaves a pager that was on Beam at the source."""
+    with world.dst.active():
+        get_db().collection("devices").document("pgr-a").update({"move.onBeam": True})
+        devices_store.update_status("pgr-a", tls="proxy", state="online", brc=brc)
+
+
+def _cfg_br(envs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e["cfg"]["br"] for e in envs if e.get("kind") == "cfg" and "br" in e.get("cfg", {})]
+
+
+def test_the_group_switch_waits_for_beam_pagers_that_move_by_themselves(beam):
+    _beam_origin(beam)
+    r = beam.dst.post("/api/admin/move/beam/switch", "sup", {})
+    assert r.status_code == 409 and r.json()["waiting"] == ["pgr-a"]
+    assert beam.soracom.sims["i1"] == "g-old"
+    assert beam.dst.get("/api/admin/move", "sup").json()["beam"]["waitingCount"] == 1
+    assert beam.dst.post("/api/admin/move/beam/switch", "sup", {"force": True}).status_code == 200
+
+
+def test_a_beam_pager_without_brc_does_not_hold_the_group_switch(beam):
+    _beam_origin(beam, brc=None)
+    assert beam.dst.post("/api/admin/move/beam/switch", "sup", {}).status_code == 200
+
+
+def test_a_pager_that_arrived_direct_is_told_to_try_beam_and_gets_the_proof(beam):
+    _beam_origin(beam)
+    pager, _ = _arrive(beam, mv_st="ok", cbor=True, tls="pinned", brc=1)
+    assert _device(beam).move.state == "moved" and _device(beam).move.onBeam
+    assert beam.dst.post("/api/admin/move/beam/switch", "sup", {}).status_code == 200
+
+    r = beam.dst.post("/api/admin/devices/bearer-try", "sup", {"deviceIds": ["pgr-a", "nope"]})
+    assert r.status_code == 200
+    assert r.json() == {"sent": ["pgr-a"], "skipped": [{"id": "nope", "reason": "unknown"}]}
+    request_id = _device(beam).bearerTry.id
+    assert _cfg_br(published(beam.dst, "pgr-a", pager.k_prime))[-1] == {"id": request_id, "b": "beam"}
+
+    # asked again while the first is outstanding: the same request, not a new one
+    beam.dst.post("/api/admin/devices/bearer-try", "sup", {})
+    assert _device(beam).bearerTry.id == request_id
+
+    # between attempts the pager is on the direct bearer: no proof goes out there
+    pager.status(beam.dst, pager.k_prime, cbor=True, tls="pinned", brc=1, br={"id": request_id, "st": "try"})
+    assert _cfg_br(published(beam.dst, "pgr-a", pager.k_prime))[-1] == {"id": request_id, "b": "beam"}
+    pager.status(beam.dst, pager.k_prime, cbor=True, tls="proxy", brc=1, br={"id": request_id, "st": "try"})
+    assert _cfg_br(published(beam.dst, "pgr-a", pager.k_prime))[-1] == {"id": request_id, "ok": True}
+    assert _device(beam).bearerTry.st == "try"
+
+    pager.status(beam.dst, pager.k_prime, cbor=True, tls="proxy", brc=1, br={"id": request_id, "st": "ok"})
+    assert _device(beam).bearerTry.st == "ok"
+    row = beam.dst.get("/api/admin/move", "sup").json()["beam"]["devices"][0]
+    assert row["bearer"] == "beam" and row["try"] == {"st": "ok", "rsn": None}
+    # on Beam now: the group must stay where it is
+    assert beam.dst.post("/api/admin/move/beam/switch-back", "sup", {}).status_code == 409
+
+
+def test_a_failed_beam_try_is_recorded_and_another_request_can_follow(beam):
+    _beam_origin(beam)
+    pager, _ = _arrive(beam, mv_st="ok", cbor=True, tls="pinned", brc=1)
+    beam.dst.post("/api/admin/devices/bearer-try", "sup", {})
+    first = _device(beam).bearerTry.id
+    pager.status(
+        beam.dst, pager.k_prime, cbor=True, tls="pinned", brc=1, br={"id": first, "st": "fail", "rsn": "auth"}
+    )
+    state = _device(beam).bearerTry
+    assert (state.st, state.rsn) == ("fail", "auth")
+    beam.dst.post("/api/admin/devices/bearer-try", "sup", {})
+    assert _device(beam).bearerTry.id != first
+
+
+def test_a_report_for_another_request_is_ignored(beam):
+    _beam_origin(beam)
+    pager, _ = _arrive(beam, mv_st="ok", cbor=True, tls="pinned", brc=1)
+    beam.dst.post("/api/admin/devices/bearer-try", "sup", {})
+    before = len(_cfg_br(published(beam.dst, "pgr-a", pager.k_prime)))
+    pager.status(beam.dst, pager.k_prime, cbor=True, tls="proxy", brc=1, br={"id": "br_000000000000", "st": "try"})
+    assert len(_cfg_br(published(beam.dst, "pgr-a", pager.k_prime))) == before
+    assert _device(beam).bearerTry.st == "sent"
+
+
+def test_pagers_that_cannot_try_beam_are_skipped_with_the_reason(beam):
+    _beam_origin(beam)
+    r = beam.dst.post("/api/admin/devices/bearer-try", "sup", {"deviceIds": ["pgr-a"]})
+    assert r.json()["skipped"] == [{"id": "pgr-a", "reason": "on_beam"}]
+    pager, _ = _arrive(beam, mv_st="try", cbor=True, tls="pinned", brc=1)
+    r = beam.dst.post("/api/admin/devices/bearer-try", "sup", {"deviceIds": ["pgr-a"]})
+    assert r.json()["skipped"] == [{"id": "pgr-a", "reason": "moving"}]
+    pager.status(beam.dst, pager.k_prime, cbor=True, tls="pinned", mv={"id": beam.move_id, "st": "ok", "at": 1})
+    r = beam.dst.post("/api/admin/devices/bearer-try", "sup", {"deviceIds": ["pgr-a"]})
+    assert r.json()["skipped"] == [{"id": "pgr-a", "reason": "firmware"}]

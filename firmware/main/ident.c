@@ -14,6 +14,7 @@ static const char *const k_slot_ns[IDENT_SLOTS] = { "ident", "ident1" };
 static const char *NVS_NS = "ident";
 static const char *NVS_NS_SEL = "idsel";
 static const char *NVS_NS_MOVE = "move";
+static const char *NVS_NS_BRTRY = "brtry"; /* bearer_try.c: a cfg.br request belongs to the server that sent it */
 static const char *NVS_NS_AUTH = "auth";
 
 static ident_t s_ident;
@@ -573,7 +574,8 @@ bool ident_erase(void)
 {
     /* Selector first, slot 0 last: a power cut part-way leaves a pager that still boots, never one
      * pointing at a slot that is gone. Every namespace is attempted. */
-    bool ok = erase_ns(NVS_NS_SEL);
+    bool ok = erase_ns(NVS_NS_BRTRY);
+    ok = erase_ns(NVS_NS_SEL) && ok;
     ok = erase_ns(NVS_NS_MOVE) && ok;
     ok = erase_ns(k_slot_ns[1]) && ok;
     ok = erase_ns(k_slot_ns[0]) && ok;

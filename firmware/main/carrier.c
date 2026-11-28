@@ -1,6 +1,12 @@
 #include "carrier.h"
 
+#include <stdint.h>
 #include <string.h>
+
+#include "esp_log.h"
+#include "nvs.h"
+
+static const char *TAG = "carrier";
 
 static const carrier_preset_t k_presets[] = {
     { "Automatic", "", NULL, "", CARRIER_BEARER_DIRECT, CARRIER_AUTH_NONE, NULL, NULL, true, NULL, 480, 240 },
@@ -181,14 +187,41 @@ const char *carrier_bearer_ovr_name(carrier_bearer_ovr_t o)
     return o == CARRIER_BEARER_OVR_DIRECT ? "direct" : (o == CARRIER_BEARER_OVR_BEAM ? "beam" : "auto");
 }
 
+carrier_bearer_ovr_t carrier_bearer_override_get(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open("carrier", NVS_READONLY, &h) != ESP_OK) {
+        return CARRIER_BEARER_OVR_AUTO;
+    }
+    if (nvs_get_u8(h, "bearer", &v) != ESP_OK || v > (uint8_t) CARRIER_BEARER_OVR_BEAM) {
+        v = 0;
+    }
+    nvs_close(h);
+    return (carrier_bearer_ovr_t) v;
+}
+
+// Power effect: one NVS write/erase; read at the next attach, or at once by net_bearer_reload().
+bool carrier_bearer_override_set(carrier_bearer_ovr_t o)
+{
+    nvs_handle_t h;
+    if (nvs_open("carrier", NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    esp_err_t e = (o == CARRIER_BEARER_OVR_AUTO) ? nvs_erase_key(h, "bearer") : nvs_set_u8(h, "bearer", (uint8_t) o);
+    if (e == ESP_ERR_NVS_NOT_FOUND) {
+        e = ESP_OK;
+    }
+    bool ok = e == ESP_OK && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    if (ok) {
+        ESP_LOGI(TAG, "bearer override stored: %s", carrier_bearer_ovr_name(o));
+    }
+    return ok;
+}
+
 #ifdef ESP_PLATFORM
 
-#include <stdint.h>
-
-#include "esp_log.h"
-#include "nvs.h"
-
-static const char *TAG = "carrier";
 static char s_apn[CARRIER_APN_MAX];
 static carrier_mode_t s_mode = CARRIER_MODE_AUTO;
 static bool s_loaded = false;
@@ -280,39 +313,6 @@ bool carrier_select_preset(size_t i)
 const carrier_preset_t *carrier_effective(const char *imsi, const char *gid1_hex, const char *iccid, const char *typed_apn)
 {
     return carrier_resolve(carrier_get_mode() == CARRIER_MODE_FIXED, carrier_get_apn(), imsi, gid1_hex, iccid, typed_apn);
-}
-
-carrier_bearer_ovr_t carrier_bearer_override_get(void)
-{
-    nvs_handle_t h;
-    uint8_t v = 0;
-    if (nvs_open("carrier", NVS_READONLY, &h) != ESP_OK) {
-        return CARRIER_BEARER_OVR_AUTO;
-    }
-    if (nvs_get_u8(h, "bearer", &v) != ESP_OK || v > (uint8_t) CARRIER_BEARER_OVR_BEAM) {
-        v = 0;
-    }
-    nvs_close(h);
-    return (carrier_bearer_ovr_t) v;
-}
-
-// Power effect: one NVS write/erase; read at the next attach.
-bool carrier_bearer_override_set(carrier_bearer_ovr_t o)
-{
-    nvs_handle_t h;
-    if (nvs_open("carrier", NVS_READWRITE, &h) != ESP_OK) {
-        return false;
-    }
-    esp_err_t e = (o == CARRIER_BEARER_OVR_AUTO) ? nvs_erase_key(h, "bearer") : nvs_set_u8(h, "bearer", (uint8_t) o);
-    if (e == ESP_ERR_NVS_NOT_FOUND) {
-        e = ESP_OK;
-    }
-    bool ok = e == ESP_OK && nvs_commit(h) == ESP_OK;
-    nvs_close(h);
-    if (ok) {
-        ESP_LOGI(TAG, "bearer override: %s; used from the next attach", carrier_bearer_ovr_name(o));
-    }
-    return ok;
 }
 
 bool carrier_auth_flag_get(void)

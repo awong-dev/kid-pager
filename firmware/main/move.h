@@ -32,22 +32,15 @@ void move_unlock(void);
 #define MOVE_NO_SLOT 0xFF
 #define MOVE_SCHED_STEPS 4  /* scheduled trials before `fail/budget` */
 
-/* Timers, docs/MOVE_FIRMWARE_DESIGN.md §5.3, §5.6. */
-#define PAGER_MOVE_BEAM_PROMPT_S 120u
-#define PAGER_MOVE_BEAM_PROBE_S 3600u       /* first 7 days after the ack */
-#define PAGER_MOVE_BEAM_PROBE_LONG_S 14400u /* then */
-#define PAGER_MOVE_BEAM_PROBE_FIRST_S (7u * 86400u)
-#define PAGER_MOVE_BEAM_SLOW_S 3600u        /* pending login after 3 SUBACKs without a proof */
-#define PAGER_MOVE_BEAM_SLOW_AFTER 3u
-#define PAGER_MOVE_BG_TRIAL_S 86400u        /* direct, after the budget */
+/* Timers, docs/MOVE_FIRMWARE_DESIGN.md §5.6. */
+#define PAGER_MOVE_BG_TRIAL_S 86400u        /* after the budget */
 #define PAGER_MOVE_ACK_WAIT_S 30u
 #define PAGER_MOVE_DRAIN_S 30u
 #define PAGER_MOVE_DRAIN_MANUAL_S 5u
 #define PAGER_MOVE_PROOF_WAIT_S 180u
-#define PAGER_MOVE_GUARD_DIRECT_S 60u
-#define PAGER_MOVE_GUARD_BEAM_S 30u
+#define PAGER_MOVE_GUARD_S 60u               /* SUBACK on the new broker */
 #define PAGER_MOVE_DISCONNECT_WAIT_S 5u
-#define PAGER_MOVE_QUIET_S 60u              /* no key this long before a background trial or probe */
+#define PAGER_MOVE_QUIET_S 60u              /* no key this long before a background trial */
 #define PAGER_MOVE_MOVING_HOLD_S 86400u     /* a `moving` receipt without an order */
 #define PAGER_MOVE_CA_TRIES 3
 #define PAGER_MOVE_CA_RETRY_S 60u
@@ -76,6 +69,12 @@ typedef enum {
     MOVE_RSN_BUSY,
 } move_rsn_t;
 
+/* `bearer` of the record. An unsettled order taken on Beam says BEAM, and its commit stores the bearer
+ * choice `direct`. The `ok` record says 0 once that is stored and OWED while the write is still to be made;
+ * a BEAM left in an `ok` record by firmware that moved through Beam's group asks for nothing. */
+#define MOVE_BEARER_BEAM 1
+#define MOVE_BEARER_OWED 2
+
 /* Ledger outcomes. */
 #define MOVE_OUT_NONE 0
 #define MOVE_OUT_OK 1
@@ -91,9 +90,9 @@ typedef struct {
     uint8_t rsn;      /* move_rsn_t reported with `st` */
     uint8_t lrsn;     /* move_rsn_t of the last failed trial, for the Device screen */
     uint8_t at;       /* trials and attempts started for this id, saturating */
-    uint8_t sched;    /* scheduled trials started (direct) */
+    uint8_t sched;    /* scheduled trials started */
     uint8_t slot;     /* the pending identity slot, MOVE_NO_SLOT if there is none */
-    uint8_t bearer;   /* 1 = Beam at the time of the order */
+    uint8_t bearer;   /* MOVE_BEARER_*: what the commit owes the bearer choice (§5.3) */
     uint8_t acked;
     uint8_t tb;       /* trial-by-restart armed (§5.4, not used by the in-boot trial) */
     uint32_t next_try_ts; /* epoch s; 0 = due, or no clock */
@@ -148,6 +147,7 @@ typedef struct {
     bool busy;            /* a catrust apply, an OTA or font download, or a cafetch runs */
     bool trial_running;   /* a trial, or the processing of another order, is in flight */
     bool trials_built;    /* CONFIG_PAGER_MOVE_TRIALS: this image can finish a move */
+    bool beam;            /* the session runs through Beam, which validates the broker for the pager */
 } move_order_ctx_t;
 
 typedef enum {
@@ -190,8 +190,8 @@ bool move_url_load(char *out, size_t cap);
 typedef struct {
     const move_cfg_t *o;
     const char *pem;
-    bool ca_failed;   /* direct bearer: the fetch failed three times; the slot is stored without a PEM */
-    bool beam;
+    bool ca_failed;   /* the fetch failed three times; the slot is stored without a PEM */
+    bool beam;        /* the pager is on Beam: recorded, so the commit leaves that bearer (§5.3) */
     uint32_t now_epoch;
 } move_accept_t;
 
@@ -206,15 +206,20 @@ bool move_note_reject(const char *id, move_rsn_t rsn);
 /* §5.5 cancel: ledger entry and `cxl`, then the pending slot is dropped. */
 bool move_cancel_apply(void);
 
-/* §4 commit point and after: writes `idsel/act`, then record `ok` and the ledger entry. False,
- * with nothing committed, if the slot cannot be committed. */
+/* §4 commit point and after: writes `idsel/act`, then the bearer choice `direct` when the order was taken
+ * on Beam, then record `ok` and the ledger entry. False, with nothing committed, if the slot cannot be
+ * committed. */
 bool move_commit(void);
+
+/* The committed move left Beam and the bearer choice `direct` is not stored yet (an NVS write failed): the
+ * caller keeps the bearer direct in RAM, and every boot tries the write again (move_boot_repair()). */
+bool move_bearer_owed(void);
 
 typedef enum {
     MOVE_BOOT_NOTHING,
     MOVE_BOOT_CLEARED,   /* `recv`: the half-written order is dropped */
     MOVE_BOOT_DEMOTED,   /* an interrupted trial goes back to `pend` */
-    MOVE_BOOT_COMMITTED, /* `act` was written, the record was not */
+    MOVE_BOOT_COMMITTED, /* `act` was written, the record (and, from Beam, the bearer choice) was not */
     MOVE_BOOT_DROPPED,   /* the record named a slot that is not there */
     MOVE_BOOT_BUDGET,    /* `pend` with the scheduled trials used up */
 } move_boot_t;
@@ -249,7 +254,7 @@ void move_status_from_rec(const move_rec_t *r, bool trying, move_status_t *out);
 uint32_t move_status_cbor_fields(bool mvc, const move_status_t *mv);
 bool move_status_cbor_write(cbor_w_t *w, bool mvc, const move_status_t *mv);
 
-/* ---- plan: what the loop does next (docs/MOVE_FIRMWARE_DESIGN.md §5.2, §5.3, §5.7) ---- */
+/* ---- plan: what the loop does next (docs/MOVE_FIRMWARE_DESIGN.md §5.2, §5.7) ---- */
 
 typedef enum {
     MOVE_ACT_NONE,
@@ -258,22 +263,18 @@ typedef enum {
     MOVE_ACT_TRIAL_SCHED,
     MOVE_ACT_TRIAL_BG,
     MOVE_ACT_TRIAL_MANUAL,
-    MOVE_ACT_BEAM_PROMPT,
-    MOVE_ACT_BEAM_PROBE,
     MOVE_ACT_REFUSE_AIRPLANE,
     MOVE_ACT_REFUSE_NO_NETWORK,
     MOVE_ACT_REFUSE_BUSY,
 } move_act_t;
 
 typedef struct {
-    bool beam;
     move_st_t st;       /* the stored state */
     uint8_t sched;
     bool acked;
     uint32_t now_epoch; /* 0 = no clock */
     uint32_t next_try_ts;
     bool mono_gate_open; /* RAM spacing so a missing clock cannot spin the schedule */
-    int64_t ack_age_us;  /* since the ack went out; -1 = not yet */
     int64_t store_age_us; /* since the order was stored in this boot; -1 = a boot ago */
     bool session_usable;
     bool registered, airplane, coverage_owns_radio;
@@ -282,9 +283,6 @@ typedef struct {
     bool reply_awaiting; /* a reply awaits its PUBACK */
     int64_t reply_wait_us;
     bool manual;
-    bool beam_prompt_done;
-    bool beam_probe_due;
-    bool pending_attempt_allowed; /* the Beam slow-down (§5.3 item 5) */
     uint8_t attempts;    /* trials and attempts started for this order (the record's `at`) */
 } move_plan_in_t;
 
@@ -299,13 +297,10 @@ uint32_t move_next_try_fill(const move_rec_t *r, uint32_t now_epoch, int64_t rem
 /* Delay after a scheduled trial that made `sched` trials: 10 min, 1 h, 6 h, then 24 h. */
 uint32_t move_sched_delay_s(uint8_t sched);
 
-/* Seconds until the next Beam probe, `since_ack_s` after the ack (0 = unknown, treated as the first week). */
-uint32_t move_probe_interval_s(uint32_t since_ack_s);
-
 /* §5.7: 5, 15, 60, 300 s, then 300 s until an hour without a session, 15 min until a day, then 30 min. */
 uint32_t move_backoff_delay_s(uint32_t idx, uint32_t no_session_s);
 
-/* §5.7 and §5.3 item 3: which login the next connect attempt uses. */
+/* §5.7: which identity the next connect attempt uses. */
 typedef struct {
     bool next_pending;      /* the next attempt goes to the pending login */
     bool usable_since_issue; /* the session was usable since the last attempt was issued */
@@ -316,9 +311,6 @@ typedef struct {
 void move_alt_on_loss(move_alt_t *a, bool on_pending);
 void move_alt_on_usable(move_alt_t *a);
 void move_alt_on_issue(move_alt_t *a);
-
-/* §5.3 item 5: after PAGER_MOVE_BEAM_SLOW_AFTER SUBACKs without a proof, one pending attempt per hour. */
-bool move_pending_attempt_allowed(uint8_t noproof_streak, int64_t since_last_pending_us);
 
 /* ---- Device screen (docs/MOVE_FIRMWARE_DESIGN.md §5.8) ---- */
 
@@ -341,7 +333,6 @@ typedef struct {
     bool have;
     char id[MOVE_ID_MAX];
     char host[MOVE_HOST_MAX]; /* the order's host, from the pending slot; "" when none */
-    bool beam;
     move_st_t st;
     move_rsn_t rsn;       /* stored: what /status carries */
     move_rsn_t last_rsn;  /* the last trial's reason, for the outcome line */
@@ -391,7 +382,7 @@ bool move_status_get(move_status_t *out);
 bool move_unsettled(void);
 
 /* A move with an unsettled order in a build that runs trials: the reconnect loop then follows §5.7
- * (the long-run schedule, the other login after a refusal). Always false without CONFIG_PAGER_MOVE_TRIALS. */
+ * (the long-run schedule, the other identity after a refusal). Always false without CONFIG_PAGER_MOVE_TRIALS. */
 bool move_trials_active(void);
 
 /* A cfg.ca apply waits while a move is `pend` or a trial runs; never without CONFIG_PAGER_MOVE_TRIALS. */
@@ -411,11 +402,11 @@ void move_note_connect_issued(void);
 void move_note_backoff_reset(int64_t now_us);
 uint32_t move_no_session_s(int64_t now_us);
 
-/* A disconnect the reconnect loop just issued (a probe's, or a trial's revert): the next DISCONNECTED within
+/* A disconnect a trial, its revert or a cfg.br attempt just issued: the next DISCONNECTED within
  * PAGER_MOVE_DISCONNECT_WAIT_S + 1 s is its own. */
 void move_note_own_disconnect(int64_t now_us);
 
-/* True once, right after a disconnect a trial or a probe asked for: its DISCONNECTED is not a lost session. */
+/* True once, right after such a disconnect: its DISCONNECTED is not a lost session. */
 bool move_swallow_own_disconnect(int64_t now_us);
 
 /* The reconnect loop asks, when it is about to connect and nothing is up: should this attempt use the
@@ -423,8 +414,8 @@ bool move_swallow_own_disconnect(int64_t now_us);
 bool move_attempt_pending_next(const move_env_t *env);
 void move_begin_pending_attempt(const move_env_t *env);
 
-/* What the reconnect loop does after a trial ended or a probe asks for it: nothing; drop the session
- * and connect on the active login at once (back-off index 0); or take the next back-off step. */
+/* What the reconnect loop does after a trial ended: nothing; drop the session and connect on the active
+ * identity at once (back-off index 0); or take the next back-off step. */
 typedef enum { MOVE_RECONNECT_NONE = 0, MOVE_RECONNECT_NOW, MOVE_RECONNECT_BACKOFF } move_reconnect_t;
 move_reconnect_t move_take_reconnect_request(void);
 

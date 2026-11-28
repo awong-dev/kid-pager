@@ -58,6 +58,8 @@ class DeviceStatus(BaseModel):
     mb: int | None = None
     # `mvc` (docs/MOVE_DESIGN.md §12.2): move capability, only ever `1`; gates a `cfg.mv` order.
     mvc: int | None = None
+    # `brc` (docs/PROTOCOL.md §5.1): the pager understands `cfg.br`; only ever `1`.
+    brc: int | None = None
     locPeriodS: int | None = None
     locMinS: int | None = None
     # Trust state and the pinned CA's short fingerprint.
@@ -176,6 +178,19 @@ class DeviceMoveLast(BaseModel):
     ts: datetime | None = None
 
 
+class DeviceBearerTry(BaseModel):
+    """`devices/{d}.bearerTry`: the last `cfg.br` request sent to the pager and its outcome
+    (docs/PROTOCOL.md §3.2). `st` is `sent` until the pager reports."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    st: Literal["sent", "try", "ok", "fail", "na"] = "sent"
+    rsn: str | None = None
+    sentAt: datetime | None = None
+    reportedAt: datetime | None = None
+
+
 class DeviceMove(BaseModel):
     """`devices/{d}.move` (docs/MOVE_DESIGN.md §7.2, §12.4): the move id and the pager's progress.
 
@@ -197,7 +212,7 @@ class DeviceMove(BaseModel):
     trialAt: datetime | None = None
     movedAt: datetime | None = None
     reprovisionedAt: datetime | None = None
-    # Target: the pager has reported the Beam bearer at some point during the move.
+    # Target: the pager was on the Beam bearer when the bundle was made, or has reported it since.
     onBeam: bool = False
 
 
@@ -231,6 +246,7 @@ class Device(BaseModel):
     provisionState: Literal["issued", "provisioned", "moved", "moving"] | None = None
     # The deployment move this device is part of (`docs/MOVE_DESIGN.md` §7.2); `None` otherwise.
     move: DeviceMove | None = None
+    bearerTry: DeviceBearerTry | None = None
     # Copied from the owner's `familyId` at creation; `None` on devices that predate it.
     familyId: str | None = None
     # Written directly via `get_db()` by the contacts store; modelled so `get_device()` returns it.

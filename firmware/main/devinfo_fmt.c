@@ -139,7 +139,9 @@ int devinfo_rows(const devinfo_view_t *v, char rows[][DEVINFO_ROW_LEN], int max_
         snprintf(rq, sizeof(rq), "%s%d.%d dB", v->rsrq_dtenths < 0 ? "-" : "", q / 10, q % 10);
     }
     ROW("rsrp %s  rsrq %s", rp, rq);
-    ROW("carrier %.24s  %s", or_dash(v->carrier), !v->bearer_known ? "--" : (v->beam ? "beam" : "direct"));
+    const bool note = v->bearer_note != NULL && v->bearer_note[0] != '\0';
+    ROW("carrier %.24s  %s%s%s%s", or_dash(v->carrier), !v->bearer_known ? "--" : (v->beam ? "beam" : "direct"),
+        note ? " (" : "", note ? v->bearer_note : "", note ? ")" : "");
     ROW("apn %s", (v->apn != NULL && v->apn[0] != '\0') ? v->apn : "(network's choice)");
     ROW("board %s", or_dash(v->board));
 #undef ROW

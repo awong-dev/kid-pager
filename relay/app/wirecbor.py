@@ -115,6 +115,8 @@ KEYMAP: dict[str, int] = {
     # §12.2).
     "mvc": 77,
     "mv": 78,
+    "brc": 79,
+    "br": 80,
 }
 REVERSE_KEYMAP: dict[int, str] = {v: k for k, v in KEYMAP.items()}
 
@@ -142,7 +144,12 @@ CFG_KEYMAP: dict[str, int] = {
     "ast": 6,
     # `cfg.mv`, the move order, cancel or proof.
     "mv": 7,
+    # `cfg.br`, the bearer-change try or proof.
+    "br": 8,
 }  # fmt: skip
+# `cfg.br` (docs/PROTOCOL.md §3.2) and the `/status` `br` report (§5.1).
+BR_KEYMAP: dict[str, int] = {"id": 0, "b": 1, "ok": 2}
+BR_REPORT_KEYMAP: dict[str, int] = {"id": 0, "st": 1, "rsn": 2}
 # `cfg.mv` (docs/MOVE_DESIGN.md §12.1); `ca` reuses `CA_KEYMAP`.
 MV_KEYMAP: dict[str, int] = {"id": 0, "host": 1, "port": 2, "ca": 3, "cancel": 4, "ok": 5}
 # `/status` `mv` report (§12.2).
@@ -177,6 +184,8 @@ _REVERSE_SMS_CONTACT = {v: k for k, v in SMS_CONTACT_KEYMAP.items()}
 _REVERSE_CFG = {v: k for k, v in CFG_KEYMAP.items()}
 _REVERSE_MV = {v: k for k, v in MV_KEYMAP.items()}
 _REVERSE_MV_REPORT = {v: k for k, v in MV_REPORT_KEYMAP.items()}
+_REVERSE_BR = {v: k for k, v in BR_KEYMAP.items()}
+_REVERSE_BR_REPORT = {v: k for k, v in BR_REPORT_KEYMAP.items()}
 _REVERSE_CELL = {v: k for k, v in CELL_KEYMAP.items()}
 _REVERSE_OTA = {v: k for k, v in OTA_KEYMAP.items()}
 # `cfg.loc = {gnss}`, `gnss` is a bool.
@@ -233,6 +242,8 @@ def _mv_to_names(v: dict[Any, Any]) -> dict[str, Any]:
 def _value_to_int_keys(name: str, value: Any) -> Any:
     if name == "mv" and isinstance(value, dict):
         return {MV_REPORT_KEYMAP[k]: v for k, v in value.items() if k in MV_REPORT_KEYMAP}
+    if name == "br" and isinstance(value, dict):
+        return {BR_REPORT_KEYMAP[k]: v for k, v in value.items() if k in BR_REPORT_KEYMAP}
     if name == "bs" and isinstance(value, dict):
         return {BS_KEYMAP[k]: v for k, v in value.items() if k in BS_KEYMAP}
     if name == "loc" and isinstance(value, dict):
@@ -263,6 +274,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
                 out[CFG_KEYMAP["ast"]] = _ota_to_int(v)
             elif k == "mv" and isinstance(v, dict):
                 out[CFG_KEYMAP["mv"]] = _mv_to_int(v)
+            elif k == "br" and isinstance(v, dict):
+                out[CFG_KEYMAP["br"]] = {BR_KEYMAP[bk]: bv for bk, bv in v.items()}
             elif k == "loc" and isinstance(v, dict):
                 out[CFG_KEYMAP["loc"]] = {CFG_LOC_KEYMAP[lk]: lv for lk, lv in v.items()}
             else:
@@ -276,6 +289,8 @@ def _value_to_int_keys(name: str, value: Any) -> Any:
 def _value_to_names(name: str, value: Any) -> Any:
     if name == "mv" and isinstance(value, dict):
         return {_REVERSE_MV_REPORT[k]: v for k, v in value.items() if k in _REVERSE_MV_REPORT}
+    if name == "br" and isinstance(value, dict):
+        return {_REVERSE_BR_REPORT[k]: v for k, v in value.items() if k in _REVERSE_BR_REPORT}
     if name == "bs" and isinstance(value, dict):
         return {_REVERSE_BS[k]: v for k, v in value.items() if k in _REVERSE_BS}
     if name == "loc" and isinstance(value, dict):
@@ -304,6 +319,8 @@ def _value_to_names(name: str, value: Any) -> Any:
                 out["ast"] = _ota_to_names(v)
             elif k == CFG_KEYMAP["mv"] and isinstance(v, dict):
                 out["mv"] = _mv_to_names(v)
+            elif k == CFG_KEYMAP["br"] and isinstance(v, dict):
+                out["br"] = {_REVERSE_BR[bk]: bv for bk, bv in v.items() if bk in _REVERSE_BR}
             elif k == CFG_KEYMAP["loc"] and isinstance(v, dict):
                 # Unknown sub-keys are ignored.
                 out["loc"] = {_REVERSE_CFG_LOC[lk]: lv for lk, lv in v.items() if lk in _REVERSE_CFG_LOC}

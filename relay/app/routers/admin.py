@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app import (
     apn_presets,
     authn_home,
+    bearer_try,
     book,
     ca_resolve,
     devcfg,
@@ -790,6 +791,22 @@ def _set_device_apn_impl(device_id: str, req: SetApnRequest) -> dict[str, str | 
         raise HTTPException(status_code=422, detail=str(exc)) from None
     devices_store.set_apn(device_id, apn)
     return {"apn": apn}
+
+
+class BearerTryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # `None`: every pager.
+    deviceIds: list[str] | None = Field(default=None, max_length=1000)
+
+
+@router.post("/devices/bearer-try", dependencies=[Depends(require_admin_write_rate_limit)])
+def devices_bearer_try(
+    req: BearerTryRequest, broker: Annotated[BrokerClient, Depends(get_broker)]
+) -> dict[str, object]:
+    """Tell pagers to try Soracom Beam (`cfg.br`); each falls back to the direct bearer by itself.
+    The outcome shows in each device's `bearerTry`."""
+    return bearer_try.start(broker, req.deviceIds)
 
 
 @router.put("/devices/{device_id}/apn", dependencies=[Depends(require_admin_write_rate_limit)])

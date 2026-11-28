@@ -371,6 +371,20 @@ static void test_mv_span(void)
     CHECK(cbor_r_key(&r, &key) && key == 4 && cbor_r_bool(&r, &b) && b, "mv cancel");
     CHECK(d.mv_off + d.mv_len == w.len, "mv span ends at the end of the buffer");
 
+    /* `br`=8: a bearer-change map, a try { id, b: "beam" } */
+    cbor_w_init(&w, buf, sizeof(buf));
+    cbor_w_map(&w, 3);
+    cbor_w_tstr(&w, 1, "m_66666666", 10);
+    cbor_w_tstr(&w, 6, "cfg", 3);
+    cbor_w_map_key(&w, 38, 1);
+    cbor_w_map_key(&w, 8, 2);
+    cbor_w_tstr(&w, 0, "br_0123456789ab", 15);
+    cbor_w_tstr(&w, 1, "beam", 4);
+    CHECK(!w.err && cfg_parse(buf, (uint16_t) w.len, false, &d) && d.have_br && !d.have_mv && !d.have_ca,
+          "a cfg envelope with `br`: have_br, nothing else");
+    cbor_r_init(&r, buf + d.br_off, d.br_len);
+    CHECK(cbor_r_map(&r, &count) && count == 2 && d.br_off + d.br_len == w.len, "captured br span is the 2-pair map");
+
     cbor_w_init(&w, buf, sizeof(buf));
     cbor_w_map(&w, 3);
     cbor_w_tstr(&w, 1, "m_44444444", 10);

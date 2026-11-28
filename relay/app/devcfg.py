@@ -68,7 +68,9 @@ _PENDING_CFG_OTA_FIELD = "pendingCfgOta"
 _PENDING_CFG_AST_FIELD = "pendingCfgAst"
 # `cfg.mv` (move order, cancel or proof) has its own slot; the newest replaces the older.
 _PENDING_CFG_MV_FIELD = "pendingCfgMv"
-# Every field `ack()`/`republish_pending()` iterate over: eight independent "newest unacked"
+# `cfg.br` (bearer-change try or proof) has its own slot; the newest replaces the older.
+_PENDING_CFG_BR_FIELD = "pendingCfgBr"
+# Every field `ack()`/`republish_pending()` iterate over: nine independent "newest unacked"
 # slots.
 _ALL_PENDING_FIELDS = (
     _PENDING_BOOK_FIELD,
@@ -79,6 +81,7 @@ _ALL_PENDING_FIELDS = (
     _PENDING_CFG_OTA_FIELD,
     _PENDING_CFG_AST_FIELD,
     _PENDING_CFG_MV_FIELD,
+    _PENDING_CFG_BR_FIELD,
 )
 
 # docs/MOVE_DESIGN.md §12.1 limits on `cfg.mv`.
@@ -603,6 +606,52 @@ def push_move_proof(device_id: str, move_id: str, n: int, broker: BrokerClient) 
         logger.warning("push_move_proof: no such device %s", device_id)
         return False
     return _push_move(device_id, build_move_proof(move_id, n), broker)
+
+
+def _br_envelope(cfg_br: dict[str, Any]) -> dict[str, Any]:
+    obj: dict[str, Any] = {
+        "v": 1,
+        "id": new_message_id(),
+        "ts": int(time.time()),
+        "kind": "cfg",
+        "cfg": {"br": cfg_br},
+        "ack": None,
+    }
+    _assert_within_envelope_limit(obj)
+    return obj
+
+
+def build_bearer_try(request_id: str) -> dict[str, Any]:
+    """The `cfg.br` try `{id, b: "beam"}` (docs/PROTOCOL.md §3.2)."""
+    _check_move_id(request_id)
+    return _br_envelope({"id": request_id, "b": "beam"})
+
+
+def build_bearer_proof(request_id: str) -> dict[str, Any]:
+    """The `cfg.br` proof `{id, ok: true}`."""
+    _check_move_id(request_id)
+    return _br_envelope({"id": request_id, "ok": True})
+
+
+def push_bearer_try(device_id: str, request_id: str, broker: BrokerClient) -> bool:
+    """Stores and publishes a `cfg.br` try under `pendingCfgBr`. False, with nothing stored, for an
+    unknown device or one whose last `/status` lacked `brc: 1`."""
+    device = devices_store.get_device(device_id)
+    if device is None or device.status.brc != 1:
+        logger.warning("push_bearer_try: device %s is unknown or did not report brc", device_id)
+        return False
+    obj = build_bearer_try(request_id)
+    _set_pending(device_id, _PENDING_CFG_BR_FIELD, obj)
+    return broker.publish_down(device_id, obj)
+
+
+def push_bearer_proof(device_id: str, request_id: str, broker: BrokerClient) -> bool:
+    """Stores and publishes a `cfg.br` proof, replacing the try in the slot."""
+    if devices_store.get_device(device_id) is None:
+        return False
+    obj = build_bearer_proof(request_id)
+    _set_pending(device_id, _PENDING_CFG_BR_FIELD, obj)
+    return broker.publish_down(device_id, obj)
 
 
 def unpin_ca(device_id: str, broker: BrokerClient) -> bool:

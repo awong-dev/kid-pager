@@ -319,11 +319,15 @@ class _DeploymentCollector(familyexport._Collector):
                 yield self.row(f"devices/{dev}", data)
                 continue
             data["provisionState"] = "moving"
-            data["move"] = {"id": self.opts.move_id, "state": "waiting"}
+            # A Beam pager arrives over the direct bearer, so its Beam origin is recorded here.
+            on_beam = (data.get("status") or {}).get("tls") == "proxy"
+            data["move"] = {"id": self.opts.move_id, "state": "waiting", "onBeam": on_beam}
             data.pop("pendingCfgCa", None)
             # an order or cancel in the slot is the source's, signed under `k`; the target sends
             # only proofs
             data.pop("pendingCfgMv", None)
+            data.pop("pendingCfgBr", None)
+            data.pop("bearerTry", None)
             yield self.row(f"devices/{dev}", data)
             yield self.row(f"deviceSecrets/{dev}", secret)
 
@@ -1151,6 +1155,8 @@ class _MoveRewriter(familyexport._Rewriter):
         if len(parts) == 2 and parts[0] == "devices":
             data = dict(row["data"])
             data.pop("pendingCfgMv", None)
+            data.pop("pendingCfgBr", None)
+            data.pop("bearerTry", None)
             return {"path": row["path"], "data": data}
         if len(parts) == 2 and parts[0] == "bridges":
             return row

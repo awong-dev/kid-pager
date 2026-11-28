@@ -167,17 +167,23 @@ The two servers do not talk to each other, so each page shows what it knows.
 
 ## A9. Soracom Beam
 
-Only if a pager's bearer is Beam. The target needs a Beam listener with a public certificate: its reverse proxy's pager port, or the nginx edge with `TLS_MODE=letsencrypt` or `external` (A2).
+Only if a pager's bearer is Beam, and only if you want it back on Beam afterwards. Beam pagers move
+like the others: each one connects to the target directly, with no change in the Soracom console.
+The SIM's group must let the pager reach the target's address.
 
-1. Wait until the source's page shows every Beam pager acked. A Beam pager that has not acked when
-   the group is switched cannot reach either server and needs a setup code.
-2. Optional canary: in the Soracom console, move one SIM to a group whose destination is
-   `mqtts://<target host>:<Beam port>` (the pager port behind a reverse proxy; `PAGER_BEAM_PORT`, 8884 unless set, on the nginx edge), and watch that pager arrive on the target's page.
-3. Target, Move page, Beam: **Switch Beam group** (target with the Soracom key: it creates the group
-   `pager-beam-<target host>` and moves every SIM of the source's Beam group into it), or, after
-   doing it in the console yourself, **Done, I switched it**.
-4. **Switch back** is possible only while no Beam pager has moved. Afterwards press **Cancel for
-   this pager** on the source for each Beam pager, or it keeps trying both servers.
+To put them back on Beam, the target needs a Beam listener with a public certificate: its reverse
+proxy's pager port, or the nginx edge with `TLS_MODE=letsencrypt` or `external` (A2).
+
+1. Wait until the target's page shows every Beam pager arrived. The page refuses the next step
+   while one is still on the old server, because it would cut that pager off.
+2. On the target's page press **Switch**. With `SORACOM_AUTH_KEY_ID` and `SORACOM_AUTH_KEY` on the
+   target it creates the group `pager-beam-<target host>` and moves the SIMs. Without them, do it
+   in the Soracom console (destination `mqtts://<target host>:<Beam port>`: the pager port behind a
+   reverse proxy; `PAGER_BEAM_PORT`, 8884 unless set, on the nginx edge) and press
+   **Done, I switched it**.
+3. Press **Switch pagers to Beam**. Each pager tries Beam and reports back. One that cannot reach
+   the target through Beam returns to its direct connection by itself and the page says why; fix
+   the group and press the button again.
 
 ## A10. Bridge phones
 
@@ -213,7 +219,8 @@ people signed in and the links announced:
 **After Start cutover:**
 1. Source: **Cancel the move**. Every ordered pager is sent a cancel first; one that receives it
    stays on the source and sends its held texts there.
-2. Beam: **Switch back** on the target, only possible while no Beam pager has moved (A9).
+2. Beam, if you switched the group: **Switch back** on the target, possible while no pager is on
+   Beam there (A9).
 3. Target: **Send bridges back**, as above.
 4. Pagers that had already switched stay on the target. They come back only with a setup code from
    the source (A13, with the source's code) or by a full move in the other direction.

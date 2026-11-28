@@ -672,29 +672,37 @@ target's own key. Subscriptions the source itself inherited from an earlier move
 
 ## 10. Soracom Beam
 
-The SIM's Beam group decides where a Beam pager goes; the relay never maps SIMs to pagers. It knows
-which devices are on Beam from `tls: "proxy"` in their last `/status`.
+The SIM's Beam group decides which broker a Beam session reaches, so a pager cannot follow an order
+through Beam, and the relay never maps SIMs to pagers. The move therefore leaves Beam, and Beam is
+restored afterwards as a separate, optional step.
 
-- **Destination.** Beam validates against a normal root store, and Beam with a private CA is not
-  verified. The target opens a second nginx `stream` listener, `BEAM_PORT` (8884 unless
-  `PAGER_BEAM_PORT` is set), with the public certificate; the pager port keeps the private CA for
-  direct pagers. Beam pagers therefore need `TLS_MODE=letsencrypt` or `external` on the target. Beam
-  orders still carry the target's pager-port host, port and CA
-  (kept by the pager for a later direct bearer).
-- **Switch Beam group** (target page, whenever the admin chooses; the source page shows which Beam
-  pagers have acked). Preferred: create `pager-beam-<target host>` with destination
-  `mqtts://<host>:<BEAM_PORT>` and pass-through credentials (`soracom.ensure_group_created`,
-  `soracom.beam_entry`), then move every SIM in the old group into it (`soracom.list_sims` filtered by
-  the old group id, `soracom.enroll`), recording which SIMs moved. The old group is left as the way
-  back. Alternative: change the old group's destination. Without the Soracom key on the target, the
-  page shows the console steps and a **Done, I switched it** button (`byHand: true`).
-- **After the switch:** an acked pager finds the target by alternating logins (M7). A pager that had
-  not acked offers `pw`, which the target refuses: it goes dark and needs a setup code.
-- **Switch back** only while no Beam device is `moved`: it moves the recorded SIMs back. Then the
-  source super presses **Cancel** for the Beam pagers on the source page, because a pager holding an
-  unsettled order keeps alternating (M7) until a cancel, a commit or a setup code ends it.
-- **Canary**, by hand: move one SIM into the new group in the console first, watch a pager arrive on
-  the target, then press Switch.
+- **The move is over the direct bearer.** A Beam pager handles its order like a direct pager: it
+  fetches the target's CA, dials the order's host and port with TLS from the modem, and waits for
+  the proof. On commit it keeps the direct bearer; a failed trial puts it back on Beam and the
+  source (PROTOCOL.md §3.2 `cfg.mv`). Nobody touches Soracom during the move. The SIM's group must
+  let the pager reach the target's address.
+- **Which pagers were on Beam.** The importer marks a pager whose last source `/status` had
+  `tls: "proxy"` (`move.onBeam`); a pager that later reports Beam here is marked too. The target
+  page's Beam block lists these with their current bearer.
+- **Step 1, point Beam at the target** (target page, any time after the pagers have arrived).
+  Preferred: create `pager-beam-<target host>` with destination `mqtts://<host>:<BEAM_PORT>` and
+  pass-through credentials (`soracom.ensure_group_created`, `soracom.beam_entry`), then move every
+  SIM in the old group into it (`soracom.list_sims` filtered by the old group id, `soracom.enroll`),
+  recording which SIMs moved. Without the Soracom key on the target, the page shows the console
+  steps and a **Done, I switched it** button (`byHand: true`). The switch is refused while a Beam
+  pager that moves by itself (`brc`) has not arrived, because it would cut that pager off from the
+  source before it has followed its order; `force` overrides.
+- **Step 2, tell the pagers to try Beam** (`POST /api/admin/devices/bearer-try`, `app/bearer_try.py`,
+  PROTOCOL.md §3.2 `cfg.br`). Each pager connects through Beam with its login and reports
+  `br{st:"try"}`; the target answers with the proof and the pager stays on Beam. Without a proof
+  after three attempts the pager returns to the direct bearer by itself and reports why, so a wrong
+  or missing group switch costs nothing but the attempt. The page shows each pager's outcome and
+  the button can be pressed again.
+- **Switch back** moves the recorded SIMs back to the old group. It is refused only while a pager
+  is on Beam here, since that would cut it off.
+- **Behind a reverse proxy** (`TLS_MODE=proxy`) the pager port has the public certificate, so
+  `BEAM_PORT` is the pager port. On the nginx edge it is a second listener, 8884 unless
+  `PAGER_BEAM_PORT` is set, because the pager port there has the private CA.
 
 ## 11. Security
 

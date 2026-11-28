@@ -78,8 +78,8 @@ bool net_ca_fetch_poll(uint8_t *buf, size_t cap, uint16_t *out_len, bool *out_cl
 /* Best-effort AT+SQNSH on the cafetch socket. */
 void net_ca_fetch_close(void);
 
-/* Server move (docs/MOVE_FIRMWARE_DESIGN.md §5.2). The pending identity's PEM goes to scratch slot 13; call
- * before the disconnect so a failure leaves the session alone. Power: one modem NVRAM write. */
+/* Server move (docs/MOVE_FIRMWARE_DESIGN.md §5.2). The pending identity's PEM goes to scratch slot 13, on
+ * either bearer; call before the disconnect so a failure leaves the session alone. Power: one modem NVRAM write. */
 bool net_login_prepare_pending(void);
 
 /* Points the modem at the pending (or, `false`, the active) identity: selects that view in ident, then TLS
@@ -281,6 +281,18 @@ bool net_check_sim(void);
 
 /* True when the session reaches the broker through Beam (plain MQTT, TLS profile 0). */
 bool net_bearer_beam(void);
+
+/* The carrier preset in force names the Beam bearer, whatever the stored choice (carrier.h) says. */
+bool net_bearer_beam_offered(void);
+
+/* The bearer of the sessions that follow, in RAM only: the stored choice, or one forced for a server-move
+ * trial (direct) or a cfg.br attempt (Beam, honoured only when the preset offers it). Call with no session
+ * up; net_login_apply() then configures the modem for it. No power effect by itself. */
+typedef enum { NET_BEARER_STORED = 0, NET_BEARER_FORCE_DIRECT, NET_BEARER_FORCE_BEAM } net_bearer_sel_t;
+void net_bearer_select(net_bearer_sel_t sel);
+
+/* Reads the stored choice again after it was written (one NVS read); true if it resolves to Beam. */
+bool net_bearer_reload(void);
 /* Label of the carrier preset in force from the last attach ("" if none). */
 const char *net_carrier_label(void);
 /* MQTT keepalive and liveness re-SUBSCRIBE interval (s) for the carrier in force. */

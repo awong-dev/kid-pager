@@ -1,6 +1,8 @@
 /* Server move, the part that drives the modem and the messages (docs/MOVE_FIRMWARE_DESIGN.md §5).
  * Decisions are in move.c. Without CONFIG_PAGER_MOVE_TRIALS an order is refused (`fail`/`rej`) and acked
- * and nothing is held. The identity switch is net_login_apply() plus modes_auth_follow_view(). */
+ * and nothing is held. The identity switch is net_login_apply() plus modes_auth_follow_view(). A trial
+ * always dials the order's host with TLS: a pager on Beam leaves that bearer for the trial
+ * (net_bearer_select()) and for good at the commit (§5.3). */
 #include "move.h"
 
 #include <stdio.h>
@@ -11,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "bearer_try.h"
 #include "ident.h"
 #include "mbedtls/sha256.h"
 #include "modes.h"
@@ -105,7 +108,6 @@ typedef struct {
     bool used, queued, order;
 } ack_t;
 static ack_t s_acks[3];
-static int64_t s_ack_us;   /* the order's ack left; 0 = not in this boot */
 static int64_t s_store_us; /* the order was stored in this boot */
 
 static void queue_ack(const char *cfg_id, bool order)
@@ -143,7 +145,6 @@ static void service_acks(const move_env_t *env)
                     r.ack_ts = env->now_epoch;
                     move_rec_update(&r);
                 }
-                s_ack_us = env->now_us;
             }
         }
     }
@@ -152,7 +153,7 @@ static void service_acks(const move_env_t *env)
 /* ---- state the UI and /status read ---- */
 
 typedef enum { PH_IDLE = 0, PH_REFETCH, PH_DISCONNECTING, PH_CONNECTING, PH_PROOF } phase_t;
-typedef enum { K_SCHED, K_BG, K_MANUAL, K_ALT, K_PROMPT } kind_t;
+typedef enum { K_SCHED, K_BG, K_MANUAL, K_ALT } kind_t;
 
 static phase_t s_ph;
 typedef enum { ORD_IDLE = 0, ORD_FETCH, ORD_RETRY } ord_phase_t;
@@ -188,7 +189,7 @@ void move_init(void)
     s_ord = ORD_IDLE;
     s_in_order = s_in_cancel = s_in_proof = false;
     memset(s_acks, 0, sizeof(s_acks));
-    s_ack_us = s_store_us = 0;
+    s_store_us = 0;
     s_status_due = false;
     s_own_fetch = false;
     pem_free();
@@ -204,6 +205,14 @@ void move_init(void)
     }
     refresh_host();
     trial_boot_init(esp_timer_get_time());
+    if (b == MOVE_BOOT_COMMITTED) {
+        brtry_clear(); /* a request from the server the pager left */
+    }
+    if (move_bearer_owed()) {
+        /* the committed identity is reached at its own host, never through Beam's group */
+        ESP_LOGI(TAG, "the bearer choice `direct` of the committed move is not stored: direct for this boot");
+        net_bearer_select(NET_BEARER_FORCE_DIRECT);
+    }
     ESP_LOGI(TAG, "move record at boot: %s%s%s (repair %d)", move_st_str((move_st_t) move_rec()->st),
              move_rec()->id[0] ? " id=" : "", move_rec()->id, (int) b);
 }
@@ -260,19 +269,16 @@ static void release_hold(void)
 
 static void ord_finish(bool ca_failed, const move_env_t *env)
 {
-    const bool beam = net_bearer_beam();
     move_accept_t a = { .o = &s_ord_o,
                         .pem = (s_ord_o.have_ca && !ca_failed && s_pem != NULL) ? s_pem : "",
                         .ca_failed = ca_failed,
-                        .beam = beam,
+                        .beam = net_bearer_beam(),
                         .now_epoch = env->now_epoch };
     bool ok = move_store_order(&a);
     ESP_LOGI(TAG, "order %s from %s:%u %s%s", s_ord_o.id, s_ord_o.host, (unsigned) s_ord_o.port,
-             ok ? "stored" : "NOT stored",
-             ca_failed ? (beam ? " (no CA, beam)" : " (CA fetch failed: fail/ca)") : "");
+             ok ? "stored" : "NOT stored", ca_failed ? " (CA fetch failed: fail/ca)" : "");
     queue_ack(s_ord_cfg_id, ok);
     s_store_us = env->now_us;
-    s_ack_us = 0;
     s_status_due = true;
     s_ord = ORD_IDLE;
     s_own_fetch = false;
@@ -284,8 +290,7 @@ static void ord_finish(bool ca_failed, const move_env_t *env)
 static void ord_fetch_failed(const move_env_t *env)
 {
     s_ord_tries++;
-    int limit = net_bearer_beam() ? 1 : PAGER_MOVE_CA_TRIES;
-    if (s_ord_tries >= limit) {
+    if (s_ord_tries >= PAGER_MOVE_CA_TRIES) {
         ord_finish(true, env);
         return;
     }
@@ -357,15 +362,21 @@ static void take_order(const move_env_t *env)
         .signing = (ident_get_flags() & IDENT_FLAG_REQ_SIG) != 0,
         .image_confirmed = ota_image_confirmed(),
         .active_pinned = ident_get_ca_len() > 0,
-        .busy = catrust_apply_in_progress() || ota_transfer_active() || (cafetch_in_progress() && !s_own_fetch),
+        .busy = catrust_apply_in_progress() || ota_transfer_active() || (cafetch_in_progress() && !s_own_fetch) ||
+                brtry_busy(),
         .trial_running = trial_running(),
         .trials_built = TRIALS,
+        .beam = net_bearer_beam(),
     };
-    move_rsn_t rsn;
-    switch (move_decide_order(move_rec(), &s_ord_o, &c, &rsn)) {
+    move_rsn_t rsn = MOVE_RSN_NONE;
+    /* While the last move's bearer choice is still to be stored, its record must stay as it is: a new
+     * record would lose the mark that keeps the pager off Beam (move_bearer_owed()). */
+    const move_order_act_t act =
+        move_bearer_owed() ? MOVE_ORD_DEFER : move_decide_order(move_rec(), &s_ord_o, &c, &rsn);
+    switch (act) {
     case MOVE_ORD_ACK_IGNORE:
         ESP_LOGD(TAG, "order %s: current or finished id, acked and ignored", s_ord_o.id);
-        /* a reset before the first ack's modem OK left `acked` at 0; this ack sets it (Beam needs it) */
+        /* a reset before the first ack's modem OK left `acked` at 0; this ack sets it */
         queue_ack(s_ord_cfg_id, strcmp(move_rec()->id, s_ord_o.id) == 0 && move_rec_unsettled(move_rec()) &&
                                     !move_rec()->acked);
         break;
@@ -454,13 +465,9 @@ static int64_t s_own_disc_until_us;
 static move_reconnect_t s_reconnect;
 static move_alt_t s_alt;
 static bool s_manual;
-static bool s_prompt_done = true; /* the prompt attempt is for a fresh order in this boot */
-static int64_t s_probe_due_us;
 static int64_t s_last_ok_us;
 static int64_t s_next_try_us;     /* RAM spacing next to next_try_ts */
 static int64_t s_rw0;             /* when a reply awaiting its PUBACK was first seen */
-static uint8_t s_noproof;
-static int64_t s_last_pending_us;
 static bool s_run_failed; /* a run failed and the active identity has not had a session since */
 
 static bool trial_running(void) { return s_ph != PH_IDLE; }
@@ -474,31 +481,24 @@ static void trial_boot_init(int64_t now_us)
     s_owner = false;
     memset(&s_alt, 0, sizeof(s_alt));
     s_manual = false;
-    s_prompt_done = true; /* a prompt attempt is for an order stored in this boot */
     s_reconnect = MOVE_RECONNECT_NONE;
     s_next_try_us = 0;
     s_rw0 = 0;
-    s_noproof = 0;
     s_own_disc_until_us = 0;
     s_run_failed = false;
-    s_last_pending_us = 0;
     s_last_ok_us = now_us;
-    s_probe_due_us = now_us + US(move_probe_interval_s(0)); /* the probe timer restarts at boot */
 }
 
 static void trial_reset_counters(void)
 {
-    s_noproof = 0;
     s_alt.next_pending = false;
     s_manual = false;
 }
 
 static void trial_order_stored(const move_env_t *env)
 {
-    s_prompt_done = false;
-    s_noproof = 0;
+    (void) env;
     s_alt.next_pending = false;
-    s_probe_due_us = env->now_us + US(move_probe_interval_s(0));
     s_next_try_us = 0;
 }
 
@@ -522,7 +522,7 @@ void move_note_loss(int64_t now_us, const net_mqtt_status_t *st)
         s_last_ok_us = now_us; /* a session that worked has just ended */
     }
     move_alt_on_loss(&s_alt, false);
-    ESP_LOGI(TAG, "connect on the active login lost: next attempt on the %s login",
+    ESP_LOGI(TAG, "connect on the active identity lost: next attempt on the %s identity",
              s_alt.next_pending ? "pending" : "active");
 }
 
@@ -557,7 +557,7 @@ move_reconnect_t move_take_reconnect_request(void)
 static bool need_ca(const move_rec_t *r)
 {
     static const uint8_t zero[32];
-    if (net_bearer_beam() || memcmp(r->ca_sha, zero, 32) == 0) {
+    if (memcmp(r->ca_sha, zero, 32) == 0) {
         return false;
     }
     ident_slot_info_t si;
@@ -589,8 +589,9 @@ static void record_failure(move_rsn_t rsn)
     }
 }
 
-/* A trial ended without a commit: back to the active login (§5.2 "Revert"). `touched`: the modem's login
- * or the session was changed. */
+/* A trial ended without a commit: back to the active login on the stored bearer (§5.2 "Revert"), which
+ * for a pager that left Beam for the trial is Beam again. `touched`: the modem's login or the session
+ * was changed. */
 static void run_failed(move_rsn_t rsn, bool touched)
 {
     int64_t now = esp_timer_get_time();
@@ -598,6 +599,8 @@ static void run_failed(move_rsn_t rsn, bool touched)
     if (touched) {
         net_session_down(); // power effect: one AT command; drops a connect in flight on the pending login
         move_note_own_disconnect(now);
+        /* the stored choice again; direct stays forced while an earlier move's choice is still owed */
+        net_bearer_select(move_bearer_owed() ? NET_BEARER_FORCE_DIRECT : NET_BEARER_STORED);
         net_login_apply(false);      // the view, the profile and the password are the active ones again
         modes_auth_follow_view();    // the saved /down window and the active key come back
     }
@@ -607,8 +610,6 @@ static void run_failed(move_rsn_t rsn, bool touched)
     pem_free();
     record_failure(rsn);
 
-    s_noproof = rsn == MOVE_RSN_PROOF ? (uint8_t) (s_noproof < 255 ? s_noproof + 1 : 255) : 0;
-    s_last_pending_us = now;
     move_alt_on_loss(&s_alt, true);
     s_last_rsn = rsn;
     s_outcome_committed = false;
@@ -628,6 +629,12 @@ static void commit(const char *proof_cfg_id)
         return;
     }
     modes_auth_commit();
+    /* The session is direct. A pager that came from Beam stays direct: by the stored choice move_commit()
+     * wrote, or in RAM for this boot while that write is owed. */
+    if (!net_bearer_reload()) {
+        net_bearer_select(NET_BEARER_STORED);
+    }
+    brtry_clear(); /* a request from the server the pager left */
     bool slot_ok = net_login_commit();
     catrust_identity_changed();
     queue_ack(proof_cfg_id, false);
@@ -636,7 +643,6 @@ static void commit(const char *proof_cfg_id)
     ota_cancel_waiting_jobs();
     s_owner = false;
     s_ph = PH_IDLE;
-    s_noproof = 0;
     s_alt.next_pending = false;
     set_host("");
     s_last_rsn = MOVE_RSN_NONE;
@@ -670,6 +676,9 @@ static bool bookkeeping(kind_t kind, const move_env_t *env)
         s_next_try_us = env->now_us + US(PAGER_MOVE_BG_TRIAL_S);
     }
     r.st = MOVE_ST_PEND;
+    if (net_bearer_beam()) {
+        r.bearer = MOVE_BEARER_BEAM; /* the commit leaves Beam (move_commit()) */
+    }
     if (!move_rec_update(&r)) {
         ESP_LOGI(TAG, "record write failed: trial not started");
         s_next_try_us = env->now_us + US(60);
@@ -680,21 +689,21 @@ static bool bookkeeping(kind_t kind, const move_env_t *env)
 
 static void apply_login(const move_env_t *env)
 {
+    net_bearer_select(NET_BEARER_FORCE_DIRECT); /* Beam's group decides its broker; the order names this one */
     if (!net_login_apply(true)) {
-        run_failed(net_bearer_beam() ? MOVE_RSN_CONN : MOVE_RSN_TLS, true);
+        run_failed(MOVE_RSN_TLS, true);
         return;
     }
     s_n_first = modes_auth_follow_view(); /* the key and the /down window follow the pending view */
     move_alt_on_issue(&s_alt);
-    if (!net_session_up()) { /* power effect: one TLS handshake (plain connect on Beam) */
+    if (!net_session_up()) { /* power effect: one TLS handshake */
         run_failed(MOVE_RSN_CONN, true);
         return;
     }
     s_t0 = env->now_us;
     s_ph = PH_CONNECTING;
-    ESP_LOGI(TAG, "trial: connecting to %s:%u as the pending identity (n_first=%llu)",
-             net_bearer_beam() ? PAGER_BEAM_HOST : ident_get_host(),
-             (unsigned) (net_bearer_beam() ? PAGER_BEAM_PORT : ident_get_port()), (unsigned long long) s_n_first);
+    ESP_LOGI(TAG, "trial: connecting to %s:%u as the pending identity (n_first=%llu)", ident_get_host(),
+             (unsigned) ident_get_port(), (unsigned long long) s_n_first);
 }
 
 static void start_connect(const move_env_t *env)
@@ -743,7 +752,7 @@ static void begin_trial(kind_t kind, const move_env_t *env)
     move_lock();
     s_in_proof = false; /* an older proof must not meet this trial */
     move_unlock();
-    static const char *const k_name[] = { "scheduled", "background", "manual", "alternating", "beam prompt" };
+    static const char *const k_name[] = { "scheduled", "background", "manual", "alternating" };
     ESP_LOGI(TAG, "trial %u (%s) of move %s starts", (unsigned) move_rec()->at, k_name[kind], move_rec()->id);
     if (need_ca(move_rec())) {
         start_refetch();
@@ -817,7 +826,7 @@ static void trial_step(const net_mqtt_status_t *st, const move_env_t *env)
         } else if (st->disconnect_edge) {
             net_ack_disconnect_edge();
             run_failed(rsn_for_loss(st), true);
-        } else if (env->now_us - s_t0 >= US(net_bearer_beam() ? PAGER_MOVE_GUARD_BEAM_S : PAGER_MOVE_GUARD_DIRECT_S)) {
+        } else if (env->now_us - s_t0 >= US(PAGER_MOVE_GUARD_S)) {
             run_failed(MOVE_RSN_CONN, true);
         }
         return;
@@ -837,9 +846,6 @@ static void trial_step(const net_mqtt_status_t *st, const move_env_t *env)
 /* A trial that started with no clock left next_try_ts at 0; when the clock shows, the spacing left is stored. */
 static void fill_next_try(const move_env_t *env)
 {
-    if (net_bearer_beam()) {
-        return; /* the Beam schedule has no clock-spaced trials */
-    }
     const int64_t left = s_next_try_us == 0 ? -1 : (s_next_try_us > env->now_us ? s_next_try_us - env->now_us : 0);
     const uint32_t at = move_next_try_fill(move_rec(), env->now_epoch, left);
     if (at != 0) {
@@ -858,7 +864,6 @@ static void plan_step(const net_mqtt_status_t *st, const move_env_t *env)
         s_rw0 = 0;
         return;
     }
-    const bool beam = net_bearer_beam();
     fill_next_try(env);
     r = move_rec();
     const bool awaiting = msg_reply_awaiting_puback();
@@ -872,7 +877,6 @@ static void plan_step(const net_mqtt_status_t *st, const move_env_t *env)
 
     move_plan_in_t in;
     memset(&in, 0, sizeof(in));
-    in.beam = beam;
     in.st = (move_st_t) r->st;
     in.sched = r->sched;
     in.acked = r->acked != 0;
@@ -880,7 +884,6 @@ static void plan_step(const net_mqtt_status_t *st, const move_env_t *env)
     in.next_try_ts = r->next_try_ts;
     in.attempts = r->at;
     in.mono_gate_open = env->now_us >= s_next_try_us;
-    in.ack_age_us = s_ack_us != 0 ? env->now_us - s_ack_us : (r->acked ? INT64_MAX / 4 : -1);
     in.store_age_us = s_store_us != 0 ? env->now_us - s_store_us : -1;
     in.session_usable = st->mqtt_connected && s_ph == PH_IDLE && ident_get_view() == IDENT_ACTIVE;
     in.registered = env->registered;
@@ -891,9 +894,6 @@ static void plan_step(const net_mqtt_status_t *st, const move_env_t *env)
     in.reply_awaiting = awaiting;
     in.reply_wait_us = s_rw0 != 0 ? env->now_us - s_rw0 : 0;
     in.manual = s_manual;
-    in.beam_prompt_done = s_prompt_done;
-    in.beam_probe_due = env->now_us >= s_probe_due_us;
-    in.pending_attempt_allowed = move_pending_attempt_allowed(s_noproof, env->now_us - s_last_pending_us);
 
     switch (move_plan(&in)) {
     case MOVE_ACT_TRIAL_SCHED:
@@ -906,17 +906,6 @@ static void plan_step(const net_mqtt_status_t *st, const move_env_t *env)
         move_note_backoff_reset(env->now_us); /* the long-run interval starts again at 5 s */
         begin_trial(K_MANUAL, env);
         break;
-    case MOVE_ACT_BEAM_PROMPT:
-        s_prompt_done = true;
-        begin_trial(K_PROMPT, env);
-        break;
-    case MOVE_ACT_BEAM_PROBE: {
-        uint32_t since = (r->ack_ts != 0 && env->now_epoch > r->ack_ts) ? env->now_epoch - r->ack_ts : 0;
-        s_probe_due_us = env->now_us + US(move_probe_interval_s(since));
-        ESP_LOGI(TAG, "beam probe: reconnecting on the active login to see whether the group was switched");
-        s_reconnect = MOVE_RECONNECT_NOW;
-        break;
-    }
     case MOVE_ACT_REFUSE_AIRPLANE:
     case MOVE_ACT_REFUSE_NO_NETWORK:
     case MOVE_ACT_REFUSE_BUSY:
@@ -936,10 +925,7 @@ bool move_attempt_pending_next(const move_env_t *env)
     if (!move_rec_unsettled(move_rec()) || !s_alt.next_pending || s_ph != PH_IDLE || s_ord != ORD_IDLE) {
         return false;
     }
-    if (!env->registered || env->airplane || env->coverage_owns_radio || env->downloading) {
-        return false;
-    }
-    return !net_bearer_beam() || move_pending_attempt_allowed(s_noproof, env->now_us - s_last_pending_us);
+    return env->registered && !env->airplane && !env->coverage_owns_radio && !env->downloading;
 }
 
 void move_begin_pending_attempt(const move_env_t *env) { begin_trial(K_ALT, env); }
@@ -1073,7 +1059,6 @@ void move_get_ui_state(move_ui_state_t *out)
     out->have = true;
     memcpy(out->id, r->id, sizeof(out->id));
     snprintf(out->host, sizeof(out->host), "%s", s_host);
-    out->beam = r->bearer != 0;
     out->st = (move_st_t) r->st;
     out->rsn = (move_rsn_t) r->rsn;
     out->at = r->at;

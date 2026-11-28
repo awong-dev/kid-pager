@@ -514,7 +514,6 @@ static void render_move_fixture(const move_fixture_t *f)
     memset(&u, 0, sizeof(u));
     u.have = f->have;
     snprintf(u.host, sizeof(u.host), "%s", f->host ? f->host : "");
-    u.beam = f->beam;
     u.st = f->st;
     u.rsn = f->rsn;
     u.last_rsn = f->last_rsn;
@@ -550,8 +549,7 @@ static const move_fixture_t k_move_fixtures[] = {
     { .name = "out_committed", .have = true, .st = MOVE_ST_OK, .committed = true, .outcome = true, .host = MV_HOST },
     { .name = "out_ca", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CA, .last_rsn = MOVE_RSN_CA, .action = true, .outcome = true, .host = MV_HOST },
     { .name = "out_tls", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_TLS, .last_rsn = MOVE_RSN_TLS, .action = true, .outcome = true, .host = MV_HOST },
-    { .name = "out_auth_direct", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_AUTH, .last_rsn = MOVE_RSN_AUTH, .action = true, .outcome = true, .host = MV_HOST },
-    { .name = "out_auth_beam", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_AUTH, .last_rsn = MOVE_RSN_AUTH, .beam = true, .action = true, .outcome = true, .host = MV_HOST },
+    { .name = "out_auth", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_AUTH, .last_rsn = MOVE_RSN_AUTH, .action = true, .outcome = true, .host = MV_HOST },
     { .name = "out_conn", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_CONN, .last_rsn = MOVE_RSN_CONN, .action = true, .outcome = true, .host = MV_HOST },
     { .name = "out_proof", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_PROOF, .last_rsn = MOVE_RSN_PROOF, .action = true, .outcome = true, .host = MV_HOST },
     { .name = "out_busy", .have = true, .st = MOVE_ST_PEND, .rsn = MOVE_RSN_BUSY, .last_rsn = MOVE_RSN_BUSY, .action = true, .outcome = true, .host = MV_HOST },

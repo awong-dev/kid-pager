@@ -1,11 +1,13 @@
 /* Host test for move_svc.c (built with CONFIG_PAGER_MOVE_TRIALS, or without it for test_move_svc_off, which
  * runs only the option-off cases) against fakes of the modem, the
  * messages and OTA: the order service, the trial state machine, commit and revert, the alternation,
- * the Beam prompt and probe, the manual action. Every fake logs its call, so the order of the modem
+ * a move that leaves Beam, the manual action. Every fake logs its call, so the order of the modem
  * steps of docs/MOVE_FIRMWARE_DESIGN.md §5.2 is checked, not just the end state. */
 #include "move.h"
 
+#include "bearer_try.h"
 #include "cafetch.h"
+#include "carrier.h"
 #include "catrust.h"
 #include "cbor.h"
 #include "ident.h"
@@ -96,7 +98,7 @@ static void log_clear(void) { f_log[0] = '\0'; }
 
 /* ---- fakes ---- */
 
-static bool f_beam, f_airplane, f_registered = true, f_in_flight, f_catrust_busy, f_ota_active, f_cafetch_busy;
+static bool f_sim_beam, f_stored_beam, f_br_busy, f_up_beam, f_airplane, f_registered = true, f_in_flight, f_catrust_busy, f_ota_active, f_cafetch_busy;
 static bool f_image_confirmed = true, f_prepare_ok = true, f_apply_ok = true, f_up_ok = true;
 static bool f_cov_owns, f_sleep = true, f_reply_awaiting, f_down_pending;
 static uint32_t f_input_age_ms = 600000;
@@ -108,7 +110,28 @@ static int f_nacks;
 
 static void ack_complete(void) { f_nacks = 0; }
 
-bool net_bearer_beam(void) { return f_beam; }
+/* The bearer as net.cpp resolves it: the stored choice read at the attach (or at a reload), unless one is
+ * forced in RAM. `f_sim_beam`: the carrier preset names Beam. */
+static net_bearer_sel_t f_sel;
+static void attach(void)
+{
+    f_stored_beam = f_sim_beam && carrier_bearer_override_get() != CARRIER_BEARER_OVR_DIRECT;
+}
+bool net_bearer_beam(void)
+{
+    return f_sel == NET_BEARER_FORCE_DIRECT ? false : (f_sel == NET_BEARER_FORCE_BEAM ? f_sim_beam : f_stored_beam);
+}
+void net_bearer_select(net_bearer_sel_t sel)
+{
+    f_sel = sel;
+    logf_("bearer(%s)", sel == NET_BEARER_FORCE_DIRECT ? "direct" : sel == NET_BEARER_FORCE_BEAM ? "beam" : "stored");
+}
+bool net_bearer_reload(void)
+{
+    f_stored_beam = f_sim_beam && carrier_bearer_override_get() != CARRIER_BEARER_OVR_DIRECT;
+    return f_stored_beam;
+}
+bool brtry_busy(void) { return f_br_busy; }
 bool net_airplane(void) { return f_airplane; }
 uint32_t net_unregistered_for_s(void) { return f_registered ? 0 : 30; }
 bool net_connect_in_flight(void) { return f_in_flight; }
@@ -129,6 +152,7 @@ void net_session_down(void)
 bool net_session_up(void)
 {
     logf_("up(%s)", ident_get_view() == IDENT_PENDING ? "pending" : "active");
+    f_up_beam = net_bearer_beam();
     f_in_flight = f_up_ok;
     return f_up_ok;
 }
@@ -323,7 +347,9 @@ static void fresh(const char *active_pem, bool beam)
     ident_scratch_release();
     ident_load();
 
-    f_beam = beam;
+    f_sim_beam = beam;
+    f_br_busy = false;
+    f_sel = NET_BEARER_STORED;
     f_airplane = f_in_flight = f_catrust_busy = f_ota_active = f_cafetch_busy = false;
     f_registered = true;
     f_image_confirmed = f_prepare_ok = f_apply_ok = f_up_ok = true;
@@ -339,6 +365,7 @@ static void fresh(const char *active_pem, bool beam)
     f_cf_active = false;
     idf_stub_advance_us(100 * 1000000);
     move_init();
+    attach();
     (void) move_take_reconnect_request();
     log_clear();
 }
@@ -597,7 +624,7 @@ static void test_failures_and_budget(void)
     CHECK(move_owns_session() && move_rec()->at == 6 && move_rec()->sched == 4, "manual trial: at counts, sched does not");
     move_ui_state_t ui;
     move_get_ui_state(&ui);
-    CHECK(ui.running && ui.phase == MOVE_PHASE_CONNECTING && !ui.beam, "UI: connecting");
+    CHECK(ui.running && ui.phase == MOVE_PHASE_CONNECTING, "UI: connecting");
     to_proof();
     move_get_ui_state(&ui);
     CHECK(ui.phase == MOVE_PHASE_WAITING && ui.st == MOVE_ST_TRY && strcmp(ui.host, "new.example") == 0,
@@ -963,98 +990,161 @@ static void test_ca_fetch(void)
     CHECK(!move_owns_session() && !has("down") && move_rec()->lrsn == MOVE_RSN_CA, "fetch fails again: ca, the session is untouched");
 }
 
+/* A reset: RAM is gone, the modem attaches again and reads the stored bearer choice. */
+static void reboot_svc(void)
+{
+    f_sel = NET_BEARER_STORED;
+    memset(&f_st, 0, sizeof(f_st));
+    f_st.mqtt_connected = true;
+    f_in_flight = f_down_pending = false;
+    f_nacks = 0;
+    ident_load();
+    move_init(); /* before the attach, as in modes_boot() */
+    attach();
+    (void) move_take_reconnect_request();
+}
+
+/* §5.3: a pager on Beam runs the same trial as a direct one, over the direct bearer, and stays there
+ * after the commit; anything else ends on the old identity over Beam. */
 static void test_beam(void)
 {
+    /* an order without a CA would trade Beam's validated hop for an unvalidated TLS session */
     fresh("", true);
-    order_stored_and_acked(false);
-    CHECK(move_rec()->bearer == 1 && move_rec()->st == MOVE_ST_PEND, "beam order stored");
-    log_clear();
-    run(110);
-    CHECK(!has("prepare"), "no prompt attempt before 120 s after the ack");
-    run_until_owned(60);
-    CHECK(has("prepare") && move_owns_session(), "one prompt attempt 120 s after the ack: %s", f_log);
-    to_connecting();
-    fail_edge(NET_MQTT_RC_PERMANENT);
-    CHECK(!move_owns_session() && move_rec()->rsn == MOVE_RSN_AUTH && move_rec()->st == MOVE_ST_PEND && move_rec()->sched == 0 &&
-              move_rec()->at == 1,
-          "refused: back to the active login, no budget on beam: rsn=%d st=%d sched=%d at=%d", move_rec()->rsn, move_rec()->st, move_rec()->sched, move_rec()->at);
-    CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NOW, "back on the old broker at once");
-    back_online();
-    log_clear();
-    run(900);
-    CHECK(!has("prepare"), "the prompt attempt is made once");
+    deliver_order(false, ID1, "m_cfg0001");
+    tick();
+    CHECK(move_rec()->st == MOVE_ST_FAIL && move_rec()->rsn == MOVE_RSN_DOWN && has("ack(m_cfg0001)") && !move_hold_up(),
+          "beam: an unpinned order is refused, fail/down");
 
-    /* the probe: a deliberate reconnect on the active login every 60 min, from a quiet wake */
-    int64_t t_init = s_now_us - 1025 * 1000000LL; /* about when move_init() ran */
-    (void) t_init;
-    int64_t probes[4];
-    int np = 0;
-    for (int t = 0; t < 4 * 3600 && np < 4; t += 5) {
-        idf_stub_advance_us(5 * 1000000);
-        tick();
-        if (move_take_reconnect_request() == MOVE_RECONNECT_NOW) {
-            probes[np++] = s_now_us;
-        }
-    }
-    CHECK(np == 4, "a probe every hour for 4 hours: %d", np);
-    for (int i = 1; i < np; i++) {
-        CHECK(probes[i] - probes[i - 1] >= 3600000000LL && probes[i] - probes[i - 1] <= 3610000000LL,
-              "probes are 60 min apart (%lld s)", (long long) ((probes[i] - probes[i - 1]) / 1000000));
-    }
-    f_input_age_ms = 1000;
-    run(7200);
-    CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NONE, "no probe while a key was pressed in the last 60 s");
-    /* the probe's own disconnect is marked: its DISCONNECTED, once, within the wait; a later one is a real loss */
+    /* the CA is fetched as on direct: three failures are fail/ca, and nothing connects without the PEM */
+    fresh("", true);
+    f_cf_n = 0;
+    deliver_order(true, ID1, "m_cfg0001");
+    run(5);
+    run(70);
+    run(70);
+    run(70);
+    CHECK(move_rec()->st == MOVE_ST_FAIL && move_rec()->rsn == MOVE_RSN_CA && count("cafetch_begin") == 3 &&
+              move_rec()->bearer == MOVE_BEARER_BEAM,
+          "beam: three CA fetches, then fail/ca: %s", f_log);
+    ack_complete();
+    run(600);
+    CHECK(!has("prepare") && net_bearer_beam(), "beam: no trial without the PEM, still on Beam");
+
+    /* a trial that fails: direct for the trial, Beam and the old identity after it */
+    fresh("", true);
+    f_cf_n = 1;
+    f_cf_script[0] = 2;
+    order_stored_and_acked(true);
+    CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->bearer == MOVE_BEARER_BEAM && net_bearer_beam(),
+          "beam: order stored with its PEM, the pager still on Beam");
+    log_clear();
+    tick();
+    CHECK(move_owns_session() && move_rec()->at == 1 && move_rec()->sched == 1,
+          "beam: the first scheduled trial starts at once, as on direct");
+    CHECK(before("prepare", "down") && !has("bearer("), "the pending CA is written first; the bearer is not touched yet: %s", f_log);
+    f_st.disconnect_edge = true;
+    tick();
+    CHECK(before("down", "bearer(direct)") && before("bearer(direct)", "login_apply(1)") && before("login_apply(1)", "up(pending)") &&
+              !f_up_beam && !net_bearer_beam(),
+          "the trial leaves Beam before the login is configured, and connects direct: %s", f_log);
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO, "the stored bearer choice is not touched by a trial");
+    log_clear();
+    fail_edge(NET_MQTT_RC_TLS_FAIL);
+    CHECK(!move_owns_session() && move_rec()->lrsn == MOVE_RSN_TLS && ident_get_view() == IDENT_ACTIVE,
+          "the TLS handshake failed: reverted as tls");
+    CHECK(before("down", "bearer(stored)") && before("bearer(stored)", "login_apply(0)") && net_bearer_beam(),
+          "revert: Beam is selected again before the active login is configured: %s", f_log);
+    CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NOW && ident_active_slot() == 0 &&
+              carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO,
+          "back on the old identity over Beam");
+    back_online();
+
+    /* a reset in the middle of a trial boots the old identity over Beam */
+    run(600 - 200);
+    run_until_owned(400);
+    to_proof();
+    CHECK(move_owns_session() && !net_bearer_beam(), "second trial waits for the proof, direct");
+    reboot_svc();
+    CHECK(!move_owns_session() && ident_active_slot() == 0 && net_bearer_beam() && move_rec()->st == MOVE_ST_PEND &&
+              move_rec()->at == 2,
+          "after a reset mid-trial: the old identity over Beam, the attempt spent");
+
+    /* the proof: committed, and direct from then on */
+    CHECK(move_request_now() == MOVE_REQ_OK, "the action");
+    tick();
+    to_proof();
+    log_clear();
+    deliver_proof(ID1, f_n_first, "m_proof001");
+    tick();
+    CHECK(ident_active_slot() == 1 && move_rec()->st == MOVE_ST_OK && move_rec()->bearer == 0, "committed on the proof");
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT && !net_bearer_beam() && !move_bearer_owed(),
+          "the bearer choice direct is stored with the new identity");
+    CHECK(has("login_commit") && !has("login_apply(0)") && !has("down"), "the session is kept: %s", f_log);
+    reboot_svc();
+    CHECK(ident_active_slot() == 1 && !net_bearer_beam() && strcmp(ident_get_host(), "new.example") == 0,
+          "the next boot: the new identity over direct");
+
+    /* power lost between `act` and the bearer choice: the boot stores it before the bearer is resolved */
+    fresh("", true);
+    f_cf_n = 1;
+    f_cf_script[0] = 2;
+    order_stored_and_acked(true);
+    tick();
+    to_proof();
+    nvs_fake_cut_after(1); /* `idsel/act` is written, nothing after it */
+    deliver_proof(ID1, f_n_first, "m_proof001");
+    tick();
+    nvs_fake_cut_after(-1);
+    CHECK(ident_active_slot() == 1 && carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && !net_bearer_beam(),
+          "cut after act: committed, the choice not stored, direct in RAM");
+    reboot_svc();
+    CHECK(ident_active_slot() == 1 && carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT && !net_bearer_beam() &&
+              move_rec()->st == MOVE_ST_OK,
+          "the boot repairs it: the new identity over direct, never over Beam");
+
+    /* the same cut, and the boot cannot write either: direct is forced for that boot */
+    fresh("", true);
+    f_cf_n = 1;
+    f_cf_script[0] = 2;
+    order_stored_and_acked(true);
+    tick();
+    to_proof();
+    nvs_fake_cut_after(1);
+    deliver_proof(ID1, f_n_first, "m_proof001");
+    tick();
+    nvs_fake_cut_after(0);
+    reboot_svc();
+    nvs_fake_cut_after(-1);
+    CHECK(ident_active_slot() == 1 && carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && !net_bearer_beam(),
+          "a boot that cannot store the choice still runs direct");
+    log_clear();
+    deliver_order(true, "mv_ba9876543210", "m_cfg0020");
+    tick();
+    tick();
+    CHECK(!has("ack(") && !has("cafetch_begin") && move_bearer_owed(), "an order waits while the bearer choice is owed");
+    reboot_svc();
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT && !move_bearer_owed() && !net_bearer_beam(),
+          "the next boot stores it");
+
+    /* a cfg.br request that is being tried defers an order */
+    fresh("", false);
+    f_br_busy = true;
+    log_clear();
+    deliver_order(false, ID1, "m_cfg0001");
+    tick();
+    tick();
+    CHECK(!has("ack(") && move_rec()->st == MOVE_ST_NONE, "an order waits while Beam is being tried");
+    f_br_busy = false;
+    tick();
+    CHECK(has("ack(m_cfg0001)") && move_rec()->st == MOVE_ST_PEND, "taken when the request has settled");
+
+    /* a trial's own disconnect is marked: its DISCONNECTED, once, within the wait; a later one is a real loss */
     move_note_own_disconnect(s_now_us);
     CHECK(move_swallow_own_disconnect(s_now_us + 1000000) && !move_swallow_own_disconnect(s_now_us + 1000000),
           "the marked DISCONNECTED is swallowed once");
     move_note_own_disconnect(s_now_us);
     CHECK(!move_swallow_own_disconnect(s_now_us + (int64_t) (PAGER_MOVE_DISCONNECT_WAIT_S + 2) * 1000000),
           "and not after the wait");
-    f_input_age_ms = 600000;
-    f_reply_awaiting = true;
-    run(30);
-    CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NONE, "no probe with a publish waiting on its PUBACK");
-    f_reply_awaiting = false;
-    run(10);
-    CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NOW, "probe when it is quiet");
-
-    /* the slow-down: three SUBACKs without a proof, then one pending attempt an hour */
-    for (int i = 0; i < 3; i++) {
-        move_env_t e = env_now();
-        f_st.mqtt_connected = false;
-        move_note_connect_issued();
-        move_note_loss(s_now_us, &f_st);
-        CHECK(move_attempt_pending_next(&e), "pending attempt %d allowed", i + 1);
-        move_begin_pending_attempt(&e);
-        f_st.mqtt_connected = true;
-        f_in_flight = false;
-        tick();
-        run(185);
-        CHECK(!move_owns_session() && move_rec()->lrsn == MOVE_RSN_PROOF, "no proof in 180 s: reverted (%d)", i + 1);
-        (void) move_take_reconnect_request();
-        back_online();
-    }
-    {
-        move_env_t e = env_now();
-        f_st.mqtt_connected = false;
-        move_note_connect_issued();
-        move_note_loss(s_now_us, &f_st);
-        CHECK(!move_attempt_pending_next(&e), "after three: slowed down");
-        run(3500);
-        e = env_now();
-        CHECK(!move_attempt_pending_next(&e), "still within the hour");
-        run(120);
-        e = env_now();
-        CHECK(move_attempt_pending_next(&e), "one pending attempt per hour");
-        move_begin_pending_attempt(&e);
-        f_st.mqtt_connected = true;
-        f_in_flight = false;
-        tick();
-        deliver_proof(ID1, f_n_first, "m_proof001");
-        tick();
-        CHECK(ident_active_slot() == 1 && move_rec()->st == MOVE_ST_OK, "a proof ends it");
-    }
 }
 
 /* Fills in the spacing when the clock first shows, and runs no trial per boot while there is none. */
@@ -1210,47 +1300,36 @@ static void test_lock_use(void)
     CHECK(g_lock_depth == 0, "the lock is not left held");
 }
 
-/* A reset before the order's ack went out leaves `acked` 0; the re-sent order's ack sets it, on either bearer. */
+/* A reset before the order's ack went out leaves `acked` 0; the re-sent order's ack sets it. */
 static void test_acked_after_reset(void)
 {
-    for (int beam = 0; beam < 2; beam++) {
-        fresh("", beam != 0);
-        deliver_order(false, ID1, "m_cfg0001");
-        tick();
-        CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->acked == 0, "beam=%d: order stored, ack queued, not yet out", beam);
-        f_nacks = 0; /* the reset lost it before the modem took it */
-        move_init();
-        CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->acked == 0, "beam=%d: the record says not acked after the reset", beam);
-        if (beam) {
-            run(3700);
-            CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NONE, "beam: no probe while the order is not acked");
-        }
-        log_clear();
-        deliver_order(false, ID1, "m_cfg0002");
-        tick();
-        CHECK(has("ack(m_cfg0002)") && move_rec()->acked == 0, "beam=%d: the re-sent order is acked again", beam);
-        ack_complete();
-        tick();
-        CHECK(move_rec()->acked == 1 && move_rec()->ack_ts != 0, "beam=%d: its ack sets acked", beam);
-        if (beam) {
-            run(10);
-            CHECK(move_take_reconnect_request() == MOVE_RECONNECT_NOW, "beam: the probe runs once the ack is out");
-        }
+    fresh("", false);
+    deliver_order(false, ID1, "m_cfg0001");
+    tick();
+    CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->acked == 0, "order stored, ack queued, not yet out");
+    f_nacks = 0; /* the reset lost it before the modem took it */
+    move_init();
+    CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->acked == 0, "the record says not acked after the reset");
+    f_registered = false; /* no trial meanwhile */
+    log_clear();
+    deliver_order(false, ID1, "m_cfg0002");
+    tick();
+    CHECK(has("ack(m_cfg0002)") && move_rec()->acked == 0, "the re-sent order is acked again");
+    ack_complete();
+    tick();
+    CHECK(move_rec()->acked == 1 && move_rec()->ack_ts != 0, "its ack sets acked");
 
-        /* an order that is already acked changes nothing in the record */
-        uint32_t ack_ts = move_rec()->ack_ts;
-        move_rec_t before = *move_rec();
-        if (!beam) {
-            f_nacks = 0;
-        }
-        log_clear();
-        deliver_order(false, ID1, "m_cfg0003");
-        tick();
-        ack_complete();
-        tick();
-        CHECK(has("ack(m_cfg0003)") && move_rec()->ack_ts == ack_ts && move_rec()->acked == 1 && move_rec()->at == before.at,
-              "beam=%d: an acked order's re-send is acked and changes nothing", beam);
-    }
+    /* an order that is already acked changes nothing in the record */
+    uint32_t ack_ts = move_rec()->ack_ts;
+    move_rec_t before = *move_rec();
+    f_nacks = 0;
+    log_clear();
+    deliver_order(false, ID1, "m_cfg0003");
+    tick();
+    ack_complete();
+    tick();
+    CHECK(has("ack(m_cfg0003)") && move_rec()->ack_ts == ack_ts && move_rec()->acked == 1 && move_rec()->at == before.at,
+          "an acked order's re-send is acked and changes nothing");
 }
 
 static void test_boot_midway(void)
@@ -1456,7 +1535,7 @@ int main(void)
            "image's order released at boot, `moving` hold kept), 0 failures\n");
 #else
     printf("PASS: move_svc.c (order service, §5.2 trial order, commit, revert, budget, background and manual trials, "
-           "alternation, CA fetch, cancel, deferral, Beam prompt, probe and slow-down, Device-screen paints, mvc gate, no-clock spacing, PEM buffer lifetime, lock use, acked after a reset), 0 failures\n");
+           "alternation, CA fetch, cancel, deferral, a move from Beam over direct with its power cuts, Device-screen paints, mvc gate, no-clock spacing, PEM buffer lifetime, lock use, acked after a reset), 0 failures\n");
 #endif
     return 0;
 }

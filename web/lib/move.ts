@@ -120,11 +120,35 @@ export interface BeamInfo {
   count: number;
   /** How many of them are `moved`. */
   movedCount: number;
+  /** Beam pagers that have not arrived from the old server yet. */
+  waitingCount: number;
+  /** Pagers on Beam here now. */
+  onBeamCount: number;
   switched: boolean;
   /** The target has the Soracom key, so the switch can be done here. */
   soracom: boolean;
   /** The switch was confirmed by hand, so switching back is by hand too. */
   byHand?: boolean;
+  devices: BeamDevice[];
+}
+
+export type BeamTrySt = "sent" | "try" | "ok" | "fail" | "na";
+
+/** One pager in the Beam block: its bearer now, whether it can be told to try Beam, and how the last ask went. */
+export interface BeamDevice {
+  deviceId: string;
+  label?: string | null;
+  bearer: Bearer | null;
+  canTry: boolean;
+  try: { st: BeamTrySt; rsn: string | null } | null;
+}
+
+export type BearerTrySkipReason = "firmware" | "on_beam" | "moving" | "unknown";
+
+/** `POST /api/admin/devices/bearer-try`. */
+export interface BearerTryResult {
+  sent: string[];
+  skipped: { id: string; reason: BearerTrySkipReason }[];
 }
 
 export interface SourceMove {
@@ -214,7 +238,10 @@ export const importBundle = (file: Blob, passphrase: string, dryRun: boolean) =>
     "X-Export-Passphrase": passphrase,
   });
 
-export const beamSwitch = (byHand: boolean) => api.post("/admin/move/beam/switch", { byHand });
+export const beamSwitch = (byHand: boolean, force = false) =>
+  api.post("/admin/move/beam/switch", force ? { byHand, force } : { byHand });
+export const bearerTry = (deviceIds: string[] | null) =>
+  api.post<BearerTryResult>("/admin/devices/bearer-try", { deviceIds });
 export const beamSwitchBack = () => api.post("/admin/move/beam/switch-back");
 export const bridgesSendBack = () => api.post("/admin/move/bridges/send-back");
 export const endMove = () => api.post("/admin/move/end");
@@ -262,7 +289,7 @@ export function normalizeAdminMove(raw: unknown): AdminMove {
       importedAt: r.importedAt as TimeValue,
       devices: arr<TargetDeviceRow>(r.devices),
       fedLinks: arr<FedLinkRow>(r.fedLinks),
-      beam: (r.beam as BeamInfo | null | undefined) ?? null,
+      beam: normalizeBeam(r.beam),
       bridgeRedirect: (r.bridgeRedirect as string | null | undefined) ?? null,
     };
   }
@@ -273,6 +300,18 @@ export function normalizeAdminMove(raw: unknown): AdminMove {
     target: { ...t, baseUrl: typeof t.baseUrl === "string" ? t.baseUrl : "" },
     targetImported: typeof r.targetImported === "boolean" ? r.targetImported : undefined,
     devices: arr<SourceDeviceRow>(r.devices),
+  };
+}
+
+/** Fills the Beam counts and list a relay may leave out. */
+function normalizeBeam(v: unknown): BeamInfo | null {
+  if (!v || typeof v !== "object") return null;
+  const b = v as Partial<BeamInfo>;
+  return {
+    ...(b as BeamInfo),
+    waitingCount: typeof b.waitingCount === "number" ? b.waitingCount : 0,
+    onBeamCount: typeof b.onBeamCount === "number" ? b.onBeamCount : 0,
+    devices: arr<BeamDevice>(b.devices),
   };
 }
 
@@ -704,20 +743,97 @@ export function peopleTally(rows: readonly PersonRow[]): PeopleTally {
   return { signedIn, notYet: rows.length - noSignIn - signedIn, noSignIn };
 }
 
-/** Switch back moves the recorded SIMs and is refused once a Beam pager has moved (§10). */
-export function beamActions(b: BeamInfo): { canSwitch: boolean; canSwitchBack: boolean; switchBackByHand: boolean } {
+export interface BeamActions {
+  canSwitch: boolean;
+  /** Pagers are still on the old server: switching needs an explicit confirmation and `force`. */
+  switchNeedsForce: boolean;
+  canSwitchBack: boolean;
+  switchBackByHand: boolean;
+  /** Step 2: the group is switched and some pager can be asked to try Beam. */
+  canTryBeam: boolean;
+}
+
+/** Switch back moves the recorded SIMs and is refused only while a pager is on Beam here. */
+export function beamActions(b: BeamInfo): BeamActions {
+  const onBeam = b.onBeamCount ?? 0;
   return {
     canSwitch: !b.switched && b.count > 0,
-    canSwitchBack: b.switched && b.movedCount === 0 && !b.byHand,
-    switchBackByHand: b.switched && b.byHand === true && b.movedCount === 0,
+    switchNeedsForce: (b.waitingCount ?? 0) > 0,
+    canSwitchBack: b.switched && onBeam === 0 && !b.byHand,
+    switchBackByHand: b.switched && b.byHand === true && onBeam === 0,
+    canTryBeam: b.switched && beamTryTargets(b.devices ?? []).length > 0,
   };
 }
 
-/** Why Switch back is unavailable, for the line under the disabled button; `null` when it is not blocked by arrivals. */
+/** Why Switch back is unavailable, for the line under the disabled button; `null` when it is not blocked. */
 export function beamSwitchBackBlock(b: BeamInfo): string | null {
-  return b.switched && b.movedCount > 0
-    ? `${plural(b.movedCount, "Beam pager")} already moved here, so the group cannot be switched back.`
+  const n = b.onBeamCount ?? 0;
+  return b.switched && n > 0
+    ? `${plural(n, "pager")} ${n === 1 ? "is" : "are"} on Beam here, so the group cannot be switched back.`
     : null;
+}
+
+/** The warning before step 1 while Beam pagers have not arrived; `null` when none are waiting. */
+export function beamWaitingWarning(b: Pick<BeamInfo, "waitingCount">): string | null {
+  const n = b.waitingCount ?? 0;
+  return n > 0
+    ? `${plural(n, "Beam pager")} ${n === 1 ? "has" : "have"} not arrived yet. Switching the group now cuts ${n === 1 ? "it" : "them"} off from the old server.`
+    : null;
+}
+
+/** The pagers step 2 asks: not on Beam yet, and able to switch. */
+export const beamTryTargets = (devices: readonly BeamDevice[]): string[] =>
+  devices.filter((d) => d.bearer !== "beam" && d.canTry).map((d) => d.deviceId);
+
+/** The pager ids in a refused switch's `409 {detail, waiting}` body; empty for any other body. */
+export function waitingFromRefusal(body: unknown): string[] {
+  if (!body || typeof body !== "object") return [];
+  return strings((body as { waiting?: unknown }).waiting);
+}
+
+const TRY_FAIL_TEXT: Record<string, string> = {
+  conn: "could not connect through Beam",
+  auth: "Beam still points at another server",
+  proof: "this server did not answer",
+};
+
+export interface BeamDeviceLine {
+  name: string;
+  bearer: string;
+  /** What happened to the last ask, or the reason it cannot be asked; `null` when there is nothing to say. */
+  outcome: string | null;
+}
+
+/** One line of the per-pager list in the Beam block. */
+export function beamDeviceLine(d: BeamDevice): BeamDeviceLine {
+  const name = d.label || d.deviceId;
+  const bearer = bearerLabel(d.bearer) ?? "Unknown";
+  const t = d.try;
+  let outcome: string | null = null;
+  if (t?.st === "sent") outcome = "Asked, waiting for the pager";
+  else if (t?.st === "try") outcome = "Trying Beam";
+  else if (t?.st === "ok") outcome = "On Beam";
+  else if (t?.st === "fail") {
+    const why = t.rsn ? (TRY_FAIL_TEXT[t.rsn] ?? t.rsn) : null;
+    outcome = why ? `Went back to direct: ${why}` : "Went back to direct";
+  } else if (t?.st === "na") outcome = "Not a Beam SIM";
+  else if (!d.canTry && d.bearer !== "beam") outcome = "Firmware too old to switch";
+  return { name, bearer, outcome };
+}
+
+const SKIP_TEXT: Record<BearerTrySkipReason, string> = {
+  firmware: "firmware too old",
+  on_beam: "already on Beam",
+  moving: "busy moving",
+  unknown: "not known here",
+};
+
+/** The short result after "Switch pagers to Beam": how many were asked, and why others were skipped. */
+export function bearerTryResultText(r: BearerTryResult, labelOf: (id: string) => string = (id) => id): string {
+  const asked = r.sent.length === 0 ? "No pager was asked." : `${plural(r.sent.length, "pager")} asked to try Beam.`;
+  if (r.skipped.length === 0) return asked;
+  const skipped = r.skipped.map((s) => `${labelOf(s.id)} (${SKIP_TEXT[s.reason] ?? s.reason})`).join(", ");
+  return `${asked} Skipped: ${skipped}.`;
 }
 
 /** "Send bridges back" has nothing to do until bridges exist, and is idle once sent. */

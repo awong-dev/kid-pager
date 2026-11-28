@@ -87,6 +87,18 @@ int main(void)
     }
     CHECK(devinfo_rows(&v, rows, 3) == 3, "max_rows respected");
 
+    /* a cfg.br request under way or failed is noted in the carrier row, which still fits the screen */
+    v.beam = false;
+    v.bearer_note = "beam try 2/3";
+    n = devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
+    CHECK(n == 12 && !strcmp(rows[9], "carrier Soracom  direct (beam try 2/3)") && strlen(rows[9]) < 40, "bearer note: \"%s\"", rows[9]);
+    v.bearer_note = "beam failed";
+    devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
+    CHECK(!strcmp(rows[9], "carrier Soracom  direct (beam failed)"), "bearer note: \"%s\"", rows[9]);
+    v.bearer_note = "";
+    devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
+    CHECK(!strcmp(rows[9], "carrier Soracom  direct"), "no note: \"%s\"", rows[9]);
+
     if (g_failures == 0) {
         printf("test_devinfo: all passed\n");
     }

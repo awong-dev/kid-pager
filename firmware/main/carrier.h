@@ -69,6 +69,10 @@ carrier_bearer_t carrier_bearer_resolve(const carrier_preset_t *p, carrier_beare
 const char *carrier_auth_name(carrier_auth_t a);   /* "none" / "PAP" / "CHAP" */
 const char *carrier_bearer_ovr_name(carrier_bearer_ovr_t o); /* "auto" / "direct" / "beam" */
 
+// NVS carrier/bearer, read on each call; set returns false on NVS failure. Also built on the host (NVS fake).
+carrier_bearer_ovr_t carrier_bearer_override_get(void);
+bool carrier_bearer_override_set(carrier_bearer_ovr_t o);
+
 typedef enum {
     CARRIER_MODE_AUTO = 0,  /* nothing chosen: detect from the SIM */
     CARRIER_MODE_FIXED = 1, /* the person chose an APN (possibly blank) */
@@ -84,9 +88,6 @@ const char *carrier_get_label(void);
 bool carrier_select_preset(size_t i);
 bool carrier_set_custom(const char *apn);
 const carrier_preset_t *carrier_effective(const char *imsi, const char *gid1_hex, const char *iccid, const char *typed_apn);
-// Read from NVS on each call; set returns false on NVS failure.
-carrier_bearer_ovr_t carrier_bearer_override_get(void);
-bool carrier_bearer_override_set(carrier_bearer_ovr_t o);
 // 1 = AT+CGAUTH credentials are in the modem (it keeps them); a later carrier must clear them.
 bool carrier_auth_flag_get(void);
 void carrier_auth_flag_set(bool on);

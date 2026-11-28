@@ -32,6 +32,7 @@
 #include "cfg.h"
 #include "caps.h"
 #include "catrust.h"
+#include "bearer_try.h"
 #include "move.h"
 
 #include "archive.h"
@@ -256,9 +257,9 @@ void modes_set_ca_apply_suppress(bool suppress)
     s_ca_apply_suppress = suppress;
 }
 
-// A CA apply trial or a server move trial owns the MQTT session: the reconnect loop, the registered-edge
-// reconnect, the modem health reset and the liveness service stand aside.
-static bool session_owned(void) { return s_ca_apply_suppress || move_owns_session(); }
+// A CA apply trial, a server move trial or a cfg.br attempt owns the MQTT session: the reconnect loop, the
+// registered-edge reconnect, the modem health reset and the liveness service stand aside.
+static bool session_owned(void) { return s_ca_apply_suppress || move_owns_session() || brtry_owns_session(); }
 
 // Coverage duty-cycle policy state, and a flag mirroring "the radio is deliberately off".
 static coverage_policy_t s_coverage;
@@ -617,6 +618,10 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     move_status_t mvs;
     const bool have_mv = move_status_get(&mvs);
     nfields += move_status_cbor_fields(have_mvc, have_mv ? &mvs : NULL);
+    // Bearer change: `brc` under the conditions of `mvc`, and the cfg.br request while one is held.
+    brtry_rec_t brs;
+    const bool have_br = brtry_status_get(&brs);
+    nfields += brtry_status_cbor_fields(have_mvc, have_br ? &brs : NULL);
     if (ost.ast == 2) {
         nfields += 1; // key 73 ast_id
     }
@@ -684,6 +689,7 @@ static bool build_status_cbor(uint8_t *out, size_t cap, size_t *out_len, const c
     cbor_w_uint(&w, STK_AST, ost.ast);
     cbor_w_uint(&w, STK_MB, MSG_BODY_MAX_BYTES); // 1024 (PROTOCOL.md §5.1)
     move_status_cbor_write(&w, have_mvc, have_mv ? &mvs : NULL);
+    brtry_status_cbor_write(&w, have_mvc, have_br ? &brs : NULL);
     if (ost.ast == 2) {
         cbor_w_tstr(&w, STK_AST_ID, ost.ast_id, strlen(ost.ast_id));
     }
@@ -749,7 +755,7 @@ static volatile int64_t s_status_publish_pending_since_us = 0;
 
 static void publish_status_online(void)
 {
-    uint8_t buf[544];
+    uint8_t buf[592];
     size_t len = 0;
     if (!build_status_cbor(buf, sizeof(buf), &len, "online")) {
         ESP_LOGI(TAG, "status CBOR build failed (buffer too small or auth_sign failed)");
@@ -1859,6 +1865,9 @@ void modes_boot(void)
     // in the middle of a trial left the active key's /down window saved in RTC; the active key is back.
     move_bind(rtc_lock, rtc_unlock);
     move_init();
+    // The cfg.br request is repaired against the stored bearer choice before net_init() resolves the bearer.
+    brtry_bind(rtc_lock, rtc_unlock);
+    brtry_init();
     rtc_lock();
     auth_window_boot_restore(&g_rtc.auth, (uint8_t) ident_active_slot());
     rtc_save();
@@ -2595,7 +2604,18 @@ void modes_run(void)
             move_note_backoff_reset(esp_timer_get_time());
         }
 
-        // A move trial ended, or a Beam probe wants a fresh connect on the active login.
+        // A cfg.br attempt ended without its proof: connect on the direct bearer at once.
+        if (brtry_take_reconnect_request()) {
+            if (st.mqtt_connected) {
+                net_session_down(); // power effect: one AT command, then one TLS connect
+                move_note_own_disconnect(esp_timer_get_time());
+                net_get_mqtt_status(&st);
+            }
+            backoff_index = 0;
+            next_session_retry_us = 0;
+        }
+
+        // A move trial ended: a fresh connect on the active identity.
         switch (move_take_reconnect_request()) {
         case MOVE_RECONNECT_NOW:
             if (st.mqtt_connected) {
@@ -2653,9 +2673,9 @@ void modes_run(void)
             if (st.disconnect_edge) {
                 net_ack_disconnect_edge();
             }
-        } else if (move_owns_session()) {
+        } else if (move_owns_session() || brtry_owns_session()) {
             // move_service() runs the connect, the proof wait and the revert of a trial; a TLS failure in it
-            // is its own, never catrust's.
+            // is its own, never catrust's. brtry_service() does the same for an attempt on Beam.
         } else if (st.disconnect_edge) {
             if (move_swallow_own_disconnect(esp_timer_get_time())) {
                 net_ack_disconnect_edge(); // the DISCONNECTED of a disconnect a trial asked for
@@ -2784,6 +2804,10 @@ void modes_run(void)
         // no move). `st` is the same snapshot the reconnect loop above saw.
         move_service(&st, &move_env);
 
+        // One step of a cfg.br request: a try or a proof to act on, and any attempt on Beam (a no-op with
+        // no request).
+        brtry_service(&st, &move_env);
+
         // One step of the pending-nudge / book-fetch state machine; shares catrust's single-flight
         // cafetch guard.
         bookpull_service();
@@ -2796,7 +2820,7 @@ void modes_run(void)
             oe.airplane = net_airplane();
             oe.mqtt_usable = st.mqtt_connected;
             oe.other_fetch = (cafetch_in_progress() && !ota_transfer_active()) || catrust_apply_in_progress() ||
-                             move_owns_session();
+                             move_owns_session() || brtry_owns_session();
             oe.sleep_mode = g_rtc.mode == (uint8_t) PAGER_MODE_SLEEP;
             oe.batt_mv = modes_batt_mv_known() ? modes_get_batt_mv() : OTA_MIN_BATT_MV; // unknown battery does not block OTA
             oe.rssi = (s_last_rssi_dbm != PAGER_RSSI_UNSET) ? s_last_rssi_dbm : 0;

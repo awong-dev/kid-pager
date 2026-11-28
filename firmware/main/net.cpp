@@ -416,9 +416,37 @@ extern "C" bool net_sim_identity(char *imsi, size_t imsi_cap, char *gid1_hex, si
 // The preset in force from the last effective_apn() (NULL = none: direct, no PDP auth, SMS allowed).
 static net_devinfo_t s_di = {}; // device-info cache
 static const carrier_preset_t *s_carrier = nullptr;
-static carrier_bearer_t s_bearer = CARRIER_BEARER_DIRECT; // resolved once per attach in effective_apn()
+static carrier_bearer_t s_bearer = CARRIER_BEARER_DIRECT; // the stored choice, resolved per attach in effective_apn()
+// A bearer forced in RAM for a move trial or a cfg.br attempt. A reset or a modem recover leaves the stored
+// choice in NVS untouched, so a forced bearer never outlives its owner.
+static volatile net_bearer_sel_t s_bearer_sel = NET_BEARER_STORED;
 
-extern "C" bool net_bearer_beam(void) { return s_bearer == CARRIER_BEARER_BEAM; }
+extern "C" bool net_bearer_beam_offered(void) { return s_carrier && s_carrier->bearer == CARRIER_BEARER_BEAM; }
+
+extern "C" bool net_bearer_beam(void)
+{
+    switch (s_bearer_sel) {
+    case NET_BEARER_FORCE_DIRECT: return false;
+    case NET_BEARER_FORCE_BEAM: return net_bearer_beam_offered(); // never plain MQTT off a Beam SIM
+    default: return s_bearer == CARRIER_BEARER_BEAM;
+    }
+}
+
+extern "C" void net_bearer_select(net_bearer_sel_t sel)
+{
+    if (sel != s_bearer_sel) {
+        ESP_LOGI(TAG, "bearer for the next session: %s",
+                 sel == NET_BEARER_FORCE_DIRECT ? "direct (forced)" : sel == NET_BEARER_FORCE_BEAM ? "beam (forced)" : "the stored choice");
+    }
+    s_bearer_sel = sel;
+}
+
+extern "C" bool net_bearer_reload(void)
+{
+    s_bearer = carrier_bearer_resolve(s_carrier, carrier_bearer_override_get()); // one NVS read
+    ESP_LOGI(TAG, "stored bearer choice read again: %s", s_bearer == CARRIER_BEARER_BEAM ? "beam" : "direct");
+    return s_bearer == CARRIER_BEARER_BEAM;
+}
 extern "C" const char *net_carrier_label(void) { return s_carrier ? s_carrier->label : ""; }
 extern "C" void net_carrier_mqtt_params(uint16_t *keepalive_s, uint16_t *ping_s)
 {
@@ -971,9 +999,7 @@ extern "C" bool net_login_prepare_pending(void)
     if (net_airplane()) {
         return false;
     }
-    if (net_bearer_beam()) {
-        return true; // plain MQTT: no CA
-    }
+    // A trial dials the order's host with TLS whatever the bearer in use, so the PEM is always written.
     bool pinned;
     return write_pending_ca(&pinned);
 }

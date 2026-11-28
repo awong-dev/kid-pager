@@ -4,6 +4,8 @@
  * msg.c taking a `moving` receipt (built with ESP_PLATFORM against the fakes below). */
 #include "move.h"
 
+#include "carrier.h"
+
 #include "caps.h"
 #include "cbor.h"
 #include "ident.h"
@@ -505,6 +507,12 @@ static void test_decisions(void)
     CHECK(move_decide_order(&rec, &o, &c, &rsn) == MOVE_ORD_ACCEPT, "a pinned order on a pinned pager is fine");
     c = ctx_ok();
     CHECK(move_decide_order(&rec, &unp, &c, &rsn) == MOVE_ORD_ACCEPT, "unpinned on unpinned is fine");
+    /* Beam validates the broker for the pager: leaving it for an unvalidated TLS session is a downgrade */
+    c.beam = true;
+    CHECK(move_decide_order(&rec, &unp, &c, &rsn) == MOVE_ORD_REJECT && rsn == MOVE_RSN_DOWN,
+          "unpinned order on a Beam pager -> down");
+    CHECK(move_decide_order(&rec, &o, &c, &rsn) == MOVE_ORD_ACCEPT, "a pinned order on a Beam pager is fine");
+    c = ctx_ok();
     c.signing = false;
     c.busy = true;
     CHECK(move_decide_order(&rec, &o, &c, &rsn) == MOVE_ORD_REJECT, "a refusal wins over a deferral");
@@ -654,10 +662,11 @@ static void test_store_and_derived_slot(void)
     ident_slot_info(1, &si);
     CHECK(si.valid && si.ca_len == 0 && memcmp(r->ca_sha, SHA_A, 32) == 0, "no PEM, ca_sha set");
 
-    /* the same failure on Beam stores `pend` and goes on */
+    /* the same failure on Beam is the same: the trial is a TLS session there too */
     setup_ident("");
     CHECK(store(true, true, true, ""), "beam: stored without a PEM");
-    CHECK(move_rec()->st == MOVE_ST_PEND && move_rec()->bearer == 1, "beam: pend");
+    CHECK(move_rec()->st == MOVE_ST_FAIL && move_rec()->rsn == MOVE_RSN_CA && move_rec()->bearer == MOVE_BEARER_BEAM,
+          "beam: fail/ca, and the record says the order was taken on Beam");
 
     /* unpinned target */
     setup_ident("");
@@ -818,6 +827,104 @@ static void test_commit_and_power_loss(void)
     ident_use(IDENT_ACTIVE);
 }
 
+/* A move taken on Beam (§5.3): the commit also stores the bearer choice `direct`. Whatever write the power
+ * fails at, the pager boots on the old identity with the choice untouched (Beam), or on the new identity
+ * with `direct` stored; while the choice cannot be written the record says it is owed. */
+static void test_commit_from_beam_power_loss(void)
+{
+    setup_ident("");
+    store(true, false, true, PEM);
+    CHECK(move_rec()->bearer == MOVE_BEARER_BEAM && carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO,
+          "order taken on Beam: recorded, the bearer choice is not touched before the commit");
+    unsigned before = nvs_fake_write_count();
+    CHECK(move_commit(), "commit");
+    unsigned total = nvs_fake_write_count() - before;
+    CHECK(ident_active_slot() == 1 && carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT &&
+              move_rec()->st == MOVE_ST_OK && move_rec()->bearer == 0 && !move_bearer_owed(),
+          "committed from Beam: new identity, bearer choice direct, nothing owed");
+
+    unsigned committed = 0, repaired = 0;
+    for (unsigned n = 0; n <= total; n++) {
+        /* the cut during the commit, then a boot whose own writes fail after `m` of them, then a clean boot */
+        for (unsigned m = 0; m <= 3; m++) {
+            setup_ident("");
+            store(true, false, true, PEM);
+            nvs_fake_cut_after((int) n);
+            move_commit();
+            nvs_fake_cut_after((int) m);
+            ident_load();
+            move_boot_repair();
+            const bool new_id = ident_active_slot() == 1;
+            const bool direct = carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT;
+            CHECK(new_id || !direct, "cut %u/%u: the old identity keeps its bearer choice (Beam)", n, m);
+            CHECK(!new_id || direct || move_bearer_owed(),
+                  "cut %u/%u: the new identity is direct, by the stored choice or owed for this boot", n, m);
+            if (new_id && !direct) {
+                repaired++;
+            }
+            reboot();
+            CHECK((ident_active_slot() == 1) == new_id, "cut %u/%u: a later boot does not change the identity", n, m);
+            if (new_id) {
+                CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT && !move_bearer_owed() &&
+                          move_rec()->st == MOVE_ST_OK && move_rec()->bearer == 0,
+                      "cut %u/%u: new identity, direct stored, record ok", n, m);
+            } else {
+                CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && move_rec()->st == MOVE_ST_PEND &&
+                          move_rec()->bearer == MOVE_BEARER_BEAM && strcmp(ident_get_host(), "old.example") == 0,
+                      "cut %u/%u: old identity, Beam, pend", n, m);
+            }
+            if (m == 0 && new_id) {
+                committed++;
+            }
+        }
+    }
+    CHECK(committed == total && repaired > 0, "every cut after `act` ends on the new identity over direct (%u of %u, %u owed boots)",
+          committed, total, repaired);
+    printf("commit-from-Beam power-loss sweep: %u x 4 cut points, %u committed, %u boots with the choice owed\n",
+           total + 1, committed, repaired);
+
+    /* the choice could not be written though the record could: marked in the `ok` record, written at a later boot */
+    setup_ident("");
+    store(true, false, true, PEM);
+    move_commit();
+    carrier_bearer_override_set(CARRIER_BEARER_OVR_AUTO);
+    move_rec_t r = *move_rec();
+    r.bearer = MOVE_BEARER_OWED;
+    move_rec_update(&r);
+    CHECK(move_bearer_owed(), "ok with the choice owed");
+    reboot();
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_DIRECT && !move_bearer_owed() && move_rec()->bearer == 0,
+          "the boot stores it and clears the mark");
+
+    /* a move committed from the direct bearer writes no bearer choice */
+    setup_ident("");
+    store(true, false, false, PEM);
+    move_commit();
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && !move_bearer_owed(), "direct: the choice is left alone");
+
+    /* an `ok` record that firmware moving through Beam's group left with `bearer` 1 asks for nothing */
+    setup_ident("");
+    store(true, false, false, PEM);
+    move_commit();
+    r = *move_rec();
+    r.bearer = MOVE_BEARER_BEAM;
+    move_rec_update(&r);
+    reboot();
+    CHECK(carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && !move_bearer_owed(),
+          "a move finished through Beam's group stays on Beam");
+
+    /* a failed trial changes nothing persistent: the stored choice stays Beam */
+    setup_ident("");
+    store(true, false, true, PEM);
+    r = *move_rec();
+    r.at = 1;
+    r.rsn = r.lrsn = MOVE_RSN_PROOF;
+    move_rec_update(&r);
+    reboot();
+    CHECK(ident_active_slot() == 0 && carrier_bearer_override_get() == CARRIER_BEARER_OVR_AUTO && !move_bearer_owed(),
+          "after a failed trial: the old identity over Beam");
+}
+
 static void test_boot_repair_rows(void)
 {
     /* during a trial (pend or try): boots active, the budget already spent, the schedule resumes */
@@ -947,13 +1054,11 @@ static move_plan_in_t base(void)
     p.st = MOVE_ST_PEND;
     p.now_epoch = 1760000000u;
     p.mono_gate_open = true;
-    p.ack_age_us = SEC(10);
     p.store_age_us = SEC(60);
     p.acked = true;
     p.session_usable = true;
     p.registered = true;
     p.quiet = false;
-    p.pending_attempt_allowed = true;
     return p;
 }
 
@@ -1107,76 +1212,6 @@ static void test_plan_direct(void)
     p.downloading = false;
     p.st = MOVE_ST_OK;
     CHECK(move_plan(&p) == MOVE_ACT_NONE, "manual with nothing held does nothing");
-}
-
-static void test_plan_beam(void)
-{
-    move_plan_in_t p = base();
-    p.beam = true;
-    p.ack_age_us = SEC(119);
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: no prompt attempt before 120 s");
-    p.ack_age_us = SEC(120);
-    CHECK(move_plan(&p) == MOVE_ACT_BEAM_PROMPT, "beam: one prompt attempt 120 s after the ack");
-    p.beam_prompt_done = true;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: only once");
-    p.beam_prompt_done = false;
-    p.acked = false;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: not before the ack");
-    p.acked = true;
-    p.reply_awaiting = true;
-    p.reply_wait_us = SEC(1);
-    CHECK(move_plan(&p) == MOVE_ACT_WAIT_REPLY, "beam: the prompt waits for a reply's PUBACK");
-    p.reply_awaiting = false;
-    p.pending_attempt_allowed = false;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: the slow-down applies to the prompt");
-    p.pending_attempt_allowed = true;
-    p.next_try_ts = p.now_epoch + 99999;
-    p.sched = MOVE_SCHED_STEPS;
-    CHECK(move_plan(&p) == MOVE_ACT_BEAM_PROMPT, "beam: no budget, no schedule");
-
-    /* the probe: pend or fail, acked, from a quiet wake, no publish waiting, no download */
-    p = base();
-    p.beam = true;
-    p.beam_prompt_done = true;
-    p.beam_probe_due = true;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: a probe needs a quiet wake");
-    p.quiet = true;
-    CHECK(move_plan(&p) == MOVE_ACT_BEAM_PROBE, "beam: probe");
-    p.reply_awaiting = true;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: no probe with a publish waiting on its PUBACK");
-    p.reply_awaiting = false;
-    p.downloading = true;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: no probe during a download");
-    p.downloading = false;
-    p.acked = false;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: no probe before the ack");
-    p.acked = true;
-    p.st = MOVE_ST_FAIL;
-    CHECK(move_plan(&p) == MOVE_ACT_BEAM_PROBE, "beam: the probe also runs in fail");
-    p.beam_probe_due = false;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: not before the timer");
-    p.beam_probe_due = true;
-    p.airplane = true;
-    CHECK(move_plan(&p) == MOVE_ACT_NONE, "beam: airplane");
-
-    /* probe cadence: 60 min for 7 days after the ack, then 4 h */
-    CHECK(move_probe_interval_s(0) == 3600 && move_probe_interval_s(86400) == 3600 &&
-              move_probe_interval_s(7 * 86400 - 1) == 3600 && move_probe_interval_s(7 * 86400) == 14400 &&
-              move_probe_interval_s(40 * 86400) == 14400,
-          "probe interval");
-
-    /* manual on beam goes to the pending login too */
-    p = base();
-    p.beam = true;
-    p.manual = true;
-    p.session_usable = false;
-    CHECK(move_plan(&p) == MOVE_ACT_TRIAL_MANUAL, "beam: manual");
-
-    /* slow-down after three SUBACKs without a proof: one pending attempt per hour */
-    CHECK(move_pending_attempt_allowed(0, 0) && move_pending_attempt_allowed(2, 0), "streak < 3: allowed");
-    CHECK(!move_pending_attempt_allowed(3, SEC(3599)) && move_pending_attempt_allowed(3, SEC(3600)) &&
-              !move_pending_attempt_allowed(9, SEC(10)),
-          "streak >= 3: one per 60 min");
 }
 
 static void test_alternation(void)
@@ -1434,7 +1469,6 @@ static void test_ui_text(void)
     ui_line(&c, 0, "Moving to home.example.org", "pend");
     move_ui_build(&c.v, NULL, 0, &l);
     CHECK(l.n == 1 && l.action && strcmp(l.action_text, "Switch to home.example.org now") == 0, "pend: the action");
-    c.u.beam = true;
     c.v.beam_now = true;
     ui_line(&c, 0, "Moving to home.example.org", "pend on Beam shows the order's host too");
 
@@ -1459,22 +1493,19 @@ static void test_ui_text(void)
     /* a run of the action and what it ends in: §5.8's outcome table */
     static const struct {
         move_rsn_t rsn;
-        bool beam;
         const char *want;
     } out[] = {
-        { MOVE_RSN_CA, false, "Can't get home.\xE2\x80\xA6 certificate" },
-        { MOVE_RSN_TLS, false, "Certificate doesn't match" },
-        { MOVE_RSN_AUTH, false, "home.exa\xE2\x80\xA6 refused this pager" },
-        { MOVE_RSN_AUTH, true, "Not switched yet" },
-        { MOVE_RSN_CONN, false, "Can't reach home.example.org" },
-        { MOVE_RSN_PROOF, false, "home.example\xE2\x80\xA6 did not answer" },
-        { MOVE_RSN_BUSY, false, "Busy, try in a few minutes" },
-        { MOVE_RSN_NVS, false, "Storage error" },
+        { MOVE_RSN_CA, "Can't get home.\xE2\x80\xA6 certificate" },
+        { MOVE_RSN_TLS, "Certificate doesn't match" },
+        { MOVE_RSN_AUTH, "home.exa\xE2\x80\xA6 refused this pager" },
+        { MOVE_RSN_CONN, "Can't reach home.example.org" },
+        { MOVE_RSN_PROOF, "home.example\xE2\x80\xA6 did not answer" },
+        { MOVE_RSN_BUSY, "Busy, try in a few minutes" },
+        { MOVE_RSN_NVS, "Storage error" },
     };
     for (size_t i = 0; i < sizeof(out) / sizeof(out[0]); i++) {
         ui_init(&c, MOVE_ST_PEND);
         c.u.last_rsn = out[i].rsn;
-        c.u.beam = out[i].beam;
         c.v.outcome_visible = true;
         move_ui_build(&c.v, NULL, 0, &l);
         CHECK(l.n >= 2 && chars(l.line[1]) <= MOVE_UI_OUTCOME_CHARS, "outcome %d: at most %d characters (\"%s\")",
@@ -1486,7 +1517,6 @@ static void test_ui_text(void)
         ui_init(&c, MOVE_ST_PEND);
         strcpy(c.u.host, "a-very-long-host-name.of-the-new-server.example.org");
         c.u.last_rsn = out[i].rsn;
-        c.u.beam = out[i].beam;
         c.v.outcome_visible = true;
         move_ui_build(&c.v, NULL, 0, &l);
         CHECK(l.n >= 2 && chars(l.line[1]) <= MOVE_UI_OUTCOME_CHARS, "long host, outcome %d: \"%s\" is %d characters",
@@ -1864,10 +1894,10 @@ int main(void)
     test_store_and_derived_slot();
     test_store_power_loss();
     test_commit_and_power_loss();
+    test_commit_from_beam_power_loss();
     test_boot_repair_rows();
     test_hold();
     test_plan_direct();
-    test_plan_beam();
     test_alternation();
     test_backoff();
     test_caps();
@@ -1879,6 +1909,6 @@ int main(void)
         return 1;
     }
     printf("PASS: move.c (cfg.mv shapes, HKDF vectors, ledger, §5.5 decisions, store/commit power-loss sweeps, "
-           "boot repair, hold, plan, alternation, back-off, /status mv bytes, Device-screen text, the `moving` receipt), 0 failures\n");
+           "commit from Beam and the bearer choice, boot repair, hold, plan, alternation, back-off, /status mv bytes, Device-screen text, the `moving` receipt), 0 failures\n");
     return 0;
 }

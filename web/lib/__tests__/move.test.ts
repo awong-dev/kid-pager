@@ -8,7 +8,13 @@ import {
   type TargetDeviceRow,
   bannerKind,
   beamActions,
+  beamDeviceLine,
   beamSwitchBackBlock,
+  beamTryTargets,
+  beamWaitingWarning,
+  bearerTryResultText,
+  waitingFromRefusal,
+  type BeamDevice,
   bridgeStillHere,
   bridgeTally,
   caFingerprintOf,
@@ -246,14 +252,63 @@ describe("bridges, people and Beam", () => {
       ]),
     ).toEqual({ signedIn: 1, notYet: 1, noSignIn: 1 });
   });
-  const beam = (o: Partial<BeamInfo>): BeamInfo => ({ count: 2, movedCount: 0, switched: false, soracom: true, ...o });
-  it("Switch back is open only while no Beam pager has moved", () => {
+  const beam = (o: Partial<BeamInfo>): BeamInfo => ({
+    count: 2, movedCount: 0, waitingCount: 0, onBeamCount: 0, switched: false, soracom: true, devices: [], ...o,
+  });
+  it("Switch back is open unless a pager is on Beam here", () => {
     expect(beamActions(beam({}))).toMatchObject({ canSwitch: true, canSwitchBack: false });
     expect(beamActions(beam({ switched: true }))).toMatchObject({ canSwitch: false, canSwitchBack: true });
-    expect(beamActions(beam({ switched: true, movedCount: 1 })).canSwitchBack).toBe(false);
-    expect(beamSwitchBackBlock(beam({ switched: true, movedCount: 1 }))).toContain("already moved");
+    expect(beamActions(beam({ switched: true, movedCount: 1 })).canSwitchBack).toBe(true);
+    expect(beamActions(beam({ switched: true, onBeamCount: 1 })).canSwitchBack).toBe(false);
+    expect(beamSwitchBackBlock(beam({ switched: true, onBeamCount: 1 }))).toContain("on Beam here");
+    expect(beamSwitchBackBlock(beam({ switched: true, onBeamCount: 2 }))).toContain("2 pagers are on Beam");
+    expect(beamSwitchBackBlock(beam({ switched: true, movedCount: 1 }))).toBeNull();
     expect(beamSwitchBackBlock(beam({ switched: true }))).toBeNull();
     expect(beamActions(beam({ switched: true, byHand: true }))).toMatchObject({ canSwitchBack: false, switchBackByHand: true });
+  });
+  it("waiting pagers make the switch need a confirmation", () => {
+    expect(beamActions(beam({ waitingCount: 0 })).switchNeedsForce).toBe(false);
+    expect(beamActions(beam({ waitingCount: 2 })).switchNeedsForce).toBe(true);
+    expect(beamWaitingWarning(beam({ waitingCount: 1 }))).toContain("1 Beam pager has not arrived");
+    expect(beamWaitingWarning(beam({ waitingCount: 3 }))).toContain("3 Beam pagers have not arrived");
+    expect(beamWaitingWarning(beam({}))).toBeNull();
+    expect(waitingFromRefusal({ detail: "x", waiting: ["a", 2, "b"] })).toEqual(["a", "b"]);
+    expect(waitingFromRefusal({ detail: "x" })).toEqual([]);
+    expect(waitingFromRefusal(null)).toEqual([]);
+  });
+  const dev = (o: Partial<BeamDevice>): BeamDevice => ({ deviceId: "d1", label: "Kit", bearer: "direct", canTry: true, try: null, ...o });
+  it("step 2 asks the pagers that are not on Beam and can try", () => {
+    const list = [
+      dev({ deviceId: "a" }),
+      dev({ deviceId: "b", bearer: "beam" }),
+      dev({ deviceId: "c", canTry: false }),
+      dev({ deviceId: "d", bearer: null }),
+    ];
+    expect(beamTryTargets(list)).toEqual(["a", "d"]);
+    expect(beamActions(beam({ switched: true, devices: list })).canTryBeam).toBe(true);
+    expect(beamActions(beam({ switched: false, devices: list })).canTryBeam).toBe(false);
+    expect(beamActions(beam({ switched: true, devices: [dev({ bearer: "beam" })] })).canTryBeam).toBe(false);
+  });
+  it("words each pager's bearer and try outcome", () => {
+    expect(beamDeviceLine(dev({ label: null }))).toMatchObject({ name: "d1", bearer: "Direct", outcome: null });
+    expect(beamDeviceLine(dev({ bearer: null })).bearer).toBe("Unknown");
+    expect(beamDeviceLine(dev({ try: { st: "sent", rsn: null } })).outcome).toBe("Asked, waiting for the pager");
+    expect(beamDeviceLine(dev({ try: { st: "try", rsn: null } })).outcome).toBe("Trying Beam");
+    expect(beamDeviceLine(dev({ bearer: "beam", try: { st: "ok", rsn: null } }))).toMatchObject({ bearer: "Beam", outcome: "On Beam" });
+    expect(beamDeviceLine(dev({ try: { st: "fail", rsn: "conn" } })).outcome).toBe("Went back to direct: could not connect through Beam");
+    expect(beamDeviceLine(dev({ try: { st: "fail", rsn: "auth" } })).outcome).toContain("another server");
+    expect(beamDeviceLine(dev({ try: { st: "fail", rsn: "proof" } })).outcome).toContain("did not answer");
+    expect(beamDeviceLine(dev({ try: { st: "fail", rsn: null } })).outcome).toBe("Went back to direct");
+    expect(beamDeviceLine(dev({ try: { st: "na", rsn: null } })).outcome).toBe("Not a Beam SIM");
+    expect(beamDeviceLine(dev({ canTry: false })).outcome).toBe("Firmware too old to switch");
+    expect(beamDeviceLine(dev({ canTry: false, bearer: "beam" })).outcome).toBeNull();
+  });
+  it("sums up the answer of the ask", () => {
+    expect(bearerTryResultText({ sent: ["a", "b"], skipped: [] })).toBe("2 pagers asked to try Beam.");
+    expect(bearerTryResultText({ sent: [], skipped: [] })).toBe("No pager was asked.");
+    expect(bearerTryResultText({ sent: ["a"], skipped: [{ id: "c", reason: "firmware" }] }, () => "Kit")).toBe(
+      "1 pager asked to try Beam. Skipped: Kit (firmware too old).",
+    );
   });
   it("there is nothing to switch with no Beam pagers", () => {
     expect(beamActions(beam({ count: 0 })).canSwitch).toBe(false);

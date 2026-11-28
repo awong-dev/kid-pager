@@ -4,6 +4,7 @@
 #include "ui.h"
 #include "modes.h"
 #include "net.h"
+#include "bearer_try.h"
 #include "devinfo_fmt.h"
 #include "board.h"
 #include "fuel_fmt.h"
@@ -52,6 +53,13 @@ static int devinfo_build(char rows[][DEVINFO_ROW_LEN])
     v.apn = d.apn;
     v.bearer_known = d.apn[0] != '\0' || net_carrier_label()[0] != '\0';
     v.beam = net_bearer_beam();
+    char br_note[24];
+    brtry_rec_t br;
+    br_note[0] = '\0';
+    if (brtry_status_get(&br)) {
+        brtry_ui_note(&br, br_note, sizeof(br_note));
+    }
+    v.bearer_note = br_note;
     v.board = board_name();
     return devinfo_rows(&v, rows, DEVINFO_MAX_ROWS);
 }

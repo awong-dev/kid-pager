@@ -52,8 +52,8 @@ bool ident_store(const ident_t *id);
  * PEM does not fit IDENT_CA_MAX or an NVS write fails. */
 bool ident_set_ca(const char *pem, const uint8_t hash[IDENT_CA_HASH_LEN]);
 
-/* Erases "ident", "ident1", "idsel" and "move"; the next ident_load() returns false. "auth" (the
- * epoch) stays. The caller zeroes the RTC down window first (modes_reset_down_window()). */
+/* Erases "ident", "ident1", "idsel", "move" and "brtry"; the next ident_load() returns false. "auth" (the
+ * epoch) and "carrier" (APN and bearer choice) stay. The caller zeroes the RTC down window first (modes_reset_down_window()). */
 bool ident_erase(void);
 
 /* Slot access. A slot is valid when its seal is present and non-zero and its fields load; an

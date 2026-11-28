@@ -22,9 +22,15 @@ import {
   TARGET_CHIP,
   beamActions,
   beamSwitch,
+  beamTryTargets,
   beamSwitchBack,
+  beamDeviceLine,
   beamSwitchBackBlock,
+  beamWaitingWarning,
   bearerLabel,
+  bearerTry,
+  bearerTryResultText,
+  waitingFromRefusal,
   bridgesSendBack,
   bridgeStillHere,
   bridgeTally,
@@ -132,8 +138,15 @@ function BeamCard({ beam, onChanged }: { beam: BeamInfo; onChanged: () => void }
   const [open, setOpen] = useState<"switch" | "back" | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refusedWaiting, setRefusedWaiting] = useState<string[]>([]);
+  const [asking, setAsking] = useState(false);
+  const [askResult, setAskResult] = useState<string | null>(null);
+  const [askError, setAskError] = useState<string | null>(null);
   const a = beamActions(beam);
   const block = beamSwitchBackBlock(beam);
+  const warning = beamWaitingWarning(beam) ?? (refusedWaiting.length > 0 ? beamWaitingWarning({ waitingCount: refusedWaiting.length }) : null);
+  const force = a.switchNeedsForce || refusedWaiting.length > 0;
+  const targets = beamTryTargets(beam.devices);
 
   async function run(fn: () => Promise<unknown>) {
     setBusy(true);
@@ -141,27 +154,50 @@ function BeamCard({ beam, onChanged }: { beam: BeamInfo; onChanged: () => void }
     try {
       await fn();
       setOpen(null);
+      setRefusedWaiting([]);
       onChanged();
     } catch (e) {
-      setError(
-        e instanceof ApiError && e.status === 409
-          ? "A Beam pager has already moved here, so the group cannot be switched back."
-          : errText(e, "That did not work."),
-      );
+      const waiting = e instanceof ApiError && e.status === 409 ? waitingFromRefusal(e.body) : [];
+      if (waiting.length > 0) {
+        setRefusedWaiting(waiting);
+      } else {
+        setError(
+          e instanceof ApiError && e.status === 409
+            ? "A pager is on Beam here, so the group cannot be switched back."
+            : errText(e, "That did not work."),
+        );
+      }
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function askPagers() {
+    setAsking(true);
+    setAskError(null);
+    setAskResult(null);
+    try {
+      const r = await bearerTry(targets);
+      const names = new Map(beam.devices.map((d) => [d.deviceId, d.label || d.deviceId]));
+      setAskResult(bearerTryResultText(r, (id) => names.get(id) ?? id));
+      onChanged();
+    } catch (e) {
+      setAskError(errText(e, "Could not ask the pagers."));
+    } finally {
+      setAsking(false);
     }
   }
 
   return (
     <Section
       title="Beam"
-      hint="Pagers on Soracom Beam follow their SIM's Beam group, not an order. Switch the group when the old server's page shows the Beam pagers have the order."
+      hint="Pagers on Soracom Beam arrive over a direct connection, without anyone touching Soracom. Moving them back to Beam is an optional second step for afterwards."
     >
       <Typography variant="body2">
-        {beam.count} Beam {beam.count === 1 ? "pager" : "pagers"}, {beam.movedCount} arrived.{" "}
+        {beam.count} Beam {beam.count === 1 ? "pager" : "pagers"}, {beam.movedCount} arrived, {beam.onBeamCount} on Beam here.{" "}
         {beam.switched ? "The Beam group is switched to this server." : "The Beam group still points at the old server."}
       </Typography>
+      <Typography variant="subtitle2">Step 1: point the Beam group at this server</Typography>
       {!beam.soracom && !beam.switched && (
         <Alert severity="info">
           This server has no Soracom key. In the Soracom console, create a Beam group with destination{" "}
@@ -169,6 +205,7 @@ function BeamCard({ beam, onChanged }: { beam: BeamInfo; onChanged: () => void }
           SIMs into it, then press &quot;Done, I switched it&quot;.
         </Alert>
       )}
+      {!beam.switched && warning && <Alert severity="warning">{warning}</Alert>}
       {error && <Alert severity="error">{error}</Alert>}
       {block && <Typography variant="body2" color="error.main">{block}</Typography>}
       {a.switchBackByHand && (
@@ -182,20 +219,51 @@ function BeamCard({ beam, onChanged }: { beam: BeamInfo; onChanged: () => void }
           Switch back
         </Button>
       </Stack>
+
+      <Typography variant="subtitle2">Step 2: switch the pagers to Beam</Typography>
+      <Typography variant="body2">
+        Each pager tries Beam and goes back to direct by itself if Beam does not reach this server.
+      </Typography>
+      {askError && <Alert severity="error">{askError}</Alert>}
+      {askResult && <Alert severity="info">{askResult}</Alert>}
+      <Box>
+        <Button variant="contained" disabled={!a.canTryBeam || asking} onClick={() => void askPagers()}>
+          Switch pagers to Beam
+        </Button>
+        {!beam.switched && (
+          <Typography variant="caption" component="div" color="text.secondary" sx={{ mt: 0.5 }}>
+            Available once the group is switched.
+          </Typography>
+        )}
+      </Box>
+
+      {beam.devices.length > 0 && (
+        <Box>
+          {beam.devices.map((d) => {
+            const line = beamDeviceLine(d);
+            return <StatusRow key={d.deviceId} title={line.name} chips={null} facts={[line.bearer]} detail={line.outcome} />;
+          })}
+        </Box>
+      )}
+
       <ConfirmDialog
         open={open === "switch"}
         title={beam.soracom ? "Switch the Beam group?" : "Confirm the group is switched?"}
-        confirmLabel={beam.soracom ? "Switch" : "Done, I switched it"}
+        confirmLabel={force ? (beam.soracom ? "Switch anyway" : "Done anyway") : beam.soracom ? "Switch" : "Done, I switched it"}
+        danger={force}
         busy={busy}
         error={error}
-        onConfirm={() => void run(() => beamSwitch(!beam.soracom))}
-        onClose={() => setOpen(null)}
+        onConfirm={() => void run(() => beamSwitch(!beam.soracom, force))}
+        onClose={() => { setOpen(null); setRefusedWaiting([]); }}
       >
-        <Typography variant="body2">
-          {beam.soracom
-            ? "Every SIM in the old group moves to a new group that points here. Pagers that have the order arrive here; a Beam pager that does not have it goes dark and needs a setup code. Tip: move one SIM by hand first and watch a pager arrive."
-            : "Only confirm once the SIMs are in the new group."}
-        </Typography>
+        <Stack spacing={1}>
+          {force && warning && <Alert severity="warning">{warning}</Alert>}
+          <Typography variant="body2">
+            {beam.soracom
+              ? "Every SIM in the old group moves to a new group that points here. Pagers that are on this server stay; a Beam pager that has not arrived is cut off from the old server and may need a setup code."
+              : "Only confirm once the SIMs are in the new group."}
+          </Typography>
+        </Stack>
       </ConfirmDialog>
       <ConfirmDialog
         open={open === "back"}
@@ -207,8 +275,7 @@ function BeamCard({ beam, onChanged }: { beam: BeamInfo; onChanged: () => void }
         onClose={() => setOpen(null)}
       >
         <Typography variant="body2">
-          The SIMs return to the old group. Then press &quot;Cancel&quot; for those Beam pagers on the old server&apos;s
-          page, because a pager holding the order keeps trying this server until it is cancelled.
+          The SIMs return to the old group. Pagers that are not on Beam here keep using their direct connection.
         </Typography>
       </ConfirmDialog>
     </Section>

@@ -436,6 +436,9 @@ static void populate_everything(void)
     uint8_t rec[8] = { 1 };
     nvs_set_blob(h, "st", rec, sizeof(rec));
     nvs_close(h);
+    nvs_open("brtry", NVS_READWRITE, &h);
+    nvs_set_blob(h, "st", rec, sizeof(rec));
+    nvs_close(h);
     nvs_open("auth", NVS_READWRITE, &h);
     nvs_set_u32(h, "epoch", 12345);
     nvs_close(h);
@@ -457,7 +460,8 @@ static void test_erase_all(void)
     populate_everything();
     CHECK(ident_erase(), "erase");
     CHECK(nvs_fake_key_count("ident") == 0 && nvs_fake_key_count("ident1") == 0, "both slots empty");
-    CHECK(nvs_fake_key_count("idsel") == 0 && nvs_fake_key_count("move") == 0, "idsel and move empty");
+    CHECK(nvs_fake_key_count("idsel") == 0 && nvs_fake_key_count("move") == 0 && nvs_fake_key_count("brtry") == 0,
+          "idsel, move and brtry empty");
     CHECK(nvs_fake_has_key("auth", "epoch"), "auth/epoch kept");
     CHECK(nvs_fake_has_key("carrier", "preset"), "unrelated namespaces kept");
     CHECK(!ident_load(), "no identity after erase");
@@ -477,7 +481,7 @@ static void test_erase_all(void)
     nvs_fake_cut_after(1000);
     ident_erase();
     unsigned total = nvs_fake_write_count();
-    CHECK(total == 4, "four namespaces, got %u", total);
+    CHECK(total == 5, "five namespaces, got %u", total);
     for (unsigned cut = 0; cut <= total; cut++) {
         populate_everything();
         nvs_fake_cut_after((int) cut);

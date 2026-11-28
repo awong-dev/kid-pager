@@ -86,11 +86,7 @@ static void make_line(line_kind_t kind, const move_ui_view_t *v, int max_chars, 
             snprintf(out, cap, "Certificate doesn't match");
             break;
         case MOVE_RSN_AUTH:
-            if (s->beam) {
-                snprintf(out, cap, "Not switched yet");
-            } else {
-                host_line(out, cap, "", ph, " refused this pager", max_chars);
-            }
+            host_line(out, cap, "", ph, " refused this pager", max_chars);
             break;
         case MOVE_RSN_CONN:
             host_line(out, cap, "Can't reach ", ph, "", max_chars);

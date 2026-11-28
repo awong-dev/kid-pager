@@ -121,6 +121,7 @@ void catrust_fingerprint_hex(const uint8_t ca_hash[32], char out[17])
 #include "cafetch.h"
 #include "ident.h"
 #include "modes.h"
+#include "bearer_try.h"
 #include "move.h"
 #include "msg.h"
 #include "net.h"
@@ -298,9 +299,10 @@ void catrust_apply_cfg_submap(const uint8_t *buf, uint16_t len, const char *id)
         return;
     }
 
-    if (move_blocks_cfg_ca()) {
-        // A server move is pending or a trial runs: not acked, so the relay re-publishes it later.
-        ESP_LOGI(TAG, "cfg.ca deferred while a server move is pending (id=%s)", id ? id : "");
+    if (move_blocks_cfg_ca() || brtry_busy()) {
+        // A server move is pending, a trial runs or Beam is being tried: not acked, so the relay
+        // re-publishes it later.
+        ESP_LOGI(TAG, "cfg.ca deferred while a server move or a bearer change is pending (id=%s)", id ? id : "");
         return;
     }
 

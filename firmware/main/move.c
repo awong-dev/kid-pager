@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "carrier.h"
 #include "catrust.h"
 #include "cbor.h"
 #include "esp_log.h"
@@ -299,7 +300,10 @@ move_order_act_t move_decide_order(const move_rec_t *rec, const move_cfg_t *o, c
         *rsn = MOVE_RSN_REJ;
         return MOVE_ORD_REJECT;
     }
-    if (!o->have_ca && c->active_pinned) {
+    /* An order without a CA makes the trial an unvalidated TLS session. That is no worse than an unpinned
+     * active identity on the direct bearer, but it is a downgrade from a pinned one, and from Beam, where
+     * the hop is inside the carrier's network and Beam validates the broker. */
+    if (!o->have_ca && (c->active_pinned || c->beam)) {
         *rsn = MOVE_RSN_DOWN;
         return MOVE_ORD_REJECT;
     }
@@ -544,7 +548,7 @@ bool move_store_order(const move_accept_t *a)
     r.rsn = r.lrsn = MOVE_RSN_NONE;
     r.at = r.sched = 0;
     r.slot = (uint8_t) (1 - ident_active_slot());
-    r.bearer = a->beam ? 1 : 0;
+    r.bearer = a->beam ? MOVE_BEARER_BEAM : 0;
     r.acked = r.tb = 0;
     r.next_try_ts = r.ack_ts = 0;
     memset(r.ca_sha, 0, sizeof(r.ca_sha));
@@ -581,7 +585,7 @@ bool move_store_order(const move_accept_t *a)
     }
 
     r = keep;
-    if (a->ca_failed && !a->beam) {
+    if (a->ca_failed) {
         r.st = MOVE_ST_FAIL;
         r.rsn = r.lrsn = MOVE_RSN_CA;
         r.sched = MOVE_SCHED_STEPS;
@@ -629,6 +633,27 @@ bool move_cancel_apply(void)
     return true;
 }
 
+/* A move taken on Beam ends on the direct bearer: the new identity is reached at its own host, and Beam's
+ * group may still point at the source. The choice is written after `idsel/act` and before the record says
+ * `ok`, so a power cut between the two leaves an unsettled record on the active slot that still asks for
+ * it (§4). A failed write is marked in the `ok` record and tried again at every boot. Power effect: one NVS
+ * write per move. */
+static void bearer_settle(move_rec_t *r)
+{
+    if (r->bearer == 0) {
+        return;
+    }
+    r->bearer = carrier_bearer_override_set(CARRIER_BEARER_OVR_DIRECT) ? 0 : MOVE_BEARER_OWED;
+}
+
+bool move_bearer_owed(void)
+{
+    if (s_rec.st == MOVE_ST_OK) {
+        return s_rec.bearer == MOVE_BEARER_OWED;
+    }
+    return s_rec.bearer != 0 && move_rec_unsettled(&s_rec) && s_rec.slot == ident_active_slot();
+}
+
 bool move_commit(void)
 {
     move_rec_t r = s_rec;
@@ -636,6 +661,7 @@ bool move_commit(void)
         return false;
     }
     /* the commit point is behind us: whatever fails from here is repaired at the next boot */
+    bearer_settle(&r);
     move_ledger_add(&r, r.id, MOVE_OUT_OK);
     r.st = MOVE_ST_OK;
     r.rsn = r.lrsn = MOVE_RSN_NONE;
@@ -670,6 +696,7 @@ move_boot_t move_boot_repair(void)
         what = MOVE_BOOT_CLEARED;
     } else if (move_rec_unsettled(&r) && r.slot == ident_active_slot()) {
         /* `idsel/act` was written, the record was not */
+        bearer_settle(&r);
         move_ledger_add(&r, r.id, MOVE_OUT_OK);
         r.st = MOVE_ST_OK;
         r.rsn = r.lrsn = MOVE_RSN_NONE;
@@ -688,6 +715,12 @@ move_boot_t move_boot_repair(void)
         r.st = MOVE_ST_FAIL;
         r.rsn = MOVE_RSN_BUDGET;
         what = MOVE_BOOT_BUDGET;
+    }
+    if (what == MOVE_BOOT_NOTHING && r.st == MOVE_ST_OK && r.bearer == MOVE_BEARER_OWED) {
+        bearer_settle(&r); /* the write that failed at the commit, again */
+        if (r.bearer == 0 && !move_rec_update(&r)) {
+            ESP_LOGI(TAG, "bearer choice stored, the record write failed");
+        }
     }
     if (what != MOVE_BOOT_NOTHING) {
         if (!move_rec_update(&r)) {
@@ -777,11 +810,6 @@ uint32_t move_sched_delay_s(uint8_t sched)
     }
 }
 
-uint32_t move_probe_interval_s(uint32_t since_ack_s)
-{
-    return since_ack_s < PAGER_MOVE_BEAM_PROBE_FIRST_S ? PAGER_MOVE_BEAM_PROBE_S : PAGER_MOVE_BEAM_PROBE_LONG_S;
-}
-
 uint32_t move_backoff_delay_s(uint32_t idx, uint32_t no_session_s)
 {
     static const uint32_t k_first[] = { 5, 15, 60, 300 };
@@ -809,12 +837,6 @@ void move_alt_on_usable(move_alt_t *a)
 }
 
 void move_alt_on_issue(move_alt_t *a) { a->usable_since_issue = false; }
-
-bool move_pending_attempt_allowed(uint8_t noproof_streak, int64_t since_last_pending_us)
-{
-    return noproof_streak < PAGER_MOVE_BEAM_SLOW_AFTER ||
-           since_last_pending_us >= (int64_t) PAGER_MOVE_BEAM_SLOW_S * 1000000;
-}
 
 uint32_t move_next_try_fill(const move_rec_t *r, uint32_t now_epoch, int64_t remaining_us)
 {
@@ -866,29 +888,15 @@ move_act_t move_plan(const move_plan_in_t *in)
     /* a reset loop without a clock must not run a trial per boot */
     const bool no_clock_repeat = in->attempts > 0 && in->now_epoch == 0;
 
-    if (!in->beam) {
-        const bool sched = in->st == MOVE_ST_PEND && in->sched < MOVE_SCHED_STEPS;
-        if (no_clock_repeat || !due(in) || (!sched && !in->quiet)) {
-            return MOVE_ACT_NONE;
-        }
-        if (!in->acked && in->store_age_us >= 0 && in->store_age_us < (int64_t) PAGER_MOVE_ACK_WAIT_S * 1000000) {
-            return MOVE_ACT_WAIT_ACK;
-        }
-        if (reply_gate) {
-            return MOVE_ACT_WAIT_REPLY;
-        }
-        return sched ? MOVE_ACT_TRIAL_SCHED : MOVE_ACT_TRIAL_BG;
-    }
-
-    if (!in->acked) {
+    const bool sched = in->st == MOVE_ST_PEND && in->sched < MOVE_SCHED_STEPS;
+    if (no_clock_repeat || !due(in) || (!sched && !in->quiet)) {
         return MOVE_ACT_NONE;
     }
-    if (in->st == MOVE_ST_PEND && !in->beam_prompt_done && in->pending_attempt_allowed && !no_clock_repeat &&
-        in->ack_age_us >= (int64_t) PAGER_MOVE_BEAM_PROMPT_S * 1000000) {
-        return reply_gate ? MOVE_ACT_WAIT_REPLY : MOVE_ACT_BEAM_PROMPT;
+    if (!in->acked && in->store_age_us >= 0 && in->store_age_us < (int64_t) PAGER_MOVE_ACK_WAIT_S * 1000000) {
+        return MOVE_ACT_WAIT_ACK;
     }
-    if (in->quiet && in->beam_probe_due && !in->reply_awaiting) {
-        return MOVE_ACT_BEAM_PROBE;
+    if (reply_gate) {
+        return MOVE_ACT_WAIT_REPLY;
     }
-    return MOVE_ACT_NONE;
+    return sched ? MOVE_ACT_TRIAL_SCHED : MOVE_ACT_TRIAL_BG;
 }

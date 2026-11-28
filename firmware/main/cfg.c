@@ -16,6 +16,7 @@
 #define CFG_KEY_LOC 5 /* loc */
 #define CFG_KEY_AST 6 /* font image job */
 #define CFG_KEY_MV 7  /* server move: order, cancel or proof */
+#define CFG_KEY_BR 8  /* bearer change: try or proof */
 
 // Skips one value and reports its [start,len) span so callers get the raw sub-map bytes.
 static bool skip_capture(cbor_r_t *r, size_t *off, size_t *len)
@@ -81,6 +82,12 @@ static bool parse_cfg_submap(cbor_r_t *r, cfg_dispatch_t *out)
                 return false;
             }
             out->have_mv = true;
+            break;
+        case CFG_KEY_BR:
+            if (!skip_capture(r, &out->br_off, &out->br_len)) {
+                return false;
+            }
+            out->have_br = true;
             break;
         default:
             // unknown cfg keys are skipped, not malformed
@@ -155,6 +162,7 @@ bool cfg_parse(const uint8_t *buf, uint16_t len, bool sig_pair_present, cfg_disp
 
 #ifdef ESP_PLATFORM
 
+#include "bearer_try.h"
 #include "catrust.h"
 #include "ident.h"
 #include "lock.h"
@@ -197,6 +205,10 @@ bool cfg_ingest_cbor(const uint8_t *buf, uint16_t len)
     if (d.have_mv) {
         // handed to move_service(), which acks on accept or reject; a malformed map is dropped
         move_apply_cfg_submap(buf + d.mv_off, (uint16_t) d.mv_len, d.id);
+    }
+    if (d.have_br) {
+        // handed to brtry_service(), which acks once the request is stored or settled
+        brtry_apply_cfg_submap(buf + d.br_off, (uint16_t) d.br_len, d.id);
     }
 
     return true;

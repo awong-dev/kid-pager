@@ -32,6 +32,8 @@ typedef struct {
     const char *apn;     /* "" = network's choice */
     bool bearer_known;
     bool beam;
+    const char *bearer_note; /* a cfg.br request under way or failed (bearer_try.h), in the carrier row;
+                                NULL or "" = none */
     const char *board; /* "" = unknown */
     bool have_pct;     /* carrier fuel gauge percent valid */
     int batt_pct;

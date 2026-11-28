@@ -295,7 +295,7 @@ def test_round_trip_home(tmp_path, src_kind, dst_kind):
         k2, pw2 = movekeys.derive(k, MOVE_ID, dev)
         d = got[f"devices/{dev}"]
         assert d["provisionState"] == "moving"
-        assert d["move"] == {"id": MOVE_ID, "state": "waiting"}
+        assert d["move"] == {"id": MOVE_ID, "state": "waiting", "onBeam": False}
         s = got[f"deviceSecrets/{dev}"]
         assert base64.b64decode(s["hmacKey"]) == k2
         assert "mqttPassword" not in s

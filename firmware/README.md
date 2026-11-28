@@ -156,10 +156,13 @@ repair, plan and back-off tables) runs on the host too; `move_svc.c` drives the 
   the `KPCAPS1:mv;` tag (`caps.c`, read by `tools/fwpub.py`) and the install-time capability check in
   `ota.c`. With no order the pager behaves as before.
 - **`CONFIG_PAGER_MOVE_TRIALS` (default off, `main/Kconfig.projbuild`)**: the trial on the pending
-  identity (connect, wait for the target's proof, commit or revert), the Beam prompt and probe, the
-  long-run reconnect schedule, the daily background trial, and `/status` `mvc`. Off, no relay will order a
-  move. The broker switch within one boot is unverified on the modem (docs/MOVE_FIRMWARE_DESIGN.md
-  §13.1); a trial by restart (§5.4) is the fallback.
+  identity (connect, wait for the target's proof, commit or revert), the
+  long-run reconnect schedule, the daily background trial, and `/status` `mvc`. A pager on Soracom Beam
+  runs the trial over the direct bearer and stays direct after the commit (NVS `carrier/bearer`);
+  `cfg.br` from its new server makes it try Beam again, up to three times, and keep it only on a signed
+  proof (`bearer_try.c`, `bearer_try_svc.c`, `/status` `brc` and `br`). Off, no relay will order a
+  move or a bearer change. The broker and bearer switch within one boot is unverified on the modem
+  (docs/MOVE_FIRMWARE_DESIGN.md §13.1); a trial by restart (§5.4) is the fallback.
   Enable it for a build with `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;<file with CONFIG_PAGER_MOVE_TRIALS=y>"`.
 - Bench commands: `identslot show|copy|flip`, `nvsstats`.
 

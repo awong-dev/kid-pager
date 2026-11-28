@@ -221,6 +221,30 @@ MOVE_STATES = ("pend", "try", "ok", "fail", "cxl")
 MOVE_RSN_MAX_BYTES = 8
 
 
+class BearerReport(BaseModel):
+    """`/status` `br` (CBOR key 80, docs/PROTOCOL.md §5.1): the pager's `cfg.br` request."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    id: str
+    st: Literal["try", "ok", "fail", "na"]
+    rsn: str | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _id(cls, v: str) -> str:
+        if MOVE_ID_RE.fullmatch(v) is None:
+            raise ValueError("invalid bearer request id")
+        return v
+
+    @field_validator("rsn")
+    @classmethod
+    def _rsn(cls, v: str | None) -> str | None:
+        if v is not None and (len(v.encode("utf-8")) > MOVE_RSN_MAX_BYTES or not v.isprintable()):
+            raise ValueError("rsn too long")
+        return v
+
+
 class MoveReport(BaseModel):
     """`/status` `mv` (CBOR key 78, docs/MOVE_DESIGN.md §12.2): the pager's move state."""
 
@@ -302,6 +326,10 @@ class StatusEnvelope(BaseModel):
     # `cfg.mv` order. `mv` (key 78) is the move report, CBOR only; a malformed one drops alone.
     mvc: int | None = None
     mv: MoveReport | None = None
+    # Bearer change (keys 79, 80): `brc` gates `cfg.br`, only `1` is legal; `br` is the pager's
+    # report, CBOR only; a malformed one drops alone.
+    brc: int | None = None
+    br: BearerReport | None = None
     # Carrier name the pager detected (key 70), display only; over-long or non-printable values
     # drop to `None`.
     car: str | None = None
@@ -390,6 +418,19 @@ class StatusEnvelope(BaseModel):
     @classmethod
     def _check_mvc(cls, value: object) -> int | None:
         return 1 if value == 1 and not isinstance(value, bool) else None
+
+    @field_validator("brc", mode="before")
+    @classmethod
+    def _check_brc(cls, value: object) -> int | None:
+        return 1 if value == 1 and not isinstance(value, bool) else None
+
+    @field_validator("br", mode="before")
+    @classmethod
+    def _check_br(cls, value: object) -> BearerReport | None:
+        try:
+            return BearerReport.model_validate(value)
+        except ValueError:
+            return None
 
     @field_validator("mv", mode="before")
     @classmethod

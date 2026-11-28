@@ -326,8 +326,8 @@ def reissue_ota(device_id: str, broker: BrokerClient, settings: Settings) -> Non
 
 
 def note_bearer(device: devices_store.Device, env: StatusEnvelope) -> None:
-    """Remembers that a pager of this move was on Beam the first time it reports so, for the
-    switch-back guard: its last bearer alone would forget it."""
+    """Remembers that a pager of this move has been on Beam: its last bearer alone would forget
+    it, since it arrives here over the direct bearer."""
     mv = device.move
     if env.tls != "proxy" or mv is None or mv.state is None or mv.onBeam:
         return
@@ -375,6 +375,16 @@ def beam_group_name(settings: Settings) -> str:
     return f"pager-beam-{settings.broker_host}"
 
 
+def _still_on_source(devs: list[devices_store.Device]) -> list[devices_store.Device]:
+    """Beam pagers that move by themselves (`brc`) and have not arrived: switching the Beam group
+    now would cut them off from the source before they have followed their order."""
+    return [
+        d
+        for d in devs
+        if d.status.brc == 1 and d.move is not None and d.move.state in ("waiting", "trying")
+    ]
+
+
 def beam_view(settings: Settings, rec: move.MoveRecord) -> dict[str, Any] | None:
     """The Beam block of the target page; `None` when this server has no Beam listener."""
     if settings.beam_port is None:
@@ -386,6 +396,21 @@ def beam_view(settings: Settings, rec: move.MoveRecord) -> dict[str, Any] | None
         "port": settings.beam_port,
         "count": len(devs),
         "movedCount": sum(1 for d in devs if d.move is not None and d.move.state == "moved"),
+        # Pagers the group switch would cut off, and pagers now on each bearer.
+        "waitingCount": len(_still_on_source(devs)),
+        "onBeamCount": sum(1 for d in devs if d.status.tls == "proxy"),
+        "devices": [
+            {
+                "deviceId": d.id,
+                "label": d.label,
+                "bearer": move.bearer_of(d.status),
+                "canTry": d.status.brc == 1,
+                "try": (
+                    {"st": d.bearerTry.st, "rsn": d.bearerTry.rsn} if d.bearerTry is not None else None
+                ),
+            }
+            for d in sorted(devs, key=lambda x: x.id)
+        ],
         "switched": beam.switched,
         "soracom": settings.soracom_configured,
         "byHand": beam.byHand,
@@ -397,14 +422,23 @@ def _soracom_client(settings: Settings) -> soracom.SoracomClient:
     return soracom.SoracomClient(settings.soracom_auth_key_id, settings.soracom_auth_key)
 
 
-def beam_switch(settings: Settings, *, by_hand: bool) -> dict[str, Any]:
+def beam_switch(settings: Settings, *, by_hand: bool, force: bool = False) -> dict[str, Any]:
     """§10: a new group with this server's Beam listener as its destination, then every SIM of the
-    old group moved into it; `by_hand` records that the admin did it in the console."""
+    old group moved into it; `by_hand` records that the admin did it in the console. Refused while
+    a Beam pager has still to arrive, unless `force`."""
     rec = _target_record("imported")
     if settings.beam_port is None:
         raise MoveError(409, "this server has no Beam listener (BEAM_PORT is not set)")
     if rec.beam is not None and rec.beam.switched:
         raise MoveError(409, "the Beam group is already switched")
+    waiting = _still_on_source(_beam_devices())
+    if waiting and not force:
+        raise MoveError(
+            409,
+            f"{len(waiting)} Beam pager(s) have not arrived yet; switching the group now cuts them "
+            "off from the old server",
+            waiting=[d.id for d in waiting],
+        )
     group = beam_group_name(settings)
     if by_hand:
         state = move.BeamState(switched=True, byHand=True, group=group, switchedAt=_now())
@@ -465,8 +499,8 @@ def beam_switch_back(settings: Settings) -> dict[str, Any]:
     beam = rec.beam
     if beam is None or not beam.switched:
         raise MoveError(409, "the Beam group is not switched")
-    if any(d.move is not None and d.move.state == "moved" for d in _beam_devices()):
-        raise MoveError(409, "a Beam pager has already moved here: it cannot go back")
+    if any(d.status.tls == "proxy" for d in _beam_devices()):
+        raise MoveError(409, "a pager is on Beam here: switching the group back would cut it off")
     if beam.byHand:
         move.patch_record(beam=move.BeamState(group=beam.group).model_dump(mode="python"))
         return {"switched": False, "byHand": True, "moved": 0}
